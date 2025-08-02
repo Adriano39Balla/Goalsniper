@@ -1,13 +1,14 @@
 import os
 import logging
 import requests
-from flask import Flask
+from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from football_api import get_live_matches
 from predictions import calculate_confidence_and_suggestion
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
@@ -21,6 +22,8 @@ def send_telegram(message):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         res = requests.post(url, json=payload, timeout=10)
+        if not res.ok:
+            logger.error(f"Telegram send failed: {res.text}")
         return res.ok
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
@@ -38,16 +41,18 @@ def check_matches():
 def home():
     return "GoalSniper is live and watching in-play matches ⚽🔥"
 
+@app.route("/predict", methods=["GET"])
+def predict():
+    logger.info("Manual prediction trigger via /predict")
+    check_matches()
+    return jsonify({"status": "Predictions sent"}), 200
+
+# Start scheduler before starting Flask
+scheduler = BackgroundScheduler()
+scheduler.add_job(check_matches, "interval", minutes=10)
+scheduler.start()
+logger.info("Scheduler started")
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(check_matches, "interval", minutes=10)
-    scheduler.start()
-
-    logger.info("Scheduler started. Press Ctrl+C to exit.")
-
-    try:
-        while True:
-            pass
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
