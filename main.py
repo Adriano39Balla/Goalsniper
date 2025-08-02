@@ -26,23 +26,24 @@ def check_matches():
         else:
             logger.info(f"No prediction for: {match['home']} vs {match['away']}")
 
-# Home route
+def send_heartbeat():
+    """Send a 'still working' message every 20 mins."""
+    logger.info("Sending heartbeat to Telegram...")
+    send_telegram_message("🔍 GoalSniper is live — scanning matches...")
+
 @app.route("/")
 def home():
     return "GoalSniper is live and watching in-play matches ⚽🔥"
 
-# Start scheduler
 def start_scheduler():
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_matches, "interval", minutes=10)
+    scheduler.add_job(send_heartbeat, "interval", minutes=20)
     scheduler.start()
     logger.info("Scheduler started...")
 
-# When running directly (dev mode)
 if __name__ == "__main__":
     start_scheduler()
     app.run(host="0.0.0.0", port=10000)
-
-# When running via Gunicorn (production on Render)
 else:
     start_scheduler()
