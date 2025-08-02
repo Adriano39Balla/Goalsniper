@@ -6,7 +6,8 @@ from football_api import get_live_matches
 from predictions import calculate_confidence_and_suggestion
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger
+app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
