@@ -4,73 +4,56 @@ import requests
 import certifi
 from requests.adapters import HTTPAdapter, Retry
 
+# Environment variables
 API_KEY = os.getenv("API_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
 
+# Logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# API headers
 HEADERS = {"x-apisports-key": API_KEY} if API_KEY else {}
 
+# Retry session
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
-def api_request(url):
-    """Makes an API request with retries and error handling."""
+def api_request(endpoint, params=None):
+    """General API request with retries."""
     if not API_KEY:
-        logger.error("API_KEY not set.")
-        return {"success": False, "error": "API key missing", "data": None}
-
+        logger.error("API_KEY not set")
+        return None
     try:
-        logger.info(f"Requesting: {url}")
-        res = session.get(url, headers=HEADERS, timeout=15, verify=certifi.where())
+        res = session.get(f"{BASE_URL}/{endpoint}", headers=HEADERS, params=params, timeout=15, verify=certifi.where())
         res.raise_for_status()
-        return {"success": True, "data": res.json()}
+        return res.json()
     except requests.exceptions.RequestException as e:
         logger.error(f"API request failed: {e}", exc_info=True)
-        return {"success": False, "error": str(e), "data": None}
+        return None
 
-def get_live_fixtures():
-    """Fetch all live matches."""
-    url = f"{BASE_URL}/fixtures?live=all"
-    response = api_request(url)
-    if not response.get("success"):
+def get_live_matches():
+    """Fetch all currently live matches with statistics."""
+    matches = api_request("fixtures", {"live": "all"})
+    if not matches or "response" not in matches:
         return []
 
-    fixtures = []
-    for match in response["data"].get("response", []):
-        fixtures.append({
-            "fixture_id": match["fixture"]["id"],
-            "home": {
-                "id": match["teams"]["home"]["id"],
-                "name": match["teams"]["home"]["name"]
-            },
-            "away": {
-                "id": match["teams"]["away"]["id"],
-                "name": match["teams"]["away"]["name"]
-            },
-            "league": match["league"]["name"],
-            "season": match["league"]["season"],
-            "elapsed": match["fixture"]["status"].get("elapsed"),
-            "score": {
-                "home": match["goals"]["home"],
-                "away": match["goals"]["away"]
-            }
+    live_data = []
+    for match in matches["response"]:
+        fixture_id = match["fixture"]["id"]
+
+        stats = api_request("fixtures/statistics", {"fixture": fixture_id})
+        stats_data = stats.get("response", []) if stats else []
+
+        live_data.append({
+            "fixture_id": fixture_id,
+            "minute": match["fixture"]["status"]["elapsed"],
+            "home": match["teams"]["home"]["name"],
+            "away": match["teams"]["away"]["name"],
+            "score_home": match["goals"]["home"],
+            "score_away": match["goals"]["away"],
+            "stats": stats_data
         })
-    return fixtures
 
-def get_live_stats(fixture_id):
-    """Fetch live statistics for a given match."""
-    url = f"{BASE_URL}/fixtures/statistics?fixture={fixture_id}"
-    response = api_request(url)
-    if not response.get("success"):
-        return {}
-
-    stats = {}
-    for team_data in response["data"].get("response", []):
-        team_name = team_data["team"]["name"]
-        team_stats = {item["type"]: item.get("value", 0) or 0 for item in team_data["statistics"]}
-        stats[team_name] = team_stats
-
-    return stats
+    return live_data
