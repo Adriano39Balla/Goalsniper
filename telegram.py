@@ -8,6 +8,9 @@ logger = logging.getLogger(__name__)
 
 def send_telegram_message(message):
     try:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.error("Telegram credentials are missing.")
+            return
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
         res = requests.post(url, data=payload, timeout=10)
