@@ -1,30 +1,41 @@
 from flask import Flask, jsonify
-from flask_cors import CORS
-from predictions import run_daily_predictions
+from apscheduler.schedulers.background import BackgroundScheduler
 import logging
 
-# Flask app initialization
+from predictions import run_daily_predictions
+from telegram import send_telegram_message
+
 app = Flask(__name__)
-CORS(app)  # Allow cross-origin requests if API will be called from browsers
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
-app.logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
+# --- Root route to avoid 404s ---
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "ok", "message": "GoalSniper API is live 🚀"})
+
+# --- Predict route ---
 @app.route("/predict", methods=["GET"])
 def predict():
-    """
-    Returns daily predictions in JSON format.
-    Never crashes the worker.
-    """
-    try:
-        app.logger.info("Prediction request received")
-        result = run_daily_predictions()
-        return jsonify(result), 200 if result.get("success") else 500
-    except Exception as e:
-        app.logger.error(f"Unexpected error in /predict: {e}", exc_info=True)
-        return jsonify({"success": False, "error": "Internal server error", "data": None}), 500
+    result = run_daily_predictions()
+    send_telegram_message(f"Daily prediction result: {result}")
+    return jsonify(result)
+
+# --- Daily scheduler ---
+def scheduled_task():
+    logger.info("Running scheduled task: daily predictions.")
+    result = run_daily_predictions()
+    send_telegram_message(f"Daily prediction result: {result}")
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(scheduled_task, 'cron', hour=8, minute=0)  # Every day at 08:00 UTC
+scheduler.start()
+
+# --- Keep scheduler alive ---
+@app.before_first_request
+def init_scheduler():
+    logger.info("Scheduler initialized and running.")
 
 if __name__ == "__main__":
-    # For development only. Use Gunicorn in production.
-    app.run(host="0.0.0.0", port=10000, debug=False)
+    app.run(host="0.0.0.0", port=5000)
