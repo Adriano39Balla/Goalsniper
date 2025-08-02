@@ -1,8 +1,4 @@
-pandas
-numpy
-scikit-learn
-sqlalchemy
-psycopg2-binary
+Flask
 requests
-python-telegram-bot==13.15
-joblib
+gunicorn
+python-dotenv
