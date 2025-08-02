@@ -1,77 +1,67 @@
-import os
 import logging
-import requests
-import certifi
-from math import floor
-from football_api import get_live_fixtures, get_live_stats
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-def send_to_telegram(message: str):
-    """Send message to Telegram."""
-    try:
-        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        res = requests.post(telegram_url, json=payload, timeout=10, verify=certifi.where())
-        res.raise_for_status()
-    except Exception as e:
-        logger.error(f"Telegram send error: {e}")
+def calculate_confidence_and_suggestion(match):
+    """Analyze match stats and produce bet suggestion with confidence."""
+    stats_map = {}
+    for team_data in match["stats"]:
+        team_name = team_data["team"]["name"]
+        stats_map[team_name] = {stat["type"]: stat["value"] for stat in team_data["statistics"]}
 
-def calculate_confidence(stats):
-    """Calculate confidence score from live stats."""
-    score = 0
-    try:
-        shots = int(stats.get("Shots on Goal", 0))
-        corners = int(stats.get("Corner Kicks", 0))
-        possession = int(stats.get("Ball Possession", "0%").replace("%", ""))
-        xg = float(stats.get("Expected Goals", 0))
+    if match["home"] not in stats_map or match["away"] not in stats_map:
+        return None
 
-        score += min(shots * 5, 25)
-        score += min(corners * 3, 15)
-        score += min(possession / 2, 15)
-        score += min(xg * 10, 45)
-    except Exception as e:
-        logger.error(f"Error calculating confidence: {e}")
+    home_stats = stats_map[match["home"]]
+    away_stats = stats_map[match["away"]]
 
-    return min(100, floor(score))
+    def extract(team_stats, key, cast_type=float):
+        val = team_stats.get(key, 0)
+        try:
+            return cast_type(str(val).replace("%", "").strip() or 0)
+        except:
+            return 0
 
-def run_live_predictions():
-    fixtures = get_live_fixtures()
-    if not fixtures:
-        send_to_telegram("⚽ No live matches found.")
-        return
+    # Extract key stats
+    home_shots = extract(home_stats, "Shots on Target", int)
+    away_shots = extract(away_stats, "Shots on Target", int)
+    home_xg = extract(home_stats, "Expected Goals", float)
+    away_xg = extract(away_stats, "Expected Goals", float)
+    home_corners = extract(home_stats, "Corner Kicks", int)
+    away_corners = extract(away_stats, "Corner Kicks", int)
+    home_poss = extract(home_stats, "Ball Possession", int)
+    away_poss = extract(away_stats, "Ball Possession", int)
 
-    for match in fixtures:
-        live_stats = get_live_stats(match["fixture_id"])
-        home_name = match["home"]["name"]
-        away_name = match["away"]["name"]
+    # Confidence calculation
+    def team_conf(shots, xg, corners, poss):
+        return (
+            (shots * 10) * 0.4 +  # Shots weight
+            (xg * 20) * 0.3 +     # xG weight
+            (corners * 5) * 0.2 + # Corners weight
+            (poss / 2) * 0.1      # Possession weight
+        )
 
-        if home_name in live_stats:
-            home_conf = calculate_confidence(live_stats[home_name])
-        else:
-            home_conf = 0
+    home_conf = team_conf(home_shots, home_xg, home_corners, home_poss)
+    away_conf = team_conf(away_shots, away_xg, away_corners, away_poss)
 
-        if away_name in live_stats:
-            away_conf = calculate_confidence(live_stats[away_name])
-        else:
-            away_conf = 0
+    # Pick team with higher confidence
+    if home_conf > away_conf:
+        high_team = match["home"]
+        confidence = home_conf
+    else:
+        high_team = match["away"]
+        confidence = away_conf
 
-        confidence = max(home_conf, away_conf)
+    if confidence < 75:  # Trigger only if ≥ 75%
+        return None
 
-        # ✅ Only trigger alert if confidence is 75% or higher
-        if confidence >= 75:
-            msg = (
-                f"⚽ <b>{home_name}</b> vs <b>{away_name}</b>\n"
-                f"⏱️ {match['elapsed']}'\n"
-                f"🔢 Score: {match['score']['home']} - {match['score']['away']}\n"
-                f"📊 Confidence: <b>{confidence}%</b>\n"
-            )
-            send_to_telegram(msg)
+    suggestion = (
+        f"⚽ {match['home']} vs {match['away']}\n"
+        f"⏱️ Minute: {match['minute']}'\n"
+        f"🔥 High pressure: {high_team}\n"
+        f"🎯 Suggestion: {high_team} to score next\n"
+        f"📊 Confidence: {confidence:.0f}%"
+    )
+
+    return suggestion
