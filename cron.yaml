@@ -1,0 +1,6 @@
+jobs:
+  - name: live-match-alerts
+    schedule: "*/2 * * * *"  # Every 2 minutes
+    type: cron
+    runtime: python
+    command: curl https://robi-superbrain-backend.onrender.com/match-alert
