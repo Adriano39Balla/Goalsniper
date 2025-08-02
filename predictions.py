@@ -66,11 +66,12 @@ def run_live_predictions():
 
         confidence = max(home_conf, away_conf)
 
-        msg = (
-            f"⚽ <b>{home_name}</b> vs <b>{away_name}</b>\n"
-            f"⏱️ {match['elapsed']}'\n"
-            f"🔢 Score: {match['score']['home']} - {match['score']['away']}\n"
-            f"📊 Confidence: <b>{confidence}%</b>\n"
-        )
-
-        send_to_telegram(msg)
+        # ✅ Only trigger alert if confidence is 75% or higher
+        if confidence >= 75:
+            msg = (
+                f"⚽ <b>{home_name}</b> vs <b>{away_name}</b>\n"
+                f"⏱️ {match['elapsed']}'\n"
+                f"🔢 Score: {match['score']['home']} - {match['score']['away']}\n"
+                f"📊 Confidence: <b>{confidence}%</b>\n"
+            )
+            send_to_telegram(msg)
