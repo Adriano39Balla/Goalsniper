@@ -2,6 +2,7 @@ import os
 import logging
 import requests
 import certifi
+from telegram import send_telegram_message
 from datetime import date
 from requests.adapters import HTTPAdapter, Retry
 
@@ -62,3 +63,9 @@ def run_daily_predictions():
     except Exception as e:
         logger.error(f"Unexpected error in run_daily_predictions: {e}", exc_info=True)
         return {"success": False, "error": "Unexpected error in predictions", "data": None}
+
+@app.route("/predict", methods=["GET"])
+def predict():
+    result = run_daily_predictions()
+    send_telegram_message(f"Daily prediction run result: {result}")
+    return jsonify(result)
