@@ -4,16 +4,33 @@ import requests
 import certifi
 from datetime import datetime
 
+# Logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# Environment variables
 API_KEY = os.getenv("API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Telegram send function
+def send_to_telegram(message: str):
+    """Send message to Telegram chat."""
+    try:
+        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        response = requests.post(telegram_url, json=payload, timeout=10, verify=certifi.where())
+        response.raise_for_status()
+        logger.info("Message sent to Telegram successfully.")
+    except Exception as e:
+        logger.error(f"Error sending message to Telegram: {e}", exc_info=True)
+
+# Main prediction function
 def run_daily_predictions():
-    """
-    Runs daily football predictions using API-Football.
-    Logs errors without crashing.
-    """
     try:
         today = datetime.utcnow().strftime("%Y-%m-%d")
         logger.info(f"Running daily predictions for {today}...")
@@ -22,7 +39,6 @@ def run_daily_predictions():
         params = {"date": today}
         headers = {"x-apisports-key": API_KEY}
 
-        # API request with SSL verification
         response = requests.get(
             url,
             headers=headers,
@@ -31,17 +47,29 @@ def run_daily_predictions():
             verify=certifi.where()
         )
         response.raise_for_status()
-
         data = response.json()
-        logger.info(f"API-Football response received. Fixtures count: {len(data.get('response', []))}")
+
+        fixtures = data.get("response", [])
+        logger.info(f"Fixtures found: {len(fixtures)}")
+
+        # Format message for Telegram
+        if fixtures:
+            message_lines = [f"⚽ <b>Today's Fixtures ({today})</b>\n"]
+            for fixture in fixtures[:10]:  # limit to first 10 for message size
+                league = fixture.get("league", {}).get("name", "Unknown League")
+                home = fixture.get("teams", {}).get("home", {}).get("name", "Home")
+                away = fixture.get("teams", {}).get("away", {}).get("name", "Away")
+                status = fixture.get("fixture", {}).get("status", {}).get("short", "TBD")
+                message_lines.append(f"<b>{home}</b> vs <b>{away}</b> ({league}) - {status}")
+
+            telegram_message = "\n".join(message_lines)
+            send_to_telegram(telegram_message)
+        else:
+            send_to_telegram(f"No fixtures found for {today}.")
+
         return {"success": True, "data": data}
 
-    except requests.exceptions.SSLError as ssl_err:
-        logger.error(f"SSL error during API-Football request: {ssl_err}", exc_info=True)
-        return {"success": False, "error": "SSL error contacting API-Football"}
-    except requests.exceptions.RequestException as req_err:
-        logger.error(f"HTTP error during API-Football request: {req_err}", exc_info=True)
-        return {"success": False, "error": "HTTP error contacting API-Football"}
     except Exception as e:
-        logger.error(f"Unexpected error in run_daily_predictions: {e}", exc_info=True)
-        return {"success": False, "error": "Unexpected error in predictions"}
+        logger.error(f"Prediction error: {e}", exc_info=True)
+        send_to_telegram(f"❌ Error running daily predictions: {e}")
+        return {"success": False, "error": str(e)}
