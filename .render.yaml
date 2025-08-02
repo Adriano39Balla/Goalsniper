@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: robi-superbrain-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python src/server.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: API_KEY
+        sync: false
+    plan: free
+    autoDeploy: true
