@@ -34,7 +34,12 @@ def check_matches():
         if tip:
             send_telegram(tip)
 
+@app.route("/")
+def home():
+    return "GoalSniper is live and watching in-play matches ⚽🔥"
+
 if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_matches, "interval", minutes=10)
     scheduler.start()
