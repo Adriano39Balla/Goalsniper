@@ -5,10 +5,25 @@ logger.setLevel(logging.INFO)
 
 def calculate_confidence_and_suggestion(match):
     """Analyze match stats and produce bet suggestion with confidence."""
+
+    # Defensive: Ensure keys exist
+    if not match or "stats" not in match or "home" not in match or "away" not in match:
+        logger.warning("Match data incomplete, skipping prediction")
+        return None
+
     stats_map = {}
-    for team_data in match["stats"]:
-        team_name = team_data["team"]["name"]
-        stats_map[team_name] = {stat["type"]: stat["value"] for stat in team_data["statistics"]}
+    try:
+        for team_data in match.get("stats", []):
+            team_name = team_data.get("team", {}).get("name")
+            if not team_name:
+                continue
+            stats_map[team_name] = {
+                stat.get("type"): stat.get("value", 0)
+                for stat in team_data.get("statistics", [])
+            }
+    except Exception as e:
+        logger.error(f"Error parsing match stats: {e}")
+        return None
 
     if match["home"] not in stats_map or match["away"] not in stats_map:
         return None
@@ -17,6 +32,7 @@ def calculate_confidence_and_suggestion(match):
     away_stats = stats_map[match["away"]]
 
     def extract(team_stats, key, cast_type=float):
+        """Extract numeric stat value safely."""
         val = team_stats.get(key, 0)
         try:
             return cast_type(str(val).replace("%", "").strip() or 0)
@@ -54,14 +70,18 @@ def calculate_confidence_and_suggestion(match):
         confidence = away_conf
 
     if confidence < 60:  # Trigger only if ≥ 60%
+        logger.info(f"Low confidence ({confidence:.1f}%), skipping suggestion")
         return None
+
+    minute = match.get("minute", "?")
 
     suggestion = (
         f"⚽ {match['home']} vs {match['away']}\n"
-        f"⏱️ Minute: {match['minute']}'\n"
+        f"⏱️ Minute: {minute}'\n"
         f"🔥 High pressure: {high_team}\n"
         f"🎯 Suggestion: {high_team} to score next\n"
         f"📊 Confidence: {confidence:.0f}%"
     )
 
+    logger.info(f"Generated suggestion: {suggestion}")
     return suggestion
