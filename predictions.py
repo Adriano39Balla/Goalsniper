@@ -1,75 +1,57 @@
 import os
-import logging
 import requests
-import certifi
 from datetime import datetime
+from flask import Flask, jsonify
+from dotenv import load_dotenv
+from your_prediction_module import get_predictions  # Replace with your actual import
 
-# Logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+# Load environment variables
+load_dotenv()
 
-# Environment variables
-API_KEY = os.getenv("API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Telegram send function
-def send_to_telegram(message: str):
-    """Send message to Telegram chat."""
-    try:
-        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        response = requests.post(telegram_url, json=payload, timeout=10, verify=certifi.where())
-        response.raise_for_status()
-        logger.info("Message sent to Telegram successfully.")
-    except Exception as e:
-        logger.error(f"Error sending message to Telegram: {e}", exc_info=True)
+app = Flask(__name__)
 
-# Main prediction function
+def send_telegram_message(message: str):
+    """Send a message to the configured Telegram chat."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Error sending message: {e}")
+
+@app.route("/predict", methods=["GET"])
 def run_daily_predictions():
+    """Run match predictions and send them to Telegram."""
     try:
+        predictions = get_predictions()  # Your prediction function
+
+        if not predictions:
+            return jsonify({"status": "ok", "message": "No predictions available"}), 200
+
+        # Format predictions message
         today = datetime.utcnow().strftime("%Y-%m-%d")
-        logger.info(f"Running daily predictions for {today}...")
+        message_lines = [f"⚽ <b>Today's Predictions ({today})</b>\n"]
+        for p in predictions:
+            # Example: "Team A vs Team B — 2-1"
+            message_lines.append(f"<b>{p['home']}</b> vs <b>{p['away']}</b> — {p['prediction']}")
 
-        url = "https://v3.football.api-sports.io/fixtures"
-        params = {"date": today}
-        headers = {"x-apisports-key": API_KEY}
+        message_text = "\n".join(message_lines)
 
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=15,
-            verify=certifi.where()
-        )
-        response.raise_for_status()
-        data = response.json()
+        # Send to Telegram
+        send_telegram_message(message_text)
 
-        fixtures = data.get("response", [])
-        logger.info(f"Fixtures found: {len(fixtures)}")
-
-        # Format message for Telegram
-        if fixtures:
-            message_lines = [f"⚽ <b>Today's Fixtures ({today})</b>\n"]
-            for fixture in fixtures[:10]:  # limit to first 10 for message size
-                league = fixture.get("league", {}).get("name", "Unknown League")
-                home = fixture.get("teams", {}).get("home", {}).get("name", "Home")
-                away = fixture.get("teams", {}).get("away", {}).get("name", "Away")
-                status = fixture.get("fixture", {}).get("status", {}).get("short", "TBD")
-                message_lines.append(f"<b>{home}</b> vs <b>{away}</b> ({league}) - {status}")
-
-            telegram_message = "\n".join(message_lines)
-            send_to_telegram(telegram_message)
-        else:
-            send_to_telegram(f"No fixtures found for {today}.")
-
-        return {"success": True, "data": data}
+        return jsonify({"status": "ok", "message": "Predictions sent"}), 200
 
     except Exception as e:
-        logger.error(f"Prediction error: {e}", exc_info=True)
-        send_to_telegram(f"❌ Error running daily predictions: {e}")
-        return {"success": False, "error": str(e)}
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
