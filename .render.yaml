@@ -1,13 +1,13 @@
 services:
   - type: web
-    name: robi-superbrain-backend
+    name: Goalsniper-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python src/server.py
     envVars:
-      - key: BOT_TOKEN
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: CHAT_ID
+      - key: TELEGRAM_CHAT_ID
         sync: false
       - key: API_KEY
         sync: false
