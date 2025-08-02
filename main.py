@@ -1,6 +1,7 @@
 import os
 import logging
 import requests
+from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from football_api import get_live_matches
 from predictions import calculate_confidence_and_suggestion
