@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram_message(message: str) -> bool:
     """Send a message to Telegram."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing in environment variables")
         return False
 
