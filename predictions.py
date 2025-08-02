@@ -53,7 +53,7 @@ def calculate_confidence_and_suggestion(match):
         high_team = match["away"]
         confidence = away_conf
 
-    if confidence < 75:  # Trigger only if ≥ 75%
+    if confidence < 60:  # Trigger only if ≥ 60%
         return None
 
     suggestion = (
