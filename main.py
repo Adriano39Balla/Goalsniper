@@ -1,28 +1,46 @@
 import os
 import logging
-from flask import Flask
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
-from predictions import run_live_predictions
+from football_api import get_live_matches
+from predictions import calculate_confidence_and_suggestion
 
 logging.basicConfig(level=logging.INFO)
-app = Flask(__name__)
+logger = logging.getLogger(__name__)
 
-scheduler = BackgroundScheduler()
+TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
-@app.route("/")
-def home():
-    return "⚽ Live Match Prediction Bot is running."
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("Telegram credentials missing")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        return res.ok
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
+        return False
 
-@app.route("/predict")
-def predict():
-    run_live_predictions()
-    return "✅ Predictions sent."
-
-def start_scheduler():
-    scheduler.add_job(run_live_predictions, "interval", minutes=10)
-    scheduler.start()
+def check_matches():
+    logger.info("Checking live matches...")
+    matches = get_live_matches()
+    for match in matches:
+        tip = calculate_confidence_and_suggestion(match)
+        if tip:
+            send_telegram(tip)
 
 if __name__ == "__main__":
-    start_scheduler()
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(check_matches, "interval", minutes=10)
+    scheduler.start()
+
+    logger.info("Scheduler started. Press Ctrl+C to exit.")
+
+    try:
+        while True:
+            pass
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown()
