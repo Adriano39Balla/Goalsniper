@@ -3,8 +3,8 @@ import logging
 import requests
 import sqlite3
 from flask import Flask, jsonify
-from typing import List, Dict, Any, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
+from typing import List, Dict, Any, Optional
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -14,12 +14,12 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("API_KEY")
-
 FOOTBALL_API_URL = "https://v3.football.api-sports.io/fixtures"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 DB_PATH = "tip_performance.db"
-CONFIDENCE_THRESHOLD = 70  # Only send if >= 70%
+
+CONFIDENCE_THRESHOLD = 70  # 70%
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -35,12 +35,15 @@ def init_db():
 
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_CHAT_ID or not TELEGRAM_BOT_TOKEN:
+        logger.error("Missing Telegram credentials.")
         return False
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML"
     }
+
     try:
         res = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=10)
         return res.ok
@@ -57,8 +60,7 @@ def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
             timeout=10
         )
         res.raise_for_status()
-        data = res.json().get("response", [])
-        return data if data else None
+        return res.json().get("response", []) or None
     except Exception as e:
         logger.warning(f"[SKIP] Stats fetch failed for {fixture_id}: {e}")
         return None
@@ -76,16 +78,37 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
         logger.error(f"API error: {e}")
         return []
 
-def calculate_confidence(s_home: dict, s_away: dict) -> int:
-    """Simple confidence calculation based on match stats"""
-    score = 0
-    score += min(int(s_home.get("Shots on Target", 0) or 0), 10) * 5
-    score += min(int(s_away.get("Shots on Target", 0) or 0), 10) * 5
-    score += min(int(s_home.get("Corner Kicks", 0) or 0), 10) * 3
-    score += min(int(s_away.get("Corner Kicks", 0) or 0), 10) * 3
-    score += abs(int(str(s_home.get("Ball Possession", "0")).replace('%', '') or 0) -
-                 int(str(s_away.get("Ball Possession", "0")).replace('%', '') or 0))
-    return min(score, 100)
+def normalize(value: float, max_value: float) -> float:
+    try:
+        return min(float(value) / max_value, 1.0)
+    except (ValueError, TypeError):
+        return 0.0
+
+def calculate_confidence(s_home, s_away) -> float:
+    shots_home = int(s_home.get("Shots on Target", 0) or 0)
+    shots_away = int(s_away.get("Shots on Target", 0) or 0)
+    corners_home = int(s_home.get("Corner Kicks", 0) or 0)
+    corners_away = int(s_away.get("Corner Kicks", 0) or 0)
+    possession_home = int(str(s_home.get("Ball Possession", "0")).replace('%', '') or 0)
+    possession_away = int(str(s_away.get("Ball Possession", "0")).replace('%', '') or 0)
+    xg_home = float(s_home.get("Expected Goals", 0) or 0)
+    xg_away = float(s_away.get("Expected Goals", 0) or 0)
+
+    # Combine stats from both teams
+    shots = shots_home + shots_away
+    corners = corners_home + corners_away
+    possession = max(possession_home, possession_away)  # stronger team's possession
+    xg = xg_home + xg_away
+
+    # Weighted confidence calculation
+    confidence = (
+        normalize(shots, 8) * 0.4 +
+        normalize(corners, 10) * 0.2 +
+        normalize(possession, 100) * 0.2 +
+        normalize(xg, 3) * 0.2
+    ) * 100
+
+    return round(confidence, 2)
 
 def generate_tip(match: Dict[str, Any]) -> Optional[str]:
     match_id = match["fixture"]["id"]
@@ -113,39 +136,39 @@ def generate_tip(match: Dict[str, Any]) -> Optional[str]:
 
     confidence = calculate_confidence(s_home, s_away)
     if confidence < CONFIDENCE_THRESHOLD:
-        return None
+        return None  # Skip low confidence matches
 
     return (
         f"⚽️ Match in progress: {home} vs {away}\n"
         f"⏱️ Minute: {elapsed}'\n"
         f"🔢 Score: {score_home} - {score_away}\n"
-        f"📊 Confidence: {confidence}%\n\n"
-        f"🤖 Suggested Bet: High attacking pressure detected!"
+        f"📊 Confidence: {confidence}%\n"
+        f"📌 This game meets your betting confidence threshold!"
     )
 
-@app.route("/")
-def home():
-    return "🤖 Robi Superbrain is active and scanning live matches."
-
-@app.route("/match-alert")
-def match_alert():
+def check_matches():
+    logger.info("Checking live matches...")
     matches = fetch_live_matches()
     sent = 0
     for match in matches:
         tip = generate_tip(match)
         if tip and send_telegram(tip):
             sent += 1
-    return jsonify({"status": "ok", "matches": len(matches), "tips_sent": sent})
+    logger.info(f"Tips sent: {sent}")
 
-def scheduled_task():
-    logger.info("Running scheduled match scan...")
-    match_alert()
+@app.route("/")
+def home():
+    return "🤖 Robi Superbrain is active and watching the game."
+
+@app.route("/match-alert")
+def match_alert():
+    check_matches()
+    return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
     init_db()
     scheduler = BackgroundScheduler()
-    scheduler.add_job(scheduled_task, "interval", minutes=5)  # Every 5 minutes
+    scheduler.add_job(check_matches, "interval", minutes=5)
     scheduler.start()
-
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
