@@ -1,6 +1,6 @@
 # main.py
 from flask import Flask, jsonify
-from betting_predictions import run_daily_predictions
+from predictions import run_daily_predictions
 
 app = Flask(__name__)
 
