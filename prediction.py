@@ -1,45 +1,46 @@
-# /app/prediction.py
-def make_predictions(stats):
+# betting_predictions.py
+import os
+import logging
+import requests
+import certifi
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+API_KEY = os.getenv("API_KEY")
+
+def run_daily_predictions():
+    """
+    Runs daily football predictions using API-Football.
+    Logs errors instead of killing the worker.
+    """
     try:
-        # Extract safely
-        home_stats = stats.get("home", {}).get("response", {})
-        away_stats = stats.get("away", {}).get("response", {})
+        logger.info("Running daily predictions...")
 
-        # Goals average
-        home_goals = float(home_stats.get("goals", {}).get("for", {}).get("average", {}).get("total", 0))
-        away_goals = float(away_stats.get("goals", {}).get("for", {}).get("average", {}).get("total", 0))
-        avg_goals = home_goals + away_goals
+        url = "https://v3.football.api-sports.io/fixtures"
+        params = {"date": "2025-08-02"}  # Example: today's date
+        headers = {"x-apisports-key": API_KEY}
 
-        # Over/Under
-        over_under = "Over 2.5" if avg_goals > 2.5 else "Under 2.5"
+        # Use certifi to avoid SSL issues
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=15,
+            verify=certifi.where()
+        )
+        response.raise_for_status()
 
-        # Win/Draw/Loss
-        home_played = max(1, home_stats.get("fixtures", {}).get("played", {}).get("total", 1))
-        away_played = max(1, away_stats.get("fixtures", {}).get("played", {}).get("total", 1))
-        home_win_rate = home_stats.get("fixtures", {}).get("wins", {}).get("total", 0) / home_played
-        away_win_rate = away_stats.get("fixtures", {}).get("wins", {}).get("total", 0) / away_played
+        data = response.json()
+        logger.info(f"API-Football response: {data}")
+        return {"success": True, "data": data}
 
-        if home_win_rate > away_win_rate:
-            result = "Home Win"
-        elif away_win_rate > home_win_rate:
-            result = "Away Win"
-        else:
-            result = "Draw"
-
-        # Double Chance
-        double_chance = "1X" if home_win_rate > 0.4 else "X2"
-
-        # Handicap
-        home_goals_for = home_stats.get("goals", {}).get("for", {}).get("total", {}).get("total", 0)
-        home_goals_against = home_stats.get("goals", {}).get("against", {}).get("total", {}).get("total", 0)
-        goal_diff = home_goals_for - home_goals_against
-        handicap = "Home -1" if goal_diff > 10 else "No Handicap"
-
-        return {
-            "over_under": over_under,
-            "result": result,
-            "double_chance": double_chance,
-            "handicap": handicap
-        }
+    except requests.exceptions.SSLError as ssl_err:
+        logger.error(f"SSL error during API-Football request: {ssl_err}", exc_info=True)
+        return {"success": False, "error": "SSL error contacting API-Football"}
+    except requests.exceptions.RequestException as req_err:
+        logger.error(f"HTTP error during API-Football request: {req_err}", exc_info=True)
+        return {"success": False, "error": "HTTP error contacting API-Football"}
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Unexpected error in run_daily_predictions: {e}", exc_info=True)
+        return {"success": False, "error": "Unexpected error in predictions"}
