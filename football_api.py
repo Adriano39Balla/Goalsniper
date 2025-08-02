@@ -2,7 +2,6 @@ import os
 import logging
 import requests
 import certifi
-from datetime import datetime
 from requests.adapters import HTTPAdapter, Retry
 
 # Environment variables
@@ -36,10 +35,9 @@ def api_request(url):
         logger.error(f"API request failed: {e}", exc_info=True)
         return {"success": False, "error": str(e), "data": None}
 
-def get_today_fixtures():
-    """Fetch today's football fixtures."""
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    url = f"{BASE_URL}/fixtures?date={today}"
+def get_live_fixtures():
+    """Fetch all currently live football fixtures."""
+    url = f"{BASE_URL}/fixtures?live=all"
     response = api_request(url)
 
     if not response.get("success"):
@@ -58,7 +56,12 @@ def get_today_fixtures():
                 "name": match["teams"]["away"]["name"]
             },
             "league_id": match["league"]["id"],
-            "season": match["league"]["season"]
+            "season": match["league"]["season"],
+            "elapsed": match["fixture"]["status"].get("elapsed"),
+            "score": {
+                "home": match["goals"]["home"],
+                "away": match["goals"]["away"]
+            }
         })
     return fixtures
 
