@@ -118,34 +118,49 @@ def generate_tip(match: Dict[str, Any]) -> Optional[str]:
     score_away = match["goals"]["away"]
     elapsed = match["fixture"]["status"]["elapsed"]
 
-    if elapsed is None or elapsed > 90:
-        return None
-
-    stats = match.get("statistics", [])
-    if not stats:
-        logger.info(f"[SKIP] No stats found for match {match_id}")
-        return None
-
+    stats = match["statistics"]
     data = {s["team"]["name"]: {i["type"]: i["value"] for i in s["statistics"]} for s in stats}
     if home not in data or away not in data:
-        logger.info(f"[SKIP] Incomplete stats for match {match_id}")
         return None
 
     s_home = data[home]
     s_away = data[away]
+    
+    xg_home = float(s_home.get("Expected Goals", 0) or 0)
+    xg_away = float(s_away.get("Expected Goals", 0) or 0)
+    shots_home = int(s_home.get("Shots on Target", 0) or 0)
+    shots_away = int(s_away.get("Shots on Target", 0) or 0)
+    corners_home = int(s_home.get("Corner Kicks", 0) or 0)
+    corners_away = int(s_away.get("Corner Kicks", 0) or 0)
 
-    confidence = calculate_confidence(s_home, s_away)
-    if confidence < CONFIDENCE_THRESHOLD:
-        return None  # Skip low confidence matches
+    tip_lines = []
+    total_score = score_home + score_away
+    pressure_threshold = 5
+    over_goal_trigger = xg_home + xg_away >= 2.5 and total_score <= 2
+
+    for team, stats in [(home, s_home), (away, s_away)]:
+        shots = int(stats.get("Shots on Target", 0) or 0)
+        corners = int(stats.get("Corner Kicks", 0) or 0)
+        poss = int(str(stats.get("Ball Possession", "0")).replace('%', '') or 0)
+
+        if shots >= pressure_threshold or corners >= pressure_threshold or poss >= 60:
+            tip_lines.append(
+                f"📈 High attacking pressure by <b>{team}</b>\n"
+                f"📊 Possession {poss}%, {corners} corners, {shots} shots on target"
+            )
+            if over_goal_trigger:
+                tip_lines.append(f"🤖 Suggested Bet: {team} to score next / Over 2.5 Goals likely")
+
+    if not tip_lines:
+        tip_lines.append("📌 Stats suggest a balanced game in progress.")
 
     return (
         f"⚽️ Match in progress: {home} vs {away}\n"
         f"⏱️ Minute: {elapsed}'\n"
-        f"🔢 Score: {score_home} - {score_away}\n"
-        f"📊 Confidence: {confidence}%\n"
-        f"📌 This game meets your betting confidence threshold!"
+        f"🔢 Score: {score_home} - {score_away}\n\n" +
+        "\n".join(tip_lines)
     )
-
+    
 def check_matches():
     logger.info("Checking live matches...")
     matches = fetch_live_matches()
