@@ -1,9 +1,8 @@
-# src/model_training.py
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import LabelEncoder
-from src.db import get_training_data
+from db import get_training_data
 
 def auto_train_model():
     data = get_training_data()
