@@ -47,7 +47,7 @@ def match_alert():
 
 @app.post("/feedback")
 def feedback_endpoint(match_id: int, result: str):
-    from src.db import store_feedback
+    from db import store_feedback
     store_feedback(match_id, result)
     auto_train_model()
     return {"status": "Feedback received"}
