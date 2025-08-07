@@ -11,6 +11,8 @@ from model_training import auto_train_model
 import requests
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
 app = FastAPI()
 logger = logging.getLogger("uvicorn")
 
@@ -65,3 +67,7 @@ def feedback_endpoint(payload: dict, x_token: str = Header(...)):
     except Exception as e:
         logger.error(f"[Feedback] Error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
