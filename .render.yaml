@@ -11,16 +11,24 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: AUTH_HEADER
+        sync: false
     autoDeploy: true
     plan: free
 
   - type: cron
     name: match-alert
-    schedule: cron.yaml
+    schedule: "*/5 * * * *"
+    method: GET
+    path: /match-alert
+    headers:
+      x-token: ${AUTH_HEADER}
     envVars:
       - key: API_KEY
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: AUTH_HEADER
         sync: false
