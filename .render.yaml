@@ -1,15 +1,26 @@
 services:
   - type: web
-    name: Goalsniper-backend
-    runtime: python
+    name: robi-superbrain
+    env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python src/server.py
+    startCommand: uvicorn src.server:app --host 0.0.0.0 --port 10000
     envVars:
+      - key: API_KEY
+        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+    autoDeploy: true
+    plan: free
+
+  - type: cron
+    name: match-alert
+    schedule: cron.yaml
+    envVars:
       - key: API_KEY
         sync: false
-    plan: free
-    autoDeploy: true
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
