@@ -1,26 +1,30 @@
 from db import get_training_data
+import logging
+
+logger = logging.getLogger("uvicorn")
 
 def generate_kombi_tips(max_tips: int = 3) -> list[dict]:
     data = get_training_data()
     if not data:
+        logger.info("[Combi] No training data available.")
         return []
 
-    # Filter only ✅ tips with high confidence
     valid = [
         {
-            "team": t,
-            "league": l,
+            "team": team,
+            "league": league,
             "tip": tip,
-            "confidence": conf
+            "confidence": confidence
         }
-        for t, l, tip, conf, res in data
-        if res == "✅" and conf >= 75
+        for team, league, tip, confidence, result in data
+        if result == "✅" and confidence >= 75
     ]
 
     if len(valid) < max_tips:
+        logger.info(f"[Combi] Not enough valid tips (found {len(valid)}, need {max_tips})")
         return []
 
-    # Select diverse leagues or teams
+    # Try to ensure different leagues
     seen_leagues = set()
     combo = []
 
@@ -32,4 +36,5 @@ def generate_kombi_tips(max_tips: int = 3) -> list[dict]:
         if len(combo) == max_tips:
             break
 
+    logger.info(f"[Combi] Returning {len(combo)} kombi tips")
     return combo
