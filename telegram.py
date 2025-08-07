@@ -21,4 +21,4 @@ def send_tip_message(tip: dict, bot_token: str, chat_id: str):
         res = requests.post(url, json=payload)
         res.raise_for_status()
     except requests.RequestException as e:
-        logger.error(f"[Telegram] Message failed: {e}")
+        logger.error(f"[Telegram] Error sending message: {e}")
