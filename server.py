@@ -5,10 +5,10 @@ import pytz
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from src.analyzer import analyze_matches
-from src.telegram import send_tip_message
-from src.db import store_tip
-from src.model_training import auto_train_model
+from analyzer import analyze_matches
+from telegram import send_tip_message
+from db import store_tip
+from model_training import auto_train_model
 
 load_dotenv()
 
