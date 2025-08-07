@@ -1,4 +1,7 @@
 import requests
+import logging
+
+logger = logging.getLogger("uvicorn")
 
 def send_tip_message(tip: dict, bot_token: str, chat_id: str):
     message = f"⚽️ *New Tip!*\n" \
@@ -11,19 +14,11 @@ def send_tip_message(tip: dict, bot_token: str, chat_id: str):
     payload = {
         "chat_id": chat_id,
         "text": message,
-        "parse_mode": "Markdown",
-        "reply_markup": {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Analyze More", "callback_data": "analyze_more"},
-                    {"text": "❌ Skip", "callback_data": "skip_tip"}
-                ]
-            ]
-        }
+        "parse_mode": "Markdown"
     }
 
     try:
         res = requests.post(url, json=payload)
         res.raise_for_status()
     except requests.RequestException as e:
-        print(f"[Telegram] Error sending message: {e}")
+        logger.error(f"[Telegram] Message failed: {e}")
