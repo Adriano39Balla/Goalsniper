@@ -8,7 +8,6 @@ from analyzer import analyze_matches
 from telegram import send_tip_message
 from db import store_tip, store_feedback
 from model_training import auto_train_model
-
 import requests
 
 load_dotenv()
@@ -18,7 +17,7 @@ logger = logging.getLogger("uvicorn")
 API_KEY = os.getenv("API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-AUTH_HEADER = os.getenv("AUTH_HEADER", "secure-token-123")  # Default fallback
+AUTH_HEADER = os.getenv("AUTH_HEADER", "secure-token-123")
 API_URL = "https://v3.football.api-sports.io/fixtures"
 HEADERS = {"x-apisports-key": API_KEY}
 
@@ -26,11 +25,9 @@ def verify_auth(x_token: str = Header(...)):
     if x_token != AUTH_HEADER:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-
 @app.get("/")
 def root():
     return {"status": "Robi_Superbrain v10 ready"}
-
 
 @app.get("/match-alert")
 def match_alert(x_token: str = Header(...)):
@@ -38,8 +35,7 @@ def match_alert(x_token: str = Header(...)):
     try:
         now = datetime.utcnow().replace(tzinfo=pytz.UTC)
         res = requests.get(API_URL, headers=HEADERS, params={"live": "all"})
-        data = res.json()
-        matches = data.get("response", [])
+        matches = res.json().get("response", [])
         sent_count = 0
 
         for match in matches:
@@ -51,11 +47,9 @@ def match_alert(x_token: str = Header(...)):
                     sent_count += 1
 
         return {"result": "ok", "tips_sent": sent_count}
-
     except Exception as e:
         logger.error(f"[MatchAlert] Error: {e}")
         return {"error": str(e)}
-
 
 @app.post("/feedback")
 def feedback_endpoint(payload: dict, x_token: str = Header(...)):
