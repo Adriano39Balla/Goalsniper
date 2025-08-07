@@ -19,9 +19,9 @@ logger = logging.getLogger("uvicorn")
 API_KEY = os.getenv("API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-AUTH_HEADER = os.getenv("AUTH_HEADER", "secure-token-123")
-API_URL = "https://v3.football.api-sports.io/fixtures"
+AUTH_HEADER = os.getenv("AUTH_HEADER", "default-secret")
 HEADERS = {"x-apisports-key": API_KEY}
+API_URL = "https://v3.football.api-sports.io/fixtures"
 
 def verify_auth(x_token: str = Header(...)):
     if x_token != AUTH_HEADER:
