@@ -1,28 +1,33 @@
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import LabelEncoder
 from db import get_training_data
+import logging
+
+logger = logging.getLogger("uvicorn")
 
 def auto_train_model():
     data = get_training_data()
     if len(data) < 10:
-        print("[ML] Not enough data to train.")
+        logger.info("[ML] Not enough data to train.")
         return
 
-    teams, leagues, tips, confidences, results = zip(*data)
-    labels = [1 if r == "✅" else 0 for r in results]
-
-    text_features = [f"{t} {l} {tip}" for t, l, tip in zip(teams, leagues, tips)]
-
-    # Simple pipeline: text vectorizer + logistic regression
-    model = make_pipeline(
-        CountVectorizer(),
-        LogisticRegression()
-    )
-
     try:
+        teams, leagues, tips, confidences, results = zip(*data)
+
+        # Ensure only valid result labels
+        labels = [1 if result == "✅" else 0 for result in results]
+
+        # Concatenate features into one string
+        text_features = [f"{team} {league} {tip}" for team, league, tip in zip(teams, leagues, tips)]
+
+        model = make_pipeline(
+            CountVectorizer(),
+            LogisticRegression()
+        )
+
         model.fit(text_features, labels)
-        print("[ML] Model trained successfully.")
+        logger.info("[ML] Model trained successfully.")
+
     except Exception as e:
-        print(f"[ML] Training error: {e}")
+        logger.error(f"[ML] Training error: {e}")
