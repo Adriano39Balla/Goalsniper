@@ -1,4 +1,3 @@
-# src/analyzer.py
 def analyze_matches(match: dict) -> dict | None:
     status = match["fixture"]["status"]["elapsed"]
     if status is None:
