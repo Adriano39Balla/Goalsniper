@@ -8,7 +8,6 @@ from analyzer import analyze_matches
 from telegram import send_tip_message
 from db import store_tip, store_feedback
 from model_training import auto_train_model
-from config import get_env_var, AUTH_HEADER
 
 import requests
 
@@ -16,11 +15,11 @@ load_dotenv()
 app = FastAPI()
 logger = logging.getLogger("uvicorn")
 
-API_KEY = get_env_var("API_KEY")
-BOT_TOKEN = get_env_var("TELEGRAM_BOT_TOKEN")
-CHAT_ID = get_env_var("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("API_KEY")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+AUTH_HEADER = os.getenv("AUTH_HEADER", "secure-token-123")  # Default fallback
 API_URL = "https://v3.football.api-sports.io/fixtures"
-
 HEADERS = {"x-apisports-key": API_KEY}
 
 def verify_auth(x_token: str = Header(...)):
