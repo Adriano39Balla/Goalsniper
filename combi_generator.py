@@ -1,4 +1,4 @@
-from src.db import get_training_data
+from db import get_training_data
 
 def generate_kombi_tips(max_tips: int = 3) -> list[dict]:
     data = get_training_data()
