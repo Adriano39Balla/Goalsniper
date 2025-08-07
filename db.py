@@ -1,7 +1,8 @@
 import sqlite3
 from datetime import datetime
+import os
 
-DB_PATH = "tips.db"
+DB_PATH = os.path.join(os.getcwd(), "tips.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -9,7 +10,7 @@ def init_db():
     c.execute("""
     CREATE TABLE IF NOT EXISTS tips (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        match_id INTEGER,
+        match_id INTEGER UNIQUE,
         team TEXT,
         league TEXT,
         tip TEXT,
@@ -21,22 +22,28 @@ def init_db():
     conn.commit()
     conn.close()
 
-def store_tip(tip: dict):
+def store_tip(tip: dict) -> bool:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO tips (match_id, team, league, tip, confidence, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        tip["match_id"],
-        tip["team"],
-        tip["league"],
-        tip["tip"],
-        tip["confidence"],
-        datetime.utcnow().isoformat()
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        c.execute("""
+            INSERT INTO tips (match_id, team, league, tip, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            tip["match_id"],
+            tip["team"],
+            tip["league"],
+            tip["tip"],
+            tip["confidence"],
+            datetime.utcnow().isoformat()
+        ))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        # Match already exists
+        return False
+    finally:
+        conn.close()
 
 def store_feedback(match_id: int, result: str):
     conn = sqlite3.connect(DB_PATH)
@@ -58,5 +65,5 @@ def get_training_data():
     conn.close()
     return rows
 
-# Initialize the DB on import
+# Initialize DB on import
 init_db()
