@@ -1,61 +1,70 @@
-import os
 import requests
-import logging
-
-logger = logging.getLogger("uvicorn")
-
-API_KEY = os.getenv("API_KEY")
-STATS_URL = "https://v3.football.api-sports.io/fixtures/statistics"
-HEADERS = {"x-apisports-key": API_KEY}
+from dotenv import dotenv_values
 
 def analyze_matches(match: dict) -> dict | None:
-    return {
-        "match_id": 999999,
-        "team": "Test FC vs Simulated United",
-        "league": "Simulation League",
-        "tip": "Over 2.5 Goals",
-        "confidence": 88
-    }
+    stats = get_match_stats(match)
+    if not stats:
+        return None
+
+    xg_home = stats.get("xg_home", 0)
+    xg_away = stats.get("xg_away", 0)
+    shots_total = stats.get("shots_total", 0)
+    corners = stats.get("corners", 0)
+    red_cards = stats.get("reds", 0)
+    score_home = match["goals"]["home"] or 0
+    score_away = match["goals"]["away"] or 0
+    total_goals = score_home + score_away
+
+    if xg_home + xg_away > 0.9 and shots_total > 15 and total_goals < 3:
+        confidence = max(70, min(95, int((xg_home + xg_away) * 20)))
+        return {
+            "match_id": match["fixture"]["id"],
+            "team": f"{match['teams']['home']['name']} vs {match['teams']['away']['name']}",
+            "league": match["league"]["name"],
+            "tip": "Over 2.5 Goals",
+            "confidence": confidence
+        }
+
+    if corners > 10 and red_cards == 0:
+        return {
+            "match_id": match["fixture"]["id"],
+            "team": f"{match['teams']['home']['name']} vs {match['teams']['away']['name']}",
+            "league": match["league"]["name"],
+            "tip": "Over 10.5 Corners",
+            "confidence": 70
+        }
+
+    return None
+
 
 def get_match_stats(match: dict) -> dict:
+    stats_url = f"https://v3.football.api-sports.io/fixtures/statistics"
     fixture_id = match["fixture"]["id"]
+    API_KEY = dotenv_values().get("API_KEY")
 
-    try:
-        res = requests.get(
-            STATS_URL,
-            params={"fixture": fixture_id},
-            headers=HEADERS
-        )
-        res.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"[Analyzer] Failed to fetch stats: {e}")
+    res = requests.get(stats_url, params={"fixture": fixture_id}, headers={"x-apisports-key": API_KEY})
+    if res.status_code != 200:
         return {}
 
     data = res.json().get("response", [])
-    total_shots = sum(
-        item["value"] or 0
-        for team in data
-        for item in team.get("statistics", [])
-        if item["type"] == "Shots on Goal"
-    )
+    total_shots = 0
+    total_corners = 0
+    total_reds = 0
+    xg_home = 0
+    xg_away = 0
 
-    total_corners = sum(
-        item["value"] or 0
-        for team in data
-        for item in team.get("statistics", [])
-        if item["type"] == "Corner Kicks"
-    )
+    for team_stats in data:
+        stats_list = team_stats.get("statistics", [])
+        for item in stats_list:
+            if "Shots on Goal" in item["type"]:
+                total_shots += item["value"] or 0
+            if "Corner Kicks" in item["type"]:
+                total_corners += item["value"] or 0
+            if "Red Cards" in item["type"]:
+                total_reds += item["value"] or 0
 
-    total_reds = sum(
-        item["value"] or 0
-        for team in data
-        for item in team.get("statistics", [])
-        if item["type"] == "Red Cards"
-    )
-
-    # These are fallback xG values – API usually doesn't provide real xG per team in this endpoint
-    xg_home = 1.1
-    xg_away = 1.2
+    xg_home = match.get("teams", {}).get("home", {}).get("xg", 0) or 0
+    xg_away = match.get("teams", {}).get("away", {}).get("xg", 0) or 0
 
     return {
         "shots_total": total_shots,
