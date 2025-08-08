@@ -1,10 +1,10 @@
-pip install --upgrade pip
 services:
   - type: web
     name: football-ai-assistant
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
+    pythonVersion: python 3.12.3
     envVars:
       - key: API_FOOTBALL_KEY
         sync: false
