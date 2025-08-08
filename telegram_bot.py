@@ -1,8 +1,3 @@
-telegram_bot.py
-
-
-
-
 import logging
 import asyncio
 import threading
