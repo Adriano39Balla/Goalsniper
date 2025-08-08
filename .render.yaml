@@ -1,34 +1,43 @@
 services:
   - type: web
-    name: robi-superbrain
+    name: football-ai-assistant
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn server:app --host 0.0.0.0 --port 10000
+    startCommand: python main.py
     envVars:
-      - key: API_KEY
+      - key: API_FOOTBALL_KEY
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: AUTH_HEADER
+      - key: SESSION_SECRET
         sync: false
-    autoDeploy: true
+      - key: DATABASE_URL
+        sync: false
     plan: free
+    autoDeploy: true
 
   - type: cron
-    name: match-alert
+    name: scan-live
     schedule: "*/5 * * * *"
+    path: /tasks/scan-live
     method: GET
-    path: /match-alert
-    headers:
-      x-token: ${AUTH_HEADER}
-    envVars:
-      - key: API_KEY
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-      - key: AUTH_HEADER
-        sync: false
+
+  - type: cron
+    name: scan-upcoming
+    schedule: "0 * * * *"
+    path: /tasks/scan-upcoming
+    method: GET
+
+  - type: cron
+    name: cleanup
+    schedule: "0 0 * * *"
+    path: /tasks/cleanup
+    method: GET
+
+  - type: cron
+    name: daily-summary
+    schedule: "0 21 * * *"
+    path: /tasks/daily-summary
+    method: GET
