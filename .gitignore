@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.env/
+.env.*  # if using different .env files per environment
+
+# SQLite DB (if you want to ignore local data)
+*.db
+*.sqlite3
+
+# Flask/Migrations (if using)
+instance/
+.mypy_cache/
+.pytest_cache/
+
+# VSCode and IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Render deploy artifacts
+*.log
