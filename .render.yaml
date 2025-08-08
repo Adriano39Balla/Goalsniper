@@ -3,7 +3,7 @@ services:
     name: football-ai-assistant
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: gunicorn main:app
     pythonVersion: python 3.12.3
     envVars:
       - key: API_FOOTBALL_KEY
