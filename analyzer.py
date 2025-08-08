@@ -15,7 +15,7 @@ def analyze_matches(match: dict) -> dict | None:
     score_away = match["goals"]["away"] or 0
     total_goals = score_home + score_away
 
-    if xg_home + xg_away > 0.9 and shots_total > 15 and total_goals < 3:
+    if xg_home + xg_away > 0.5 and shots_total > 3 and total_goals < 3:
         confidence = max(70, min(95, int((xg_home + xg_away) * 20)))
         return {
             "match_id": match["fixture"]["id"],
