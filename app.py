@@ -1,16 +1,10 @@
-# app.py
-
 import os
 import logging
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.orm import DeclarativeBase
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-class Base(DeclarativeBase):
-    pass
-
-db = SQLAlchemy(model_class=Base)
+db = SQLAlchemy()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", "football-betting-assistant-2024")
@@ -29,11 +23,9 @@ with app.app_context():
     db.create_all()
 
 from routes.dashboard import dashboard_bp
-from routes.tasks import task_bp  # new
+from routes.tasks import task_bp
 app.register_blueprint(dashboard_bp)
 app.register_blueprint(task_bp)
 
 from services.telegram_bot import init_telegram_bot
 init_telegram_bot()
-
-# Removed init_scheduler() since Render will now use Cron Jobs
