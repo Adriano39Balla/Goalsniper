@@ -1,4 +1,3 @@
-# /app/prediction.py
 def make_predictions(stats):
     try:
         # Extract safely
