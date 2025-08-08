@@ -19,7 +19,6 @@ class APIFootballService:
     def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
         """Make a rate-limited request to the API"""
         try:
-            # Rate limiting
             current_time = time.time()
             time_since_last = current_time - self.last_request_time
             if time_since_last < Config.REQUEST_DELAY:
@@ -40,7 +39,7 @@ class APIFootballService:
             return None
 
     def get_live_matches(self) -> List[Dict]:
-        """Get all live matches"""
+        """Get all live matches (no league filtering)"""
         try:
             data = self._make_request('fixtures', {'live': 'all'})
             if data and 'response' in data:
@@ -58,7 +57,6 @@ class APIFootballService:
                         'date': fixture['fixture']['date']
                     }
                     for fixture in data['response']
-                    if fixture['league']['id'] in Config.MAJOR_LEAGUES
                 ]
             return []
         except Exception as e:
@@ -85,31 +83,30 @@ class APIFootballService:
             return None
 
     def get_upcoming_matches(self, days_ahead: int = 1) -> List[Dict]:
-        """Get upcoming matches for the next N days"""
+        """Get upcoming matches from all leagues"""
         try:
             today = datetime.now().strftime('%Y-%m-%d')
             end_date = (datetime.now() + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
 
-            upcoming_matches = []
-            for league_id in Config.MAJOR_LEAGUES:
-                data = self._make_request('fixtures', {
-                    'league': league_id,
-                    'from': today,
-                    'to': end_date
-                })
+            data = self._make_request('fixtures', {
+                'from': today,
+                'to': end_date
+            })
 
-                if data and 'response' in data:
-                    for fixture in data['response']:
-                        if fixture['fixture']['status']['short'] == 'NS':
-                            upcoming_matches.append({
-                                'id': fixture['fixture']['id'],
-                                'home_team': fixture['teams']['home']['name'],
-                                'away_team': fixture['teams']['away']['name'],
-                                'league': fixture['league']['name'],
-                                'league_id': fixture['league']['id'],
-                                'date': fixture['fixture']['date'],
-                                'timestamp': fixture['fixture']['timestamp']
-                            })
+            upcoming_matches = []
+
+            if data and 'response' in data:
+                for fixture in data['response']:
+                    if fixture['fixture']['status']['short'] == 'NS':
+                        upcoming_matches.append({
+                            'id': fixture['fixture']['id'],
+                            'home_team': fixture['teams']['home']['name'],
+                            'away_team': fixture['teams']['away']['name'],
+                            'league': fixture['league']['name'],
+                            'league_id': fixture['league']['id'],
+                            'date': fixture['fixture']['date'],
+                            'timestamp': fixture['fixture']['timestamp']
+                        })
 
             return upcoming_matches
         except Exception as e:
