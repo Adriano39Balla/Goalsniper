@@ -1,5 +1,5 @@
 import asyncio
-from .scanner import run_scan_and_send
+from scanner import run_scan_and_send
 
 def main():
     result = asyncio.run(run_scan_and_send())
