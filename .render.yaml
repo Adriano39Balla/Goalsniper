@@ -1,34 +1,71 @@
 services:
   - type: web
-    name: robi-superbrain
+    name: goalsniper
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn server:app --host 0.0.0.0 --port 10000
-    envVars:
-      - key: API_KEY
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-      - key: AUTH_HEADER
-        sync: false
-    autoDeploy: true
     plan: free
-
-  - type: cron
-    name: match-alert
-    schedule: "*/5 * * * *"
-    method: GET
-    path: /match-alert
-    headers:
-      x-token: ${AUTH_HEADER}
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn goalsniper.server:app --host 0.0.0.0 --port $PORT"
+    autoDeploy: true
     envVars:
-      - key: API_KEY
+      - key: APISPORTS_KEY
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: AUTH_HEADER
+      - key: RUN_TOKEN
+        generateValue: true
+      - key: TELEGRAM_WEBHOOK_TOKEN
+        generateValue: true
+      - key: SCAN_DAYS
+        value: "1"
+      - key: MAX_CONCURRENT_REQUESTS
+        value: "6"
+      - key: STATS_REQUEST_DELAY_MS
+        value: "200"
+      - key: MAX_TIPS_PER_RUN
+        value: "150"
+      - key: MIN_CONFIDENCE_TO_SEND
+        value: "0.58"
+      - key: LEAGUE_EXCLUDE_TYPES
+        value: ""
+      - key: LIVE_ENABLED
+        value: "true"
+      - key: LIVE_MINUTE_MIN
+        value: "10"
+      - key: LIVE_MINUTE_MAX
+        value: "85"
+      - key: LIVE_MAX_FIXTURES
+        value: "80"
+      - key: TZ
+        value: "UTC"
+  - type: cron
+    name: goalsniper-cron
+    plan: free
+    schedule: "0 * * * *"   # hourly
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m goalsniper.run_once"
+    envVars:
+      - key: APISPORTS_KEY
         sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: SCAN_DAYS
+        value: "1"
+      - key: MAX_CONCURRENT_REQUESTS
+        value: "6"
+      - key: STATS_REQUEST_DELAY_MS
+        value: "200"
+      - key: MAX_TIPS_PER_RUN
+        value: "150"
+      - key: MIN_CONFIDENCE_TO_SEND
+        value: "0.58"
+      - key: LEAGUE_EXCLUDE_TYPES
+        value: ""
+      - key: LIVE_ENABLED
+        value: "false"
+      - key: TZ
+        value: "UTC"
