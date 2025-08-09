@@ -5,7 +5,7 @@ from .config import APISPORTS_KEY, MAX_CONCURRENT_REQUESTS
 from .logger import log
 
 BASE = "https://v3.football.api-sports.io"
-HEADERS = {"x-apisports-key": APISPORTS_KEY}
+HEADERS = {"x-apisports-key": API_KEY}
 _sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any]) -> Any:
