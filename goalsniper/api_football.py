@@ -1,7 +1,7 @@
 import asyncio
 from typing import Any, Dict, List, Optional
 import httpx
-from .config import APISPORTS_KEY, MAX_CONCURRENT_REQUESTS
+from .config import API_KEY, MAX_CONCURRENT_REQUESTS
 from .logger import log
 
 BASE = "https://v3.football.api-sports.io"
