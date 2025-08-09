@@ -1,73 +1,52 @@
 import os
-import logging
-import pytz
-from datetime import datetime
-from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, status
-from analyzer import analyze_matches
-from telegram import send_tip_message
-from db import store_tip, store_feedback
-from model_training import auto_train_model
-import requests
+from fastapi import FastAPI, Request, HTTPException
+from .scanner import run_scan_and_send
+from .config import RUN_TOKEN, TELEGRAM_WEBHOOK_TOKEN
+from .storage import set_outcome
+from .logger import log
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
+app = FastAPI(title="Goalsniper", version="1.3.0")
 
-app = FastAPI()
-logger = logging.getLogger("uvicorn")
+@app.get("/health")
+async def health():
+    return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
 
-API_KEY = os.getenv("API_KEY")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-AUTH_HEADER = os.getenv("AUTH_HEADER", "secure-token-123")
-API_URL = "https://v3.football.api-sports.io/fixtures"
-HEADERS = {"x-apisports-key": API_KEY}
+def _auth(request: Request):
+    auth = request.headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = auth[len("Bearer "):].strip()
+    if token != RUN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-def verify_auth(x_token: str = Header(...)):
-    if x_token != AUTH_HEADER:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+@app.post("/run")
+async def run(request: Request):
+    _auth(request)
+    return {"status": "ok", **(await run_scan_and_send())}
 
-@app.get("/")
-def root():
-    return {"status": "Robi_Superbrain v10 ready"}
+# Telegram webhook: set to https://<your-app>/telegram/webhook[/<token>]
+@app.post("/telegram/webhook")
+@app.post("/telegram/webhook/{token}")
+async def telegram_webhook(request: Request, token: str | None = None):
+    if TELEGRAM_WEBHOOK_TOKEN and token != TELEGRAM_WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-@app.get("/match-alert")
-def match_alert(x_token: str = Header(...)):
-    verify_auth(x_token)
+    payload = await request.json()
+    cq = payload.get("callback_query")
+    if not cq:
+        return {"ok": True}
+
+    data = cq.get("data") or ""
+    if not data.startswith("fb:"):
+        return {"ok": True}
+
     try:
-        now = datetime.utcnow().replace(tzinfo=pytz.UTC)
-        res = requests.get(API_URL, headers=HEADERS, params={"live": "all"})
-        matches = res.json().get("response", [])
-        sent_count = 0
-
-        for match in matches:
-            tip = analyze_matches(match)
-            if tip:
-                was_stored = store_tip(tip)
-                if was_stored:
-                    send_tip_message(tip, BOT_TOKEN, CHAT_ID)
-                    sent_count += 1
-
-        return {"result": "ok", "tips_sent": sent_count}
+        _, tip_id_s, outcome_s = data.split(":")
+        tip_id = int(tip_id_s)
+        outcome = 1 if outcome_s == "1" else 0
+        await set_outcome(tip_id, outcome)
+        log(f"Feedback received tip_id={tip_id} outcome={outcome}")
     except Exception as e:
-        logger.error(f"[MatchAlert] Error: {e}")
-        return {"error": str(e)}
+        raise HTTPException(status_code=400, detail=f"bad data: {str(e)}")
 
-@app.post("/feedback")
-def feedback_endpoint(payload: dict, x_token: str = Header(...)):
-    verify_auth(x_token)
-    try:
-        match_id = int(payload.get("match_id"))
-        result = str(payload.get("result"))
-        if result not in ["✅", "❌"]:
-            raise ValueError("Invalid result format")
-        store_feedback(match_id, result)
-        auto_train_model()
-        return {"status": "Feedback received"}
-    except Exception as e:
-        logger.error(f"[Feedback] Error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    return {"ok": True}
