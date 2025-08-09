@@ -40,3 +40,9 @@ __all__ = [
     "LIVE_ENABLED", "LIVE_MINUTE_MIN", "LIVE_MINUTE_MAX", "LIVE_MAX_FIXTURES",
     "TELEGRAM_WEBHOOK_TOKEN",
 ]
+
+# Throttle & dedupe
+THROTTLE_TIPS_PER_WINDOW = int(os.getenv("THROTTLE_TIPS_PER_WINDOW", "10"))
+THROTTLE_WINDOW_MINUTES = int(os.getenv("THROTTLE_WINDOW_MINUTES", "10"))
+# suppress duplicate tips for same fixture if we’ve sent any within this window
+DUPLICATE_SUPPRESS_MINUTES = int(os.getenv("DUPLICATE_SUPPRESS_MINUTES", "360"))  # 6h
