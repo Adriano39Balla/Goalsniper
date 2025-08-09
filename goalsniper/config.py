@@ -11,7 +11,7 @@ def must(name: str) -> str:
 
 # Required
 PORT = int(os.getenv("PORT", "10000"))
-APISPORTS_KEY = must("APISPORTS_KEY")
+API_KEY = must("API_KEY")
 TELEGRAM_BOT_TOKEN = must("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = must("TELEGRAM_CHAT_ID")
 
