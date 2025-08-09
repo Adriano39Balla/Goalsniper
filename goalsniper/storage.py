@@ -3,6 +3,7 @@ import sqlite3
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any, List
+from datetime import timedelta
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "goalsniper.db")
 
@@ -112,3 +113,24 @@ async def recent_market_samples(market: str, limit: int = 400):
 
 async def recent_market_league_samples(market: str, league_id: int, limit: int = 120):
     return await asyncio.to_thread(_recent_market_league_samples_sync, market, league_id, limit)
+
+@_with_conn
+def _count_sent_since_sync(conn: sqlite3.Connection, since_iso: str) -> int:
+    row = conn.execute("SELECT COUNT(*) AS c FROM tips WHERE sent_at >= ?", (since_iso,)).fetchone()
+    return int(row["c"] or 0)
+
+async def count_sent_in_last_minutes(minutes: int) -> int:
+    since = (datetime.now(timezone.utc) - timedelta(minutes=int(minutes))).isoformat()
+    return await asyncio.to_thread(_count_sent_since_sync, since)
+
+@_with_conn
+def _has_fixture_recent_sync(conn: sqlite3.Connection, fixture_id: int, since_iso: str) -> int:
+    row = conn.execute(
+        "SELECT 1 FROM tips WHERE fixture_id=? AND sent_at >= ? LIMIT 1",
+        (int(fixture_id), since_iso),
+    ).fetchone()
+    return 1 if row else 0
+
+async def has_fixture_tip_recent(fixture_id: int, minutes: int) -> bool:
+    since = (datetime.now(timezone.utc) - timedelta(minutes=int(minutes))).isoformat()
+    return bool(await asyncio.to_thread(_has_fixture_recent_sync, fixture_id, since))
