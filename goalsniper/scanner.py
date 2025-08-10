@@ -226,12 +226,12 @@ async def run_scan_and_send() -> Dict[str, int]:
       - fetch live fixtures (1 call) and today's fixtures (1 call)
       - generate tips (in-memory)
       - enforce per-run cap, daily cap, dedupe per fixture, skip finished
-      - LOG where tips were filtered out
+      - return detailed debug stats in JSON
     """
     started = datetime.now(timezone.utc)
 
-    live_fixtures = []
-    today_fixtures = []
+    live_fixtures: List[Dict] = []
+    today_fixtures: List[Dict] = []
 
     async with httpx.AsyncClient(timeout=30) as client:
         # Fetch fixtures
@@ -267,16 +267,20 @@ async def run_scan_and_send() -> Dict[str, int]:
 
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
 
-    # --------- compact debug line ---------
+    # aggregate debug totals
+    total_candidates = live_stats.get("raw_candidates", 0) + today_stats.get("raw_candidates", 0)
+    total_low_conf   = live_stats.get("low_conf", 0) + today_stats.get("low_conf", 0)
+    total_inrun_dup  = live_stats.get("inrun_dedup_removed", 0) + today_stats.get("inrun_dedup_removed", 0)
+    total_ever_sent  = live_stats.get("send_ever_sent_skipped", 0) + today_stats.get("send_ever_sent_skipped", 0)
+    total_cap_hits   = live_stats.get("send_daily_cap_hits", 0) + today_stats.get("send_daily_cap_hits", 0)
+
+    # keep the compact log, but the main info will be returned below
     log(
         "DEBUG scan: "
         f"fixtures(live={len(live_fixtures)},today={len(today_fixtures)})  "
-        f"candidates={ (live_stats.get('raw_candidates',0) + today_stats.get('raw_candidates',0)) }  "
-        f"low_conf={ (live_stats.get('low_conf',0) + today_stats.get('low_conf',0)) }  "
-        f"inrun_dedup={ (live_stats.get('inrun_dedup_removed',0) + today_stats.get('inrun_dedup_removed',0)) }  "
-        f"ever_sent={ (live_stats.get('send_ever_sent_skipped',0) + today_stats.get('send_ever_sent_skipped',0)) }  "
-        f"sent={total_sent}  "
-        f"daily_cap_hits={ (live_stats.get('send_daily_cap_hits',0) + today_stats.get('send_daily_cap_hits',0)) }"
+        f"candidates={total_candidates}  low_conf={total_low_conf}  "
+        f"inrun_dedup={total_inrun_dup}  ever_sent={total_ever_sent}  "
+        f"sent={total_sent}  daily_cap_hits={total_cap_hits}"
     )
 
     return {
@@ -284,4 +288,21 @@ async def run_scan_and_send() -> Dict[str, int]:
         "fixturesChecked": fixtures_checked,
         "tipsSent": total_sent,
         "elapsedSeconds": int(elapsed),
+        "debug": {
+            "liveFixtures": len(live_fixtures),
+            "todayFixtures": len(today_fixtures),
+            "candidates": total_candidates,
+            "lowConfidenceFiltered": total_low_conf,
+            "inRunDuplicatesRemoved": total_inrun_dup,
+            "everSentDuplicatesSkipped": total_ever_sent,
+            "dailyCapHits": total_cap_hits,
+            "config": {
+                "MIN_CONFIDENCE_TO_SEND": MIN_CONFIDENCE_TO_SEND,
+                "MAX_TIPS_PER_RUN": MAX_TIPS_PER_RUN,
+                "DAILY_TIP_CAP": DAILY_TIP_CAP,
+                "LIVE_MINUTE_MIN": LIVE_MINUTE_MIN,
+                "LIVE_MINUTE_MAX": LIVE_MINUTE_MAX,
+                "LIVE_MAX_FIXTURES": LIVE_MAX_FIXTURES,
+            }
+        }
     }
