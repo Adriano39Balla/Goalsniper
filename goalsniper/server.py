@@ -1,20 +1,22 @@
-import os
 from fastapi import FastAPI, Request, HTTPException, Query
-from .scanner import run_scan_and_send
+import os
 from .config import RUN_TOKEN, TELEGRAM_WEBHOOK_TOKEN
 from .storage import set_outcome
 from .logger import log
 
-app = FastAPI(title="Goalsniper", version="1.3.2")
+app = FastAPI(title="Goalsniper", version="1.3.3")
 
 @app.get("/health")
 async def health():
     return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
 
-@app.get("/wake")
-async def wake():
-    # simple endpoint you can ping with a browser or uptime monitor
-    return {"ok": True, "woke": True}
+def _load_scanner():
+    # Lazy import so startup never crashes; we return exceptions for debugging
+    try:
+        from . import scanner
+        return scanner, None
+    except Exception as e:
+        return None, e
 
 def _auth_header(request: Request):
     auth = request.headers.get("authorization") or ""
@@ -27,16 +29,21 @@ def _auth_header(request: Request):
 @app.post("/run")
 async def run_post(request: Request):
     _auth_header(request)
-    return {"status": "ok", **(await run_scan_and_send())}
+    scanner, err = _load_scanner()
+    if err:
+        # Show the real import error
+        raise HTTPException(status_code=500, detail=f"scanner import failed: {err}")
+    return {"status": "ok", **(await scanner.run_scan_and_send())}
 
-# Browser-friendly: allow GET /run?token=RUN_TOKEN
 @app.get("/run")
-async def run_get(token: str = Query(default="", description="RUN_TOKEN")):
-    if not token or token != RUN_TOKEN:
+async def run_get(token: str = Query("")):
+    if token != RUN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return {"status": "ok", **(await run_scan_and_send())}
+    scanner, err = _load_scanner()
+    if err:
+        raise HTTPException(status_code=500, detail=f"scanner import failed: {err}")
+    return {"status": "ok", **(await scanner.run_scan_and_send())}
 
-# Telegram webhook — set to https://<app>/telegram/webhook/<token>
 @app.post("/telegram/webhook")
 @app.post("/telegram/webhook/{token}")
 async def telegram_webhook(request: Request, token: str | None = None):
@@ -46,11 +53,9 @@ async def telegram_webhook(request: Request, token: str | None = None):
     payload = await request.json()
     cq = payload.get("callback_query")
     if not cq:
-        # ignore non-callback updates; bot may receive other updates we don't need
         return {"ok": True}
 
     data = cq.get("data") or ""
-    # expected: fb:<tip_id>:<1|0>
     if not data.startswith("fb:"):
         return {"ok": True}
 
