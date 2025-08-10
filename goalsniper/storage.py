@@ -1,10 +1,10 @@
 import os
 import sqlite3
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, Any, List
-from datetime import timedelta
 
+# DB under /data so it survives service restarts (if you attach a disk)
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "goalsniper.db")
 
 SCHEMA = """
@@ -42,6 +42,8 @@ def _with_conn(fn):
             conn.close()
     return wrapper
 
+# ----------------- sync primitives -----------------
+
 @_with_conn
 def _insert_tip_sync(conn: sqlite3.Connection, tip: Dict[str, Any], message_id: Optional[int]) -> int:
     cur = conn.execute(
@@ -58,7 +60,7 @@ def _insert_tip_sync(conn: sqlite3.Connection, tip: Dict[str, Any], message_id: 
             int(tip.get("leagueId") or 0),
             int(tip.get("season") or 0),
             datetime.now(timezone.utc).isoformat(),
-            int(message_id or 0),
+            int(tip.get("messageId") or (message_id or 0)),
         ),
     )
     return int(cur.lastrowid)
@@ -97,7 +99,25 @@ def _recent_market_league_samples_sync(conn: sqlite3.Connection, market: str, le
     )
     return cur.fetchall()
 
-# -------- async wrappers (run sync DB ops off the loop) --------
+@_with_conn
+def _count_sent_since_sync(conn: sqlite3.Connection, since_iso: str) -> int:
+    row = conn.execute("SELECT COUNT(*) AS c FROM tips WHERE sent_at >= ?", (since_iso,)).fetchone()
+    return int(row["c"] or 0)
+
+@_with_conn
+def _fixture_ever_sent_sync(conn: sqlite3.Connection, fixture_id: int) -> int:
+    row = conn.execute("SELECT 1 FROM tips WHERE fixture_id=? LIMIT 1", (int(fixture_id),)).fetchone()
+    return 1 if row else 0
+
+@_with_conn
+def _has_fixture_recent_sync(conn: sqlite3.Connection, fixture_id: int, since_iso: str) -> int:
+    row = conn.execute(
+        "SELECT 1 FROM tips WHERE fixture_id=? AND sent_at >= ? LIMIT 1",
+        (int(fixture_id), since_iso),
+    ).fetchone()
+    return 1 if row else 0
+
+# ----------------- async wrappers -----------------
 
 async def insert_tip_return_id(tip: Dict[str, Any], message_id: Optional[int]) -> int:
     return await asyncio.to_thread(_insert_tip_sync, tip, message_id)
@@ -114,39 +134,12 @@ async def recent_market_samples(market: str, limit: int = 400):
 async def recent_market_league_samples(market: str, league_id: int, limit: int = 120):
     return await asyncio.to_thread(_recent_market_league_samples_sync, market, league_id, limit)
 
-@_with_conn
-def _count_sent_since_sync(conn: sqlite3.Connection, since_iso: str) -> int:
-    row = conn.execute("SELECT COUNT(*) AS c FROM tips WHERE sent_at >= ?", (since_iso,)).fetchone()
-    return int(row["c"] or 0)
-
 async def count_sent_today() -> int:
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     return await asyncio.to_thread(_count_sent_since_sync, start)
 
-@_with_conn
-def _fixture_ever_sent_sync(conn: sqlite3.Connection, fixture_id: int) -> int:
-    row = conn.execute("SELECT 1 FROM tips WHERE fixture_id=? LIMIT 1", (int(fixture_id),)).fetchone()
-    return 1 if row else 0
-
 async def fixture_ever_sent(fixture_id: int) -> bool:
     return bool(await asyncio.to_thread(_fixture_ever_sent_sync, fixture_id))
-
-@_with_conn
-def _count_sent_since_sync(conn: sqlite3.Connection, since_iso: str) -> int:
-    row = conn.execute("SELECT COUNT(*) AS c FROM tips WHERE sent_at >= ?", (since_iso,)).fetchone()
-    return int(row["c"] or 0)
-
-async def count_sent_in_last_minutes(minutes: int) -> int:
-    since = (datetime.now(timezone.utc) - timedelta(minutes=int(minutes))).isoformat()
-    return await asyncio.to_thread(_count_sent_since_sync, since)
-
-@_with_conn
-def _has_fixture_recent_sync(conn: sqlite3.Connection, fixture_id: int, since_iso: str) -> int:
-    row = conn.execute(
-        "SELECT 1 FROM tips WHERE fixture_id=? AND sent_at >= ? LIMIT 1",
-        (int(fixture_id), since_iso),
-    ).fetchone()
-    return 1 if row else 0
 
 async def has_fixture_tip_recent(fixture_id: int, minutes: int) -> bool:
     since = (datetime.now(timezone.utc) - timedelta(minutes=int(minutes))).isoformat()
