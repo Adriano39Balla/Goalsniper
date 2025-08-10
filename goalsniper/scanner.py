@@ -120,8 +120,25 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
     if not fn:
         warn("No fixtures-by-date API function available; skipping scheduled scan")
         return []
+
     day = date.today().isoformat()
-    data = await (fn(client, day) if asyncio.iscoroutinefunction(fn) else fn(client, day))
+    try:
+        params = list(inspect.signature(fn).parameters.keys())
+    except Exception:
+        params = []
+
+    # Call with whatever the function needs.
+    if {"season", "date_iso"}.issubset(set(params)):
+        season = datetime.now(timezone.utc).year
+        data = await (fn(client, season=season, date_iso=day) if asyncio.iscoroutinefunction(fn)
+                      else fn(client, season=season, date_iso=day))
+    elif "date_iso" in params:
+        data = await (fn(client, date_iso=day) if asyncio.iscoroutinefunction(fn)
+                      else fn(client, date_iso=day))
+    else:
+        data = await (fn(client, day) if asyncio.iscoroutinefunction(fn)
+                      else fn(client, day))
+
     out = []
     for f in data:
         st = _status(f)
