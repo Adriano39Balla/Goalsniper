@@ -1,10 +1,11 @@
 import asyncio
 import math
 from typing import Any, Dict, List, Optional, Tuple
-from .api_football import get_team_statistics, get_odds_for_fixture
+from .api_football import get_team_statistics
 from .config import STATS_REQUEST_DELAY_MS, MIN_CONFIDENCE_TO_SEND
 from .logger import warn
 
+# ---------- helpers ----------
 def _form_to_points(form: Optional[str]) -> int:
     if not form:
         return 0
@@ -56,23 +57,6 @@ def _poisson_zero_prob(lmbd: float) -> float:
 def _btts_prob(lambda_home: float, lambda_away: float) -> float:
     return (1 - _poisson_zero_prob(lambda_home)) * (1 - _poisson_zero_prob(lambda_away))
 
-def _asian_line_from_rating_diff(diff: float) -> Tuple[str, float]:
-    if diff >= 0.55:   return ("HOME -1.0",  -1.0)
-    if diff >= 0.40:   return ("HOME -0.75", -0.75)
-    if diff >= 0.25:   return ("HOME -0.5",  -0.5)
-    if diff >= 0.12:   return ("HOME -0.25", -0.25)
-    if diff <= -0.55:  return ("AWAY -1.0",  +1.0)
-    if diff <= -0.40:  return ("AWAY -0.75", +0.75)
-    if diff <= -0.25:  return ("AWAY -0.5",  +0.5)
-    if diff <= -0.12:  return ("AWAY -0.25", +0.25)
-    return ("DRAW NO BET (AH 0)", 0.0)
-
-def _asian_win_prob_from_scores(h_score: float, a_score: float, line: float) -> float:
-    adv = h_score - a_score
-    base = 1 / (1 + math.exp(-3.5 * adv))
-    adj = base + (0.12 if line in (-0.25, +0.25) else 0.18 if line in (-0.5, +0.5) else 0.24 if abs(line) == 0.75 else 0.30 if abs(line) == 1.0 else 0.0)
-    return _clamp01(adj if line <= 0 else 1 - adj)
-
 async def _fetch_stats_pair(client, league_id: int, season: int, home_id: int, away_id: int):
     h = asyncio.create_task(get_team_statistics(client, league_id, season, home_id))
     await asyncio.sleep(STATS_REQUEST_DELAY_MS / 1000.0)
@@ -97,7 +81,28 @@ def _adjust_for_live(lambda_home: float, lambda_away: float, minute: Optional[in
         la *= 1.10
     return (lh, la)
 
+# ---------- 1st-half helpers ----------
+_FIRST_HALF_SHARE = 0.56  # rough share of goals in first half
+
+def _first_half_xg(total_xg: float) -> float:
+    return max(0.01, total_xg * _FIRST_HALF_SHARE)
+
+def _first_half_remaining_factor(minute: Optional[int]) -> float:
+    if not minute or minute <= 0:
+        return 1.0  # entire 1H remains
+    if minute >= 45:
+        return 0.0
+    return (45 - minute) / 45.0
+
+# ---------- main entry ----------
 async def generate_tips_for_fixture(client, fixture: Dict[str, Any], league_id: int, season: int) -> List[Dict[str, Any]]:
+    """
+    Only the requested markets:
+      - 1X2 (Win/Draw/Lose)
+      - OVER/UNDER 2.5 (full-time)
+      - BTTS (Yes/No)
+      - 1st Half Over/Under (auto line 1.0 or 1.5)
+    """
     tips: List[Dict[str, Any]] = []
     fixture_id = ((fixture.get("fixture", {}) or {}).get("id"))
     home_id = ((fixture.get("teams", {}) or {}).get("home", {}) or {}).get("id")
@@ -113,11 +118,13 @@ async def generate_tips_for_fixture(client, fixture: Dict[str, Any], league_id: 
     homeR = _build_team_rating(home_stats, "home")
     awayR = _build_team_rating(away_stats, "away")
 
+    # expected goals (full match)
     lambda_home, lambda_away = _lambda_by_side(homeR, awayR)
     lambda_home_live, lambda_away_live = _adjust_for_live(lambda_home, lambda_away, minute, goals_h, goals_a)
     expected_goals = lambda_home + lambda_away
     expected_goals_live = lambda_home_live + lambda_away_live
 
+    # 1X2 baseline using ratings (+ small home adv)
     home_score = homeR["rating"] + 0.06
     away_score = awayR["rating"]
     draw_base = 0.25 + max(0.0, 0.1 - abs(home_score - away_score))
@@ -125,61 +132,61 @@ async def generate_tips_for_fixture(client, fixture: Dict[str, Any], league_id: 
     s = expA + expB + expD
     p_home, p_draw, p_away = expA / s, expD / s, expB / s
 
-    try:
-        odds = await get_odds_for_fixture(client, fixture_id)
-        if odds:
-            bmk = (odds[0].get("bookmakers") or [])
-            if bmk:
-                bets = bmk[0].get("bets") or []
-                mw = next((b for b in bets if b.get("name") == "Match Winner"), None)
-                if mw and (mw.get("values") or []):
-                    values = mw["values"]
-                    def _grab(lbl):
-                        for v in values:
-                            val = (v.get("value") or "").lower()
-                            if lbl == "home" and "home" in val: return float(v.get("odd"))
-                            if lbl == "draw" and "draw" in val: return float(v.get("odd"))
-                            if lbl == "away" and "away" in val: return float(v.get("odd"))
-                        return None
-                    oh, od, oa = _grab("home"), _grab("draw"), _grab("away")
-                    if oh and od and oa:
-                        ih, id_, ia = 1/oh, 1/od, 1/oa
-                        isum = ih + id_ + ia
-                        bh, bd, ba = ih/isum, id_/isum, ia/isum
-                        p_home = _clamp01(0.8*p_home + 0.2*bh)
-                        p_draw = _clamp01(0.8*p_draw + 0.2*bd)
-                        p_away = _clamp01(0.8*p_away + 0.2*ba)
-    except Exception as e:
-        warn("odds fetch failed:", str(e))
-
     picks: List[Tuple[str, str, float, float]] = []
-    diff = abs(p_home - p_away)
-    if diff < 0.08:
-        p_over = _clamp01((expected_goals - 2.5) * 0.25 + 0.5)
-        p_under = 1.0 - p_over
-        if p_over >= p_under:
-            picks.append(("OVER_UNDER_2.5", "OVER 2.5", p_over, expected_goals))
-        else:
-            picks.append(("OVER_UNDER_2.5", "UNDER 2.5", p_under, expected_goals))
-    else:
-        if p_home > max(p_draw, p_away):
+
+    # --- (A) 1X2 ---
+    # choose the strongest outcome
+    if max(p_home, p_draw, p_away) - sorted([p_home, p_draw, p_away])[1] >= 0.02:
+        if p_home >= p_draw and p_home >= p_away:
             picks.append(("1X2", "HOME", p_home, expected_goals))
-        elif p_away > max(p_draw, p_home):
+        elif p_away >= p_home and p_away >= p_draw:
             picks.append(("1X2", "AWAY", p_away, expected_goals))
         else:
             picks.append(("1X2", "DRAW", p_draw, expected_goals))
 
+    # --- (B) Over/Under 2.5 (full time) ---
+    p_over = _clamp01((expected_goals - 2.5) * 0.25 + 0.5)
+    p_under = 1.0 - p_over
+    if _prob_to_confidence(max(p_over, p_under)) >= MIN_CONFIDENCE_TO_SEND:
+        if p_over >= p_under:
+            picks.append(("OVER_UNDER_2.5", "OVER 2.5", p_over, expected_goals))
+        else:
+            picks.append(("OVER_UNDER_2.5", "UNDER 2.5", p_under, expected_goals))
+
+    # --- (C) BTTS ---
     p_btts = _btts_prob(lambda_home, lambda_away)
     p_btts_live = _btts_prob(lambda_home_live, lambda_away_live)
     p_btts_use = p_btts_live if minute else p_btts
     if _prob_to_confidence(p_btts_use) >= MIN_CONFIDENCE_TO_SEND:
         picks.append(("BTTS", "YES" if p_btts_use >= 0.5 else "NO", p_btts_use, expected_goals_live if minute else expected_goals))
 
-    line_label, line = _asian_line_from_rating_diff(home_score - away_score)
-    p_ah = _asian_win_prob_from_scores(home_score, away_score, line)
-    if _prob_to_confidence(p_ah) >= MIN_CONFIDENCE_TO_SEND:
-        picks.append(("ASIAN_HANDICAP", line_label, p_ah, expected_goals))
+    # --- (D) 1st Half Over/Under (auto line 1.0 or 1.5) ---
+    # If match past 45', skip 1H market.
+    if not minute or minute < 45:
+        fh_factor = _first_half_remaining_factor(minute)
+        fh_xg_total = _first_half_xg(expected_goals)
+        if minute:
+            # scale to remaining part of the first half when live
+            fh_xg_total *= fh_factor
 
+        # Evaluate both 1.0 and 1.5 lines, choose the more confident outcome.
+        def ou_conf(line: float) -> Tuple[str, float]:
+            p_over_fh = _clamp01((fh_xg_total - line) * 0.60 + 0.5)  # steeper than FT
+            p_under_fh = 1.0 - p_over_fh
+            if p_over_fh >= p_under_fh:
+                return (f"OVER {line}", p_over_fh)
+            else:
+                return (f"UNDER {line}", p_under_fh)
+
+        sel10, prob10 = ou_conf(1.0)
+        sel15, prob15 = ou_conf(1.5)
+        if max(prob10, prob15) and _prob_to_confidence(max(prob10, prob15)) >= MIN_CONFIDENCE_TO_SEND:
+            if prob10 >= prob15:
+                picks.append(("OVER_UNDER_1H", sel10, prob10, fh_xg_total))
+            else:
+                picks.append(("OVER_UNDER_1H", sel15, prob15, fh_xg_total))
+
+    # Format tips
     for market, selection, prob, xg in picks:
         conf = _prob_to_confidence(prob)
         if conf < MIN_CONFIDENCE_TO_SEND:
