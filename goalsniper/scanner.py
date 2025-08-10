@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from datetime import datetime, timezone, date
 from typing import Dict, List, Callable, Optional, Tuple
 
@@ -31,15 +32,13 @@ FINISHED_STATES = {"FT", "AET", "PEN", "CANC", "PST", "ABD", "AWD", "WO"}
 LIVE_STATES     = {"1H", "2H", "HT", "ET"}
 NS_STATES       = {"NS"}
 
+# ---------- report which functions we actually use ----------
+FOUND_BUILDER_NAME: Optional[str] = None
+FOUND_LIVE_API_NAME: Optional[str] = None
+FOUND_DATE_API_NAME: Optional[str] = None
 
 # ---------- flexible resolver helpers ----------
-
-FOUND_BUILDER_NAME = None
-FOUND_LIVE_API_NAME = None
-FOUND_DATE_API_NAME = None
-
 def _resolve_fn_with_name(mod, candidates, required=True):
-    global FOUND_BUILDER_NAME, FOUND_LIVE_API_NAME, FOUND_DATE_API_NAME
     for name in candidates:
         fn = getattr(mod, name, None)
         if callable(fn):
@@ -48,42 +47,39 @@ def _resolve_fn_with_name(mod, candidates, required=True):
         warn(f"Missing functions. Tried: {candidates} in module {mod.__name__}")
     return None, None
 
-def _get_live_api():
+def _get_live_api() -> Optional[Callable]:
     global FOUND_LIVE_API_NAME
     fn, nm = _resolve_fn_with_name(
         api,
-        ["get_live_fixtures","fetch_live_fixtures","live_fixtures","get_fixtures_live"],
-        required=False
+        ["get_live_fixtures", "fetch_live_fixtures", "live_fixtures", "get_fixtures_live"],
+        required=False,
     )
     FOUND_LIVE_API_NAME = nm
     return fn
 
-def _get_by_date_api():
+def _get_by_date_api() -> Optional[Callable]:
     global FOUND_DATE_API_NAME
     fn, nm = _resolve_fn_with_name(
         api,
-        ["get_fixtures_by_date","fixtures_by_date","get_fixtures_date","fetch_fixtures_by_date"],
-        required=False
+        ["get_fixtures_by_date", "fixtures_by_date", "get_fixtures_date", "fetch_fixtures_by_date"],
+        required=False,
     )
     FOUND_DATE_API_NAME = nm
     return fn
 
-def _get_build_tips_fn():
+def _get_build_tips_fn() -> Optional[Callable]:
     global FOUND_BUILDER_NAME
-    # Try a wider set of common names
     candidates = [
         "build_tips_for_fixture", "build_for_fixture",
         "generate_tips_for_fixture", "generate_tips",
-        "build_tips", "make_tips", "predict_fixture", "predict_tips",
-        "tips_for_fixture", "create_tips_for_fixture"
+        "build_tips", "make_tips", "predict_fixture",
+        "predict_tips", "tips_for_fixture", "create_tips_for_fixture",
     ]
     fn, nm = _resolve_fn_with_name(tip_engine, candidates, required=False)
     FOUND_BUILDER_NAME = nm
     return fn
-    
 
 # ---------- small utils ----------
-
 def _status(fx: Dict) -> str:
     return (fx.get("fixture", {}).get("status", {}) or {}).get("short") or ""
 
@@ -101,15 +97,13 @@ def _league_id(fx: Dict) -> int:
 def _season(fx: Dict) -> int:
     return int((fx.get("league", {}) or {}).get("season") or 0)
 
-
 # ---------- fetchers (1–2 calls per run) ----------
-
 async def _fetch_live(client: httpx.AsyncClient) -> List[Dict]:
     fn = _get_live_api()
     if not fn:
         warn("No live fixtures API function available; skipping live scan")
         return []
-    data = await fn(client)  # list of fixtures
+    data = await (fn(client) if asyncio.iscoroutinefunction(fn) else fn(client))
     out = []
     for f in data[: LIVE_MAX_FIXTURES]:
         st = _status(f)
@@ -127,9 +121,9 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
         warn("No fixtures-by-date API function available; skipping scheduled scan")
         return []
     day = date.today().isoformat()
-    fixtures = await fn(client, day)
+    data = await (fn(client, day) if asyncio.iscoroutinefunction(fn) else fn(client, day))
     out = []
-    for f in fixtures:
+    for f in data:
         st = _status(f)
         if st in FINISHED_STATES:
             continue
@@ -138,9 +132,7 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
         out.append(f)
     return out
 
-
 # ---------- tip generation & sending with debug stats ----------
-
 def _dedupe_in_run(candidates: List[Dict]) -> Tuple[List[Dict], int]:
     seen = set()
     out = []
@@ -153,6 +145,22 @@ def _dedupe_in_run(candidates: List[Dict]) -> Tuple[List[Dict], int]:
         seen.add(fid)
         out.append(t)
     return out, removed
+
+async def _invoke_builder(build_fn: Callable, client: httpx.AsyncClient, fixture: Dict) -> Optional[List[Dict]]:
+    """
+    Call the builder with best-effort kwargs. Supports your `generate_tips_for_fixture(client, fixture, league_id, season)`.
+    If the function only accepts (client, fixture), we call it that way.
+    """
+    params = list(inspect.signature(build_fn).parameters.keys())
+    kwargs = {}
+    if "league_id" in params:
+        kwargs["league_id"] = _league_id(fixture)
+    if "season" in params:
+        kwargs["season"] = _season(fixture)
+
+    if asyncio.iscoroutinefunction(build_fn):
+        return await build_fn(client, fixture, **kwargs)
+    return build_fn(client, fixture, **kwargs)
 
 async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dict]) -> Tuple[List[Dict], Dict[str, int]]:
     """
@@ -169,8 +177,9 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
     raw: List[Dict] = []
     for f in fixtures:
         try:
-            res = await build_fn(client, f) if asyncio.iscoroutinefunction(build_fn) else build_fn(client, f)
+            res = await _invoke_builder(build_fn, client, f)
             if res:
+                # ensure essentials present
                 for t in res:
                     t.setdefault("fixtureId", _fixture_id(f))
                     t.setdefault("leagueId", _league_id(f))
@@ -181,6 +190,7 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
         await asyncio.sleep(max(0, STATS_REQUEST_DELAY_MS) / 1000.0)
 
     stats["raw_candidates"] = len(raw)
+
     # confidence filter
     conf_filtered = [t for t in raw if float(t.get("confidence", 0.0)) >= MIN_CONFIDENCE_TO_SEND]
     stats["low_conf"] = len(raw) - len(conf_filtered)
@@ -191,8 +201,16 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
 
     return deduped, stats
 
+async def _get_send_fn() -> Optional[Callable]:
+    candidates = ["send_tip_message", "send_tip", "send_message_with_feedback", "send_message", "push_tip", "send"]
+    for name in candidates:
+        fn = getattr(tg, name, None)
+        if callable(fn):
+            return fn
+    return None
+
 async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
-    send_fn = _get_send_fn()
+    send_fn = await _get_send_fn()
     if not send_fn:
         raise RuntimeError(
             "No send function found in goalsniper.telegram "
@@ -235,9 +253,7 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> Tuple[int, 
 
     return sent, stats
 
-
 # ---------- public entrypoint ----------
-
 async def run_scan_and_send() -> Dict[str, int]:
     """
     Single run:
@@ -292,7 +308,7 @@ async def run_scan_and_send() -> Dict[str, int]:
     total_ever_sent  = live_stats.get("send_ever_sent_skipped", 0) + today_stats.get("send_ever_sent_skipped", 0)
     total_cap_hits   = live_stats.get("send_daily_cap_hits", 0) + today_stats.get("send_daily_cap_hits", 0)
 
-    # keep the compact log, but the main info will be returned below
+    # compact log
     log(
         "DEBUG scan: "
         f"fixtures(live={len(live_fixtures)},today={len(today_fixtures)})  "
@@ -314,6 +330,9 @@ async def run_scan_and_send() -> Dict[str, int]:
             "inRunDuplicatesRemoved": total_inrun_dup,
             "everSentDuplicatesSkipped": total_ever_sent,
             "dailyCapHits": total_cap_hits,
+            "builderFn": FOUND_BUILDER_NAME,
+            "liveApiFn": FOUND_LIVE_API_NAME,
+            "dateApiFn": FOUND_DATE_API_NAME,
             "config": {
                 "MIN_CONFIDENCE_TO_SEND": MIN_CONFIDENCE_TO_SEND,
                 "MAX_TIPS_PER_RUN": MAX_TIPS_PER_RUN,
@@ -321,6 +340,6 @@ async def run_scan_and_send() -> Dict[str, int]:
                 "LIVE_MINUTE_MIN": LIVE_MINUTE_MIN,
                 "LIVE_MINUTE_MAX": LIVE_MINUTE_MAX,
                 "LIVE_MAX_FIXTURES": LIVE_MAX_FIXTURES,
-            }
-        }
+            },
+        },
     }
