@@ -63,3 +63,35 @@ async def edit_message_markup(client: httpx.AsyncClient, message_id: int, reply_
         json={"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "reply_markup": reply_markup},
         timeout=30.0,
     )
+
+# ---------- NEW: tip sender with inline feedback buttons ----------
+
+def _feedback_keyboard(tip: dict) -> dict:
+    # include enough identifiers so webhook learning can record it
+    fid = tip.get("fixtureId") or 0
+    market = (tip.get("market") or "NA").upper()
+    sel = (tip.get("selection") or "NA").upper()
+    ok_cb = f"tip:{fid}:{market}:{sel}:ok"
+    bad_cb = f"tip:{fid}:{market}:{sel}:bad"
+    return {
+        "inline_keyboard": [[
+            {"text": "👍 Correct", "callback_data": ok_cb},
+            {"text": "👎 Wrong",   "callback_data": bad_cb},
+        ]]
+    }
+
+async def send_tip_message(client: httpx.AsyncClient, tip: dict) -> int:
+    """
+    Preferred entrypoint used by scanner.py. Sends a formatted tip with 👍/👎 buttons.
+    Returns Telegram message_id.
+    """
+    text = format_tip_message(tip)
+    kb = _feedback_keyboard(tip)
+    return await send_telegram_message(client, text, kb)
+
+# aliases so scanner can find any of these names
+send_tip = send_tip_message
+send_message_with_feedback = send_tip_message
+send_message = send_tip_message
+push_tip = send_tip_message
+send = send_tip_message
