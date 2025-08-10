@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi import FastAPI, Request, HTTPException, Query, Response
 import os
 from .config import RUN_TOKEN, TELEGRAM_WEBHOOK_TOKEN
 from .storage import set_outcome
@@ -6,9 +6,11 @@ from .logger import log
 
 app = FastAPI(title="Goalsniper", version="1.3.3")
 
+
 @app.get("/health")
 async def health():
     return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
+
 
 def _load_scanner():
     # Lazy import so startup never crashes; we return exceptions for debugging
@@ -18,6 +20,7 @@ def _load_scanner():
     except Exception as e:
         return None, e
 
+
 def _auth_header(request: Request):
     auth = request.headers.get("authorization") or ""
     if not auth.startswith("Bearer "):
@@ -25,6 +28,7 @@ def _auth_header(request: Request):
     token = auth[len("Bearer "):].strip()
     if token != RUN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
+
 
 @app.post("/run")
 async def run_post(request: Request):
@@ -35,14 +39,26 @@ async def run_post(request: Request):
         raise HTTPException(status_code=500, detail=f"scanner import failed: {err}")
     return {"status": "ok", **(await scanner.run_scan_and_send())}
 
-@app.get("/run")
-async def run_get(token: str = Query("")):
+
+# UPDATED: accept both GET and HEAD so UptimeRobot free (HEAD) can trigger scans.
+@app.api_route("/run", methods=["GET", "HEAD"])
+async def run_get_or_head(request: Request, token: str = Query("")):
     if token != RUN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     scanner, err = _load_scanner()
     if err:
         raise HTTPException(status_code=500, detail=f"scanner import failed: {err}")
-    return {"status": "ok", **(await scanner.run_scan_and_send())}
+
+    # Trigger the scan for both GET and HEAD
+    result = await scanner.run_scan_and_send()
+
+    # HEAD must not include a body; return 200 if scan executed
+    if request.method == "HEAD":
+        return Response(status_code=200)
+
+    return {"status": "ok", **result}
+
 
 @app.post("/telegram/webhook")
 @app.post("/telegram/webhook/{token}")
