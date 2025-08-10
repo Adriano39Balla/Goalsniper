@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timezone, date
-from typing import Dict, List, Callable, Optional
+from typing import Dict, List, Callable, Optional, Tuple
 
 import httpx
 
@@ -12,7 +12,6 @@ from .storage import (
     insert_tip_return_id,
     fixture_ever_sent,
     count_sent_today,
-    has_fixture_tip_recent,  # kept for possible future use
 )
 from .config import (
     MIN_CONFIDENCE_TO_SEND,
@@ -21,7 +20,7 @@ from .config import (
     LIVE_MINUTE_MIN,
     LIVE_MINUTE_MAX,
     LIVE_MAX_FIXTURES,
-    SCAN_DAYS,  # not heavily used now but kept for compatibility
+    SCAN_DAYS,  # kept for compatibility/info
     DAILY_TIP_CAP,
     DUPLICATE_SUPPRESS_FOREVER,
     STATS_REQUEST_DELAY_MS,
@@ -45,7 +44,6 @@ def _resolve_fn(mod, candidates: List[str], required: bool = True) -> Optional[C
     return None
 
 def _get_live_api() -> Optional[Callable]:
-    # your api_football.py might name this differently; we try common ones
     return _resolve_fn(api, [
         "get_live_fixtures", "fetch_live_fixtures", "live_fixtures", "get_fixtures_live"
     ], required=False)
@@ -61,7 +59,6 @@ def _get_build_tips_fn() -> Optional[Callable]:
     ], required=False)
 
 def _get_send_fn() -> Optional[Callable]:
-    # whatever function you have in telegram.py to send a tip message
     return _resolve_fn(tg, [
         "send_tip_message", "send_tip", "send_message_with_feedback", "send_message", "push_tip", "send"
     ], required=False)
@@ -94,7 +91,7 @@ async def _fetch_live(client: httpx.AsyncClient) -> List[Dict]:
     if not fn:
         warn("No live fixtures API function available; skipping live scan")
         return []
-    data = await fn(client)  # should return list of fixtures
+    data = await fn(client)  # list of fixtures
     out = []
     for f in data[: LIVE_MAX_FIXTURES]:
         st = _status(f)
@@ -111,8 +108,8 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
     if not fn:
         warn("No fixtures-by-date API function available; skipping scheduled scan")
         return []
-    today = date.today().isoformat()
-    fixtures = await fn(client, today)  # list
+    day = date.today().isoformat()
+    fixtures = await fn(client, day)
     out = []
     for f in fixtures:
         st = _status(f)
@@ -124,25 +121,34 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
     return out
 
 
-# ---------- tip generation & sending ----------
+# ---------- tip generation & sending with debug stats ----------
 
-def _dedupe_in_run(candidates: List[Dict]) -> List[Dict]:
+def _dedupe_in_run(candidates: List[Dict]) -> Tuple[List[Dict], int]:
     seen = set()
     out = []
+    removed = 0
     for t in candidates:
         fid = _fixture_id(t)
-        if fid and fid not in seen:
-            seen.add(fid)
-            out.append(t)
-    return out
+        if fid in seen:
+            removed += 1
+            continue
+        seen.add(fid)
+        out.append(t)
+    return out, removed
 
-async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dict]) -> List[Dict]:
+async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dict]) -> Tuple[List[Dict], Dict[str, int]]:
+    """
+    Returns (tips_after_filters, stats)
+    stats keys:
+      raw_candidates, low_conf, inrun_dedup_removed
+    """
+    stats = {"raw_candidates": 0, "low_conf": 0, "inrun_dedup_removed": 0}
     build_fn = _get_build_tips_fn()
     if not build_fn:
         warn("No tip builder function found in tips module; skipping tip generation")
-        return []
+        return [], stats
 
-    candidates: List[Dict] = []
+    raw: List[Dict] = []
     for f in fixtures:
         try:
             res = await build_fn(client, f) if asyncio.iscoroutinefunction(build_fn) else build_fn(client, f)
@@ -151,13 +157,21 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
                     t.setdefault("fixtureId", _fixture_id(f))
                     t.setdefault("leagueId", _league_id(f))
                     t.setdefault("season", _season(f))
-                candidates.extend(res)
+                raw.extend(res)
         except Exception as e:
             warn("Tip build failed for fixture", _fixture_id(f), str(e))
         await asyncio.sleep(max(0, STATS_REQUEST_DELAY_MS) / 1000.0)
 
-    filtered = [t for t in candidates if float(t.get("confidence", 0.0)) >= MIN_CONFIDENCE_TO_SEND]
-    return _dedupe_in_run(filtered)
+    stats["raw_candidates"] = len(raw)
+    # confidence filter
+    conf_filtered = [t for t in raw if float(t.get("confidence", 0.0)) >= MIN_CONFIDENCE_TO_SEND]
+    stats["low_conf"] = len(raw) - len(conf_filtered)
+
+    # in-run dedupe per fixture
+    deduped, removed = _dedupe_in_run(conf_filtered)
+    stats["inrun_dedup_removed"] = removed
+
+    return deduped, stats
 
 async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
     send_fn = _get_send_fn()
@@ -171,17 +185,26 @@ async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
     log(f"Sent tip id={tip_id} fixture={tip['fixtureId']} {tip['market']} {tip['selection']} conf={tip['confidence']:.2f}")
     return True
 
-async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> int:
+async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> Tuple[int, Dict[str, int]]:
+    """
+    Returns (sent_count, stats)
+    stats keys:
+      ever_sent_skipped, daily_cap_hits
+    """
+    stats = {"ever_sent_skipped": 0, "daily_cap_hits": 0}
     sent = 0
+
     for t in tips:
-        # Daily cap
+        # daily cap
         if (await count_sent_today()) >= DAILY_TIP_CAP:
+            stats["daily_cap_hits"] += 1
             log(f"Daily cap reached ({DAILY_TIP_CAP}). Stopping.")
             break
 
-        # Forever de-duplication per fixture
+        # forever dedupe
         fid = _fixture_id(t)
         if DUPLICATE_SUPPRESS_FOREVER and fid and await fixture_ever_sent(fid):
+            stats["ever_sent_skipped"] += 1
             continue
 
         try:
@@ -191,7 +214,8 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> int:
                     break
         except Exception as e:
             warn("Send failed:", str(e))
-    return sent
+
+    return sent, stats
 
 
 # ---------- public entrypoint ----------
@@ -202,29 +226,62 @@ async def run_scan_and_send() -> Dict[str, int]:
       - fetch live fixtures (1 call) and today's fixtures (1 call)
       - generate tips (in-memory)
       - enforce per-run cap, daily cap, dedupe per fixture, skip finished
+      - LOG where tips were filtered out
     """
     started = datetime.now(timezone.utc)
-    fixtures_checked = 0
-    total_sent = 0
+
+    live_fixtures = []
+    today_fixtures = []
 
     async with httpx.AsyncClient(timeout=30) as client:
+        # Fetch fixtures
         if LIVE_ENABLED:
             try:
-                live = await _fetch_live(client)
-                fixtures_checked += len(live)
-                live_tips = await _build_tips_for_fixtures(client, live)
-                total_sent += await _send_tips(client, live_tips)
+                live_fixtures = await _fetch_live(client)
             except Exception as e:
-                warn("Live scan failed:", str(e))
+                warn("Live fetch failed:", str(e))
 
         try:
-            todays = await _fetch_today(client)
-            fixtures_checked += len(todays)
-            today_tips = await _build_tips_for_fixtures(client, todays)
-            total_sent += await _send_tips(client, today_tips)
+            today_fixtures = await _fetch_today(client)
         except Exception as e:
-            warn("Today scan failed:", str(e))
+            warn("Today fetch failed:", str(e))
+
+        fixtures_checked = len(live_fixtures) + len(today_fixtures)
+
+        # Build tips + send (LIVE)
+        live_stats, today_stats = {}, {}
+        total_sent = 0
+
+        if live_fixtures:
+            live_tips, live_stats = await _build_tips_for_fixtures(client, live_fixtures)
+            sent_live, send_live_stats = await _send_tips(client, live_tips)
+            total_sent += sent_live
+            live_stats.update({f"send_{k}": v for k, v in send_live_stats.items()})
+
+        # Build tips + send (TODAY)
+        if today_fixtures:
+            today_tips, today_stats = await _build_tips_for_fixtures(client, today_fixtures)
+            sent_today, send_today_stats = await _send_tips(client, today_tips)
+            total_sent += sent_today
+            today_stats.update({f"send_{k}": v for k, v in send_today_stats.items()})
 
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-    log(f"Scan complete: fixtures={fixtures_checked}, tips sent={total_sent}, elapsed={elapsed:.1f}s")
-    return {"fixturesChecked": fixtures_checked, "tipsSent": total_sent, "elapsedSeconds": int(elapsed)}
+
+    # --------- compact debug line ---------
+    log(
+        "DEBUG scan: "
+        f"fixtures(live={len(live_fixtures)},today={len(today_fixtures)})  "
+        f"candidates={ (live_stats.get('raw_candidates',0) + today_stats.get('raw_candidates',0)) }  "
+        f"low_conf={ (live_stats.get('low_conf',0) + today_stats.get('low_conf',0)) }  "
+        f"inrun_dedup={ (live_stats.get('inrun_dedup_removed',0) + today_stats.get('inrun_dedup_removed',0)) }  "
+        f"ever_sent={ (live_stats.get('send_ever_sent_skipped',0) + today_stats.get('send_ever_sent_skipped',0)) }  "
+        f"sent={total_sent}  "
+        f"daily_cap_hits={ (live_stats.get('send_daily_cap_hits',0) + today_stats.get('send_daily_cap_hits',0)) }"
+    )
+
+    return {
+        "status": "ok",
+        "fixturesChecked": fixtures_checked,
+        "tipsSent": total_sent,
+        "elapsedSeconds": int(elapsed),
+    }
