@@ -15,6 +15,10 @@ API_KEY = must("API_KEY")  # changed from APISPORTS_KEY
 TELEGRAM_BOT_TOKEN = must("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = must("TELEGRAM_CHAT_ID")
 
+# Daily cap & duplicate policy
+DAILY_TIP_CAP = int(os.getenv("DAILY_TIP_CAP", "15"))
+DUPLICATE_SUPPRESS_FOREVER = os.getenv("DUPLICATE_SUPPRESS_FOREVER", "true").lower() == "true"
+
 # Controls (defaults are safe)
 RUN_TOKEN = os.getenv("RUN_TOKEN", "change_me_to_a_long_random_string")
 SCAN_DAYS = max(1, int(os.getenv("SCAN_DAYS", "1")))
