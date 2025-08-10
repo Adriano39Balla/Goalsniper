@@ -8,7 +8,7 @@ import httpx
 from .logger import log, warn
 from . import api_football as api
 from . import tips as tip_engine
-from . import telegram as tg  # resolve sender dynamically
+from . import telegram as tg  # uses send_tip_plain + attach_feedback_buttons
 from .storage import (
     insert_tip_return_id,
     fixture_ever_sent,
@@ -201,23 +201,20 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
 
     return deduped, stats
 
-async def _get_send_fn() -> Optional[Callable]:
-    candidates = ["send_tip_message", "send_tip", "send_message_with_feedback", "send_message", "push_tip", "send"]
-    for name in candidates:
-        fn = getattr(tg, name, None)
-        if callable(fn):
-            return fn
-    return None
-
+# ---------- sending ----------
 async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
-    send_fn = await _get_send_fn()
-    if not send_fn:
-        raise RuntimeError(
-            "No send function found in goalsniper.telegram "
-            "(expected one of: send_tip_message, send_tip, send_message_with_feedback, send_message, push_tip, send)"
-        )
-    msg_id = await send_fn(client, tip) if asyncio.iscoroutinefunction(send_fn) else send_fn(client, tip)
+    # 1) send message WITHOUT buttons
+    msg_id = await tg.send_tip_plain(client, tip)
+
+    # 2) insert and get DB tip_id
     tip_id = await insert_tip_return_id({**tip, "messageId": msg_id}, msg_id)
+
+    # 3) attach buttons with fb:<tip_id>:<1|0> so webhook learns
+    try:
+        await tg.attach_feedback_buttons(client, msg_id, tip_id)
+    except Exception as e:
+        warn("attach feedback buttons failed:", str(e))
+
     log(f"Sent tip id={tip_id} fixture={tip['fixtureId']} {tip['market']} {tip['selection']} conf={tip['confidence']:.2f}")
     return True
 
