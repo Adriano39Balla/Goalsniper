@@ -58,38 +58,42 @@ async def send_telegram_message(client: httpx.AsyncClient, text: str, reply_mark
     return int(((data or {}).get("result") or {}).get("message_id") or 0)
 
 async def edit_message_markup(client: httpx.AsyncClient, message_id: int, reply_markup: dict):
-    await client.post(
+    r = await client.post(
         f"{BASE}/editMessageReplyMarkup",
         json={"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "reply_markup": reply_markup},
         timeout=30.0,
     )
+    r.raise_for_status()
 
-# ---------- NEW: tip sender with inline feedback buttons ----------
+# ---------- Feedback keyboards ----------
 
-def _feedback_keyboard(tip: dict) -> dict:
-    # include enough identifiers so webhook learning can record it
-    fid = tip.get("fixtureId") or 0
-    market = (tip.get("market") or "NA").upper()
-    sel = (tip.get("selection") or "NA").upper()
-    ok_cb = f"tip:{fid}:{market}:{sel}:ok"
-    bad_cb = f"tip:{fid}:{market}:{sel}:bad"
+def feedback_keyboard_by_tip_id(tip_id: int) -> dict:
+    """Build inline keyboard with fb:<tip_id>:<1|0> so webhook learning works."""
     return {
         "inline_keyboard": [[
-            {"text": "👍 Correct", "callback_data": ok_cb},
-            {"text": "👎 Wrong",   "callback_data": bad_cb},
+            {"text": "👍 Correct", "callback_data": f"fb:{int(tip_id)}:1"},
+            {"text": "👎 Wrong",   "callback_data": f"fb:{int(tip_id)}:0"},
         ]]
     }
 
-async def send_tip_message(client: httpx.AsyncClient, tip: dict) -> int:
-    """
-    Preferred entrypoint used by scanner.py. Sends a formatted tip with 👍/👎 buttons.
-    Returns Telegram message_id.
-    """
-    text = format_tip_message(tip)
-    kb = _feedback_keyboard(tip)
-    return await send_telegram_message(client, text, kb)
+# ---------- Public helpers used by scanner ----------
 
-# aliases so scanner can find any of these names
+async def send_tip_plain(client: httpx.AsyncClient, tip: dict) -> int:
+    """Send the tip message WITHOUT buttons (we don't have tip_id yet)."""
+    text = format_tip_message(tip)
+    return await send_telegram_message(client, text, None)
+
+async def attach_feedback_buttons(client: httpx.AsyncClient, message_id: int, tip_id: int) -> None:
+    """After inserting into DB, attach the correct fb buttons."""
+    kb = feedback_keyboard_by_tip_id(int(tip_id))
+    await edit_message_markup(client, int(message_id), kb)
+
+# Backwards-compat alias (if something still calls it)
+async def send_tip_message(client: httpx.AsyncClient, tip: dict) -> int:
+    # Not used in the new flow, but keep as plain send for compatibility
+    return await send_tip_plain(client, tip)
+
+# Other aliases for scanner discovery
 send_tip = send_tip_message
 send_message_with_feedback = send_tip_message
 send_message = send_tip_message
