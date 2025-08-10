@@ -68,14 +68,14 @@ async def edit_message_markup(client: httpx.AsyncClient, message_id: int, reply_
 # ---------- Feedback keyboards ----------
 
 def feedback_keyboard_by_tip_id(tip_id: int) -> dict:
-    """Build inline keyboard with fb:<tip_id>:<1|0> so webhook learning works."""
+    # Compact, always < 64 bytes per callback_data
     return {
         "inline_keyboard": [[
-            {"text": "👍 Correct", "callback_data": f"fb:{int(tip_id)}:1"},
-            {"text": "👎 Wrong",   "callback_data": f"fb:{int(tip_id)}:0"},
+            {"text": "👍 Correct", "callback_data": f"fb:{tip_id}:1"},
+            {"text": "👎 Wrong",   "callback_data": f"fb:{tip_id}:0"},
         ]]
     }
-
+    
 # ---------- Public helpers used by scanner ----------
 
 async def send_tip_plain(client: httpx.AsyncClient, tip: dict) -> int:
