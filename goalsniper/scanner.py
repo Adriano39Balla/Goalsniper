@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict
 import httpx
 
+from .storage import insert_tip_return_id, set_outcome, market_stats, recent_market_samples, recent_market_league_samples, fixture_ever_sent, count_sent_today
+from .config import DAILY_TIP_CAP, DUPLICATE_SUPPRESS_FOREVER
 from .api_football import get_current_leagues, get_fixtures_by_date, get_live_fixtures
 from .tips import generate_tips_for_fixture
 from .telegram import send_telegram_message, format_tip_message, edit_message_markup
