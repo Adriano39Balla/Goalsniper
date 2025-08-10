@@ -117,6 +117,80 @@ def _has_fixture_recent_sync(conn: sqlite3.Connection, fixture_id: int, since_is
     ).fetchone()
     return 1 if row else 0
 
+# ---- NEW: fetch a full tip by id (for learning payload) ----
+@_with_conn
+def _get_tip_sync(conn: sqlite3.Connection, tip_id: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT id, fixture_id, market, selection, probability, confidence,
+               league_id, season, sent_at, message_id, outcome
+        FROM tips WHERE id = ?
+        """,
+        (int(tip_id),),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": int(row["id"]),
+        "fixtureId": int(row["fixture_id"]),
+        "market": str(row["market"]),
+        "selection": str(row["selection"]),
+        "probability": float(row["probability"]),
+        "confidence": float(row["confidence"]),
+        "leagueId": int(row["league_id"] or 0),
+        "season": int(row["season"] or 0),
+        "sentAt": str(row["sent_at"]),
+        "messageId": int(row["message_id"] or 0),
+        "outcome": (None if row["outcome"] is None else int(row["outcome"])),
+    }
+
+# ---- NEW: daily counts + total counts ----
+def _day_bounds_utc(d: datetime) -> tuple[str, str]:
+    d = d.astimezone(timezone.utc)
+    start = d.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+@_with_conn
+def _daily_counts_sync(conn: sqlite3.Connection, start_iso: str, end_iso: str) -> dict:
+    row = conn.execute(
+        """
+        SELECT
+          COUNT(*) AS sent,
+          SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS good,
+          SUM(CASE WHEN outcome=0 THEN 1 ELSE 0 END) AS bad,
+          SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) AS pending
+        FROM tips
+        WHERE sent_at >= ? AND sent_at < ?
+        """,
+        (start_iso, end_iso),
+    ).fetchone()
+    return {
+        "sent": int(row["sent"] or 0),
+        "good": int(row["good"] or 0),
+        "bad": int(row["bad"] or 0),
+        "pending": int(row["pending"] or 0),
+    }
+
+@_with_conn
+def _totals_sync(conn: sqlite3.Connection) -> dict:
+    row = conn.execute(
+        """
+        SELECT
+          COUNT(*) AS sent,
+          SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS good,
+          SUM(CASE WHEN outcome=0 THEN 1 ELSE 0 END) AS bad,
+          SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) AS pending
+        FROM tips
+        """,
+    ).fetchone()
+    return {
+        "sent": int(row["sent"] or 0),
+        "good": int(row["good"] or 0),
+        "bad": int(row["bad"] or 0),
+        "pending": int(row["pending"] or 0),
+    }
+
 # ----------------- async wrappers -----------------
 
 async def insert_tip_return_id(tip: Dict[str, Any], message_id: Optional[int]) -> int:
@@ -144,3 +218,14 @@ async def fixture_ever_sent(fixture_id: int) -> bool:
 async def has_fixture_tip_recent(fixture_id: int, minutes: int) -> bool:
     since = (datetime.now(timezone.utc) - timedelta(minutes=int(minutes))).isoformat()
     return bool(await asyncio.to_thread(_has_fixture_recent_sync, fixture_id, since))
+
+# ---- NEW async helpers ----
+async def get_tip_by_id(tip_id: int) -> Optional[Dict[str, Any]]:
+    return await asyncio.to_thread(_get_tip_sync, tip_id)
+
+async def daily_counts_for(date_dt: datetime) -> dict:
+    start_iso, end_iso = _day_bounds_utc(date_dt)
+    return await asyncio.to_thread(_daily_counts_sync, start_iso, end_iso)
+
+async def totals() -> dict:
+    return await asyncio.to_thread(_totals_sync)
