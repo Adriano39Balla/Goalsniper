@@ -80,10 +80,7 @@ async def telegram_webhook(request: Request, token: str | None = None):
     data = (cq.get("data") or "").strip()
 
     # Expected format (current): "fb:<tip_id>:<1|0>"
-    # We also accept legacy "fb:<tip_id>:1" and ignore anything else.
     if not data.startswith("fb:"):
-        # If you later switch to "tip:<fixtureId>:<MARKET>:<SEL>:ok|bad", adapt here.
-        # For now, just ignore non-fb callbacks gracefully.
         return {"ok": True}
 
     try:
@@ -97,9 +94,11 @@ async def telegram_webhook(request: Request, token: str | None = None):
         # learning hook with full tip payload (if found)
         try:
             info = await learning.on_feedback_update(tip_id, outcome)
-            log(f"[learn] tip={tip_id} market={info.get('market')} "
+            log(
+                f"[learn] tip={tip_id} market={info.get('market')} "
                 f"p_cal={info.get('calibratedProb'):.3f} conf={info.get('confidence'):.3f} "
-                f"thr={info.get('marketThreshold'):.3f} outcome={outcome}")
+                f"thr={info.get('marketThreshold'):.3f} outcome={outcome}"
+            )
         except Exception as le:
             log(f"[learn] update failed for tip_id={tip_id}: {le}")
 
@@ -111,8 +110,9 @@ async def telegram_webhook(request: Request, token: str | None = None):
 
 
 # Daily digest — returns JSON and can push a Telegram message
-@app.get("/digest")
+@app.api_route("/digest", methods=["GET", "HEAD"])
 async def digest_get(
+    request: Request,
     token: str = Query(""),
     date: str | None = Query(None, description="YYYY-MM-DD in UTC (optional)"),
     push: int = Query(1, description="1=send to Telegram, 0=JSON only"),
@@ -156,6 +156,7 @@ async def digest_get(
         "pushed": False,
     }
 
+    # Execute the send for both GET and HEAD; only include body for GET
     if push:
         async with httpx.AsyncClient(timeout=20) as client:
             try:
@@ -163,5 +164,8 @@ async def digest_get(
                 result["pushed"] = True
             except Exception as e:
                 result["error"] = f"telegram: {e}"
+
+    if request.method == "HEAD":
+        return Response(status_code=200)
 
     return result
