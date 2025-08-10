@@ -119,6 +119,23 @@ def _count_sent_since_sync(conn: sqlite3.Connection, since_iso: str) -> int:
     row = conn.execute("SELECT COUNT(*) AS c FROM tips WHERE sent_at >= ?", (since_iso,)).fetchone()
     return int(row["c"] or 0)
 
+async def count_sent_today() -> int:
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    return await asyncio.to_thread(_count_sent_since_sync, start)
+
+@_with_conn
+def _fixture_ever_sent_sync(conn: sqlite3.Connection, fixture_id: int) -> int:
+    row = conn.execute("SELECT 1 FROM tips WHERE fixture_id=? LIMIT 1", (int(fixture_id),)).fetchone()
+    return 1 if row else 0
+
+async def fixture_ever_sent(fixture_id: int) -> bool:
+    return bool(await asyncio.to_thread(_fixture_ever_sent_sync, fixture_id))
+
+@_with_conn
+def _count_sent_since_sync(conn: sqlite3.Connection, since_iso: str) -> int:
+    row = conn.execute("SELECT COUNT(*) AS c FROM tips WHERE sent_at >= ?", (since_iso,)).fetchone()
+    return int(row["c"] or 0)
+
 async def count_sent_in_last_minutes(minutes: int) -> int:
     since = (datetime.now(timezone.utc) - timedelta(minutes=int(minutes))).isoformat()
     return await asyncio.to_thread(_count_sent_since_sync, since)
