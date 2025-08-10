@@ -97,7 +97,58 @@ def _league_id(fx: Dict) -> int:
 def _season(fx: Dict) -> int:
     return int((fx.get("league", {}) or {}).get("season") or 0)
 
-# ---------- fetchers (1–2 calls per run) ----------
+# ---------- league filtering (reuse your emoji + keyword policy) ----------
+def _flag_to_iso2(flag: str) -> str:
+    cps = [ord(c) - 0x1F1E6 for c in flag if 0x1F1E6 <= ord(c) <= 0x1F1FF]
+    if len(cps) == 2:
+        return chr(cps[0] + 65) + chr(cps[1] + 65)
+    return flag.upper()
+
+def _normalize_country_flags(flags_csv: str) -> set[str]:
+    out = set()
+    for chunk in (flags_csv or "").split(","):
+        s = chunk.strip()
+        if not s:
+            continue
+        if any(0x1F1E6 <= ord(c) <= 0x1F1FF for c in s):
+            out.add(_flag_to_iso2(s))
+        else:
+            out.add(s.upper())
+    return out
+
+# Pull the same allowlists used inside api_football.py
+_ALLOW_COUNTRIES = _normalize_country_flags(getattr(api, "COUNTRY_FLAGS_ALLOW", ""))
+
+_ALLOW_KEYS = [k.upper() for k in getattr(api, "LEAGUE_ALLOW_KEYWORDS", [])]
+_EX_KEYS    = [k.upper() for k in getattr(api, "EXCLUDE_KEYWORDS", [])]
+
+_COUNTRY_TO_ISO = {
+    "GERMANY":"DE","ENGLAND":"GB","FRANCE":"FR","SPAIN":"ES","NETHERLANDS":"NL","HOLLAND":"NL",
+    "EGYPT":"EG","BELGIUM":"BE","CHINA":"CN","AUSTRALIA":"AU","ITALY":"IT","CROATIA":"HR",
+    "AUSTRIA":"AT","PORTUGAL":"PT","ROMANIA":"RO","SCOTLAND":"GB","SWEDEN":"SE","SWITZERLAND":"CH",
+    "TURKEY":"TR","USA":"US","UNITED STATES":"US"
+}
+
+def _league_row_allowed(row: Dict) -> bool:
+    """Filter get_current_leagues rows before we call fixtures-by-date."""
+    lname = (row.get("leagueName") or "").upper()
+    country = (row.get("country") or "").upper()
+    if not lname:
+        return False
+    # exclude youth/friendlies/reserves etc.
+    for bad in _EX_KEYS:
+        if bad and bad in lname:
+            return False
+    # include by league keywords
+    if _ALLOW_KEYS and not any(k in lname for k in _ALLOW_KEYS):
+        return False
+    # include by country flags
+    iso = _COUNTRY_TO_ISO.get(country, country)
+    if _ALLOW_COUNTRIES and iso not in _ALLOW_COUNTRIES:
+        return False
+    return True
+
+# ---------- fetchers ----------
 async def _fetch_live(client: httpx.AsyncClient) -> List[Dict]:
     fn = _get_live_api()
     if not fn:
@@ -116,37 +167,47 @@ async def _fetch_live(client: httpx.AsyncClient) -> List[Dict]:
     return out
 
 async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
-    fn = _get_by_date_api()
-    if not fn:
-        warn("No fixtures-by-date API function available; skipping scheduled scan")
+    """Fetch current leagues once; then fetch today fixtures per allowed league+season."""
+    get_leagues = getattr(api, "get_current_leagues", None)
+    by_date_fn  = _get_by_date_api()
+    if not get_leagues or not by_date_fn:
+        warn("No fixtures-by-date path available; skipping scheduled scan")
         return []
 
+    leagues = await (get_leagues(client) if asyncio.iscoroutinefunction(get_leagues) else get_leagues(client))
+    if not leagues:
+        return []
+
+    # Filter leagues aggressively (countries via flags + league keywords)
+    leagues = [row for row in leagues if _league_row_allowed(row)]
+    if not leagues:
+        return []
+
+    out: List[Dict] = []
     day = date.today().isoformat()
-    try:
-        params = list(inspect.signature(fn).parameters.keys())
-    except Exception:
-        params = []
 
-    # Call with whatever the function needs.
-    if {"season", "date_iso"}.issubset(set(params)):
-        season = datetime.now(timezone.utc).year
-        data = await (fn(client, season=season, date_iso=day) if asyncio.iscoroutinefunction(fn)
-                      else fn(client, season=season, date_iso=day))
-    elif "date_iso" in params:
-        data = await (fn(client, date_iso=day) if asyncio.iscoroutinefunction(fn)
-                      else fn(client, date_iso=day))
-    else:
-        data = await (fn(client, day) if asyncio.iscoroutinefunction(fn)
-                      else fn(client, day))
+    # Gentle sequential loop (keeps API usage predictable)
+    for row in leagues:
+        try:
+            lid = int(row.get("leagueId") or 0)
+            season = int(row.get("season") or 0)
+            if not lid or not season:
+                continue
+            if asyncio.iscoroutinefunction(by_date_fn):
+                res = await by_date_fn(client, lid, season, day)
+            else:
+                res = by_date_fn(client, lid, season, day)
+            for f in (res or []):
+                st = _status(f)
+                if st in FINISHED_STATES:
+                    continue
+                if st not in NS_STATES:
+                    continue
+                out.append(f)
+        except Exception as e:
+            warn("fixtures_by_date failed:", str(e))
+        await asyncio.sleep(max(0, STATS_REQUEST_DELAY_MS) / 1000.0)
 
-    out = []
-    for f in data:
-        st = _status(f)
-        if st in FINISHED_STATES:
-            continue
-        if st not in NS_STATES:
-            continue
-        out.append(f)
     return out
 
 # ---------- tip generation & sending with debug stats ----------
@@ -271,7 +332,8 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> Tuple[int, 
 async def run_scan_and_send() -> Dict[str, int]:
     """
     Single run:
-      - fetch live fixtures (1 call) and today's fixtures (1 call)
+      - fetch live fixtures (1 call, already filtered)
+      - fetch today's fixtures (current leagues -> allowed -> per league+season)
       - generate tips (in-memory)
       - enforce per-run cap, daily cap, dedupe per fixture, skip finished
       - return detailed debug stats in JSON
