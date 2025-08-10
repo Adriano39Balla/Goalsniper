@@ -34,35 +34,53 @@ NS_STATES       = {"NS"}
 
 # ---------- flexible resolver helpers ----------
 
-def _resolve_fn(mod, candidates: List[str], required: bool = True) -> Optional[Callable]:
+FOUND_BUILDER_NAME = None
+FOUND_LIVE_API_NAME = None
+FOUND_DATE_API_NAME = None
+
+def _resolve_fn_with_name(mod, candidates, required=True):
+    global FOUND_BUILDER_NAME, FOUND_LIVE_API_NAME, FOUND_DATE_API_NAME
     for name in candidates:
         fn = getattr(mod, name, None)
         if callable(fn):
-            return fn
+            return fn, name
     if required:
         warn(f"Missing functions. Tried: {candidates} in module {mod.__name__}")
-    return None
+    return None, None
 
-def _get_live_api() -> Optional[Callable]:
-    return _resolve_fn(api, [
-        "get_live_fixtures", "fetch_live_fixtures", "live_fixtures", "get_fixtures_live"
-    ], required=False)
+def _get_live_api():
+    global FOUND_LIVE_API_NAME
+    fn, nm = _resolve_fn_with_name(
+        api,
+        ["get_live_fixtures","fetch_live_fixtures","live_fixtures","get_fixtures_live"],
+        required=False
+    )
+    FOUND_LIVE_API_NAME = nm
+    return fn
 
-def _get_by_date_api() -> Optional[Callable]:
-    return _resolve_fn(api, [
-        "get_fixtures_by_date", "fixtures_by_date", "get_fixtures_date", "fetch_fixtures_by_date"
-    ], required=False)
+def _get_by_date_api():
+    global FOUND_DATE_API_NAME
+    fn, nm = _resolve_fn_with_name(
+        api,
+        ["get_fixtures_by_date","fixtures_by_date","get_fixtures_date","fetch_fixtures_by_date"],
+        required=False
+    )
+    FOUND_DATE_API_NAME = nm
+    return fn
 
-def _get_build_tips_fn() -> Optional[Callable]:
-    return _resolve_fn(tip_engine, [
-        "build_tips_for_fixture", "build_for_fixture", "generate_tips_for_fixture", "generate_tips"
-    ], required=False)
-
-def _get_send_fn() -> Optional[Callable]:
-    return _resolve_fn(tg, [
-        "send_tip_message", "send_tip", "send_message_with_feedback", "send_message", "push_tip", "send"
-    ], required=False)
-
+def _get_build_tips_fn():
+    global FOUND_BUILDER_NAME
+    # Try a wider set of common names
+    candidates = [
+        "build_tips_for_fixture", "build_for_fixture",
+        "generate_tips_for_fixture", "generate_tips",
+        "build_tips", "make_tips", "predict_fixture", "predict_tips",
+        "tips_for_fixture", "create_tips_for_fixture"
+    ]
+    fn, nm = _resolve_fn_with_name(tip_engine, candidates, required=False)
+    FOUND_BUILDER_NAME = nm
+    return fn
+    
 
 # ---------- small utils ----------
 
