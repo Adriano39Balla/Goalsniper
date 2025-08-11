@@ -1,4 +1,3 @@
-# goalsniper/api_football.py
 from __future__ import annotations
 
 import asyncio
@@ -8,9 +7,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from .config import API_KEY, MAX_CONCURRENT_REQUESTS
+from .config import (
+    API_KEY, MAX_CONCURRENT_REQUESTS,
+    CACHE_TTL_LEAGUES, CACHE_TTL_FIXTURES_BYDATE, CACHE_TTL_LIVE,
+    CACHE_TTL_TEAM_STATS, CACHE_TTL_ODDS,
+)
 from .logger import log, warn
-from . import filters  # <-- NEW
+from . import filters
 
 BASE_URL = os.getenv("API_BASE_URL", "https://v3.football.api-sports.io")
 API_TIMEOUT = float(os.getenv("API_TIMEOUT", "30"))
@@ -18,14 +21,9 @@ API_RETRIES = int(os.getenv("API_RETRIES", "3"))
 API_BACKOFF_INITIAL = float(os.getenv("API_BACKOFF_INITIAL", "0.5"))
 API_BACKOFF_MAX = float(os.getenv("API_BACKOFF_MAX", "2.0"))
 
+# Token-bucket (RPS)
 API_RPS = float(os.getenv("API_RPS", "3"))
 API_BURST = int(os.getenv("API_BURST", "6"))
-
-TTL_CURRENT_LEAGUES = int(os.getenv("CACHE_TTL_LEAGUES", "1800"))
-TTL_FIXTURES_BY_DATE = int(os.getenv("CACHE_TTL_FIXTURES", "900"))
-TTL_LIVE_FIXTURES = int(os.getenv("CACHE_TTL_LIVE", "90"))
-TTL_TEAM_STATS = int(os.getenv("CACHE_TTL_TEAM_STATS", "600"))
-TTL_ODDS = int(os.getenv("CACHE_TTL_ODDS", "600"))
 
 HEADERS = {"x-apisports-key": API_KEY}
 _sem = asyncio.Semaphore(max(1, int(MAX_CONCURRENT_REQUESTS)))
@@ -109,7 +107,7 @@ async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any],
                 backoff = min(backoff * 2.0, API_BACKOFF_MAX)
     return None
 
-# --------- dynamic filtering helpers ----------
+# --------- filtering ----------
 def _league_name(fx: dict) -> str:
     return ((fx.get("league") or {}).get("name") or "").upper()
 
@@ -117,31 +115,26 @@ def _country_name(fx: dict) -> str:
     return ((fx.get("league") or {}).get("country") or "").upper()
 
 async def _is_allowed_fixture(fx: dict) -> bool:
-    # Pull live filters (cached in filters.py)
     f = await filters.get_filters()
     lname = _league_name(fx)
     if not lname:
         return False
-
     excl = f["excludeKeywords"]
     if excl and any(bad in lname for bad in excl):
         return False
-
     allow_keys = f["allowLeagueKeywords"]
     if allow_keys and not any(k in lname for k in allow_keys):
         return False
-
     allow_countries = f["allowCountries"]
     if allow_countries:
         c = _country_name(fx)
         if c and (c not in allow_countries):
             return False
-
     return True
 
-# ----------------- public functions -----------------
+# --------- public API ----------
 async def get_current_leagues(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    res = await _api_get(client, "/leagues", {"current": "true"}, TTL_CURRENT_LEAGUES)
+    res = await _api_get(client, "/leagues", {"current": "true"}, CACHE_TTL_LEAGUES)
     leagues: List[Dict[str, Any]] = []
     for item in res or []:
         seasons = item.get("seasons") or []
@@ -161,7 +154,7 @@ async def get_fixtures_by_date(client: httpx.AsyncClient, league_id: int, season
     data = await _api_get(
         client, "/fixtures",
         {"league": int(league_id), "season": int(season), "date": date_iso},
-        TTL_FIXTURES_BY_DATE,
+        CACHE_TTL_FIXTURES_BYDATE,
     ) or []
     out: List[Dict[str, Any]] = []
     for fx in data:
@@ -170,7 +163,7 @@ async def get_fixtures_by_date(client: httpx.AsyncClient, league_id: int, season
     return out
 
 async def get_live_fixtures(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    data = await _api_get(client, "/fixtures", {"live": "all"}, TTL_LIVE_FIXTURES) or []
+    data = await _api_get(client, "/fixtures", {"live": "all"}, CACHE_TTL_LIVE) or []
     out: List[Dict[str, Any]] = []
     for fx in data:
         if await _is_allowed_fixture(fx):
@@ -181,8 +174,8 @@ async def get_team_statistics(client: httpx.AsyncClient, league_id: int, season:
     return await _api_get(
         client, "/teams/statistics",
         {"league": int(league_id), "season": int(season), "team": int(team_id)},
-        TTL_TEAM_STATS,
+        CACHE_TTL_TEAM_STATS,
     ) or {}
 
-async def get_odds_for_fixture(client: httpx.AsyncClient, fixture_id: int):
-    return await _api_get(client, "/odds", {"fixture": int(fixture_id)}, TTL_ODDS) or []
+async def get_odds_for_fixture(client: httpx.AsyncClient, fixture_id: int) -> Any:
+    return await _api_get(client, "/odds", {"fixture": int(fixture_id)}, CACHE_TTL_ODDS) or []
