@@ -1,4 +1,3 @@
-# goalsniper/scanner.py
 from __future__ import annotations
 
 import asyncio
@@ -10,12 +9,13 @@ import httpx
 
 from .logger import log, warn
 from . import api_football as api
+from . import filters
 from . import tips as tip_engine
 from .storage import (
     insert_tip_return_id,
     fixture_ever_sent,
     count_sent_today,
-    has_fixture_tip_recent,   # NEW: recent-window dedupe
+    has_fixture_tip_recent,
 )
 from .config import (
     MIN_CONFIDENCE_TO_SEND,
@@ -24,25 +24,24 @@ from .config import (
     LIVE_MINUTE_MIN,
     LIVE_MINUTE_MAX,
     LIVE_MAX_FIXTURES,
-    SCAN_DAYS,  # kept for compatibility/info
+    SCAN_DAYS,
     DAILY_TIP_CAP,
     DUPLICATE_SUPPRESS_FOREVER,
     STATS_REQUEST_DELAY_MS,
-    DUPLICATE_SUPPRESS_MINUTES,  # NEW
+    DUPLICATE_SUPPRESS_MINUTES,
 )
-from .learning import calibrate_probability, dynamic_conf_threshold  # NEW: learning gate
+from .learning import calibrate_probability, dynamic_conf_threshold
 
 # ---------- status sets ----------
 FINISHED_STATES = {"FT", "AET", "PEN", "CANC", "PST", "ABD", "AWD", "WO"}
 LIVE_STATES     = {"1H", "2H", "HT", "ET"}
 NS_STATES       = {"NS"}
 
-# ---------- report which functions we actually use ----------
 FOUND_BUILDER_NAME: Optional[str] = None
 FOUND_LIVE_API_NAME: Optional[str] = None
 FOUND_DATE_API_NAME: Optional[str] = None
 
-# ---------- flexible resolver helpers ----------
+# ---------- resolvers ----------
 def _resolve_fn_with_name(mod, candidates, required=True):
     for name in candidates:
         fn = getattr(mod, name, None)
@@ -54,37 +53,27 @@ def _resolve_fn_with_name(mod, candidates, required=True):
 
 def _get_live_api() -> Optional[Callable]:
     global FOUND_LIVE_API_NAME
-    fn, nm = _resolve_fn_with_name(
-        api,
-        ["get_live_fixtures", "fetch_live_fixtures", "live_fixtures", "get_fixtures_live"],
-        required=False,
-    )
+    fn, nm = _resolve_fn_with_name(api, ["get_live_fixtures"], required=False)
     FOUND_LIVE_API_NAME = nm
     return fn
 
 def _get_by_date_api() -> Optional[Callable]:
     global FOUND_DATE_API_NAME
-    fn, nm = _resolve_fn_with_name(
-        api,
-        ["get_fixtures_by_date", "fixtures_by_date", "get_fixtures_date", "fetch_fixtures_by_date"],
-        required=False,
-    )
+    fn, nm = _resolve_fn_with_name(api, ["get_fixtures_by_date"], required=False)
     FOUND_DATE_API_NAME = nm
     return fn
 
 def _get_build_tips_fn() -> Optional[Callable]:
     global FOUND_BUILDER_NAME
-    candidates = [
-        "build_tips_for_fixture", "build_for_fixture",
-        "generate_tips_for_fixture", "generate_tips",
-        "build_tips", "make_tips", "predict_fixture",
-        "predict_tips", "tips_for_fixture", "create_tips_for_fixture",
-    ]
-    fn, nm = _resolve_fn_with_name(tip_engine, candidates, required=False)
+    fn, nm = _resolve_fn_with_name(
+        tip_engine,
+        ["generate_tips_for_fixture", "build_tips_for_fixture", "build_tips"],
+        required=False,
+    )
     FOUND_BUILDER_NAME = nm
     return fn
 
-# ---------- small utils ----------
+# ---------- utils ----------
 def _status(fx: Dict) -> str:
     return (fx.get("fixture", {}).get("status", {}) or {}).get("short") or ""
 
@@ -102,49 +91,23 @@ def _league_id(fx: Dict) -> int:
 def _season(fx: Dict) -> int:
     return int((fx.get("league", {}) or {}).get("season") or 0)
 
-# ---------- league filtering (reuse any policy set in api_football via env) ----------
-def _flag_to_iso2(flag: str) -> str:
-    cps = [ord(c) - 0x1F1E6 for c in flag if 0x1F1E6 <= ord(c) <= 0x1F1FF]
-    if len(cps) == 2:
-        return chr(cps[0] + 65) + chr(cps[1] + 65)
-    return flag.upper()
-
-def _normalize_country_flags(flags_csv: str) -> set[str]:
-    out = set()
-    for chunk in (flags_csv or "").split(","):
-        s = chunk.strip()
-        if not s:
-            continue
-        if any(0x1F1E6 <= ord(c) <= 0x1F1FF for c in s):
-            out.add(_flag_to_iso2(s))
-        else:
-            out.add(s.upper())
-    return out
-
-_ALLOW_COUNTRIES = _normalize_country_flags(getattr(api, "COUNTRY_FLAGS_ALLOW", ""))
-_ALLOW_KEYS = [k.upper() for k in getattr(api, "LEAGUE_ALLOW_KEYWORDS", [])]
-_EX_KEYS    = [k.upper() for k in getattr(api, "EXCLUDE_KEYWORDS", [])]
-
-_COUNTRY_TO_ISO = {
-    "GERMANY":"DE","ENGLAND":"GB","FRANCE":"FR","SPAIN":"ES","NETHERLANDS":"NL","HOLLAND":"NL",
-    "EGYPT":"EG","BELGIUM":"BE","CHINA":"CN","AUSTRALIA":"AU","ITALY":"IT","CROATIA":"HR",
-    "AUSTRIA":"AT","PORTUGAL":"PT","ROMANIA":"RO","SCOTLAND":"GB","SWEDEN":"SE","SWITZERLAND":"CH",
-    "TURKEY":"TR","USA":"US","UNITED STATES":"US"
-}
-
-def _league_row_allowed(row: Dict) -> bool:
+# ---------- league filtering (applied BEFORE per-league fixture calls) ----------
+async def _league_row_allowed(row: Dict) -> bool:
+    f = await filters.get_filters()
     lname = (row.get("leagueName") or "").upper()
     country = (row.get("country") or "").upper()
+
     if not lname:
         return False
-    for bad in _EX_KEYS:
-        if bad and bad in lname:
+    excl = f["excludeKeywords"]
+    if excl and any(bad in lname for bad in excl):
+        return False
+    allow_keys = f["allowLeagueKeywords"]
+    if allow_keys and not any(k in lname for k in allow_keys):
+        return False
+    if f["allowCountries"]:
+        if country and (country not in f["allowCountries"]):
             return False
-    if _ALLOW_KEYS and not any(k in lname for k in _ALLOW_KEYS):
-        return False
-    iso = _COUNTRY_TO_ISO.get(country, country)
-    if _ALLOW_COUNTRIES and iso not in _ALLOW_COUNTRIES:
-        return False
     return True
 
 # ---------- fetchers ----------
@@ -166,7 +129,6 @@ async def _fetch_live(client: httpx.AsyncClient) -> List[Dict]:
     return out
 
 async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
-    """Fetch current leagues once; then fetch today fixtures per allowed league+season."""
     get_leagues = getattr(api, "get_current_leagues", None)
     by_date_fn  = _get_by_date_api()
     if not get_leagues or not by_date_fn:
@@ -177,14 +139,22 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
     if not leagues:
         return []
 
-    leagues = [row for row in leagues if _league_row_allowed(row)]
-    if not leagues:
+    # Filter BEFORE making per-league fixture calls
+    allowed = []
+    for row in leagues:
+        try:
+            if await _league_row_allowed(row):
+                allowed.append(row)
+        except Exception as e:
+            warn("league_row filter failed:", str(e))
+
+    if not allowed:
         return []
 
     out: List[Dict] = []
     day = date.today().isoformat()
 
-    for row in leagues:
+    for row in allowed:
         try:
             lid = int(row.get("leagueId") or 0)
             season = int(row.get("season") or 0)
@@ -265,10 +235,6 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
 
 # ---------- learning gate ----------
 async def _calibrate_and_filter(t: dict) -> Optional[dict]:
-    """
-    Calibrate raw probability using historical feedback and apply a dynamic
-    per‑market threshold. If learning is cold or fails, drop the tip quietly.
-    """
     try:
         p_raw = float(t.get("probability", 0.5))
         market = str(t.get("market", ""))
@@ -302,14 +268,10 @@ async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
     except Exception as e:
         warn("attach feedback buttons failed:", str(e))
 
-    log(
-        f"Sent tip id={tip_id} fixture={tip['fixtureId']} "
-        f"{tip['market']} {tip['selection']} conf={tip['confidence']:.2f}"
-    )
+    log(f"Sent tip id={tip_id} fixture={tip['fixtureId']} {tip['market']} {tip['selection']} conf={tip['confidence']:.2f}")
     return True
 
 async def _recently_sent(fid: int) -> bool:
-    """Optional short-window dedupe if FOREVER suppression is off."""
     if DUPLICATE_SUPPRESS_FOREVER:
         return False
     if DUPLICATE_SUPPRESS_MINUTES <= 0:
@@ -334,7 +296,6 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> Tuple[int, 
             stats["ever_sent_skipped"] += 1
             continue
 
-        # learning gate: recalibrate + enforce dynamic threshold
         t = await _calibrate_and_filter(t)
         if not t:
             continue
@@ -349,7 +310,7 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> Tuple[int, 
 
     return sent, stats
 
-# ---------- public entrypoint ----------
+# ---------- entrypoint ----------
 async def run_scan_and_send() -> Dict[str, int]:
     started = datetime.now(timezone.utc)
 
