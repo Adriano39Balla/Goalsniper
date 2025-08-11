@@ -127,21 +127,23 @@ async def generate_tips_for_fixture(
     if not fixture_id or not home_id or not away_id:
         return tips
 
-    status  = fx_info.get("status") or {}
-    minute  = status.get("elapsed")
-    goals   = fx.get("goals") or {}
-    goals_h = goals.get("home") or 0
-    goals_a = goals.get("away") or 0
+    status = fx_info.get("status") or {}
+    minute_i = int(status.get("elapsed") or 0)  # normalize once
+    goals = fx.get("goals") or {}
+    goals_h = int(goals.get("home") or 0)
+    goals_a = int(goals.get("away") or 0)
 
     home_stats, away_stats = await _fetch_stats_pair(client, league_id, season, int(home_id), int(away_id))
     homeR = _build_team_rating(home_stats, "home")
     awayR = _build_team_rating(away_stats, "away")
 
+    # expected goals (full match)
     lambda_home, lambda_away = _lambda_by_side(homeR, awayR)
-    lambda_home_live, lambda_away_live = _adjust_for_live(lambda_home, lambda_away, minute, goals_h, goals_a)
+    lambda_home_live, lambda_away_live = _adjust_for_live(lambda_home, lambda_away, minute_i, goals_h, goals_a)
     expected_goals = lambda_home + lambda_away
     expected_goals_live = lambda_home_live + lambda_away_live
 
+    # 1X2 baseline using ratings (+ small home advantage)
     home_score = homeR["rating"] + 0.06
     away_score = awayR["rating"]
     draw_base  = 0.25 + max(0.0, 0.1 - abs(home_score - away_score))
@@ -151,7 +153,7 @@ async def generate_tips_for_fixture(
 
     picks: List[Tuple[str, str, float, float]] = []
 
-    # 1X2
+    # (A) 1X2
     gap = max(p_home, p_draw, p_away) - sorted([p_home, p_draw, p_away])[1]
     if gap >= 0.02:
         if p_home >= p_draw and p_home >= p_away:
@@ -161,24 +163,25 @@ async def generate_tips_for_fixture(
         else:
             picks.append(("1X2", "DRAW", p_draw, expected_goals))
 
-    # O/U 2.5
+    # (B) Over/Under 2.5
     p_over = _clamp01((expected_goals - 2.5) * 0.25 + 0.5)
     p_under = 1.0 - p_over
-    if _prob_to_confidence(max(p_over, p_under)) >= MIN_CONFIDENCE_TO_SEND:
+    best_ft_prob = max(p_over, p_under)
+    if _prob_to_confidence(best_ft_prob) >= MIN_CONFIDENCE_TO_SEND:
         picks.append(("OVER_UNDER_2.5", "OVER 2.5" if p_over >= p_under else "UNDER 2.5",
-                      max(p_over, p_under), expected_goals))
+                      best_ft_prob, expected_goals))
 
-    # BTTS
+    # (C) BTTS
     p_btts = _btts_prob(lambda_home, lambda_away)
     p_btts_live = _btts_prob(lambda_home_live, lambda_away_live)
-    p_btts_use = p_btts_live if minute else p_btts
+    p_btts_use = p_btts_live if minute_i else p_btts
     if _prob_to_confidence(p_btts_use) >= MIN_CONFIDENCE_TO_SEND:
         picks.append(("BTTS", "YES" if p_btts_use >= 0.5 else "NO",
-                      p_btts_use, expected_goals_live if minute else expected_goals))
+                      p_btts_use, expected_goals_live if minute_i else expected_goals))
 
-    # 1H O/U (1.0 or 1.5)
-    if not minute or minute < 45:
-        fh_factor = _first_half_remaining_factor(minute)
+    # (D) 1st Half O/U (1.0 or 1.5)
+    if minute_i < 45:
+        fh_factor = _first_half_remaining_factor(minute_i)
         fh_xg_total = _first_half_xg(expected_goals) * fh_factor
 
         def _ou(line: float) -> Tuple[str, float]:
@@ -192,8 +195,8 @@ async def generate_tips_for_fixture(
         if _prob_to_confidence(best_prob) >= MIN_CONFIDENCE_TO_SEND:
             picks.append(("OVER_UNDER_1H", best_sel, best_prob, fh_xg_total))
 
+    # Emit tips
     league = fixture.get("league") or {}
-    teams  = fixture.get("teams")  or {}
     for market, selection, prob, xg in picks:
         conf = _prob_to_confidence(prob)
         if conf < MIN_CONFIDENCE_TO_SEND:
@@ -212,9 +215,9 @@ async def generate_tips_for_fixture(
             "probability": round(float(prob), 3),
             "confidence": round(float(conf), 3),
             "expectedGoals": round(float(xg), 2),
-            "note": ("LIVE" if minute else None),
-            "live": bool(minute),
-            "minute": int(minute or 0),
+            "note": ("LIVE" if minute_i else None),
+            "live": bool(minute_i),
+            "minute": minute_i,
             "score": f"{goals_h}-{goals_a}",
         })
 
