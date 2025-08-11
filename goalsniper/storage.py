@@ -2,7 +2,7 @@ import os
 import sqlite3
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List  # <- added Tuple
 
 # DB under /data so it survives service restarts (if you attach a disk)
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "goalsniper.db")
