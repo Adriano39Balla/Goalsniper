@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
-from __future__ import annotations
 from .api_football import get_team_statistics
 from .config import STATS_REQUEST_DELAY_MS, MIN_CONFIDENCE_TO_SEND
 
@@ -119,7 +120,7 @@ async def generate_tips_for_fixture(
 
     fx = fixture or {}
     fx_info = fx.get("fixture") or {}
-    teams    = fx.get("teams") or {}
+    teams = fx.get("teams") or {}
 
     fixture_id = fx_info.get("id")
     home_id = (teams.get("home") or {}).get("id")
@@ -127,11 +128,11 @@ async def generate_tips_for_fixture(
     if not fixture_id or not home_id or not away_id:
         return tips
 
-    status   = fx_info.get("status") or {}
-    minute   = status.get("elapsed")
-    goals    = fx.get("goals") or {}
-    goals_h  = goals.get("home") or 0
-    goals_a  = goals.get("away") or 0
+    status  = fx_info.get("status") or {}
+    minute  = status.get("elapsed")
+    goals   = fx.get("goals") or {}
+    goals_h = goals.get("home") or 0
+    goals_a = goals.get("away") or 0
 
     home_stats, away_stats = await _fetch_stats_pair(client, league_id, season, int(home_id), int(away_id))
     homeR = _build_team_rating(home_stats, "home")
@@ -177,8 +178,12 @@ async def generate_tips_for_fixture(
     p_btts_live = _btts_prob(lambda_home_live, lambda_away_live)
     p_btts_use  = p_btts_live if minute else p_btts
     if _prob_to_confidence(p_btts_use) >= MIN_CONFIDENCE_TO_SEND:
-        picks.append(("BTTS", "YES" if p_btts_use >= 0.5 else "NO",
-                      p_btts_use, expected_goals_live if minute else expected_goals))
+        picks.append((
+            "BTTS",
+            "YES" if p_btts_use >= 0.5 else "NO",
+            p_btts_use,
+            expected_goals_live if minute else expected_goals
+        ))
 
     # --- (D) 1st Half Over/Under (1.0 or 1.5, choose stronger) ---
     if not minute or minute < 45:
