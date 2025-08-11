@@ -1,8 +1,10 @@
+# goalsniper/storage.py
+
 import os
 import sqlite3
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple, Dict, Any, List  # <- added Tuple
+from typing import Optional, Tuple, Dict, Any, List
 
 # DB under /data so it survives service restarts (if you attach a disk)
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "goalsniper.db")
@@ -24,6 +26,13 @@ CREATE TABLE IF NOT EXISTS tips (
 CREATE INDEX IF NOT EXISTS idx_tips_fixture ON tips(fixture_id);
 CREATE INDEX IF NOT EXISTS idx_tips_market ON tips(market);
 CREATE INDEX IF NOT EXISTS idx_tips_league ON tips(league_id, market);
+
+-- NEW: simple key/value config store
+CREATE TABLE IF NOT EXISTS config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 def _ensure_dir():
@@ -189,6 +198,40 @@ def _totals_sync(conn: sqlite3.Connection) -> dict:
         "pending": int(row["pending"] or 0),
     }
 
+# ----------------- config sync primitives -----------------
+
+@_with_conn
+def _config_get_sync(conn: sqlite3.Connection, key: str) -> str:
+    row = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+    return str(row["value"]) if row else ""
+
+@_with_conn
+def _config_set_sync(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO config(key, value, updated_at)
+        VALUES(?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          value=excluded.value,
+          updated_at=excluded.updated_at
+        """,
+        (key, value, datetime.now(timezone.utc).isoformat()),
+    )
+
+@_with_conn
+def _config_get_bulk_sync(conn: sqlite3.Connection, keys: List[str]) -> Dict[str, str]:
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    rows = conn.execute(
+        f"SELECT key, value FROM config WHERE key IN ({placeholders})",
+        tuple(keys),
+    ).fetchall()
+    out = {k: "" for k in keys}
+    for r in rows:
+        out[str(r["key"])] = str(r["value"])
+    return out
+
 # ----------------- async wrappers -----------------
 
 async def insert_tip_return_id(tip: Dict[str, Any], message_id: Optional[int]) -> int:
@@ -226,3 +269,14 @@ async def daily_counts_for(date_dt: datetime) -> dict:
 
 async def totals() -> dict:
     return await asyncio.to_thread(_totals_sync)
+
+# -------- config async wrappers --------
+
+async def get_config(key: str) -> str:
+    return await asyncio.to_thread(_config_get_sync, key)
+
+async def set_config(key: str, value: str) -> None:
+    await asyncio.to_thread(_config_set_sync, key, value)
+
+async def get_config_bulk(keys: List[str]) -> Dict[str, str]:
+    return await asyncio.to_thread(_config_get_bulk_sync, keys)
