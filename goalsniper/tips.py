@@ -69,7 +69,6 @@ def _btts_prob(lambda_home: float, lambda_away: float) -> float:
     return (1 - _poisson_zero_prob(lambda_home)) * (1 - _poisson_zero_prob(lambda_away))
 
 async def _fetch_stats_pair(client, league_id: int, season: int, home_id: int, away_id: int):
-    # staggered to respect API pacing
     h = asyncio.create_task(get_team_statistics(client, int(league_id), int(season), int(home_id)))
     await asyncio.sleep(max(0, int(STATS_REQUEST_DELAY_MS)) / 1000.0)
     a = asyncio.create_task(get_team_statistics(client, int(league_id), int(season), int(away_id)))
@@ -83,8 +82,8 @@ def _lambda_by_side(homeR: Dict[str, float], awayR: Dict[str, float]) -> Tuple[f
 def _adjust_for_live(lambda_home: float, lambda_away: float, minute: Optional[int], goals_h: int, goals_a: int) -> Tuple[float, float]:
     if not minute or int(minute) <= 0:
         return lambda_home, lambda_away
-    minute = min(90, max(0, int(minute)))
-    remain = 90 - minute
+    m = min(90, max(0, int(minute)))
+    remain = 90 - m
     factor = remain / 90.0
     lh = lambda_home * factor
     la = lambda_away * factor
@@ -95,7 +94,7 @@ def _adjust_for_live(lambda_home: float, lambda_away: float, minute: Optional[in
     return (lh, la)
 
 # ---------- 1st-half helpers ----------
-_FIRST_HALF_SHARE = 0.56  # rough share of goals in first half
+_FIRST_HALF_SHARE = 0.56
 
 def _first_half_xg(total_xg: float) -> float:
     return max(0.01, total_xg * _FIRST_HALF_SHARE)
@@ -108,7 +107,7 @@ def _first_half_remaining_factor(minute: Optional[int]) -> float:
         return 0.0
     return (45 - m) / 45.0
 
-# ---------- main entry ----------
+# ---------- main ----------
 async def generate_tips_for_fixture(
     client,
     fixture: Dict[str, Any],
@@ -116,11 +115,7 @@ async def generate_tips_for_fixture(
     season: int
 ) -> List[Dict[str, Any]]:
     """
-    Markets:
-      - 1X2
-      - OVER/UNDER 2.5 (FT)
-      - BTTS
-      - 1st Half Over/Under (1.0 or 1.5, pick stronger)
+    Markets: 1X2, OVER/UNDER 2.5, BTTS, 1ST_HALF_OU (1.0 or 1.5)
     """
     tips: List[Dict[str, Any]] = []
 
@@ -137,8 +132,8 @@ async def generate_tips_for_fixture(
     status  = fx_info.get("status") or {}
     minute  = status.get("elapsed")
     goals   = fx.get("goals") or {}
-    goals_h = goals.get("home") or 0
-    goals_a = goals.get("away") or 0
+    goals_h = int(goals.get("home") or 0)
+    goals_a = int(goals.get("away") or 0)
 
     try:
         home_stats, away_stats = await _fetch_stats_pair(client, league_id, season, int(home_id), int(away_id))
@@ -149,13 +144,11 @@ async def generate_tips_for_fixture(
     homeR = _build_team_rating(home_stats, "home")
     awayR = _build_team_rating(away_stats, "away")
 
-    # expected goals (full match)
     lambda_home, lambda_away = _lambda_by_side(homeR, awayR)
-    lambda_home_live, lambda_away_live = _adjust_for_live(lambda_home, lambda_away, minute, int(goals_h), int(goals_a))
+    lambda_home_live, lambda_away_live = _adjust_for_live(lambda_home, lambda_away, minute, goals_h, goals_a)
     expected_goals = lambda_home + lambda_away
     expected_goals_live = lambda_home_live + lambda_away_live
 
-    # 1X2 baseline using ratings (+ small home adv)
     home_score = homeR["rating"] + 0.06
     away_score = awayR["rating"]
     draw_base  = 0.25 + max(0.0, 0.1 - abs(home_score - away_score))
@@ -165,7 +158,7 @@ async def generate_tips_for_fixture(
 
     picks: List[Tuple[str, str, float, float]] = []
 
-    # --- 1X2 ---
+    # 1X2 (only if there is a clear winner gap ≥ 0.02)
     gap = max(p_home, p_draw, p_away) - sorted([p_home, p_draw, p_away])[1]
     if gap >= 0.02:
         if p_home >= p_draw and p_home >= p_away:
@@ -175,7 +168,7 @@ async def generate_tips_for_fixture(
         else:
             picks.append(("1X2", "DRAW", p_draw, expected_goals))
 
-    # --- Over/Under 2.5 (FT) ---
+    # Over/Under 2.5
     p_over  = _clamp01((expected_goals - 2.5) * 0.25 + 0.5)
     p_under = 1.0 - p_over
     best_ou_prob = max(p_over, p_under)
@@ -187,7 +180,7 @@ async def generate_tips_for_fixture(
             expected_goals,
         ))
 
-    # --- BTTS ---
+    # BTTS
     p_btts      = _btts_prob(lambda_home, lambda_away)
     p_btts_live = _btts_prob(lambda_home_live, lambda_away_live)
     p_btts_use  = p_btts_live if minute else p_btts
@@ -195,13 +188,13 @@ async def generate_tips_for_fixture(
         picks.append(("BTTS", "YES" if p_btts_use >= 0.5 else "NO",
                       p_btts_use, expected_goals_live if minute else expected_goals))
 
-    # --- 1st Half Over/Under (1.0 or 1.5) ---
+    # 1st Half Over/Under (1.0 or 1.5)
     if not minute or int(minute) < 45:
         fh_factor   = _first_half_remaining_factor(minute)
         fh_xg_total = _first_half_xg(expected_goals) * fh_factor
 
         def _ou(line: float) -> Tuple[str, float]:
-            p_over_fh  = _clamp01((fh_xg_total - line) * 0.60 + 0.5)  # steeper than FT
+            p_over_fh  = _clamp01((fh_xg_total - line) * 0.60 + 0.5)
             p_under_fh = 1.0 - p_over_fh
             return (f"OVER {line}", p_over_fh) if p_over_fh >= p_under_fh else (f"UNDER {line}", p_under_fh)
 
@@ -209,7 +202,7 @@ async def generate_tips_for_fixture(
         sel15, prob15 = _ou(1.5)
         best_sel, best_prob = (sel10, prob10) if prob10 >= prob15 else (sel15, prob15)
         if _prob_to_confidence(best_prob) >= MIN_CONFIDENCE_TO_SEND:
-            picks.append(("OVER_UNDER_1H", best_sel, best_prob, fh_xg_total))
+            picks.append(("1ST_HALF_OU", best_sel, best_prob, fh_xg_total))
 
     # Format tips
     league = fixture.get("league") or {}
@@ -235,7 +228,7 @@ async def generate_tips_for_fixture(
             "note": ("LIVE" if minute else None),
             "live": bool(minute),
             "minute": int(minute or 0),
-            "score": f"{int(goals_h)}-{int(goals_a)}",
+            "score": f"{goals_h}-{goals_a}",
         })
 
     return tips
