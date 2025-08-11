@@ -1,3 +1,4 @@
+# goalsniper/scanner.py
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +15,7 @@ from .storage import (
     insert_tip_return_id,
     fixture_ever_sent,
     count_sent_today,
+    has_fixture_tip_recent,   # NEW: recent-window dedupe
 )
 from .config import (
     MIN_CONFIDENCE_TO_SEND,
@@ -26,7 +28,9 @@ from .config import (
     DAILY_TIP_CAP,
     DUPLICATE_SUPPRESS_FOREVER,
     STATS_REQUEST_DELAY_MS,
+    DUPLICATE_SUPPRESS_MINUTES,  # NEW
 )
+from .learning import calibrate_probability, dynamic_conf_threshold  # NEW: learning gate
 
 # ---------- status sets ----------
 FINISHED_STATES = {"FT", "AET", "PEN", "CANC", "PST", "ABD", "AWD", "WO"}
@@ -98,7 +102,7 @@ def _league_id(fx: Dict) -> int:
 def _season(fx: Dict) -> int:
     return int((fx.get("league", {}) or {}).get("season") or 0)
 
-# ---------- league filtering (reuse your emoji + keyword policy) ----------
+# ---------- league filtering (reuse any policy set in api_football via env) ----------
 def _flag_to_iso2(flag: str) -> str:
     cps = [ord(c) - 0x1F1E6 for c in flag if 0x1F1E6 <= ord(c) <= 0x1F1FF]
     if len(cps) == 2:
@@ -117,9 +121,7 @@ def _normalize_country_flags(flags_csv: str) -> set[str]:
             out.add(s.upper())
     return out
 
-# Pull the same allowlists used inside api_football.py
 _ALLOW_COUNTRIES = _normalize_country_flags(getattr(api, "COUNTRY_FLAGS_ALLOW", ""))
-
 _ALLOW_KEYS = [k.upper() for k in getattr(api, "LEAGUE_ALLOW_KEYWORDS", [])]
 _EX_KEYS    = [k.upper() for k in getattr(api, "EXCLUDE_KEYWORDS", [])]
 
@@ -131,7 +133,6 @@ _COUNTRY_TO_ISO = {
 }
 
 def _league_row_allowed(row: Dict) -> bool:
-    """Filter get_current_leagues rows before we call fixtures-by-date."""
     lname = (row.get("leagueName") or "").upper()
     country = (row.get("country") or "").upper()
     if not lname:
@@ -206,7 +207,7 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
 
     return out
 
-# ---------- tip generation & sending with debug stats ----------
+# ---------- tip generation ----------
 def _dedupe_in_run(candidates: List[Dict]) -> Tuple[List[Dict], int]:
     seen = set()
     out: List[Dict] = []
@@ -262,9 +263,31 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
 
     return deduped, stats
 
+# ---------- learning gate ----------
+async def _calibrate_and_filter(t: dict) -> Optional[dict]:
+    """
+    Calibrate raw probability using historical feedback and apply a dynamic
+    per‑market threshold. If learning is cold or fails, drop the tip quietly.
+    """
+    try:
+        p_raw = float(t.get("probability", 0.5))
+        market = str(t.get("market", ""))
+        league_id = t.get("leagueId")
+        p_cal = await calibrate_probability(market, p_raw, league_id)
+        conf = abs(p_cal - 0.5) * 2.0
+        thr = await dynamic_conf_threshold(market)
+        if conf < max(thr, MIN_CONFIDENCE_TO_SEND):
+            return None
+        out = dict(t)
+        out["probability"] = round(p_cal, 3)
+        out["confidence"] = round(conf, 3)
+        return out
+    except Exception as e:
+        warn("learning gate failed:", str(e))
+        return None
+
 # ---------- sending ----------
 async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
-    # lazy import telegram so scanner import can’t fail if TG module has an issue
     try:
         from . import telegram as tg
     except Exception as e:
@@ -272,7 +295,6 @@ async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
         return False
 
     msg_id = await tg.send_tip_plain(client, tip)
-
     tip_id = await insert_tip_return_id({**tip, "messageId": msg_id}, msg_id)
 
     try:
@@ -285,6 +307,14 @@ async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
         f"{tip['market']} {tip['selection']} conf={tip['confidence']:.2f}"
     )
     return True
+
+async def _recently_sent(fid: int) -> bool:
+    """Optional short-window dedupe if FOREVER suppression is off."""
+    if DUPLICATE_SUPPRESS_FOREVER:
+        return False
+    if DUPLICATE_SUPPRESS_MINUTES <= 0:
+        return False
+    return await has_fixture_tip_recent(fid, DUPLICATE_SUPPRESS_MINUTES)
 
 async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> Tuple[int, Dict[str, int]]:
     stats = {"ever_sent_skipped": 0, "daily_cap_hits": 0}
@@ -299,6 +329,14 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> Tuple[int, 
         fid = _fixture_id(t)
         if DUPLICATE_SUPPRESS_FOREVER and fid and await fixture_ever_sent(fid):
             stats["ever_sent_skipped"] += 1
+            continue
+        if fid and await _recently_sent(fid):
+            stats["ever_sent_skipped"] += 1
+            continue
+
+        # learning gate: recalibrate + enforce dynamic threshold
+        t = await _calibrate_and_filter(t)
+        if not t:
             continue
 
         try:
