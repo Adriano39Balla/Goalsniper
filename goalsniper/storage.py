@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import asyncio
+from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, Any, List
 
