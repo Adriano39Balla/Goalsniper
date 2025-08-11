@@ -45,23 +45,21 @@ async def run_post(request: Request):
     return {"status": "ok", **(await scanner.run_scan_and_send())}
 
 
-# Accept both GET and HEAD so UptimeRobot free (HEAD) can trigger scans.
+# Accept GET for scans; HEAD returns 200 without scanning (for uptime checks).
 @app.api_route("/run", methods=["GET", "HEAD"])
 async def run_get_or_head(request: Request, token: str = Query("")):
     if token != RUN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    # HEAD → do NOT trigger a scan, just say "OK"
+    if request.method == "HEAD":
+        return Response(status_code=200)
+
     scanner, err = _load_scanner()
     if err:
         raise HTTPException(status_code=500, detail=f"scanner import failed: {err}")
 
-    # Trigger the scan for both GET and HEAD
     result = await scanner.run_scan_and_send()
-
-    # HEAD must not include a body; return 200 if scan executed
-    if request.method == "HEAD":
-        return Response(status_code=200)
-
     return {"status": "ok", **result}
 
 
