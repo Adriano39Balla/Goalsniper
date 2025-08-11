@@ -1,30 +1,30 @@
 import asyncio
 import math
 from typing import Any, Dict, List, Optional, Tuple
+
 from .api_football import get_team_statistics
 from .config import STATS_REQUEST_DELAY_MS, MIN_CONFIDENCE_TO_SEND
-from .logger import warn
 
 # ---------- helpers ----------
 def _form_to_points(form: Optional[str]) -> int:
     if not form:
         return 0
     pts = 0
-    for ch in (ch for ch in form if ch in ("W","D","L")):
+    for ch in (c for c in form if c in ("W", "D", "L")):
         pts += 3 if ch == "W" else (1 if ch == "D" else 0)
     return pts
 
-def _build_team_rating(stats: Optional[Dict[str, Any]], home_away: str):
+def _build_team_rating(stats: Optional[Dict[str, Any]], home_away: str) -> Dict[str, Any]:
     if not stats:
-        return dict(rating=0.5, gf=1.2, ga=1.2, form_pts=0, games=0)
+        return {"rating": 0.5, "gf": 1.2, "ga": 1.2, "form_pts": 0, "games": 0}
 
     fixtures = stats.get("fixtures", {}) or {}
-    wins = (fixtures.get("wins", {}) or {}).get("total", 0) or 0
+    wins  = (fixtures.get("wins",  {}) or {}).get("total", 0) or 0
     draws = (fixtures.get("draws", {}) or {}).get("total", 0) or 0
     loses = (fixtures.get("loses", {}) or {}).get("total", 0) or 0
     games = (wins + draws + loses) or 1
 
-    gf = ((stats.get("goals", {}) or {}).get("for", {}) or {}).get("total", {}).get("total", 0) or 0
+    gf = ((stats.get("goals", {}) or {}).get("for",     {}) or {}).get("total", {}).get("total", 0) or 0
     ga = ((stats.get("goals", {}) or {}).get("against", {}) or {}).get("total", {}).get("total", 0) or 0
     gf_per = gf / games
     ga_per = ga / games
@@ -39,11 +39,16 @@ def _build_team_rating(stats: Optional[Dict[str, Any]], home_away: str):
     side_perf = home_perf if home_away == "home" else away_perf
 
     gd_per = (gf - ga) / games
-    rating = 0.5 + 0.5 * (win_rate - 0.5) * 2 * 0.5 + 0.3 * math.tanh(gd_per) + 0.2 * (side_perf - 0.5) * 2
-    rating += min(0.08, (form_pts / (5 * 3)) * 0.08)
+    rating = (
+        0.5
+        + 0.5 * (win_rate - 0.5) * 2 * 0.5
+        + 0.3 * math.tanh(gd_per)
+        + 0.2 * (side_perf - 0.5) * 2
+    )
+    rating += min(0.08, (form_pts / 15.0) * 0.08)
     rating = max(0.1, min(0.9, rating))
 
-    return dict(rating=rating, gf=max(0.05, gf_per), ga=max(0.05, ga_per), form_pts=form_pts, games=games)
+    return {"rating": rating, "gf": max(0.05, gf_per), "ga": max(0.05, ga_per), "form_pts": form_pts, "games": games}
 
 def _prob_to_confidence(p: float) -> float:
     return abs(p - 0.5) * 2.0
@@ -63,13 +68,13 @@ async def _fetch_stats_pair(client, league_id: int, season: int, home_id: int, a
     a = asyncio.create_task(get_team_statistics(client, league_id, season, away_id))
     return await asyncio.gather(h, a)
 
-def _lambda_by_side(homeR, awayR) -> Tuple[float, float]:
+def _lambda_by_side(homeR: Dict[str, float], awayR: Dict[str, float]) -> Tuple[float, float]:
     lh = 0.6 * homeR["gf"] + 0.4 * awayR["ga"]
     la = 0.6 * awayR["gf"] + 0.4 * homeR["ga"]
     return (max(0.05, lh), max(0.05, la))
 
 def _adjust_for_live(lambda_home: float, lambda_away: float, minute: Optional[int], goals_h: int, goals_a: int) -> Tuple[float, float]:
-    if minute is None or minute <= 0:
+    if not minute or minute <= 0:
         return lambda_home, lambda_away
     remain = max(0, 90 - min(90, minute))
     factor = remain / 90.0
@@ -89,32 +94,45 @@ def _first_half_xg(total_xg: float) -> float:
 
 def _first_half_remaining_factor(minute: Optional[int]) -> float:
     if not minute or minute <= 0:
-        return 1.0  # entire 1H remains
+        return 1.0
     if minute >= 45:
         return 0.0
     return (45 - minute) / 45.0
 
 # ---------- main entry ----------
-async def generate_tips_for_fixture(client, fixture: Dict[str, Any], league_id: int, season: int) -> List[Dict[str, Any]]:
+async def generate_tips_for_fixture(
+    client,
+    fixture: Dict[str, Any],
+    league_id: int,
+    season: int
+) -> List[Dict[str, Any]]:
     """
-    Only the requested markets:
+    Markets:
       - 1X2 (Win/Draw/Lose)
       - OVER/UNDER 2.5 (full-time)
+      - OVER/UNDER 3.5 (full-time)
       - BTTS (Yes/No)
       - 1st Half Over/Under (auto line 1.0 or 1.5)
     """
     tips: List[Dict[str, Any]] = []
-    fixture_id = ((fixture.get("fixture", {}) or {}).get("id"))
-    home_id = ((fixture.get("teams", {}) or {}).get("home", {}) or {}).get("id")
-    away_id = ((fixture.get("teams", {}) or {}).get("away", {}) or {}).get("id")
+
+    fx = fixture or {}
+    fx_info = fx.get("fixture") or {}
+    teams    = fx.get("teams") or {}
+
+    fixture_id = fx_info.get("id")
+    home_id = (teams.get("home") or {}).get("id")
+    away_id = (teams.get("away") or {}).get("id")
     if not fixture_id or not home_id or not away_id:
         return tips
 
-    minute = ((fixture.get("fixture", {}) or {}).get("status", {}) or {}).get("elapsed")
-    goals_h = ((fixture.get("goals", {}) or {}).get("home")) or 0
-    goals_a = ((fixture.get("goals", {}) or {}).get("away")) or 0
+    status   = fx_info.get("status") or {}
+    minute   = status.get("elapsed")
+    goals    = fx.get("goals") or {}
+    goals_h  = goals.get("home") or 0
+    goals_a  = goals.get("away") or 0
 
-    home_stats, away_stats = await _fetch_stats_pair(client, league_id, season, home_id, away_id)
+    home_stats, away_stats = await _fetch_stats_pair(client, league_id, season, int(home_id), int(away_id))
     homeR = _build_team_rating(home_stats, "home")
     awayR = _build_team_rating(away_stats, "away")
 
@@ -124,10 +142,10 @@ async def generate_tips_for_fixture(client, fixture: Dict[str, Any], league_id: 
     expected_goals = lambda_home + lambda_away
     expected_goals_live = lambda_home_live + lambda_away_live
 
-    # 1X2 baseline using ratings (+ small home adv)
+    # 1X2 baseline using ratings (+ small home advantage)
     home_score = homeR["rating"] + 0.06
     away_score = awayR["rating"]
-    draw_base = 0.25 + max(0.0, 0.1 - abs(home_score - away_score))
+    draw_base  = 0.25 + max(0.0, 0.1 - abs(home_score - away_score))
     expA, expB, expD = math.exp(home_score), math.exp(away_score), math.exp(draw_base)
     s = expA + expB + expD
     p_home, p_draw, p_away = expA / s, expD / s, expB / s
@@ -135,8 +153,8 @@ async def generate_tips_for_fixture(client, fixture: Dict[str, Any], league_id: 
     picks: List[Tuple[str, str, float, float]] = []
 
     # --- (A) 1X2 ---
-    # choose the strongest outcome
-    if max(p_home, p_draw, p_away) - sorted([p_home, p_draw, p_away])[1] >= 0.02:
+    gap = max(p_home, p_draw, p_away) - sorted([p_home, p_draw, p_away])[1]
+    if gap >= 0.02:
         if p_home >= p_draw and p_home >= p_away:
             picks.append(("1X2", "HOME", p_home, expected_goals))
         elif p_away >= p_home and p_away >= p_draw:
@@ -144,8 +162,8 @@ async def generate_tips_for_fixture(client, fixture: Dict[str, Any], league_id: 
         else:
             picks.append(("1X2", "DRAW", p_draw, expected_goals))
 
-    # --- (B) Over/Under 2.5 (full time) ---
-    p_over = _clamp01((expected_goals - 2.5) * 0.25 + 0.5)
+    # --- (B) Over/Under 2.5 ---
+    p_over  = _clamp01((expected_goals - 2.5) * 0.25 + 0.5)
     p_under = 1.0 - p_over
     if _prob_to_confidence(max(p_over, p_under)) >= MIN_CONFIDENCE_TO_SEND:
         if p_over >= p_under:
@@ -154,52 +172,48 @@ async def generate_tips_for_fixture(client, fixture: Dict[str, Any], league_id: 
             picks.append(("OVER_UNDER_2.5", "UNDER 2.5", p_under, expected_goals))
 
     # --- (C) BTTS ---
-    p_btts = _btts_prob(lambda_home, lambda_away)
+    p_btts      = _btts_prob(lambda_home, lambda_away)
     p_btts_live = _btts_prob(lambda_home_live, lambda_away_live)
-    p_btts_use = p_btts_live if minute else p_btts
+    p_btts_use  = p_btts_live if minute else p_btts
     if _prob_to_confidence(p_btts_use) >= MIN_CONFIDENCE_TO_SEND:
-        picks.append(("BTTS", "YES" if p_btts_use >= 0.5 else "NO", p_btts_use, expected_goals_live if minute else expected_goals))
+        picks.append(("BTTS", "YES" if p_btts_use >= 0.5 else "NO",
+                      p_btts_use, expected_goals_live if minute else expected_goals))
 
-    # --- (D) 1st Half Over/Under (auto line 1.0 or 1.5) ---
-    # If match past 45', skip 1H market.
+    # --- (D) 1st Half Over/Under (1.0 or 1.5, choose stronger) ---
     if not minute or minute < 45:
-        fh_factor = _first_half_remaining_factor(minute)
-        fh_xg_total = _first_half_xg(expected_goals)
-        if minute:
-            # scale to remaining part of the first half when live
-            fh_xg_total *= fh_factor
+        fh_factor   = _first_half_remaining_factor(minute)
+        fh_xg_total = _first_half_xg(expected_goals) * fh_factor
 
-        # Evaluate both 1.0 and 1.5 lines, choose the more confident outcome.
-        def ou_conf(line: float) -> Tuple[str, float]:
-            p_over_fh = _clamp01((fh_xg_total - line) * 0.60 + 0.5)  # steeper than FT
+        def _ou(line: float) -> Tuple[str, float]:
+            p_over_fh  = _clamp01((fh_xg_total - line) * 0.60 + 0.5)
             p_under_fh = 1.0 - p_over_fh
             if p_over_fh >= p_under_fh:
                 return (f"OVER {line}", p_over_fh)
             else:
                 return (f"UNDER {line}", p_under_fh)
 
-        sel10, prob10 = ou_conf(1.0)
-        sel15, prob15 = ou_conf(1.5)
-        if max(prob10, prob15) and _prob_to_confidence(max(prob10, prob15)) >= MIN_CONFIDENCE_TO_SEND:
-            if prob10 >= prob15:
-                picks.append(("OVER_UNDER_1H", sel10, prob10, fh_xg_total))
-            else:
-                picks.append(("OVER_UNDER_1H", sel15, prob15, fh_xg_total))
+        sel10, prob10 = _ou(1.0)
+        sel15, prob15 = _ou(1.5)
+        best_sel, best_prob = (sel10, prob10) if prob10 >= prob15 else (sel15, prob15)
+        if _prob_to_confidence(best_prob) >= MIN_CONFIDENCE_TO_SEND:
+            picks.append(("OVER_UNDER_1H", best_sel, best_prob, fh_xg_total))
 
-    # Format tips
+    # Emit tips in unified format
+    league = fixture.get("league") or {}
+    teams  = fixture.get("teams")  or {}
     for market, selection, prob, xg in picks:
         conf = _prob_to_confidence(prob)
         if conf < MIN_CONFIDENCE_TO_SEND:
             continue
         tips.append({
-            "leagueId": league_id,
-            "season": season,
-            "fixtureId": fixture_id,
-            "kickOff": ((fixture.get("fixture") or {}).get("date")),
-            "leagueName": ((fixture.get("league") or {}).get("name") or ""),
-            "country": ((fixture.get("league") or {}).get("country") or ""),
-            "home": ((fixture.get("teams") or {}).get("home") or {}).get("name") or "Home",
-            "away": ((fixture.get("teams") or {}).get("away") or {}).get("name") or "Away",
+            "leagueId": int(league.get("id") or 0),
+            "season": int(league.get("season") or 0),
+            "fixtureId": int(fixture_id),
+            "kickOff": (fixture.get("fixture") or {}).get("date"),
+            "leagueName": league.get("name") or "",
+            "country": league.get("country") or "",
+            "home": (teams.get("home") or {}).get("name") or "Home",
+            "away": (teams.get("away") or {}).get("name") or "Away",
             "market": market,
             "selection": selection,
             "probability": round(float(prob), 3),
@@ -207,7 +221,7 @@ async def generate_tips_for_fixture(client, fixture: Dict[str, Any], league_id: 
             "expectedGoals": round(float(xg), 2),
             "note": ("LIVE" if minute else None),
             "live": bool(minute),
-            "minute": minute or 0,
+            "minute": int(minute or 0),
             "score": f"{goals_h}-{goals_a}",
         })
 
