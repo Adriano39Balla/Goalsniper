@@ -60,7 +60,7 @@ async def run_get_or_head(request: Request, token: str = Query("")):
 
     scanner, err = _load_scanner()
     if err:
-        raise HTTPException(status_code=500, detail=f"scanner import failed: {err}")
+        raise HTTPException(status_code=500, detail:f"scanner import failed: {err}")
 
     result = await scanner.run_scan_and_send()
     return {"status": "ok", **result}
