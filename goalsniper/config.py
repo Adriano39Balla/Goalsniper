@@ -30,7 +30,7 @@ def must_any(*names: str) -> str:
 # Required Credentials
 # ------------------------------
 PORT = _int("PORT", "10000")
-API_KEY = must_any("API_KEY", "APISPORTS_KEY")
+API_KEY = must_any("API_KEY", "API_KEY")
 TELEGRAM_BOT_TOKEN = must("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = must("TELEGRAM_CHAT_ID")
 
