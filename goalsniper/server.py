@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Request, HTTPException, Query, Response
 import os
-from datetime import datetime, timezone
-import httpx
+import sqlite3
+import asyncio
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List, Tuple
 
 from .config import RUN_TOKEN, TELEGRAM_WEBHOOK_TOKEN
 from .storage import set_outcome, daily_counts_for, totals
