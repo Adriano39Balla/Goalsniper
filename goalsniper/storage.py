@@ -119,7 +119,6 @@ def _has_fixture_recent_sync(conn: sqlite3.Connection, fixture_id: int, since_is
     ).fetchone()
     return 1 if row else 0
 
-# ---- NEW: fetch a full tip by id (for learning payload) ----
 @_with_conn
 def _get_tip_sync(conn: sqlite3.Connection, tip_id: int) -> Optional[Dict[str, Any]]:
     row = conn.execute(
@@ -146,7 +145,6 @@ def _get_tip_sync(conn: sqlite3.Connection, tip_id: int) -> Optional[Dict[str, A
         "outcome": (None if row["outcome"] is None else int(row["outcome"])),
     }
 
-# ---- NEW: daily counts + total counts ----
 def _day_bounds_utc(d: datetime) -> tuple[str, str]:
     d = d.astimezone(timezone.utc)
     start = d.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -221,7 +219,6 @@ async def has_fixture_tip_recent(fixture_id: int, minutes: int) -> bool:
     since = (datetime.now(timezone.utc) - timedelta(minutes=int(minutes))).isoformat()
     return bool(await asyncio.to_thread(_has_fixture_recent_sync, fixture_id, since))
 
-# ---- NEW async helpers ----
 async def get_tip_by_id(tip_id: int) -> Optional[Dict[str, Any]]:
     return await asyncio.to_thread(_get_tip_sync, tip_id)
 
