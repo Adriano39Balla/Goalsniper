@@ -9,13 +9,21 @@ from .logger import log
 from . import learning
 from . import telegram as tg
 
-app = FastAPI(title="Goalsniper", version="1.4.1")
+app = FastAPI(title="Goalsniper", version="1.4.2")
 
-
-@app.get("/health")
-async def health():
+# --- Health endpoints: allow GET and HEAD (HEAD returns empty 200) ---
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health(request: Request):
+    if request.method == "HEAD":
+        return Response(status_code=200)
     return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
 
+# Optional root alias (also HEAD-safe)
+@app.api_route("/", methods=["GET", "HEAD"])
+async def root(request: Request):
+    if request.method == "HEAD":
+        return Response(status_code=200)
+    return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
 
 def _load_scanner():
     # Lazy import so startup never crashes; we return exceptions for debugging
@@ -25,7 +33,6 @@ def _load_scanner():
     except Exception as e:
         return None, e
 
-
 def _auth_header(request: Request):
     auth = request.headers.get("authorization") or ""
     if not auth.startswith("Bearer "):
@@ -34,7 +41,6 @@ def _auth_header(request: Request):
     if token != RUN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-
 @app.post("/run")
 async def run_post(request: Request):
     _auth_header(request)
@@ -42,7 +48,6 @@ async def run_post(request: Request):
     if err:
         raise HTTPException(status_code=500, detail=f"scanner import failed: {err}")
     return {"status": "ok", **(await scanner.run_scan_and_send())}
-
 
 # GET triggers a scan; HEAD returns 200 with no scan (safe for uptime checks).
 @app.api_route("/run", methods=["GET", "HEAD"])
@@ -59,7 +64,6 @@ async def run_get_or_head(request: Request, token: str = Query("")):
 
     result = await scanner.run_scan_and_send()
     return {"status": "ok", **result}
-
 
 # Telegram webhook with feedback -> learning
 @app.post("/telegram/webhook")
@@ -102,7 +106,6 @@ async def telegram_webhook(request: Request, token: str | None = None):
         raise HTTPException(status_code=400, detail=f"bad data: {str(e)}")
 
     return {"ok": True}
-
 
 # Daily digest — GET computes & (optionally) sends; HEAD returns 200 without work
 @app.api_route("/digest", methods=["GET", "HEAD"])
