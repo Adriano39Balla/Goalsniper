@@ -1,12 +1,10 @@
-# goalsniper/storage.py
-
 import os
 import sqlite3
 import asyncio
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple, Dict, Any, List
 
-# DB under /data so it survives service restarts (if you attach a disk)
+# DB under /data so it survives restarts
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "goalsniper.db")
 
 SCHEMA = """
@@ -27,11 +25,10 @@ CREATE INDEX IF NOT EXISTS idx_tips_fixture ON tips(fixture_id);
 CREATE INDEX IF NOT EXISTS idx_tips_market ON tips(market);
 CREATE INDEX IF NOT EXISTS idx_tips_league ON tips(league_id, market);
 
--- NEW: simple key/value config store
+-- key/value config store (for runtime filters etc.)
 CREATE TABLE IF NOT EXISTS config (
   key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  value TEXT
 );
 """
 
@@ -51,8 +48,7 @@ def _with_conn(fn):
             conn.close()
     return wrapper
 
-# ----------------- sync primitives -----------------
-
+# ---------- tips primitives ----------
 @_with_conn
 def _insert_tip_sync(conn: sqlite3.Connection, tip: Dict[str, Any], message_id: Optional[int]) -> int:
     cur = conn.execute(
@@ -129,11 +125,9 @@ def _has_fixture_recent_sync(conn: sqlite3.Connection, fixture_id: int, since_is
 @_with_conn
 def _get_tip_sync(conn: sqlite3.Connection, tip_id: int) -> Optional[Dict[str, Any]]:
     row = conn.execute(
-        """
-        SELECT id, fixture_id, market, selection, probability, confidence,
-               league_id, season, sent_at, message_id, outcome
-        FROM tips WHERE id = ?
-        """,
+        "SELECT id, fixture_id, market, selection, probability, confidence,"
+        "       league_id, season, sent_at, message_id, outcome "
+        "FROM tips WHERE id = ?",
         (int(tip_id),),
     ).fetchone()
     if not row:
@@ -152,7 +146,8 @@ def _get_tip_sync(conn: sqlite3.Connection, tip_id: int) -> Optional[Dict[str, A
         "outcome": (None if row["outcome"] is None else int(row["outcome"])),
     }
 
-def _day_bounds_utc(d: datetime) -> tuple[str, str]:
+# ---------- daily totals ----------
+def _day_bounds_utc(d: datetime) -> Tuple[str, str]:
     d = d.astimezone(timezone.utc)
     start = d.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
@@ -161,15 +156,11 @@ def _day_bounds_utc(d: datetime) -> tuple[str, str]:
 @_with_conn
 def _daily_counts_sync(conn: sqlite3.Connection, start_iso: str, end_iso: str) -> dict:
     row = conn.execute(
-        """
-        SELECT
-          COUNT(*) AS sent,
-          SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS good,
-          SUM(CASE WHEN outcome=0 THEN 1 ELSE 0 END) AS bad,
-          SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) AS pending
-        FROM tips
-        WHERE sent_at >= ? AND sent_at < ?
-        """,
+        "SELECT COUNT(*) AS sent,"
+        " SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS good,"
+        " SUM(CASE WHEN outcome=0 THEN 1 ELSE 0 END) AS bad,"
+        " SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) AS pending "
+        "FROM tips WHERE sent_at >= ? AND sent_at < ?",
         (start_iso, end_iso),
     ).fetchone()
     return {
@@ -182,14 +173,11 @@ def _daily_counts_sync(conn: sqlite3.Connection, start_iso: str, end_iso: str) -
 @_with_conn
 def _totals_sync(conn: sqlite3.Connection) -> dict:
     row = conn.execute(
-        """
-        SELECT
-          COUNT(*) AS sent,
-          SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS good,
-          SUM(CASE WHEN outcome=0 THEN 1 ELSE 0 END) AS bad,
-          SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) AS pending
-        FROM tips
-        """,
+        "SELECT COUNT(*) AS sent,"
+        " SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS good,"
+        " SUM(CASE WHEN outcome=0 THEN 1 ELSE 0 END) AS bad,"
+        " SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) AS pending "
+        "FROM tips",
     ).fetchone()
     return {
         "sent": int(row["sent"] or 0),
@@ -198,42 +186,26 @@ def _totals_sync(conn: sqlite3.Connection) -> dict:
         "pending": int(row["pending"] or 0),
     }
 
-# ----------------- config sync primitives -----------------
-
+# ---------- config K/V (for filters) ----------
 @_with_conn
-def _config_get_sync(conn: sqlite3.Connection, key: str) -> str:
-    row = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
-    return str(row["value"]) if row else ""
-
-@_with_conn
-def _config_set_sync(conn: sqlite3.Connection, key: str, value: str) -> None:
-    conn.execute(
-        """
-        INSERT INTO config(key, value, updated_at)
-        VALUES(?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET
-          value=excluded.value,
-          updated_at=excluded.updated_at
-        """,
-        (key, value, datetime.now(timezone.utc).isoformat()),
-    )
-
-@_with_conn
-def _config_get_bulk_sync(conn: sqlite3.Connection, keys: List[str]) -> Dict[str, str]:
+def _get_config_bulk_sync(conn: sqlite3.Connection, keys: List[str]) -> Dict[str, str]:
     if not keys:
         return {}
     placeholders = ",".join("?" for _ in keys)
-    rows = conn.execute(
-        f"SELECT key, value FROM config WHERE key IN ({placeholders})",
-        tuple(keys),
-    ).fetchall()
-    out = {k: "" for k in keys}
-    for r in rows:
-        out[str(r["key"])] = str(r["value"])
-    return out
+    cur = conn.execute(f"SELECT key, value FROM config WHERE key IN ({placeholders})", keys)
+    found = {str(r["key"]): str(r["value"] or "") for r in cur.fetchall()}
+    # ensure keys exist with empty default
+    return {k: found.get(k, "") for k in keys}
 
-# ----------------- async wrappers -----------------
+@_with_conn
+def _set_config_sync(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO config(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(key), str(value or "")),
+    )
 
+# ---------- async wrappers ----------
 async def insert_tip_return_id(tip: Dict[str, Any], message_id: Optional[int]) -> int:
     return await asyncio.to_thread(_insert_tip_sync, tip, message_id)
 
@@ -270,13 +242,9 @@ async def daily_counts_for(date_dt: datetime) -> dict:
 async def totals() -> dict:
     return await asyncio.to_thread(_totals_sync)
 
-# -------- config async wrappers --------
-
-async def get_config(key: str) -> str:
-    return await asyncio.to_thread(_config_get_sync, key)
+# Config API
+async def get_config_bulk(keys: List[str]) -> Dict[str, str]:
+    return await asyncio.to_thread(_get_config_bulk_sync, keys)
 
 async def set_config(key: str, value: str) -> None:
-    await asyncio.to_thread(_config_set_sync, key, value)
-
-async def get_config_bulk(keys: List[str]) -> Dict[str, str]:
-    return await asyncio.to_thread(_config_get_bulk_sync, keys)
+    await asyncio.to_thread(_set_config_sync, key, value)
