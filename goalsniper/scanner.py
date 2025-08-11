@@ -27,9 +27,6 @@ from .config import (
     STATS_REQUEST_DELAY_MS,
 )
 
-# ---------- single-run lock (avoid overlap) ----------
-_RUN_LOCK = asyncio.Lock()
-
 # ---------- status sets ----------
 FINISHED_STATES = {"FT", "AET", "PEN", "CANC", "PST", "ABD", "AWD", "WO"}
 LIVE_STATES     = {"1H", "2H", "HT", "ET"}
@@ -138,11 +135,14 @@ def _league_row_allowed(row: Dict) -> bool:
     country = (row.get("country") or "").upper()
     if not lname:
         return False
+    # exclude youth/friendlies/reserves etc.
     for bad in _EX_KEYS:
         if bad and bad in lname:
             return False
+    # include by league keywords
     if _ALLOW_KEYS and not any(k in lname for k in _ALLOW_KEYS):
         return False
+    # include by country flags
     iso = _COUNTRY_TO_ISO.get(country, country)
     if _ALLOW_COUNTRIES and iso not in _ALLOW_COUNTRIES:
         return False
@@ -178,6 +178,7 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
     if not leagues:
         return []
 
+    # Filter leagues aggressively (countries via flags + league keywords)
     leagues = [row for row in leagues if _league_row_allowed(row)]
     if not leagues:
         return []
@@ -239,17 +240,11 @@ async def _invoke_builder(build_fn: Callable, client: httpx.AsyncClient, fixture
         return await build_fn(client, fixture, **kwargs)
     return build_fn(client, fixture, **kwargs)
 
-async def _build_tips_for_fixtures(
-    client: httpx.AsyncClient,
-    fixtures: List[Dict],
-    remaining_budget: int,
-) -> Tuple[List[Dict], Dict[str, int]]:
+async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dict]) -> Tuple[List[Dict], Dict[str, int]]:
     """
     Returns (tips_after_filters, stats)
     stats keys:
       raw_candidates, low_conf, inrun_dedup_removed
-    We cap how many fixtures we build from to avoid excessive stats calls when
-    only a few tips can be sent (remaining budget).
     """
     stats = {"raw_candidates": 0, "low_conf": 0, "inrun_dedup_removed": 0}
     build_fn = _get_build_tips_fn()
@@ -257,15 +252,12 @@ async def _build_tips_for_fixtures(
         warn("No tip builder function found in tips module; skipping tip generation")
         return [], stats
 
-    # Safety cap: process at most ~2x remaining + cushion (10)
-    max_fixtures = max(0, min(len(fixtures), remaining_budget * 2 + 10))
-    fixtures = fixtures[:max_fixtures]
-
     raw: List[Dict] = []
     for f in fixtures:
         try:
             res = await _invoke_builder(build_fn, client, f)
             if res:
+                # ensure essentials present
                 for t in res:
                     t.setdefault("fixtureId", _fixture_id(f))
                     t.setdefault("leagueId", _league_id(f))
@@ -277,9 +269,11 @@ async def _build_tips_for_fixtures(
 
     stats["raw_candidates"] = len(raw)
 
+    # confidence filter
     conf_filtered = [t for t in raw if float(t.get("confidence", 0.0)) >= MIN_CONFIDENCE_TO_SEND]
     stats["low_conf"] = len(raw) - len(conf_filtered)
 
+    # in-run dedupe per fixture
     deduped, removed = _dedupe_in_run(conf_filtered)
     stats["inrun_dedup_removed"] = removed
 
@@ -287,25 +281,38 @@ async def _build_tips_for_fixtures(
 
 # ---------- sending ----------
 async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
+    # 1) send message WITHOUT buttons
     msg_id = await tg.send_tip_plain(client, tip)
+
+    # 2) insert and get DB tip_id
     tip_id = await insert_tip_return_id({**tip, "messageId": msg_id}, msg_id)
+
+    # 3) attach buttons with fb:<tip_id>:<1|0> so webhook learns
     try:
         await tg.attach_feedback_buttons(client, msg_id, tip_id)
     except Exception as e:
         warn("attach feedback buttons failed:", str(e))
+
     log(f"Sent tip id={tip_id} fixture={tip['fixtureId']} {tip['market']} {tip['selection']} conf={tip['confidence']:.2f}")
     return True
 
 async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> Tuple[int, Dict[str, int]]:
+    """
+    Returns (sent_count, stats)
+    stats keys:
+      ever_sent_skipped, daily_cap_hits
+    """
     stats = {"ever_sent_skipped": 0, "daily_cap_hits": 0}
     sent = 0
 
     for t in tips:
+        # daily cap
         if (await count_sent_today()) >= DAILY_TIP_CAP:
             stats["daily_cap_hits"] += 1
             log(f"Daily cap reached ({DAILY_TIP_CAP}). Stopping.")
             break
 
+        # forever dedupe
         fid = _fixture_id(t)
         if DUPLICATE_SUPPRESS_FOREVER and fid and await fixture_ever_sent(fid):
             stats["ever_sent_skipped"] += 1
@@ -325,107 +332,90 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict]) -> Tuple[int, 
 async def run_scan_and_send() -> Dict[str, int]:
     """
     Single run:
-      - avoid overlap using a lock
-      - check daily cap early
-      - fetch live fixtures and today's fixtures (filtered)
-      - build only up to a budget-based number of fixtures
-      - send with per-run and daily caps
+      - fetch live fixtures (1 call, already filtered)
+      - fetch today's fixtures (current leagues -> allowed -> per league+season)
+      - generate tips (in-memory)
+      - enforce per-run cap, daily cap, dedupe per fixture, skip finished
+      - return detailed debug stats in JSON
     """
-    if _RUN_LOCK.locked():
-        return {"status": "busy", "fixturesChecked": 0, "tipsSent": 0, "elapsedSeconds": 0}
+    started = datetime.now(timezone.utc)
 
-    async with _RUN_LOCK:
-        started = datetime.now(timezone.utc)
+    live_fixtures: List[Dict] = []
+    today_fixtures: List[Dict] = []
 
-        # Early exit if daily cap already reached
-        today_count = await count_sent_today()
-        if today_count >= DAILY_TIP_CAP:
-            log(f"Daily cap already reached ({DAILY_TIP_CAP}) – skipping run.")
-            return {
-                "status": "ok",
-                "fixturesChecked": 0,
-                "tipsSent": 0,
-                "elapsedSeconds": 0,
-                "debug": {"dailyCapReachedAtStart": True},
-            }
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Fetch fixtures
+        if LIVE_ENABLED:
+            try:
+                live_fixtures = await _fetch_live(client)
+            except Exception as e:
+                warn("Live fetch failed:", str(e))
 
-        remaining_budget = max(0, min(MAX_TIPS_PER_RUN, DAILY_TIP_CAP - today_count))
+        try:
+            today_fixtures = await _fetch_today(client)
+        except Exception as e:
+            warn("Today fetch failed:", str(e))
 
-        live_fixtures: List[Dict] = []
-        today_fixtures: List[Dict] = []
+        fixtures_checked = len(live_fixtures) + len(today_fixtures)
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            if LIVE_ENABLED and remaining_budget > 0:
-                try:
-                    live_fixtures = await _fetch_live(client)
-                except Exception as e:
-                    warn("Live fetch failed:", str(e))
+        # Build tips + send (LIVE)
+        live_stats, today_stats = {}, {}
+        total_sent = 0
 
-            # If no budget left, skip today fetch entirely
-            if remaining_budget > 0:
-                try:
-                    today_fixtures = await _fetch_today(client)
-                except Exception as e:
-                    warn("Today fetch failed:", str(e))
+        if live_fixtures:
+            live_tips, live_stats = await _build_tips_for_fixtures(client, live_fixtures)
+            sent_live, send_live_stats = await _send_tips(client, live_tips)
+            total_sent += sent_live
+            live_stats.update({f"send_{k}": v for k, v in send_live_stats.items()})
 
-            fixtures_checked = len(live_fixtures) + len(today_fixtures)
+        # Build tips + send (TODAY)
+        if today_fixtures:
+            today_tips, today_stats = await _build_tips_for_fixtures(client, today_fixtures)
+            sent_today, send_today_stats = await _send_tips(client, today_tips)
+            total_sent += sent_today
+            today_stats.update({f"send_{k}": v for k, v in send_today_stats.items()})
 
-            live_stats, today_stats = {}, {}
-            total_sent = 0
+    elapsed = (datetime.now(timezone.utc) - started).total_seconds()
 
-            if live_fixtures and remaining_budget > 0:
-                live_tips, live_stats = await _build_tips_for_fixtures(client, live_fixtures, remaining_budget)
-                sent_live, send_live_stats = await _send_tips(client, live_tips)
-                total_sent += sent_live
-                remaining_budget = max(0, remaining_budget - sent_live)
-                live_stats.update({f"send_{k}": v for k, v in send_live_stats.items()})
+    # aggregate debug totals
+    total_candidates = live_stats.get("raw_candidates", 0) + today_stats.get("raw_candidates", 0)
+    total_low_conf   = live_stats.get("low_conf", 0) + today_stats.get("low_conf", 0)
+    total_inrun_dup  = live_stats.get("inrun_dedup_removed", 0) + today_stats.get("inrun_dedup_removed", 0)
+    total_ever_sent  = live_stats.get("send_ever_sent_skipped", 0) + today_stats.get("send_ever_sent_skipped", 0)
+    total_cap_hits   = live_stats.get("send_daily_cap_hits", 0) + today_stats.get("send_daily_cap_hits", 0)
 
-            if today_fixtures and remaining_budget > 0:
-                today_tips, today_stats = await _build_tips_for_fixtures(client, today_fixtures, remaining_budget)
-                sent_today, send_today_stats = await _send_tips(client, today_tips)
-                total_sent += sent_today
-                remaining_budget = max(0, remaining_budget - sent_today)
-                today_stats.update({f"send_{k}": v for k, v in send_today_stats.items()})
+    # compact log
+    log(
+        "DEBUG scan: "
+        f"fixtures(live={len(live_fixtures)},today={len(today_fixtures)})  "
+        f"candidates={total_candidates}  low_conf={total_low_conf}  "
+        f"inrun_dedup={total_inrun_dup}  ever_sent={total_ever_sent}  "
+        f"sent={total_sent}  daily_cap_hits={total_cap_hits}"
+    )
 
-        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-
-        total_candidates = live_stats.get("raw_candidates", 0) + today_stats.get("raw_candidates", 0)
-        total_low_conf   = live_stats.get("low_conf", 0) + today_stats.get("low_conf", 0)
-        total_inrun_dup  = live_stats.get("inrun_dedup_removed", 0) + today_stats.get("inrun_dedup_removed", 0)
-        total_ever_sent  = live_stats.get("send_ever_sent_skipped", 0) + today_stats.get("send_ever_sent_skipped", 0)
-        total_cap_hits   = live_stats.get("send_daily_cap_hits", 0) + today_stats.get("send_daily_cap_hits", 0)
-
-        log(
-            "DEBUG scan: "
-            f"fixtures(live={len(live_fixtures)},today={len(today_fixtures)})  "
-            f"candidates={total_candidates}  low_conf={total_low_conf}  "
-            f"inrun_dedup={total_inrun_dup}  ever_sent={total_ever_sent}  "
-            f"sent={total_sent}  daily_cap_hits={total_cap_hits}"
-        )
-
-        return {
-            "status": "ok",
-            "fixturesChecked": fixtures_checked,
-            "tipsSent": total_sent,
-            "elapsedSeconds": int(elapsed),
-            "debug": {
-                "liveFixtures": len(live_fixtures),
-                "todayFixtures": len(today_fixtures),
-                "candidates": total_candidates,
-                "lowConfidenceFiltered": total_low_conf,
-                "inRunDuplicatesRemoved": total_inrun_dup,
-                "everSentDuplicatesSkipped": total_ever_sent,
-                "dailyCapHits": total_cap_hits,
-                "builderFn": FOUND_BUILDER_NAME,
-                "liveApiFn": FOUND_LIVE_API_NAME,
-                "dateApiFn": FOUND_DATE_API_NAME,
-                "config": {
-                    "MIN_CONFIDENCE_TO_SEND": MIN_CONFIDENCE_TO_SEND,
-                    "MAX_TIPS_PER_RUN": MAX_TIPS_PER_RUN,
-                    "DAILY_TIP_CAP": DAILY_TIP_CAP,
-                    "LIVE_MINUTE_MIN": LIVE_MINUTE_MIN,
-                    "LIVE_MINUTE_MAX": LIVE_MINUTE_MAX,
-                    "LIVE_MAX_FIXTURES": LIVE_MAX_FIXTURES,
-                },
+    return {
+        "status": "ok",
+        "fixturesChecked": fixtures_checked,
+        "tipsSent": total_sent,
+        "elapsedSeconds": int(elapsed),
+        "debug": {
+            "liveFixtures": len(live_fixtures),
+            "todayFixtures": len(today_fixtures),
+            "candidates": total_candidates,
+            "lowConfidenceFiltered": total_low_conf,
+            "inRunDuplicatesRemoved": total_inrun_dup,
+            "everSentDuplicatesSkipped": total_ever_sent,
+            "dailyCapHits": total_cap_hits,
+            "builderFn": FOUND_BUILDER_NAME,
+            "liveApiFn": FOUND_LIVE_API_NAME,
+            "dateApiFn": FOUND_DATE_API_NAME,
+            "config": {
+                "MIN_CONFIDENCE_TO_SEND": MIN_CONFIDENCE_TO_SEND,
+                "MAX_TIPS_PER_RUN": MAX_TIPS_PER_RUN,
+                "DAILY_TIP_CAP": DAILY_TIP_CAP,
+                "LIVE_MINUTE_MIN": LIVE_MINUTE_MIN,
+                "LIVE_MINUTE_MAX": LIVE_MINUTE_MAX,
+                "LIVE_MAX_FIXTURES": LIVE_MAX_FIXTURES,
             },
-        }
+        },
+    }
