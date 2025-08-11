@@ -2,6 +2,7 @@ import asyncio
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
+from __future__ import annotations
 from .api_football import get_team_statistics
 from .config import STATS_REQUEST_DELAY_MS, MIN_CONFIDENCE_TO_SEND
 
