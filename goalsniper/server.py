@@ -1,7 +1,9 @@
+# goalsniper/server.py
 from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Query, Response
@@ -9,16 +11,23 @@ from fastapi import FastAPI, Request, HTTPException, Query, Response
 # Keep boot ultra‑light: only stdlib + FastAPI here.
 # Do **not** import storage/scanner/telegram/learning at module import time.
 
-app = FastAPI(title="Goalsniper", version="1.4.3")
+app = FastAPI(title="Goalsniper", version="1.4.4")
 
 
+# -------------------------
+# env helpers (no defaults for secrets in code)
+# -------------------------
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
 def _run_token() -> str:
-    # Pull on demand so server can start even if .env is missing at first.
-    return _env("RUN_TOKEN", "change_me_to_a_long_random_string")
+    # Required at call time; if missing, deny requests.
+    tok = _env("RUN_TOKEN", "")
+    if not tok:
+        # consistent error; we purposely do not crash the process
+        raise HTTPException(status_code=500, detail="RUN_TOKEN not set")
+    return tok
 
 
 def _telegram_webhook_token() -> str:
@@ -47,16 +56,19 @@ def _auth_header(request: Request):
 
 
 def _auth_qs(token: str):
-    if token != _run_token():
+    if not token or token != _run_token():
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-# --- Health & root (HEAD-safe) ------------------------------------------------
+# -------------------------
+# Health & root (HEAD-safe)
+# -------------------------
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health(request: Request):
     if request.method == "HEAD":
         return Response(status_code=200)
     return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
+
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root(request: Request):
@@ -65,15 +77,16 @@ async def root(request: Request):
     return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
 
 
-# --- Run scan (POST header auth, GET query auth; HEAD is a no-op) -------------
+# -----------------------------------------
+# Run scan (POST header auth, GET query auth)
+# -----------------------------------------
 @app.post("/run")
 async def run_post(request: Request):
     _auth_header(request)
-    # Lazy import scanner at call time
-    scanner = _safe_import("goalsniper.scanner")
-    # run
+    scanner = _safe_import("goalsniper.scanner")  # lazy import
     result = await scanner.run_scan_and_send()
     return {"status": "ok", **result}
+
 
 @app.api_route("/run", methods=["GET", "HEAD"])
 async def run_get_or_head(request: Request, token: str = Query("")):
@@ -85,19 +98,24 @@ async def run_get_or_head(request: Request, token: str = Query("")):
     return {"status": "ok", **result}
 
 
-# --- Telegram webhook (feedback) ----------------------------------------------
+# -------------------------
+# Telegram webhook (feedback)
+# -------------------------
 @app.post("/telegram/webhook")
 @app.post("/telegram/webhook/{token}")
-async def telegram_webhook(request: Request, token: str | None = None):
-    if _telegram_webhook_token() and token != _telegram_webhook_token():
+async def telegram_webhook(request: Request, token: Optional[str] = None):
+    secret = _telegram_webhook_token()
+    if secret and token != secret:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     payload = await request.json()
     cq = payload.get("callback_query")
     if not cq:
+        # ignore non-callback updates; bot may receive other updates we don't need
         return {"ok": True}
 
     data = (cq.get("data") or "").strip()
+    # expected: fb:<tip_id>:<1|0>
     if not data.startswith("fb:"):
         return {"ok": True}
 
@@ -112,13 +130,15 @@ async def telegram_webhook(request: Request, token: str | None = None):
 
         await storage.set_outcome(tip_id, outcome)
 
+        # Optional: learning telemetry (defensive, never breaks webhook)
         try:
             info = await learning.on_feedback_update(tip_id, outcome)
-            logger.log(
-                f"[learn] tip={tip_id} market={info.get('market')} "
-                f"p_cal={info.get('calibratedProb'):.3f} conf={info.get('confidence'):.3f} "
-                f"thr={info.get('marketThreshold'):.3f} outcome={outcome}"
-            )
+            if info.get("ok"):
+                logger.log(
+                    f"[learn] tip={tip_id} market={info.get('market')} "
+                    f"p_cal={info.get('calibratedProb'):.3f} conf={info.get('confidence'):.3f} "
+                    f"thr={info.get('marketThreshold'):.3f} outcome={outcome}"
+                )
         except Exception as le:
             logger.log(f"[learn] update failed for tip_id={tip_id}: {le}")
 
@@ -129,7 +149,9 @@ async def telegram_webhook(request: Request, token: str | None = None):
     return {"ok": True}
 
 
-# --- Daily digest (GET/HEAD) --------------------------------------------------
+# -------------------------
+# Daily digest (GET/HEAD)
+# -------------------------
 @app.api_route("/digest", methods=["GET", "HEAD"])
 async def digest_get(
     request: Request,
