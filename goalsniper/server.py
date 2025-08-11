@@ -4,12 +4,12 @@ from datetime import datetime, timezone
 import httpx
 
 from .config import RUN_TOKEN, TELEGRAM_WEBHOOK_TOKEN
-from .storage import set_outcome, daily_counts_for, totals, get_tip_by_id
+from .storage import set_outcome, daily_counts_for, totals
 from .logger import log
 from . import learning
 from . import telegram as tg
 
-app = FastAPI(title="Goalsniper", version="1.4.0")
+app = FastAPI(title="Goalsniper", version="1.4.1")
 
 
 @app.get("/health")
@@ -40,18 +40,16 @@ async def run_post(request: Request):
     _auth_header(request)
     scanner, err = _load_scanner()
     if err:
-        # Show the real import error
         raise HTTPException(status_code=500, detail=f"scanner import failed: {err}")
     return {"status": "ok", **(await scanner.run_scan_and_send())}
 
 
-# Accept GET for scans; HEAD returns 200 without scanning (for uptime checks).
+# GET triggers a scan; HEAD returns 200 with no scan (safe for uptime checks).
 @app.api_route("/run", methods=["GET", "HEAD"])
 async def run_get_or_head(request: Request, token: str = Query("")):
     if token != RUN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # HEAD → do NOT trigger a scan, just say "OK"
     if request.method == "HEAD":
         return Response(status_code=200)
 
@@ -77,7 +75,7 @@ async def telegram_webhook(request: Request, token: str | None = None):
 
     data = (cq.get("data") or "").strip()
 
-    # Expected format (current): "fb:<tip_id>:<1|0>"
+    # Expected format: "fb:<tip_id>:<1|0>"
     if not data.startswith("fb:"):
         return {"ok": True}
 
@@ -86,10 +84,9 @@ async def telegram_webhook(request: Request, token: str | None = None):
         tip_id = int(tip_id_s)
         outcome = 1 if outcome_s == "1" else 0
 
-        # persist outcome
         await set_outcome(tip_id, outcome)
 
-        # learning hook with full tip payload (if found)
+        # Learning hook (best effort)
         try:
             info = await learning.on_feedback_update(tip_id, outcome)
             log(
@@ -107,7 +104,7 @@ async def telegram_webhook(request: Request, token: str | None = None):
     return {"ok": True}
 
 
-# Daily digest — returns JSON and can push a Telegram message
+# Daily digest — GET computes & (optionally) sends; HEAD returns 200 without work
 @app.api_route("/digest", methods=["GET", "HEAD"])
 async def digest_get(
     request: Request,
@@ -117,6 +114,10 @@ async def digest_get(
 ):
     if token != RUN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # HEAD: do not compute stats or send messages
+    if request.method == "HEAD":
+        return Response(status_code=200)
 
     # pick day (UTC) or today
     try:
@@ -154,7 +155,6 @@ async def digest_get(
         "pushed": False,
     }
 
-    # Execute the send for both GET and HEAD; only include body for GET
     if push:
         async with httpx.AsyncClient(timeout=20) as client:
             try:
@@ -162,8 +162,5 @@ async def digest_get(
                 result["pushed"] = True
             except Exception as e:
                 result["error"] = f"telegram: {e}"
-
-    if request.method == "HEAD":
-        return Response(status_code=200)
 
     return result
