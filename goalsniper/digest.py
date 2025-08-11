@@ -1,31 +1,21 @@
 import sqlite3
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import httpx
 
-from .telegram import send_telegram_message
-from .config import TELEGRAM_CHAT_ID  # just to ensure config is loaded
-from . import storage as st  # to reuse DB path
+from . import storage as st
+from .telegram import send_text
 
 def _today_utc_start_iso() -> str:
-    return datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ).isoformat()
+    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 def _fetch_today_rows() -> List[sqlite3.Row]:
     conn = sqlite3.connect(st.DB_PATH, timeout=30, isolation_level=None)
     try:
         conn.row_factory = sqlite3.Row
         start_iso = _today_utc_start_iso()
-        cur = conn.execute(
-            """
-            SELECT market, outcome
-            FROM tips
-            WHERE sent_at >= ?
-            """,
-            (start_iso,),
-        )
+        cur = conn.execute("SELECT market, outcome FROM tips WHERE sent_at >= ?", (start_iso,))
         return cur.fetchall()
     finally:
         conn.close()
@@ -48,7 +38,6 @@ def _summarize(rows: List[sqlite3.Row]) -> Dict:
         else:
             d["pend"] += 1
 
-    # best market of the day (≥ 2 resolved)
     best = None
     best_acc = -1.0
     for m, d in by_market.items():
@@ -70,9 +59,7 @@ def _summarize(rows: List[sqlite3.Row]) -> Dict:
 
 def _format_digest(summary: Dict) -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    total, wins, loss, pend = (
-        summary["total"], summary["wins"], summary["loss"], summary["pend"]
-    )
+    total, wins, loss, pend = summary["total"], summary["wins"], summary["loss"], summary["pend"]
     resolved = wins + loss
     acc = (wins / resolved * 100.0) if resolved else 0.0
 
@@ -86,36 +73,28 @@ def _format_digest(summary: Dict) -> str:
         "<b>Markets today</b>:",
     ]
 
-    # per‑market lines
     if summary["by_market"]:
         for m, d in sorted(summary["by_market"].items()):
             res = d["wins"] + d["loss"]
             acc_m = (d["wins"] / res * 100.0) if res else 0.0
             lines.append(
-                f"• {m}: total {d['total']} | "
-                f"resolved {res} (👍{d['wins']} / 👎{d['loss']}) | "
-                f"acc {acc_m:.0f}%"
+                f"• {m}: total {d['total']} | resolved {res} (👍{d['wins']} / 👎{d['loss']}) | acc {acc_m:.0f}%"
             )
     else:
         lines.append("• No tips today.")
 
-    # best market
     if summary["best"]:
         m, d, acc_b = summary["best"]
-        lines += [
-            "",
-            f"🏅 Best (≥2 resolved): <b>{m}</b> — {int(acc_b*100)}% (👍{d['wins']} / 👎{d['loss']})"
-        ]
+        lines += ["", f"🏅 Best (≥2 resolved): <b>{m}</b> — {int(acc_b*100)}% (👍{d['wins']} / 👎{d['loss']})"]
 
     return "\n".join(lines)
 
 async def send_daily_digest():
-    """Collect today’s stats and send a digest message to Telegram."""
     rows = _fetch_today_rows()
     summary = _summarize(rows)
     text = _format_digest(summary)
     async with httpx.AsyncClient(timeout=30) as client:
-        await send_telegram_message(client, text)
+        await send_text(client, text)
     return {
         "ok": True,
         "sent": True,
