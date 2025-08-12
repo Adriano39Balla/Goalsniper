@@ -4,6 +4,7 @@ import httpx
 import asyncio
 import random
 from typing import Optional, Dict
+from datetime import datetime
 
 from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from .logger import log, warn
@@ -45,7 +46,6 @@ async def _post_json(client: httpx.AsyncClient, method: str, payload: Dict) -> D
         await asyncio.sleep(delay + random.uniform(0, 0.25))
         r = await client.post(f"{BASE}/{method}", json=payload, timeout=30.0)
     if r.status_code == 400:
-        # Bubble meaningful Telegram error text to logs
         try:
             js = r.json()
             desc = js.get("description") or js
@@ -70,41 +70,74 @@ def _extract_telegram_error(e: Exception) -> str:
 
 # ---- public API --------------------------------------------------------------
 
-def _render_tip_text(tip: dict) -> str:
+def _nice_market_line(tip: dict) -> str:
     market = (tip.get("market") or "").upper()
     selection = (tip.get("selection") or "").upper().strip()
 
     if market == "1X2":
-        return "Home Win" if selection == "HOME" else "Away Win" if selection == "AWAY" else "Draw"
+        label = "Home Win" if selection == "HOME" else ("Away Win" if selection == "AWAY" else "Draw")
+        return f"🎯 <b>Pick:</b> {label}"
 
     if market in ("OVER_UNDER_2.5", "OVER/UNDER"):
         parts = selection.split()
         if len(parts) == 2 and parts[0] in ("OVER", "UNDER"):
-            return f"{parts[0].title()} {parts[1]} Goals"
-        return selection.title()
+            return f"🎯 <b>Pick:</b> {parts[0].title()} {parts[1]} Goals"
+        return f"🎯 <b>Pick:</b> {selection.title()}"
 
     if market == "BTTS":
-        return f"BTTS: {'Yes' if selection.startswith('Y') else 'No'}"
+        return f"🎯 <b>Pick:</b> BTTS — {'Yes' if selection.startswith('Y') else 'No'}"
 
     if market in ("1ST_HALF_OU", "OVER_UNDER_1H"):
         parts = selection.split()
         if len(parts) == 2 and parts[0] in ("OVER", "UNDER"):
-            return f"1st Half {parts[0].title()} {parts[1]}"
-        return f"1st Half {selection.title()}"
+            return f"🎯 <b>Pick:</b> 1st Half {parts[0].title()} {parts[1]}"
+        return f"🎯 <b>Pick:</b> 1st Half {selection.title()}"
 
-    return selection.title()
+    return f"🎯 <b>Pick:</b> {selection.title()}"
+
+def _confidence_bar(conf: float) -> str:
+    # 10 chars bar: ▒ to █
+    blocks = int(max(0.0, min(1.0, conf)) * 10)
+    return "█" * blocks + "░" * (10 - blocks)
+
+def _fmt_kickoff(tip: dict) -> str:
+    # tip["kickOff"] is ISO; show HH:MM UTC and date
+    ko = tip.get("kickOff")
+    if not ko:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ko.replace("Z", "+00:00"))
+        return f"{dt.strftime('%Y-%m-%d %H:%M')} UTC"
+    except Exception:
+        return str(ko)
 
 def format_tip_message(tip: dict) -> str:
-    header = "⚽️ <b>New Tip!</b>"
-    match_line = f"🏟️ <b>Match:</b> {tip.get('home','Home')} vs {tip.get('away','Away')}"
-    tip_line = f"📊 <b>Tip:</b> {_render_tip_text(tip)}"
-    conf_pct = f"{round(float(tip.get('confidence', 0) * 100))}%"
-    confidence_line = f"📈 <b>Confidence:</b> {conf_pct}"
+    home = tip.get("home", "Home")
+    away = tip.get("away", "Away")
     league_name = tip.get("leagueName") or ""
     country = tip.get("country") or ""
-    league_label = f"{country} - {league_name}" if country and league_name else (league_name or country or "Unknown")
-    league_line = f"🏆 <b>League:</b> {league_label}"
-    return "\n".join([header, match_line, tip_line, confidence_line, league_line])
+    league_label = f"{country} — {league_name}" if country and league_name else (league_name or country or "Unknown")
+
+    conf = float(tip.get("confidence", 0.0))
+    conf_pct = round(conf * 100)
+    conf_line = f"📈 <b>Confidence:</b> {conf_pct}%  [{_confidence_bar(conf)}]"
+
+    live = bool(tip.get("live"))
+    minute = int(tip.get("minute") or 0)
+    score  = str(tip.get("score") or "0-0")
+    status_line = f"⏱️ <b>Live:</b> {minute}'  |  <b>Score:</b> {score}" if live else f"🕒 <b>Kickoff:</b> {_fmt_kickoff(tip)}"
+
+    lines = [
+        "⚽️ <b>Goalsniper Tip</b>",
+        f"🏟️ <b>Match:</b> {home} vs {away}",
+        f"🏆 <b>League:</b> {league_label}",
+        _nice_market_line(tip),
+        conf_line,
+        status_line,
+        "",
+        "Tap below to grade the tip after the match 👇",
+    ]
+    return "\n".join(lines)
 
 async def send_text(client: httpx.AsyncClient, text: str, reply_markup: dict | None = None) -> int:
     """
