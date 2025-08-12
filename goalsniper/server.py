@@ -4,12 +4,12 @@ import os
 import importlib
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Query, Response
 
-app = FastAPI(title="Goalsniper", version="1.6.0")
+app = FastAPI(title="Goalsniper", version="1.6.1")
 
 # -------------------------
 # env helpers
@@ -32,6 +32,16 @@ def _safe_import(module_name: str):
         return importlib.import_module(module_name)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"import error: {module_name}: {e}")
+
+# optional logger (defensive import)
+try:
+    _logger = importlib.import_module("goalsniper.logger")
+    log = getattr(_logger, "log", print)
+    warn = getattr(_logger, "warn", print)
+except Exception:
+    def log(*a, **k):  # noqa: N802
+        print(*a)
+    warn = log
 
 def _auth_header(request: Request):
     auth = request.headers.get("authorization") or ""
@@ -76,6 +86,7 @@ async def _do_scan():
     scanner = importlib.import_module("goalsniper.scanner")
     _last_run_error = None
     _last_run_started = datetime.now(timezone.utc).isoformat()
+    log(f"[server] scan starting at {_last_run_started}")
     try:
         res = await scanner.run_scan_and_send()
         _last_run_result = {
@@ -84,19 +95,25 @@ async def _do_scan():
             "elapsedSeconds": res.get("elapsedSeconds", 0),
             "debug": res.get("debug", {}),
         }
+        log(f"[server] scan finished: tipsSent={_last_run_result['tipsSent']} "
+            f"fixturesChecked={_last_run_result['fixturesChecked']}")
     except Exception as e:
         _last_run_error = str(e)
         _last_run_result = None
+        warn(f"[server] scan error: {e}")
     finally:
         _last_run_finished = datetime.now(timezone.utc).isoformat()
 
-def _kick_off_background_scan() -> bool:
-    """Start a background scan if none is running. Returns True if started, False if already running."""
+def _kick_off_background_scan() -> Tuple[bool, str]:
+    """
+    Start a background scan if none is running.
+    Returns (started, reason). reason is '' when started is True.
+    """
     global _scan_task
     if _scan_task and not _scan_task.done():
-        return False
+        return False, "already_running"
     _scan_task = asyncio.create_task(_do_scan())
-    return True
+    return True, ""
 
 # -----------------------------------------
 # /run (non‑blocking)
@@ -104,9 +121,15 @@ def _kick_off_background_scan() -> bool:
 @app.post("/run")
 async def run_post(request: Request):
     _auth_header(request)
-    started = _kick_off_background_scan()
+    started, reason = _kick_off_background_scan()
+    if started:
+        log("[server] /run accepted -> started")
+    else:
+        log(f"[server] /run accepted -> not started (reason={reason})")
     return Response(
-        content=(b'{"accepted":true,"started":' + (b"true" if started else b"false") + b"}"),
+        content=(b'{"accepted":true,"started":' +
+                 (b"true" if started else b"false") +
+                 (b',"reason":"' + reason.encode("utf-8") + b'"}' if not started else b"}")),
         status_code=202,
         media_type="application/json",
     )
@@ -116,12 +139,16 @@ async def run_get(request: Request, token: str = Query("")):
     _auth_qs(token)
     if request.method == "HEAD":
         return Response(status_code=200)
-    started = _kick_off_background_scan()
-    return Response(
-        content=(b'{"accepted":true,"started":' + (b"true" if started else b"false") + b"}"),
-        status_code=202,
-        media_type="application/json",
-    )
+    started, reason = _kick_off_background_scan()
+    if started:
+        log("[server] /run (GET) accepted -> started")
+    else:
+        log(f"[server] /run (GET) accepted -> not started (reason={reason})")
+    return {
+        "accepted": True,
+        "started": bool(started),
+        **({ "reason": reason } if not started else {})
+    }
 
 # -----------------------------------------
 # /run/wait — blocking one‑shot
@@ -140,6 +167,7 @@ async def _run_wait_impl():
     async with _scan_lock:
         global _scan_task
         if _scan_task and not _scan_task.done():
+            log("[server] /run/wait — awaiting running scan")
             await _scan_task
             _scan_task = None
         await _do_scan()
