@@ -133,6 +133,7 @@ def _normalize_country_flags(flags_csv: str) -> set[str]:
     return out
 
 def _csv_upper(s: str) -> list[str]:
+    # ✅ Correctly parse CSV env vars into KEYWORDS (not characters)
     return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
 
 _ALLOW_COUNTRIES = _normalize_country_flags(getattr(api, "COUNTRY_FLAGS_ALLOW", ""))
