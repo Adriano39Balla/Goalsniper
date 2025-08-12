@@ -33,7 +33,7 @@ RUN_TOKEN = must("RUN_TOKEN")
 TELEGRAM_WEBHOOK_TOKEN = os.getenv("TELEGRAM_WEBHOOK_TOKEN", "")
 
 # Server
-PORT = _int("PORT", "10000")
+PORT = int(os.getenv("PORT", "8080"))  
 
 # ---------- scanning / tip policy ----------
 SCAN_DAYS = max(1, _int("SCAN_DAYS", "1"))
