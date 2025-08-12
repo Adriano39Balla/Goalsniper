@@ -1,4 +1,5 @@
 import math
+import time
 from typing import Dict, Any, List, Tuple, Optional
 
 from .storage import (
@@ -6,7 +7,7 @@ from .storage import (
     recent_market_samples,
     recent_market_league_samples,
     insert_tip_return_id,
-    get_tip_by_id,   # NEW: use full tip payload on feedback
+    get_tip_by_id,
 )
 from .config import MIN_CONFIDENCE_TO_SEND
 
@@ -14,16 +15,27 @@ from .config import MIN_CONFIDENCE_TO_SEND
 _ALPHA = 2.0
 _BETA = 2.0
 
+# small per-process cache to avoid refitting models repeatedly within a scan
+_CAL_CACHE: dict[tuple, tuple] = {}   # key -> (ts, value)
+_TTL = 60  # seconds
+
+def _cache_get(key):
+    v = _CAL_CACHE.get(key)
+    if not v:
+        return None
+    ts, val = v
+    return val if (time.time() - ts) < _TTL else None
+
+def _cache_put(key, val):
+    _CAL_CACHE[key] = (time.time(), val)
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
-
 
 def _logit(p: float) -> float:
     p = _clamp01(p)
     p = min(1 - 1e-6, max(1e-6, p))
     return math.log(p / (1 - p))
-
 
 def _sigmoid(z: float) -> float:
     if z >= 0:
@@ -32,6 +44,20 @@ def _sigmoid(z: float) -> float:
     ez = math.exp(z)
     return ez / (1.0 + ez)
 
+def _clean_samples(rows):
+    out=[]
+    for r in rows:
+        try:
+            p=float(r["probability"])
+            y=int(r["outcome"])
+            if not (0.0 <= p <= 1.0): 
+                continue
+            if y not in (0,1):
+                continue
+            out.append((p,y))
+        except Exception:
+            continue
+    return out
 
 def _fit_platt(
     samples: List[Tuple[float, int]],
@@ -86,10 +112,8 @@ def _fit_platt(
 
     return float(a), float(b)
 
-
 def _apply_platt(a: float, b: float, p: float) -> float:
     return _clamp01(_sigmoid(a + b * _logit(p)))
-
 
 def _fit_league_intercept(
     a: float,
@@ -129,32 +153,42 @@ def _fit_league_intercept(
 
     return float(c)
 
-
 async def calibrate_probability(market: str, p: float, league_id: Optional[int] = None) -> float:
     """Return calibrated probability for this market (optionally league-adjusted)."""
-    rows = await recent_market_samples(market, limit=400)
-    samples = [(float(r["probability"]), int(r["outcome"])) for r in rows]
-    a, b = _fit_platt(samples)
+    key = ("cal", market, int(league_id or 0))
+    cached = _cache_get(key)
+    if cached:
+        a, b, c = cached
+    else:
+        rows = await recent_market_samples(market, limit=400)
+        samples = _clean_samples(rows)
+        a, b = _fit_platt(samples)
 
-    c = 0.0
-    if league_id is not None:
-        rows_l = await recent_market_league_samples(market, int(league_id), limit=120)
-        samples_l = [(float(r["probability"]), int(r["outcome"])) for r in rows_l]
-        c = _fit_league_intercept(a, b, samples_l)
+        c = 0.0
+        if league_id is not None:
+            rows_l = await recent_market_league_samples(market, int(league_id), limit=120)
+            samples_l = _clean_samples(rows_l)
+            c = _fit_league_intercept(a, b, samples_l)
+
+        _cache_put(key, (a, b, c))
 
     return _clamp01(_sigmoid(a + c + b * _logit(float(p))))
-
 
 async def dynamic_conf_threshold(market: str) -> float:
     """
     Choose a confidence threshold for this market aiming at a smoothed precision target,
     with a fall-back to the static MIN_CONFIDENCE_TO_SEND when data is scarce.
     """
+    key = ("thr", market)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
     rows = await recent_market_samples(market, limit=250)
     if len(rows) < 40:
         return MIN_CONFIDENCE_TO_SEND
 
-    samples = [(float(r["probability"]), int(r["outcome"])) for r in rows]
+    samples = _clean_samples(rows)
     a, b = _fit_platt(samples)
 
     wins, losses = await market_stats(market)
@@ -188,24 +222,14 @@ async def dynamic_conf_threshold(market: str) -> float:
         if prec >= target_precision and (chosen is None or thr < chosen):
             chosen = thr
 
-    if chosen is not None:
-        return float(_clamp01(chosen))
-    return float(_clamp01(best_f1[1]))
-
+    out = float(_clamp01(chosen if chosen is not None else best_f1[1]))
+    _cache_put(key, out)
+    return out
 
 async def register_sent_tip(tip: Dict[str, Any], message_id: int) -> int:
-    """Persist a sent tip (returns DB tip id)."""
     return await insert_tip_return_id(tip, message_id)
 
-
-# -------- NEW: optional feedback hook --------
 async def on_feedback_update(tip_id: int, outcome: int) -> Dict[str, Any]:
-    """
-    Called after outcome is recorded (👍=1 / 👎=0). We pull the *full* tip payload
-    to enable richer learning/telemetry. This function doesn’t need to persist
-    anything extra — model calibration already uses DB history — but it returns
-    helpful, precomputed info for logs/dashboards.
-    """
     tip = await get_tip_by_id(int(tip_id))
     if not tip:
         return {"ok": False, "reason": "tip_not_found"}
@@ -214,7 +238,6 @@ async def on_feedback_update(tip_id: int, outcome: int) -> Dict[str, Any]:
     leagueId = tip.get("leagueId")
     prob     = float(tip.get("probability") or 0.5)
 
-    # Recompute calibrated prob + a fresh market threshold for observability
     p_cal = await calibrate_probability(market, prob, leagueId)
     conf  = abs(p_cal - 0.5) * 2.0
     thr   = await dynamic_conf_threshold(market)
