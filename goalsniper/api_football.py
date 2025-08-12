@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from .config import API_KEY, MAX_CONCURRENT_REQUESTS
-from .logger import warn
+from .logger import warn, log
 
 # ---- API base / retries / token bucket ---------------------------------------
 BASE_URL = os.getenv("API_BASE_URL", "https://v3.football.api-sports.io")
@@ -19,7 +19,7 @@ API_RETRIES = int(os.getenv("API_RETRIES", "3"))
 API_BACKOFF_INITIAL = float(os.getenv("API_BACKOFF_INITIAL", "0.5"))
 API_BACKOFF_MAX = float(os.getenv("API_BACKOFF_MAX", "2.0"))
 
-# token bucket (per process)
+# token bucket (per process) — can adapt at runtime from headers
 _api_rps_env = os.getenv("API_RPS")
 if _api_rps_env is None:
     per_min = os.getenv("API_RATE_PER_MIN")
@@ -67,6 +67,11 @@ class _TokenBucket:
                 self.tokens = 0.0
             else:
                 self.tokens -= 1.0
+
+    async def update_rate(self, new_rate: float):
+        # allow dynamic throttling from X-RateLimit headers
+        async with self._lock:
+            self.rate = max(0.2, min(10.0, float(new_rate)))
 
 _bucket = _TokenBucket(API_RPS, API_BURST)
 
@@ -140,6 +145,25 @@ def _is_allowed_fixture(fx: dict) -> bool:
             return False
     return True
 
+# --------------- helpers: rate-limit adaptation ---------------
+def _maybe_adapt_rate(headers: httpx.Headers):
+    try:
+        # API-Football common headers (values vary by plan)
+        rem = headers.get("x-ratelimit-remaining")
+        reset = headers.get("x-ratelimit-reset")
+        if rem is None or reset is None:
+            return
+        rem_i = max(0, int(rem))
+        reset_i = max(1, int(reset))  # seconds until reset
+        # aim to spread remaining calls across reset window, keep a safety margin
+        rps = max(0.2, min(8.0, rem_i / max(1.0, reset_i) * 0.9))
+        # update bucket asynchronously (no await here; fire-and-forget)
+        asyncio.create_task(_bucket.update_rate(rps))
+        # optional debug line (comment out if noisy)
+        log(f"[api] adapt rate: remaining={rem_i} reset={reset_i}s -> rps≈{rps:.2f}")
+    except Exception:
+        pass
+
 # --------------- core GET with retries + coalescing --------
 async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any], ttl: int) -> Any:
     key = _stable_key(path, params)
@@ -177,6 +201,9 @@ async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any],
             async with _sem:
                 try:
                     r = await client.get(url, params=params, headers=HEADERS, timeout=API_TIMEOUT)
+                    # observe headers to adapt rate (when successful or 429)
+                    _maybe_adapt_rate(r.headers)
+
                     if r.status_code == 429:
                         ra = r.headers.get("Retry-After")
                         delay = float(ra) if (ra and ra.isdigit()) else backoff
