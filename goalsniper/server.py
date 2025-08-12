@@ -1,4 +1,3 @@
-# goalsniper/server.py
 from __future__ import annotations
 
 import os
@@ -10,7 +9,7 @@ from typing import Optional, Any, Dict
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Query, Response
 
-app = FastAPI(title="Goalsniper", version="1.5.0")
+app = FastAPI(title="Goalsniper", version="1.6.0")
 
 # -------------------------
 # env helpers
@@ -96,12 +95,11 @@ def _kick_off_background_scan() -> bool:
     global _scan_task
     if _scan_task and not _scan_task.done():
         return False
-    # create a fresh task
     _scan_task = asyncio.create_task(_do_scan())
     return True
 
 # -----------------------------------------
-# /run (non‑blocking)  — GET ?token=...  or  POST with Authorization: Bearer
+# /run (non‑blocking)
 # -----------------------------------------
 @app.post("/run")
 async def run_post(request: Request):
@@ -126,7 +124,7 @@ async def run_get(request: Request, token: str = Query("")):
     )
 
 # -----------------------------------------
-# /run/wait — runs scan and waits (blocking)
+# /run/wait — blocking one‑shot
 # -----------------------------------------
 @app.post("/run/wait")
 async def run_wait_post(request: Request):
@@ -140,12 +138,10 @@ async def run_wait_get(token: str = Query("")):
 
 async def _run_wait_impl():
     async with _scan_lock:
-        # ensure no overlap; if a background one is going, wait for it
         global _scan_task
         if _scan_task and not _scan_task.done():
             await _scan_task
             _scan_task = None
-        # now run a dedicated scan
         await _do_scan()
         return {
             "status": "ok",
@@ -186,7 +182,6 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
         return {"ok": True}
 
     data = (cq.get("data") or "").strip()
-    # expected: fb:<tip_id>:<1|0>
     if not data.startswith("fb:"):
         return {"ok": True}
 
@@ -198,6 +193,7 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
         storage = _safe_import("goalsniper.storage")
         learning = _safe_import("goalsniper.learning")
         logger = _safe_import("goalsniper.logger")
+        telegram = _safe_import("goalsniper.telegram")
 
         await storage.set_outcome(tip_id, outcome)
 
@@ -211,6 +207,13 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
                 )
         except Exception as le:
             logger.log(f"[learn] update failed for tip_id={tip_id}: {le}")
+
+        # Acknowledge the button so Telegram UI stops spinning
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await telegram.answer_callback_query(client, cq.get("id"), "Recorded ✅")
+        except Exception as e:
+            logger.log(f"answerCallbackQuery failed: {e}")
 
         logger.log(f"Feedback received tip_id={tip_id} outcome={outcome}")
     except Exception as e:
