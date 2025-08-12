@@ -1,4 +1,4 @@
-# goalsniper/config.py
+goalsniper/config.py
 """
 Centralized configuration (env-driven).
 """
@@ -33,7 +33,7 @@ RUN_TOKEN = must("RUN_TOKEN")
 TELEGRAM_WEBHOOK_TOKEN = os.getenv("TELEGRAM_WEBHOOK_TOKEN", "")
 
 # Server
-PORT = int(os.getenv("PORT", "8080"))  
+PORT = int(os.getenv("PORT", "8080"))
 
 # ---------- scanning / tip policy ----------
 SCAN_DAYS = max(1, _int("SCAN_DAYS", "1"))
@@ -57,7 +57,7 @@ THROTTLE_TIPS_PER_WINDOW = max(1, _int("THROTTLE_TIPS_PER_WINDOW", "8"))
 THROTTLE_WINDOW_MINUTES = max(1, _int("THROTTLE_WINDOW_MINUTES", "10"))
 
 # ---------- api_football knobs ----------
-API_RATE_PER_MIN = max(1, _int("API_RATE_PER_MIN", "60"))  # if you prefer per‑min budgeting
+API_RATE_PER_MIN = max(1, _int("API_RATE_PER_MIN", "60"))
 
 CACHE_TTL_LEAGUES = max(0, _int("CACHE_TTL_LEAGUES", "1800"))
 CACHE_TTL_FIXTURES_BYDATE = max(0, _int("CACHE_TTL_FIXTURES_BYDATE", "1800"))
