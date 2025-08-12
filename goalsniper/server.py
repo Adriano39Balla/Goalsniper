@@ -3,25 +3,30 @@ from __future__ import annotations
 
 import os
 import importlib
+import asyncio
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any, Dict
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Query, Response
 
-app = FastAPI(title="Goalsniper", version="1.4.6")
-
+app = FastAPI(title="Goalsniper", version="1.5.0")
 
 # -------------------------
-# env helpers (no defaults for secrets in code)
+# env helpers
 # -------------------------
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
+def _run_token() -> str:
+    tok = _env("RUN_TOKEN", "")
+    if not tok:
+        # don't crash process; surface clearly
+        raise HTTPException(status_code=500, detail="RUN_TOKEN not set")
+    return tok
 
 def _telegram_webhook_token() -> str:
     return _env("TELEGRAM_WEBHOOK_TOKEN", "")
-
 
 def _safe_import(module_name: str):
     try:
@@ -29,27 +34,17 @@ def _safe_import(module_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"import error: {module_name}: {e}")
 
-
-# -------------------------
-# unified auth (header OR query)
-# -------------------------
-def _get_bearer_from_header(request: Request) -> str:
-    auth = (request.headers.get("authorization") or "").strip()
-    if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return ""
-
-
-def _auth_any(request: Request, qs_token: Optional[str] = None):
-    provided = (qs_token or "").strip() or _get_bearer_from_header(request)
-    expected = (_env("RUN_TOKEN", "") or "").strip()
-
-    if not expected:
-        raise HTTPException(status_code=500, detail="RUN_TOKEN not set")
-    if not provided or provided != expected:
-        # Use 401 to avoid hinting anything about token validity
+def _auth_header(request: Request):
+    auth = request.headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    token = auth[len("Bearer "):].strip()
+    if token != _run_token():
+        raise HTTPException(status_code=403, detail="Forbidden")
 
+def _auth_qs(token: str):
+    if not token or token != _run_token():
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 # -------------------------
 # Health & root (HEAD-safe)
@@ -60,34 +55,120 @@ async def health(request: Request):
         return Response(status_code=200)
     return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
 
-
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root(request: Request):
     if request.method == "HEAD":
         return Response(status_code=200)
     return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
 
+# -------------------------
+# Scan orchestration (non‑blocking)
+# -------------------------
+_scan_lock = asyncio.Lock()
+_scan_task: Optional[asyncio.Task] = None
+_last_run_started: Optional[str] = None   # ISO time
+_last_run_finished: Optional[str] = None  # ISO time
+_last_run_result: Optional[Dict[str, Any]] = None
+_last_run_error: Optional[str] = None
+
+async def _do_scan():
+    """Run one scan and update status snapshots."""
+    global _last_run_started, _last_run_finished, _last_run_result, _last_run_error
+    scanner = importlib.import_module("goalsniper.scanner")
+    _last_run_error = None
+    _last_run_started = datetime.now(timezone.utc).isoformat()
+    try:
+        res = await scanner.run_scan_and_send()
+        _last_run_result = {
+            "fixturesChecked": res.get("fixturesChecked", 0),
+            "tipsSent": res.get("tipsSent", 0),
+            "elapsedSeconds": res.get("elapsedSeconds", 0),
+            "debug": res.get("debug", {}),
+        }
+    except Exception as e:
+        _last_run_error = str(e)
+        _last_run_result = None
+    finally:
+        _last_run_finished = datetime.now(timezone.utc).isoformat()
+
+def _kick_off_background_scan() -> bool:
+    """Start a background scan if none is running. Returns True if started, False if already running."""
+    global _scan_task
+    if _scan_task and not _scan_task.done():
+        return False
+    # create a fresh task
+    _scan_task = asyncio.create_task(_do_scan())
+    return True
 
 # -----------------------------------------
-# Run scan (POST header auth, GET/HEAD header or query auth)
+# /run (non‑blocking)  — GET ?token=...  or  POST with Authorization: Bearer
 # -----------------------------------------
 @app.post("/run")
 async def run_post(request: Request):
-    _auth_any(request)  # header Bearer token
-    scanner = _safe_import("goalsniper.scanner")
-    result = await scanner.run_scan_and_send()
-    return {"status": "ok", **result}
-
+    _auth_header(request)
+    started = _kick_off_background_scan()
+    return Response(
+        content=(b'{"accepted":true,"started":' + (b"true" if started else b"false") + b"}"),
+        status_code=202,
+        media_type="application/json",
+    )
 
 @app.api_route("/run", methods=["GET", "HEAD"])
-async def run_get_or_head(request: Request, token: str = Query("")):
-    _auth_any(request, token)  # query ?token=... OR header Bearer ...
+async def run_get(request: Request, token: str = Query("")):
+    _auth_qs(token)
     if request.method == "HEAD":
         return Response(status_code=200)
-    scanner = _safe_import("goalsniper.scanner")
-    result = await scanner.run_scan_and_send()
-    return {"status": "ok", **result}
+    started = _kick_off_background_scan()
+    return Response(
+        content=(b'{"accepted":true,"started":' + (b"true" if started else b"false") + b"}"),
+        status_code=202,
+        media_type="application/json",
+    )
 
+# -----------------------------------------
+# /run/wait — runs scan and waits (blocking)
+# -----------------------------------------
+@app.post("/run/wait")
+async def run_wait_post(request: Request):
+    _auth_header(request)
+    return await _run_wait_impl()
+
+@app.get("/run/wait")
+async def run_wait_get(token: str = Query("")):
+    _auth_qs(token)
+    return await _run_wait_impl()
+
+async def _run_wait_impl():
+    async with _scan_lock:
+        # ensure no overlap; if a background one is going, wait for it
+        global _scan_task
+        if _scan_task and not _scan_task.done():
+            await _scan_task
+            _scan_task = None
+        # now run a dedicated scan
+        await _do_scan()
+        return {
+            "status": "ok",
+            "startedAt": _last_run_started,
+            "finishedAt": _last_run_finished,
+            "result": _last_run_result,
+            "error": _last_run_error,
+        }
+
+# -----------------------------------------
+# /run/status — inspect last/background state
+# -----------------------------------------
+@app.get("/run/status")
+async def run_status(token: str = Query("")):
+    _auth_qs(token)
+    running = bool(_scan_task and not _scan_task.done())
+    return {
+        "running": running,
+        "startedAt": _last_run_started,
+        "finishedAt": _last_run_finished,
+        "result": _last_run_result,
+        "error": _last_run_error,
+    }
 
 # -------------------------
 # Telegram webhook (feedback)
@@ -102,7 +183,6 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
     payload = await request.json()
     cq = payload.get("callback_query")
     if not cq:
-        # ignore non-callback updates
         return {"ok": True}
 
     data = (cq.get("data") or "").strip()
@@ -121,7 +201,6 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
 
         await storage.set_outcome(tip_id, outcome)
 
-        # Optional learning telemetry (never breaks webhook)
         try:
             info = await learning.on_feedback_update(tip_id, outcome)
             if info.get("ok"):
@@ -139,9 +218,8 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
 
     return {"ok": True}
 
-
 # -------------------------
-# Daily digest (GET/HEAD)
+# Daily digest
 # -------------------------
 @app.api_route("/digest", methods=["GET", "HEAD"])
 async def digest_get(
@@ -150,7 +228,7 @@ async def digest_get(
     date: str | None = Query(None, description="YYYY-MM-DD in UTC (optional)"),
     push: int = Query(1, description="1=send to Telegram, 0=JSON only"),
 ):
-    _auth_any(request, token)
+    _auth_qs(token)
 
     if request.method == "HEAD":
         return Response(status_code=200)
@@ -158,7 +236,6 @@ async def digest_get(
     storage = _safe_import("goalsniper.storage")
     telegram = _safe_import("goalsniper.telegram")
 
-    # Parse day
     try:
         day = (
             datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -170,10 +247,7 @@ async def digest_get(
     stats = await storage.daily_counts_for(day)
     tot = await storage.totals()
 
-    sent = stats["sent"]
-    good = stats["good"]
-    bad = stats["bad"]
-    pending = stats["pending"]
+    sent = stats["sent"]; good = stats["good"]; bad = stats["bad"]; pending = stats["pending"]
     acc = (good / sent * 100.0) if sent else 0.0
 
     day_str = day.strftime("%Y-%m-%d")
