@@ -1,3 +1,4 @@
+# goalsniper/server.py
 from __future__ import annotations
 
 import os
@@ -8,19 +9,19 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Query, Response
 
-app = FastAPI(title="Goalsniper", version="1.4.5")
+app = FastAPI(title="Goalsniper", version="1.4.6")
 
+
+# -------------------------
+# env helpers (no defaults for secrets in code)
+# -------------------------
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
-def _run_token() -> str:
-    tok = _env("RUN_TOKEN", "")
-    if not tok:
-        raise HTTPException(status_code=500, detail="RUN_TOKEN not set")
-    return tok
 
 def _telegram_webhook_token() -> str:
     return _env("TELEGRAM_WEBHOOK_TOKEN", "")
+
 
 def _safe_import(module_name: str):
     try:
@@ -28,24 +29,37 @@ def _safe_import(module_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"import error: {module_name}: {e}")
 
-def _auth_header(request: Request):
-    auth = request.headers.get("authorization") or ""
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    token = auth[len("Bearer "):].strip()
-    if token != _run_token():
-        raise HTTPException(status_code=403, detail="Forbidden")
 
-def _auth_qs(token: str):
-    if not token or token != _run_token():
+# -------------------------
+# unified auth (header OR query)
+# -------------------------
+def _get_bearer_from_header(request: Request) -> str:
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def _auth_any(request: Request, qs_token: Optional[str] = None):
+    provided = (qs_token or "").strip() or _get_bearer_from_header(request)
+    expected = (_env("RUN_TOKEN", "") or "").strip()
+
+    if not expected:
+        raise HTTPException(status_code=500, detail="RUN_TOKEN not set")
+    if not provided or provided != expected:
+        # Use 401 to avoid hinting anything about token validity
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# Health & root
+
+# -------------------------
+# Health & root (HEAD-safe)
+# -------------------------
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health(request: Request):
     if request.method == "HEAD":
         return Response(status_code=200)
     return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
+
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root(request: Request):
@@ -53,24 +67,31 @@ async def root(request: Request):
         return Response(status_code=200)
     return {"ok": True, "name": "Goalsniper", "time": os.getenv("TZ", "UTC")}
 
-# Run scan
+
+# -----------------------------------------
+# Run scan (POST header auth, GET/HEAD header or query auth)
+# -----------------------------------------
 @app.post("/run")
 async def run_post(request: Request):
-    _auth_header(request)
+    _auth_any(request)  # header Bearer token
     scanner = _safe_import("goalsniper.scanner")
     result = await scanner.run_scan_and_send()
     return {"status": "ok", **result}
 
+
 @app.api_route("/run", methods=["GET", "HEAD"])
 async def run_get_or_head(request: Request, token: str = Query("")):
-    _auth_qs(token)
+    _auth_any(request, token)  # query ?token=... OR header Bearer ...
     if request.method == "HEAD":
         return Response(status_code=200)
     scanner = _safe_import("goalsniper.scanner")
     result = await scanner.run_scan_and_send()
     return {"status": "ok", **result}
 
-# Telegram webhook
+
+# -------------------------
+# Telegram webhook (feedback)
+# -------------------------
 @app.post("/telegram/webhook")
 @app.post("/telegram/webhook/{token}")
 async def telegram_webhook(request: Request, token: Optional[str] = None):
@@ -81,9 +102,11 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
     payload = await request.json()
     cq = payload.get("callback_query")
     if not cq:
+        # ignore non-callback updates
         return {"ok": True}
 
     data = (cq.get("data") or "").strip()
+    # expected: fb:<tip_id>:<1|0>
     if not data.startswith("fb:"):
         return {"ok": True}
 
@@ -98,6 +121,7 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
 
         await storage.set_outcome(tip_id, outcome)
 
+        # Optional learning telemetry (never breaks webhook)
         try:
             info = await learning.on_feedback_update(tip_id, outcome)
             if info.get("ok"):
@@ -115,7 +139,10 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
 
     return {"ok": True}
 
-# Daily digest
+
+# -------------------------
+# Daily digest (GET/HEAD)
+# -------------------------
 @app.api_route("/digest", methods=["GET", "HEAD"])
 async def digest_get(
     request: Request,
@@ -123,7 +150,7 @@ async def digest_get(
     date: str | None = Query(None, description="YYYY-MM-DD in UTC (optional)"),
     push: int = Query(1, description="1=send to Telegram, 0=JSON only"),
 ):
-    _auth_qs(token)
+    _auth_any(request, token)
 
     if request.method == "HEAD":
         return Response(status_code=200)
@@ -131,6 +158,7 @@ async def digest_get(
     storage = _safe_import("goalsniper.storage")
     telegram = _safe_import("goalsniper.telegram")
 
+    # Parse day
     try:
         day = (
             datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -142,7 +170,10 @@ async def digest_get(
     stats = await storage.daily_counts_for(day)
     tot = await storage.totals()
 
-    sent = stats["sent"]; good = stats["good"]; bad = stats["bad"]; pending = stats["pending"]
+    sent = stats["sent"]
+    good = stats["good"]
+    bad = stats["bad"]
+    pending = stats["pending"]
     acc = (good / sent * 100.0) if sent else 0.0
 
     day_str = day.strftime("%Y-%m-%d")
