@@ -44,6 +44,14 @@ async def _post_json(client: httpx.AsyncClient, method: str, payload: Dict) -> D
         delay = float(ra) if (ra and ra.isdigit()) else 1.0
         await asyncio.sleep(delay + random.uniform(0, 0.25))
         r = await client.post(f"{BASE}/{method}", json=payload, timeout=30.0)
+    if r.status_code == 400:
+        # Bubble meaningful Telegram error text to logs
+        try:
+            js = r.json()
+            desc = js.get("description") or js
+            raise httpx.HTTPStatusError(str(desc), request=r.request, response=r)
+        except Exception:
+            r.raise_for_status()
     r.raise_for_status()
     data = r.json()
     if not data.get("ok"):
