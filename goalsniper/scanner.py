@@ -11,6 +11,7 @@ import httpx
 from .logger import log, warn
 from . import api_football as api
 from . import tips as tip_engine
+from . import filters as cfg_filters
 from .storage import (
     insert_tip_return_id,
     fixture_ever_sent,
@@ -125,27 +126,24 @@ def _season(fx: Dict) -> int:
     return int((fx.get("league", {}) or {}).get("season") or 0)
 
 
-# ---------- League filters ----------
-def _csv_upper(s: str) -> list[str]:
-    return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
-
-
-_ALLOW_COUNTRIES = _csv_upper(getattr(api, "COUNTRY_ALLOW", ""))
-_ALLOW_KEYS = _csv_upper(getattr(api, "LEAGUE_ALLOW_KEYWORDS", ""))
-_EX_KEYS = _csv_upper(getattr(api, "EXCLUDE_KEYWORDS", ""))
-
-
-def _league_row_allowed(row: Dict) -> bool:
+# ---------- League filters (DB/env unified) ----------
+async def _league_row_allowed(row: Dict) -> bool:
+    filters = await cfg_filters.get_filters()
     lname = (row.get("leagueName") or "").upper()
     country = (row.get("country") or "").upper()
     if not lname:
         return False
-    for bad in _EX_KEYS:
+    # Exclude by keywords
+    for bad in filters["excludeKeywords"]:
         if bad in lname:
             return False
-    if _ALLOW_KEYS and not any(k in lname for k in _ALLOW_KEYS):
+    # Positive league keywords (if any configured)
+    allow_keys = filters["allowLeagueKeywords"]
+    if allow_keys and not any(k in lname for k in allow_keys):
         return False
-    if _ALLOW_COUNTRIES and country not in _ALLOW_COUNTRIES:
+    # Countries (if any configured)
+    allow_countries = filters["allowCountries"]
+    if allow_countries and country and (country not in allow_countries):
         return False
     return True
 
@@ -179,7 +177,7 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
         return []
 
     leagues = await _call_fn(get_leagues, client)
-    leagues = [row for row in leagues if _league_row_allowed(row)]
+    leagues = [row for row in leagues if await _league_row_allowed(row)]
     log(f"[scan] allowed_leagues={len(leagues)}")
 
     if not leagues:
