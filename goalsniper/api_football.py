@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -64,8 +65,9 @@ _bucket = _TokenBucket(API_RPS, API_BURST)
 _CacheVal = Tuple[float, Any]
 _cache: Dict[str, _CacheVal] = {}
 
-def _ckey(path: str, params: Dict[str, Any]) -> str:
-    return f"{path}|{tuple(sorted(params.items()))}"
+def _stable_key(path: str, params: Dict[str, Any]) -> str:
+    # robust for lists/nested structures
+    return f"{path}|{json.dumps(params, sort_keys=True, separators=(',', ':'))}"
 
 def _cache_get(key: str, ttl: int) -> Optional[Any]:
     if ttl <= 0:
@@ -78,6 +80,11 @@ def _cache_get(key: str, ttl: int) -> Optional[Any]:
 
 def _cache_put(key: str, data: Any):
     _cache[key] = (time.time(), data)
+
+# --------------- in‑flight single‑flight (coalescing) ---------------
+from asyncio import Future
+_inflight: Dict[str, Future] = {}
+_inflight_lock = asyncio.Lock()
 
 # --------------- filtering helpers ------------
 def _parse_csv(csv: str) -> List[str]:
@@ -125,41 +132,76 @@ def _is_allowed_fixture(fx: dict) -> bool:
             return False
     return True
 
-# --------------- core GET with retries --------
+# --------------- core GET with retries + coalescing --------
 async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any], ttl: int) -> Any:
-    key = _ckey(path, params)
+    key = _stable_key(path, params)
     cached = _cache_get(key, ttl)
     if cached is not None:
         return cached
 
+    # single‑flight: coalesce identical concurrent requests
+    async with _inflight_lock:
+        fut = _inflight.get(key)
+        if fut is None:
+            fut = asyncio.get_running_loop().create_future()
+            _inflight[key] = fut
+            leader = True
+        else:
+            leader = False
+
+    if not leader:
+        # follower: wait for leader result (bounded)
+        try:
+            return await asyncio.wait_for(fut, timeout=5)
+        except asyncio.TimeoutError:
+            # stale‑while‑revalidate fallback
+            cached = _cache_get(key, ttl)
+            if cached is not None:
+                return cached
+            # last resort: wait without timeout
+            return await fut
+
     url = f"{BASE_URL}{path}"
     backoff = API_BACKOFF_INITIAL
+    last_exc: Optional[BaseException] = None
 
-    for attempt in range(1, API_RETRIES + 1):
-        await _bucket.acquire()
-        async with _sem:
-            try:
-                r = await client.get(url, params=params, headers=HEADERS, timeout=API_TIMEOUT)
-                if r.status_code == 429 or 500 <= r.status_code < 600:
-                    if attempt < API_RETRIES:
-                        warn("API retry", r.status_code, (r.text or "")[:160])
-                        await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2.0, API_BACKOFF_MAX)
-                        continue
-                r.raise_for_status()
-                data = r.json()
-                if isinstance(data, dict) and data.get("errors"):
-                    raise httpx.HTTPError(str(data["errors"]))
-                payload = data.get("response") if isinstance(data, dict) else data
-                if ttl > 0:
-                    _cache_put(key, payload)
-                return payload
-            except Exception as e:
-                if attempt >= API_RETRIES:
-                    raise
-                warn("API retry on exception:", str(e))
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2.0, API_BACKOFF_MAX)
+    try:
+        for attempt in range(1, API_RETRIES + 1):
+            await _bucket.acquire()
+            async with _sem:
+                try:
+                    r = await client.get(url, params=params, headers=HEADERS, timeout=API_TIMEOUT)
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        if attempt < API_RETRIES:
+                            warn("API retry", r.status_code, (r.text or "")[:160])
+                            await asyncio.sleep(backoff)
+                            backoff = min(backoff * 2.0, API_BACKOFF_MAX)
+                            continue
+                    r.raise_for_status()
+                    data = r.json()
+                    if isinstance(data, dict) and data.get("errors"):
+                        raise httpx.HTTPError(str(data["errors"]))
+                    payload = data.get("response") if isinstance(data, dict) else data
+                    if ttl > 0:
+                        _cache_put(key, payload)
+                    return payload
+                except Exception as e:
+                    last_exc = e
+                    if attempt >= API_RETRIES:
+                        raise
+                    warn("API retry on exception:", str(e))
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2.0, API_BACKOFF_MAX)
+    finally:
+        # complete and release waiters
+        async with _inflight_lock:
+            fut = _inflight.pop(key, None)
+            if fut and not fut.done():
+                if last_exc is None:
+                    fut.set_result(_cache_get(key, ttl))
+                else:
+                    fut.set_exception(last_exc)
+
     return None
 
 # --------------- public API -------------------
