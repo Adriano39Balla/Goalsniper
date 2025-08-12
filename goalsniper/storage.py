@@ -4,10 +4,18 @@ import asyncio
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 
-# DB under /data so it survives restarts
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "goalsniper.db")
+# DB: env override; default to persistent /data on Railway, else /tmp
+DB_PATH = os.getenv(
+    "DB_PATH",
+    "/data/goalsniper.db" if os.path.isdir("/data") else "/tmp/goalsniper.db"
+)
 
 SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
+
 CREATE TABLE IF NOT EXISTS tips (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   fixture_id INTEGER NOT NULL,
@@ -21,11 +29,16 @@ CREATE TABLE IF NOT EXISTS tips (
   message_id INTEGER,
   outcome INTEGER
 );
+-- Avoid duplicate tips per fixture/market/selection
+CREATE UNIQUE INDEX IF NOT EXISTS ux_tips_fixture_market_sel
+  ON tips(fixture_id, market, selection);
+
 CREATE INDEX IF NOT EXISTS idx_tips_fixture ON tips(fixture_id);
 CREATE INDEX IF NOT EXISTS idx_tips_market ON tips(market);
 CREATE INDEX IF NOT EXISTS idx_tips_league ON tips(league_id, market);
+CREATE INDEX IF NOT EXISTS idx_tips_sent_at ON tips(sent_at);
+CREATE INDEX IF NOT EXISTS idx_tips_fixture_sent_at ON tips(fixture_id, sent_at);
 
--- key/value config store (for runtime filters etc.)
 CREATE TABLE IF NOT EXISTS config (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -34,7 +47,8 @@ CREATE TABLE IF NOT EXISTS config (
 
 def _ensure_dir():
     d = os.path.dirname(DB_PATH)
-    os.makedirs(d, exist_ok=True)
+    if d and d not in (".", "/"):
+        os.makedirs(d, exist_ok=True)
 
 def _with_conn(fn):
     def wrapper(*args, **kwargs):
@@ -51,24 +65,31 @@ def _with_conn(fn):
 # ---------- tips primitives ----------
 @_with_conn
 def _insert_tip_sync(conn: sqlite3.Connection, tip: Dict[str, Any], message_id: Optional[int]) -> int:
-    cur = conn.execute(
-        """INSERT INTO tips
-           (fixture_id, market, selection, probability, confidence,
-            league_id, season, sent_at, message_id, outcome)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
-        (
-            int(tip["fixtureId"]),
-            str(tip["market"]),
-            str(tip["selection"]),
-            float(tip["probability"]),
-            float(tip["confidence"]),
-            int(tip.get("leagueId") or 0),
-            int(tip.get("season") or 0),
-            datetime.now(timezone.utc).isoformat(),
-            int(tip.get("messageId") or (message_id or 0)),
-        ),
-    )
-    return int(cur.lastrowid)
+    try:
+        cur = conn.execute(
+            """INSERT INTO tips
+               (fixture_id, market, selection, probability, confidence,
+                league_id, season, sent_at, message_id, outcome)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+            (
+                int(tip["fixtureId"]),
+                str(tip["market"]),
+                str(tip["selection"]),
+                float(tip["probability"]),
+                float(tip["confidence"]),
+                int(tip.get("leagueId") or 0),
+                int(tip.get("season") or 0),
+                datetime.now(timezone.utc).isoformat(),
+                int(tip.get("messageId") or (message_id or 0)),
+            ),
+        )
+        return int(cur.lastrowid)
+    except sqlite3.IntegrityError:
+        row = conn.execute(
+            "SELECT id FROM tips WHERE fixture_id=? AND market=? AND selection=? ORDER BY id DESC LIMIT 1",
+            (int(tip["fixtureId"]), str(tip["market"]), str(tip["selection"]))
+        ).fetchone()
+        return int(row["id"]) if row else 0
 
 @_with_conn
 def _set_outcome_sync(conn: sqlite3.Connection, tip_id: int, outcome: int) -> None:
@@ -186,7 +207,7 @@ def _totals_sync(conn: sqlite3.Connection) -> dict:
         "pending": int(row["pending"] or 0),
     }
 
-# ---------- config K/V (for filters) ----------
+# ---------- config K/V ----------
 @_with_conn
 def _get_config_bulk_sync(conn: sqlite3.Connection, keys: List[str]) -> Dict[str, str]:
     if not keys:
@@ -194,7 +215,6 @@ def _get_config_bulk_sync(conn: sqlite3.Connection, keys: List[str]) -> Dict[str
     placeholders = ",".join("?" for _ in keys)
     cur = conn.execute(f"SELECT key, value FROM config WHERE key IN ({placeholders})", keys)
     found = {str(r["key"]): str(r["value"] or "") for r in cur.fetchall()}
-    # ensure keys exist with empty default
     return {k: found.get(k, "") for k in keys}
 
 @_with_conn
