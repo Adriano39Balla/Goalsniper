@@ -43,7 +43,10 @@ EXCLUDE_KEYWORDS      = os.getenv(
     "U19,U20,U21,U23,YOUTH,WOMEN,FRIENDLY,CLUB FRIENDLIES,RESERVE,AMATEUR,B-TEAM",
 )
 
-HEADERS = {"x-apisports-key": API_KEY}
+HEADERS = {
+    "x-apisports-key": API_KEY,
+    "Accept": "application/json",
+}
 _sem = asyncio.Semaphore(max(1, int(MAX_CONCURRENT_REQUESTS)))
 
 # ---------------- Token bucket ----------------
@@ -223,7 +226,11 @@ async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any],
                     data = r.json()
                     if isinstance(data, dict) and data.get("errors"):
                         raise httpx.HTTPError(str(data["errors"]))
-                    payload = data.get("response") if isinstance(data, dict) else data
+                    # API-Football standard: {'response': [...]}
+                    if isinstance(data, dict) and "response" in data:
+                        payload = data["response"]
+                    else:
+                        payload = data
                     if ttl > 0:
                         _cache_put(key, payload)
                     return payload
