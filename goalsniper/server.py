@@ -75,8 +75,8 @@ async def root(request: Request):
 # -------------------------
 _scan_lock = asyncio.Lock()
 _scan_task: Optional[asyncio.Task] = None
-_last_run_started: Optional[str] = None   # ISO time
-_last_run_finished: Optional[str] = None  # ISO time
+_last_run_started: Optional[str] = None
+_last_run_finished: Optional[str] = None
 _last_run_result: Optional[Dict[str, Any]] = None
 _last_run_error: Optional[str] = None
 
