@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -19,12 +20,17 @@ API_BACKOFF_INITIAL = float(os.getenv("API_BACKOFF_INITIAL", "0.5"))
 API_BACKOFF_MAX = float(os.getenv("API_BACKOFF_MAX", "2.0"))
 
 # token bucket (per process)
-API_RPS   = float(os.getenv("API_RPS", "2"))
+_api_rps_env = os.getenv("API_RPS")
+if _api_rps_env is None:
+    per_min = os.getenv("API_RATE_PER_MIN")
+    API_RPS = float(per_min) / 60.0 if per_min else float(os.getenv("API_RPS", "2"))
+else:
+    API_RPS = float(_api_rps_env)
 API_BURST = int(os.getenv("API_BURST", "4"))
 
 # ---- Cache TTLs --------------------------------------------------------------
 TTL_CURRENT_LEAGUES  = int(os.getenv("CACHE_TTL_LEAGUES", "1800"))
-TTL_FIXTURES_BY_DATE = int(os.getenv("CACHE_TTL_FIXTURES", "900"))
+TTL_FIXTURES_BY_DATE = int(os.getenv("CACHE_TTL_FIXTURES_BYDATE", os.getenv("CACHE_TTL_FIXTURES", "900")))
 TTL_LIVE_FIXTURES    = int(os.getenv("CACHE_TTL_LIVE", "90"))
 TTL_TEAM_STATS       = int(os.getenv("CACHE_TTL_TEAM_STATS", "600"))
 TTL_ODDS             = int(os.getenv("CACHE_TTL_ODDS", "600"))
@@ -32,7 +38,10 @@ TTL_ODDS             = int(os.getenv("CACHE_TTL_ODDS", "600"))
 # ---- Env filters (empty == allow all) ----------------------------------------
 COUNTRY_FLAGS_ALLOW   = os.getenv("COUNTRY_FLAGS_ALLOW", "")
 LEAGUE_ALLOW_KEYWORDS = os.getenv("LEAGUE_ALLOW_KEYWORDS", "")
-EXCLUDE_KEYWORDS      = os.getenv("EXCLUDE_KEYWORDS", "U19,U20,U21,U23,YOUTH,WOMEN,FRIENDLY,RESERVE,AMATEUR")
+EXCLUDE_KEYWORDS      = os.getenv(
+    "EXCLUDE_KEYWORDS",
+    "U19,U20,U21,U23,YOUTH,WOMEN,FRIENDLY,CLUB FRIENDLIES,RESERVE,AMATEUR,B-TEAM",
+)
 
 HEADERS = {"x-apisports-key": API_KEY}
 _sem = asyncio.Semaphore(max(1, int(MAX_CONCURRENT_REQUESTS)))
@@ -66,7 +75,6 @@ _CacheVal = Tuple[float, Any]
 _cache: Dict[str, _CacheVal] = {}
 
 def _stable_key(path: str, params: Dict[str, Any]) -> str:
-    # robust for lists/nested structures
     return f"{path}|{json.dumps(params, sort_keys=True, separators=(',', ':'))}"
 
 def _cache_get(key: str, ttl: int) -> Optional[Any]:
@@ -81,7 +89,7 @@ def _cache_get(key: str, ttl: int) -> Optional[Any]:
 def _cache_put(key: str, data: Any):
     _cache[key] = (time.time(), data)
 
-# --------------- in‑flight single‑flight (coalescing) ---------------
+# --------------- in‑flight coalescing ---------------
 from asyncio import Future
 _inflight: Dict[str, Future] = {}
 _inflight_lock = asyncio.Lock()
@@ -150,20 +158,18 @@ async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any],
             leader = False
 
     if not leader:
-        # follower: wait for leader result (bounded)
         try:
             return await asyncio.wait_for(fut, timeout=5)
         except asyncio.TimeoutError:
-            # stale‑while‑revalidate fallback
             cached = _cache_get(key, ttl)
             if cached is not None:
                 return cached
-            # last resort: wait without timeout
             return await fut
 
     url = f"{BASE_URL}{path}"
     backoff = API_BACKOFF_INITIAL
     last_exc: Optional[BaseException] = None
+    payload = None
 
     try:
         for attempt in range(1, API_RETRIES + 1):
@@ -171,12 +177,21 @@ async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any],
             async with _sem:
                 try:
                     r = await client.get(url, params=params, headers=HEADERS, timeout=API_TIMEOUT)
-                    if r.status_code in (429, 500, 502, 503, 504):
+                    if r.status_code == 429:
+                        ra = r.headers.get("Retry-After")
+                        delay = float(ra) if (ra and ra.isdigit()) else backoff
+                        await asyncio.sleep(delay + random.uniform(0, 0.25))
+                        backoff = min(backoff * 2.0, API_BACKOFF_MAX)
+                        if attempt < API_RETRIES:
+                            warn("API 429, retrying", delay)
+                            continue
+                    if r.status_code in (500, 502, 503, 504):
                         if attempt < API_RETRIES:
                             warn("API retry", r.status_code, (r.text or "")[:160])
-                            await asyncio.sleep(backoff)
+                            await asyncio.sleep(backoff + random.uniform(0, 0.25))
                             backoff = min(backoff * 2.0, API_BACKOFF_MAX)
                             continue
+
                     r.raise_for_status()
                     data = r.json()
                     if isinstance(data, dict) and data.get("errors"):
@@ -190,15 +205,14 @@ async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any],
                     if attempt >= API_RETRIES:
                         raise
                     warn("API retry on exception:", str(e))
-                    await asyncio.sleep(backoff)
+                    await asyncio.sleep(backoff + random.uniform(0, 0.25))
                     backoff = min(backoff * 2.0, API_BACKOFF_MAX)
     finally:
-        # complete and release waiters
         async with _inflight_lock:
             fut = _inflight.pop(key, None)
             if fut and not fut.done():
                 if last_exc is None:
-                    fut.set_result(_cache_get(key, ttl))
+                    fut.set_result(payload if payload is not None else _cache_get(key, ttl))
                 else:
                     fut.set_exception(last_exc)
 
