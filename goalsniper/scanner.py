@@ -1,3 +1,4 @@
+# goalsniper/scanner.py
 from __future__ import annotations
 
 import os
@@ -24,7 +25,7 @@ from .config import (
     LIVE_MINUTE_MIN,
     LIVE_MINUTE_MAX,
     LIVE_MAX_FIXTURES,
-    SCAN_DAYS,                  # kept for info
+    SCAN_DAYS,                  # kept for info (informational only)
     DAILY_TIP_CAP,
     DUPLICATE_SUPPRESS_FOREVER,
     STATS_REQUEST_DELAY_MS,
@@ -33,15 +34,15 @@ from .config import (
 from .learning import calibrate_probability, dynamic_conf_threshold
 
 # -------------------- additional caps (env-driven) --------------------
-MAX_TODAY_FIXTURES = max(0, int(os.getenv("MAX_TODAY_FIXTURES", "24")))
-BUILD_FIXTURE_LIMIT = max(0, int(os.getenv("BUILD_FIXTURE_LIMIT", "20")))
+MAX_TODAY_FIXTURES  = max(0, int(os.getenv("MAX_TODAY_FIXTURES", "24")))  # how many NS fixtures to even consider
+BUILD_FIXTURE_LIMIT = max(0, int(os.getenv("BUILD_FIXTURE_LIMIT", "20"))) # how many fixtures we run tip builder on
 
 # ---------- status sets ----------
 FINISHED_STATES = {"FT", "AET", "PEN", "CANC", "PST", "ABD", "AWD", "WO"}
 LIVE_STATES     = {"1H", "2H", "HT", "ET"}
 NS_STATES       = {"NS"}
 
-# ---------- report which functions we actually use ----------
+# ---------- report which functions we actually use (debug) ----------
 FOUND_BUILDER_NAME: Optional[str] = None
 FOUND_LIVE_API_NAME: Optional[str] = None
 FOUND_DATE_API_NAME: Optional[str] = None
@@ -133,12 +134,12 @@ def _normalize_country_flags(flags_csv: str) -> set[str]:
     return out
 
 def _csv_upper(s: str) -> list[str]:
-    # ✅ Correctly parse CSV env vars into KEYWORDS (not characters)
+    # ✅ Proper CSV → tokens (not characters)
     return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
 
 _ALLOW_COUNTRIES = _normalize_country_flags(getattr(api, "COUNTRY_FLAGS_ALLOW", ""))
-_ALLOW_KEYS = _csv_upper(getattr(api, "LEAGUE_ALLOW_KEYWORDS", ""))
-_EX_KEYS    = _csv_upper(getattr(api, "EXCLUDE_KEYWORDS", ""))
+_ALLOW_KEYS      = _csv_upper(getattr(api, "LEAGUE_ALLOW_KEYWORDS", ""))
+_EX_KEYS         = _csv_upper(getattr(api, "EXCLUDE_KEYWORDS", ""))
 
 _COUNTRY_TO_ISO = {
     "GERMANY":"DE","ENGLAND":"GB","FRANCE":"FR","SPAIN":"ES","NETHERLANDS":"NL","HOLLAND":"NL",
@@ -194,15 +195,18 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
     if not leagues:
         return []
 
+    total_leagues = len(leagues)
     leagues = [row for row in leagues if _league_row_allowed(row)]
+    log(f"[scan] leagues: total={total_leagues} allowed={len(leagues)}")
     if not leagues:
         return []
 
     out: List[Dict] = []
+    # use UTC date to avoid boundary issues
     day = datetime.now(timezone.utc).date().isoformat()
 
     for row in leagues:
-        if len(out) >= MAX_TODAY_FIXTURES:   # HARD CAP
+        if len(out) >= MAX_TODAY_FIXTURES:   # HARD CAP across all allowed leagues
             break
         try:
             lid = int(row.get("leagueId") or 0)
@@ -261,6 +265,7 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
         return [], stats
 
     raw: List[Dict] = []
+    # process only the first N fixtures (API-sparing)
     for f in fixtures[:BUILD_FIXTURE_LIMIT]:
         try:
             res = await _invoke_builder(build_fn, client, f)
@@ -277,6 +282,7 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
     deduped, removed = _dedupe_in_run(raw)
     stats["raw_candidates"] = len(deduped)
     stats["inrun_dedup_removed"] = removed
+    # 'low_conf' is counted during send after calibration
     return deduped, stats
 
 # ---------- learning gate ----------
@@ -332,6 +338,7 @@ async def _recently_sent(fid: int) -> bool:
 async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: Optional[int] = None) -> Tuple[int, Dict[str, int]]:
     stats = {"ever_sent_skipped": 0, "daily_cap_hits": 0, "low_conf": 0}
     sent = 0
+    # cache today's count locally to avoid querying per tip
     if start_count is None:
         used_today = await count_sent_today()
     else:
@@ -351,6 +358,7 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: O
             stats["ever_sent_skipped"] += 1
             continue
 
+        # learning gate (calibration + dynamic threshold)
         tt = await _calibrate_and_filter(t)
         if not tt:
             stats["low_conf"] += 1
@@ -368,94 +376,4 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: O
     return sent, stats
 
 # ---------- public entrypoint ----------
-async def run_scan_and_send() -> Dict[str, int]:
-    started = datetime.now(timezone.utc)
-
-    live_fixtures: List[Dict] = []
-    today_fixtures: List[Dict] = []
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        if LIVE_ENABLED:
-            try:
-                live_fixtures = await _fetch_live(client)
-            except Exception as e:
-                warn("Live fetch failed:", str(e))
-
-        try:
-            today_fixtures = await _fetch_today(client)
-        except Exception as e:
-            warn("Today fetch failed:", str(e))
-
-        fixtures_checked = len(live_fixtures) + len(today_fixtures)
-
-        live_tips: List[Dict] = []
-        today_tips: List[Dict] = []
-        live_stats: Dict[str, int] = {}
-        today_stats: Dict[str, int] = {}
-
-        if live_fixtures:
-            live_tips, live_stats = await _build_tips_for_fixtures(client, live_fixtures)
-
-        if today_fixtures:
-            today_tips, today_stats = await _build_tips_for_fixtures(client, today_fixtures)
-
-        # cross‑bucket dedupe
-        combined = live_tips + today_tips
-        combined, cross_removed = _dedupe_in_run(combined)
-        today_stats["inrun_dedup_removed"] = today_stats.get("inrun_dedup_removed", 0) + cross_removed
-
-        start_count = await count_sent_today()
-        sent_total, send_stats = await _send_tips(client, combined, start_count)
-
-        live_stats.update({f"send_{k}": v for k, v in send_stats.items()})
-        today_stats.update({f"send_{k}": 0 for k in send_stats})  # keep keys symmetrical
-
-    elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-
-    total_candidates = live_stats.get("raw_candidates", 0) + today_stats.get("raw_candidates", 0)
-    total_low_conf   = (
-        live_stats.get("low_conf", 0)
-        + today_stats.get("low_conf", 0)
-        + live_stats.get("send_low_conf", 0)
-        + today_stats.get("send_low_conf", 0)
-    )
-    total_inrun_dup  = live_stats.get("inrun_dedup_removed", 0) + today_stats.get("inrun_dedup_removed", 0)
-    total_ever_sent  = live_stats.get("send_ever_sent_skipped", 0) + today_stats.get("send_ever_sent_skipped", 0)
-    total_cap_hits   = live_stats.get("send_daily_cap_hits", 0) + today_stats.get("send_daily_cap_hits", 0)
-
-    log(
-        "DEBUG scan: "
-        f"fixtures(live={len(live_fixtures)},today={len(today_fixtures)})  "
-        f"candidates={total_candidates}  low_conf={total_low_conf}  "
-        f"inrun_dedup={total_inrun_dup}  ever_sent={total_ever_sent}  "
-        f"sent={sent_total}  daily_cap_hits={total_cap_hits}"
-    )
-
-    return {
-        "status": "ok",
-        "fixturesChecked": fixtures_checked,
-        "tipsSent": sent_total,
-        "elapsedSeconds": round(elapsed),
-        "debug": {
-            "liveFixtures": len(live_fixtures),
-            "todayFixtures": len(today_fixtures),
-            "candidates": total_candidates,
-            "lowConfidenceFiltered": total_low_conf,
-            "inRunDuplicatesRemoved": total_inrun_dup,
-            "everSentDuplicatesSkipped": total_ever_sent,
-            "dailyCapHits": total_cap_hits,
-            "builderFn": FOUND_BUILDER_NAME,
-            "liveApiFn": FOUND_LIVE_API_NAME,
-            "dateApiFn": FOUND_DATE_API_NAME,
-            "config": {
-                "MIN_CONFIDENCE_TO_SEND": MIN_CONFIDENCE_TO_SEND,
-                "MAX_TIPS_PER_RUN": MAX_TIPS_PER_RUN,
-                "DAILY_TIP_CAP": DAILY_TIP_CAP,
-                "LIVE_MINUTE_MIN": LIVE_MINUTE_MIN,
-                "LIVE_MINUTE_MAX": LIVE_MINUTE_MAX,
-                "LIVE_MAX_FIXTURES": LIVE_MAX_FIXTURES,
-                "MAX_TODAY_FIXTURES": MAX_TODAY_FIXTURES,
-                "BUILD_FIXTURE_LIMIT": BUILD_FIXTURE_LIMIT,
-            },
-        },
-    }
+async def run_scan_and
