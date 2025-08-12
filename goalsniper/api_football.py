@@ -151,18 +151,14 @@ def _is_allowed_fixture(fx: dict) -> bool:
 # --------------- helpers: rate-limit adaptation ---------------
 def _maybe_adapt_rate(headers: httpx.Headers):
     try:
-        # API-Football common headers (values vary by plan)
         rem = headers.get("x-ratelimit-remaining")
         reset = headers.get("x-ratelimit-reset")
         if rem is None or reset is None:
             return
         rem_i = max(0, int(rem))
         reset_i = max(1, int(reset))  # seconds until reset
-        # aim to spread remaining calls across reset window, keep a safety margin
         rps = max(0.2, min(8.0, rem_i / max(1.0, reset_i) * 0.9))
-        # update bucket asynchronously (no await here; fire-and-forget)
         asyncio.create_task(_bucket.update_rate(rps))
-        # optional debug line (comment out if noisy)
         log(f"[api] adapt rate: remaining={rem_i} reset={reset_i}s -> rps≈{rps:.2f}")
     except Exception:
         pass
@@ -204,7 +200,6 @@ async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any],
             async with _sem:
                 try:
                     r = await client.get(url, params=params, headers=HEADERS, timeout=API_TIMEOUT)
-                    # observe headers to adapt rate (when successful or 429)
                     _maybe_adapt_rate(r.headers)
 
                     if r.status_code == 429:
@@ -223,14 +218,21 @@ async def _api_get(client: httpx.AsyncClient, path: str, params: Dict[str, Any],
                             continue
 
                     r.raise_for_status()
-                    data = r.json()
+                    try:
+                        data = r.json()
+                    except Exception as je:
+                        # fall back: if API returns text unexpectedly
+                        warn("API JSON decode failed:", str(je))
+                        data = {"response": []}
+
                     if isinstance(data, dict) and data.get("errors"):
                         raise httpx.HTTPError(str(data["errors"]))
-                    # API-Football standard: {'response': [...]}
+
                     if isinstance(data, dict) and "response" in data:
                         payload = data["response"]
                     else:
                         payload = data
+
                     if ttl > 0:
                         _cache_put(key, payload)
                     return payload
