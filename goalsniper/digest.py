@@ -4,7 +4,7 @@ from typing import Dict, List
 
 import httpx
 
-from . import storage as st
+from .import storage as st
 from .telegram import send_text
 
 def _today_utc_start_iso() -> str:
