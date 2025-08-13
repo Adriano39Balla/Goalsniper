@@ -1,4 +1,3 @@
-goalsniper/config.py
 """
 Centralized configuration (env-driven).
 """
