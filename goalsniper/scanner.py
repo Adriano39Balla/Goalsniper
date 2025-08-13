@@ -36,9 +36,13 @@ from .learning import calibrate_probability, dynamic_conf_threshold
 # ---------- Limits from .env ----------
 MAX_TODAY_FIXTURES = max(0, int(os.getenv("MAX_TODAY_FIXTURES", "24")))
 BUILD_FIXTURE_LIMIT = max(0, int(os.getenv("BUILD_FIXTURE_LIMIT", "20")))
-# New: safe parallelism for leagues and tip builds (token bucket will still protect upstream)
+
+# New: safe parallelism for leagues and tip builds (token bucket still protects upstream)
 LEAGUE_SCAN_CONCURRENCY = max(1, int(os.getenv("LEAGUE_SCAN_CONCURRENCY", "6")))
 BUILD_CONCURRENCY = max(1, int(os.getenv("BUILD_CONCURRENCY", "6")))
+
+# NEW: hard cap on leagues scanned per run (quota safety net)
+MAX_LEAGUES_PER_RUN = max(1, int(os.getenv("MAX_LEAGUES_PER_RUN", "24")))
 
 # ---------- Status sets ----------
 FINISHED_STATES = {"FT", "AET", "PEN", "CANC", "PST", "ABD", "AWD", "WO"}
@@ -176,9 +180,16 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
         warn("No fixtures-by-date path available; skipping scheduled scan")
         return []
 
-    leagues = await _call_fn(get_leagues, client)
-    leagues = [row for row in leagues if await _league_row_allowed(row)]
-    log(f"[scan] allowed_leagues={len(leagues)}")
+    leagues_all = await _call_fn(get_leagues, client)
+    leagues = [row for row in leagues_all if await _league_row_allowed(row)]
+
+    # Quota safety: clamp number of leagues scanned this run
+    total_allowed = len(leagues)
+    if total_allowed > MAX_LEAGUES_PER_RUN:
+        leagues = leagues[:MAX_LEAGUES_PER_RUN]
+        log(f"[scan] allowed_leagues={total_allowed} capped_to={MAX_LEAGUES_PER_RUN}")
+    else:
+        log(f"[scan] allowed_leagues={total_allowed}")
 
     if not leagues:
         return []
@@ -197,7 +208,6 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
                 if not lid or not season:
                     return
                 res = await _call_fn(by_date_fn, client, lid, season, day)
-                # collect NS only
                 adds = [f for f in (res or []) if _status(f) in NS_STATES]
                 return adds
             except Exception as e:
