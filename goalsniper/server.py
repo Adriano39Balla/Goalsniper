@@ -9,7 +9,7 @@ from typing import Optional, Any, Dict, Tuple, List
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Query, Response
 
-app = FastAPI(title="Goalsniper", version="1.6.2")
+app = FastAPI(title="Goalsniper", version="1.6.3")
 
 # -------------------------
 # env helpers
@@ -315,7 +315,6 @@ async def debug_functions(token: str = Query("")):
     api     = _safe_import("goalsniper.api_football")
     tips    = _safe_import("goalsniper.tips")
 
-    # Which functions scanner resolved
     info = {
         "scanner.builderFn": getattr(scanner, "FOUND_BUILDER_NAME", None),
         "scanner.liveApiFn": getattr(scanner, "FOUND_LIVE_API_NAME", None),
@@ -359,7 +358,6 @@ async def debug_leagues_today(token: str = Query(""), cap: int = Query(50)):
         leagues = await api.get_current_leagues(client)
         eff = await filters.get_filters()
 
-        # filter leagues the same way scanner does
         def allowed(row: Dict) -> bool:
             lname = (row.get("leagueName") or "").upper()
             if not lname:
@@ -403,3 +401,79 @@ async def debug_leagues_today(token: str = Query(""), cap: int = Query(50)):
             "day": day,
             "data": out,
         }
+
+@app.get("/debug/live-fixtures")
+async def debug_live_fixtures(token: str = Query("")):
+    _auth_qs(token)
+    api = _safe_import("goalsniper.api_football")
+    filters = _safe_import("goalsniper.filters")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            live_fixtures = await api.get_live_fixtures(client)
+            eff = await filters.get_filters()
+
+            def passes_filters(fx: Dict) -> bool:
+                league = (fx.get("league") or {})
+                lname = (league.get("name") or "").upper()
+                country = (league.get("country") or "").upper()
+                if eff["excludeKeywords"] and any(bad in lname for bad in eff["excludeKeywords"]):
+                    return False
+                if eff["allowLeagueKeywords"] and not any(k in lname for k in eff["allowLeagueKeywords"]):
+                    return False
+                if eff["allowCountries"] and country and country not in eff["allowCountries"]:
+                    return False
+                return True
+
+            passing = [fx for fx in live_fixtures if passes_filters(fx)]
+
+            return {
+                "totalLiveFixtures": len(live_fixtures),
+                "passingFilters": len(passing),
+                "passingFixtures": [
+                    {
+                        "id": (fx.get("fixture") or {}).get("id"),
+                        "league": (fx.get("league") or {}).get("name"),
+                        "country": (fx.get("league") or {}).get("country"),
+                        "home": (fx.get("teams") or {}).get("home", {}).get("name"),
+                        "away": (fx.get("teams") or {}).get("away", {}).get("name"),
+                        "minute": (fx.get("fixture") or {}).get("status", {}).get("elapsed"),
+                        "score": f"{(fx.get('goals') or {}).get('home', 0)}-{(fx.get('goals') or {}).get('away', 0)}"
+                    }
+                    for fx in passing
+                ]
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+@app.get("/debug/diagnostics")
+async def debug_diagnostics(token: str = Query("")):
+    """
+    One-shot dashboard: returns functions resolved, filters, live count,
+    and a small sample of passing live fixtures.
+    """
+    _auth_qs(token)
+    # Reuse existing endpoints internally
+    funcs = await debug_functions(token)
+    fltrs = await debug_filters(token)
+    live_count = await debug_live_count(token)
+
+    # Try to get a small sample of passing live fixtures
+    live_sample: Dict[str, Any] = {}
+    try:
+        lf = await debug_live_fixtures(token)
+        if isinstance(lf, dict):
+            live_sample = {
+                "totalLiveFixtures": lf.get("totalLiveFixtures"),
+                "passingFilters": lf.get("passingFilters"),
+                "sample": (lf.get("passingFixtures") or [])[:10],
+            }
+    except Exception as e:
+        live_sample = {"error": str(e)}
+
+    return {
+        "functions": funcs,
+        "filters": fltrs,
+        "liveCount": live_count,
+        "liveSample": live_sample,
+    }
