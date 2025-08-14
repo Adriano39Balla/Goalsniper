@@ -7,6 +7,9 @@ services:
     startCommand: "uvicorn goalsniper.server:app --host 0.0.0.0 --port $PORT"
     autoDeploy: true
     envVars:
+      # use the name the code expects; or keep both to be safe
+      - key: API_KEY
+        sync: false
       - key: APISPORTS_KEY
         sync: false
       - key: TELEGRAM_BOT_TOKEN
@@ -17,6 +20,8 @@ services:
         generateValue: true
       - key: TELEGRAM_WEBHOOK_TOKEN
         generateValue: true
+      - key: DB_PATH
+        value: "/data/goalsniper.db"
       - key: SCAN_DAYS
         value: "1"
       - key: MAX_CONCURRENT_REQUESTS
@@ -27,8 +32,6 @@ services:
         value: "150"
       - key: MIN_CONFIDENCE_TO_SEND
         value: "0.58"
-      - key: LEAGUE_EXCLUDE_TYPES
-        value: ""
       - key: LIVE_ENABLED
         value: "true"
       - key: LIVE_MINUTE_MIN
@@ -39,6 +42,7 @@ services:
         value: "80"
       - key: TZ
         value: "UTC"
+
   - type: cron
     name: goalsniper-cron
     plan: free
@@ -47,12 +51,16 @@ services:
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python -m goalsniper.run_once"
     envVars:
+      - key: API_KEY
+        sync: false
       - key: APISPORTS_KEY
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: DB_PATH
+        value: "/data/goalsniper.db"
       - key: SCAN_DAYS
         value: "1"
       - key: MAX_CONCURRENT_REQUESTS
@@ -63,8 +71,6 @@ services:
         value: "150"
       - key: MIN_CONFIDENCE_TO_SEND
         value: "0.58"
-      - key: LEAGUE_EXCLUDE_TYPES
-        value: ""
       - key: LIVE_ENABLED
         value: "false"
       - key: TZ
