@@ -130,10 +130,13 @@ async def generate_tips_for_fixture(
         return tips
 
     status  = fx_info.get("status") or {}
-    minute  = status.get("elapsed")
+    minute  = int(status.get("elapsed") or 0)
+    is_live = minute > 0
+
     goals   = fx.get("goals") or {}
     goals_h = int(goals.get("home") or 0)
     goals_a = int(goals.get("away") or 0)
+    total_goals = goals_h + goals_a
 
     try:
         home_stats, away_stats = await _fetch_stats_pair(client, league_id, season, int(home_id), int(away_id))
@@ -158,7 +161,7 @@ async def generate_tips_for_fixture(
 
     picks: List[Tuple[str, str, float, float]] = []
 
-    # 1X2 (only if there is a clear winner gap ≥ 0.02)
+    # 1X2
     gap = max(p_home, p_draw, p_away) - sorted([p_home, p_draw, p_away])[1]
     if gap >= 0.02:
         if p_home >= p_draw and p_home >= p_away:
@@ -168,10 +171,7 @@ async def generate_tips_for_fixture(
         else:
             picks.append(("1X2", "DRAW", p_draw, expected_goals))
 
-    is_live = bool(minute)
-    total_goals = goals_h + goals_a
-
-    # Over/Under 2.5 (skip if already decided live)
+    # Over/Under 2.5
     if not (is_live and total_goals >= 3):
         eg_for_ou = expected_goals_live if is_live else expected_goals
         p_over  = _clamp01((eg_for_ou - 2.5) * 0.25 + 0.5)
@@ -184,7 +184,7 @@ async def generate_tips_for_fixture(
             eg_for_ou,
         ))
 
-    # BTTS (skip if already decided YES live)
+    # BTTS
     if not (is_live and goals_h > 0 and goals_a > 0):
         p_btts      = _btts_prob(lambda_home, lambda_away)
         p_btts_live = _btts_prob(lambda_home_live, lambda_away_live)
@@ -193,7 +193,7 @@ async def generate_tips_for_fixture(
                       p_btts_use, expected_goals_live if is_live else expected_goals))
 
     # 1st Half OU
-    if not minute or int(minute) < 45:
+    if minute < 45:
         fh_factor   = _first_half_remaining_factor(minute)
         fh_xg_total = _first_half_xg(expected_goals) * fh_factor
 
@@ -206,14 +206,13 @@ async def generate_tips_for_fixture(
         sel15, prob15 = _ou(1.5)
         best_sel, best_prob = (sel10, prob10) if prob10 >= prob15 else (sel15, prob15)
 
-        # if live in 1H and goals already settle the chosen line, skip
-        if not (is_live and int(minute or 0) < 45 and (
+        if not (is_live and (
             (best_sel.startswith("OVER") and total_goals >= float(best_sel.split()[1])) or
             (best_sel.startswith("UNDER") and total_goals > float(best_sel.split()[1]))
         )):
             picks.append(("1ST_HALF_OU", best_sel, best_prob, fh_xg_total))
 
-    # Format tips (no thresholding here; scanner calibrates & gates)
+    # Format tips
     league = fixture.get("league") or {}
     tms    = fixture.get("teams")  or {}
     for market, selection, prob, xg in picks:
@@ -230,11 +229,11 @@ async def generate_tips_for_fixture(
             "market": market,
             "selection": selection,
             "probability": round(float(prob), 3),
-            "confidence": round(float(conf), 3),  # overwritten after calibration
+            "confidence": round(float(conf), 3),
             "expectedGoals": round(float(xg), 2),
             "note": ("LIVE" if is_live else None),
             "live": is_live,
-            "minute": int(minute or 0),
+            "minute": minute,
             "score": f"{goals_h}-{goals_a}",
         })
 
