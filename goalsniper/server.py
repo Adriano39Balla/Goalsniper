@@ -249,6 +249,16 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
 
     return {"ok": True}
 
+@app.get("/feedback")
+async def feedback_list(token: str = Query(""), limit: int = Query(50)):
+    _auth_qs(token)
+    storage = _safe_import("goalsniper.storage")
+    tips = await storage.all_tips_with_feedback(limit)
+    return {
+        "count": len(tips),
+        "tips": tips
+    }
+
 # -------------------------
 # Daily digest
 # -------------------------
