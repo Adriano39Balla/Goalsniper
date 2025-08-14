@@ -36,12 +36,8 @@ from .learning import calibrate_probability, dynamic_conf_threshold
 # ---------- Limits from .env ----------
 MAX_TODAY_FIXTURES = max(0, int(os.getenv("MAX_TODAY_FIXTURES", "24")))
 BUILD_FIXTURE_LIMIT = max(0, int(os.getenv("BUILD_FIXTURE_LIMIT", "20")))
-
-# New: safe parallelism for leagues and tip builds (token bucket still protects upstream)
 LEAGUE_SCAN_CONCURRENCY = max(1, int(os.getenv("LEAGUE_SCAN_CONCURRENCY", "6")))
 BUILD_CONCURRENCY = max(1, int(os.getenv("BUILD_CONCURRENCY", "6")))
-
-# NEW: hard cap on leagues scanned per run (quota safety net)
 MAX_LEAGUES_PER_RUN = max(1, int(os.getenv("MAX_LEAGUES_PER_RUN", "24")))
 
 # ---------- Status sets ----------
@@ -53,7 +49,6 @@ FOUND_BUILDER_NAME: Optional[str] = None
 FOUND_LIVE_API_NAME: Optional[str] = None
 FOUND_DATE_API_NAME: Optional[str] = None
 
-
 # ---------- Resolve helpers ----------
 def _resolve_fn_with_name(mod, candidates, required=True):
     for name in candidates:
@@ -63,7 +58,6 @@ def _resolve_fn_with_name(mod, candidates, required=True):
     if required:
         warn(f"Missing functions. Tried: {candidates} in module {mod.__name__}")
     return None, None
-
 
 def _get_live_api() -> Optional[Callable]:
     global FOUND_LIVE_API_NAME
@@ -75,7 +69,6 @@ def _get_live_api() -> Optional[Callable]:
     FOUND_LIVE_API_NAME = nm
     return fn
 
-
 def _get_by_date_api() -> Optional[Callable]:
     global FOUND_DATE_API_NAME
     fn, nm = _resolve_fn_with_name(
@@ -86,71 +79,43 @@ def _get_by_date_api() -> Optional[Callable]:
     FOUND_DATE_API_NAME = nm
     return fn
 
-
 def _get_build_tips_fn() -> Optional[Callable]:
     global FOUND_BUILDER_NAME
     fn, nm = _resolve_fn_with_name(
         tip_engine,
         [
             "generate_tips_for_fixture", "build_tips_for_fixture",
-            "predict_fixture", "create_tips_for_fixture"
+            "predict_fixture", "create_tips_for_fixture",
         ],
         required=False,
     )
     FOUND_BUILDER_NAME = nm
     return fn
 
-
 # ---------- Async call helpers ----------
 async def _maybe_await(x):
     return await x if inspect.isawaitable(x) else x
 
-
 async def _call_fn(fn, *args, **kwargs):
     return await _maybe_await(fn(*args, **kwargs))
-
 
 # ---------- Fixture utils ----------
 def _status(fx: Dict) -> str:
     return (fx.get("fixture", {}).get("status", {}) or {}).get("short") or ""
 
-
 def _elapsed_minute(fx: Dict) -> int:
     return int((fx.get("fixture", {}).get("status", {}) or {}).get("elapsed") or 0)
-
 
 def _fixture_id(fx_or_tip: Dict) -> int:
     if "fixtureId" in fx_or_tip:
         return int(fx_or_tip["fixtureId"])
     return int((fx_or_tip.get("fixture", {}) or {}).get("id") or 0)
 
-
 def _league_id(fx: Dict) -> int:
     return int((fx.get("league", {}) or {}).get("id") or 0)
 
-
 def _season(fx: Dict) -> int:
     return int((fx.get("league", {}) or {}).get("season") or 0)
-
-
-# ---------- League filters (DB/env unified) ----------
-async def _league_row_allowed(row: Dict) -> bool:
-    filters = await cfg_filters.get_filters()
-    lname = (row.get("leagueName") or "").upper()
-    country = (row.get("country") or "").upper()
-    if not lname:
-        return False
-    for bad in filters["excludeKeywords"]:
-        if bad in lname:
-            return False
-    allow_keys = filters["allowLeagueKeywords"]
-    if allow_keys and not any(k in lname for k in allow_keys):
-        return False
-    allow_countries = filters["allowCountries"]
-    if allow_countries and country and (country not in allow_countries):
-        return False
-    return True
-
 
 # ---------- Fetchers ----------
 async def _fetch_live(client: httpx.AsyncClient) -> List[Dict]:
@@ -170,20 +135,37 @@ async def _fetch_live(client: httpx.AsyncClient) -> List[Dict]:
         out.append(f)
     return out
 
-
 async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
     if MAX_TODAY_FIXTURES <= 0:
         return []
     get_leagues = getattr(api, "get_current_leagues", None)
-    by_date_fn = _get_by_date_api()
+    by_date_fn  = _get_by_date_api()
     if not get_leagues or not by_date_fn:
         warn("No fixtures-by-date path available; skipping scheduled scan")
         return []
 
-    leagues_all = await _call_fn(get_leagues, client)
-    leagues = [row for row in leagues_all if await _league_row_allowed(row)]
+    # Fetch once; filters module itself caches for TTL
+    eff = await cfg_filters.get_filters()
+    allow_keys = eff.get("allowLeagueKeywords", [])
+    ex_keys    = eff.get("excludeKeywords", [])
+    allow_c    = eff.get("allowCountries", set())
 
-    # Quota safety: clamp number of leagues scanned this run
+    def allowed(row: Dict) -> bool:
+        lname = (row.get("leagueName") or "").upper()
+        if not lname:
+            return False
+        if ex_keys and any(bad in lname for bad in ex_keys):
+            return False
+        if allow_keys and not any(k in lname for k in allow_keys):
+            return False
+        country = (row.get("country") or "").upper()
+        if allow_c and country and country not in allow_c:
+            return False
+        return True
+
+    leagues_all = await _call_fn(get_leagues, client)
+    leagues = [row for row in leagues_all if allowed(row)]
+
     total_allowed = len(leagues)
     if total_allowed > MAX_LEAGUES_PER_RUN:
         leagues = leagues[:MAX_LEAGUES_PER_RUN]
@@ -196,22 +178,20 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
 
     out: List[Dict] = []
     day = datetime.now(timezone.utc).date().isoformat()
-
     sem = asyncio.Semaphore(LEAGUE_SCAN_CONCURRENCY)
 
     async def _pull_league(row: Dict):
-        nonlocal out
         async with sem:
             try:
                 lid = int(row.get("leagueId") or 0)
                 season = int(row.get("season") or 0)
                 if not lid or not season:
-                    return
+                    return []
                 res = await _call_fn(by_date_fn, client, lid, season, day)
-                adds = [f for f in (res or []) if _status(f) in NS_STATES]
-                return adds
+                return [f for f in (res or []) if _status(f) in NS_STATES]
             except Exception as e:
                 warn("fixtures_by_date failed:", str(e))
+                return []
             finally:
                 await asyncio.sleep(STATS_REQUEST_DELAY_MS / 1000.0)
 
@@ -220,19 +200,17 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
         if len(out) >= MAX_TODAY_FIXTURES:
             break
         chunk = await fut
-        if chunk:
-            for f in chunk:
-                if len(out) >= MAX_TODAY_FIXTURES:
-                    break
-                out.append(f)
+        for f in chunk:
+            if len(out) >= MAX_TODAY_FIXTURES:
+                break
+            out.append(f)
 
     return out
-
 
 # ---------- Tip generation ----------
 def _dedupe_in_run(candidates: List[Dict]) -> Tuple[List[Dict], int]:
     seen = set()
-    out = []
+    out: List[Dict] = []
     removed = 0
     for t in candidates:
         fid = _fixture_id(t)
@@ -243,7 +221,6 @@ def _dedupe_in_run(candidates: List[Dict]) -> Tuple[List[Dict], int]:
         out.append(t)
     return out, removed
 
-
 async def _invoke_builder(build_fn: Callable, client: httpx.AsyncClient, fixture: Dict) -> Optional[List[Dict]]:
     params = list(inspect.signature(build_fn).parameters.keys())
     kwargs = {}
@@ -251,8 +228,9 @@ async def _invoke_builder(build_fn: Callable, client: httpx.AsyncClient, fixture
         kwargs["league_id"] = _league_id(fixture)
     if "season" in params:
         kwargs["season"] = _season(fixture)
+    if "fixture_id" in params:
+        kwargs["fixture_id"] = _fixture_id(fixture)
     return await _call_fn(build_fn, client, fixture, **kwargs)
-
 
 async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dict]) -> Tuple[List[Dict], Dict[str, int]]:
     stats = {"raw_candidates": 0, "low_conf": 0, "inrun_dedup_removed": 0}
@@ -268,22 +246,21 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
                 return await _invoke_builder(build_fn, client, f)
             except Exception as e:
                 warn("Tip build failed for fixture", _fixture_id(f), str(e))
+                return None
             finally:
                 await asyncio.sleep(STATS_REQUEST_DELAY_MS / 1000.0)
 
-    slice_fx = fixtures[:BUILD_FIXTURE_LIMIT]
-    tasks = [asyncio.create_task(_build_one(f)) for f in slice_fx]
     raw: List[Dict] = []
+    tasks = [asyncio.create_task(_build_one(f)) for f in fixtures[:BUILD_FIXTURE_LIMIT]]
     for fut in asyncio.as_completed(tasks):
-        r = await fut
-        if r:
-            raw.extend(r)
+        res = await fut
+        if res:
+            raw.extend(res)
 
     deduped, removed = _dedupe_in_run(raw)
     stats["raw_candidates"] = len(deduped)
     stats["inrun_dedup_removed"] = removed
     return deduped, stats
-
 
 # ---------- Learning gate ----------
 async def _calibrate_and_filter(t: dict) -> Optional[dict]:
@@ -303,7 +280,6 @@ async def _calibrate_and_filter(t: dict) -> Optional[dict]:
         warn("learning gate failed:", str(e))
         return None
 
-
 # ---------- Sending ----------
 async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
     from . import telegram as tg
@@ -313,14 +289,12 @@ async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
     log(f"Sent tip id={tip_id} fixture={tip['fixtureId']} {tip['market']} {tip['selection']} conf={tip['confidence']:.2f}")
     return True
 
-
 async def _recently_sent(fid: int) -> bool:
     if DUPLICATE_SUPPRESS_FOREVER:
         return False
     if DUPLICATE_SUPPRESS_MINUTES <= 0:
         return False
     return await has_fixture_tip_recent(fid, DUPLICATE_SUPPRESS_MINUTES)
-
 
 async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: Optional[int] = None) -> Tuple[int, Dict[str, int]]:
     stats = {"ever_sent_skipped": 0, "daily_cap_hits": 0, "low_conf": 0}
@@ -350,15 +324,20 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: O
 
     return sent, stats
 
-
 # ---------- Entrypoint ----------
 async def run_scan_and_send() -> Dict[str, int]:
     started = datetime.now(timezone.utc)
+
     async with httpx.AsyncClient(timeout=30) as client:
-        live_fixtures = await _fetch_live(client) if LIVE_ENABLED else []
-        today_fixtures = await _fetch_today(client)
-        live_tips, _ = await _build_tips_for_fixtures(client, live_fixtures) if live_fixtures else ([], {})
-        today_tips, _ = await _build_tips_for_fixtures(client, today_fixtures) if today_fixtures else ([], {})
+        live_fixtures: List[Dict] = await _fetch_live(client) if LIVE_ENABLED else []
+        today_fixtures: List[Dict] = await _fetch_today(client)
+
+        live_tips: List[Dict] = []
+        today_tips: List[Dict] = []
+        if live_fixtures:
+            live_tips, _ = await _build_tips_for_fixtures(client, live_fixtures)
+        if today_fixtures:
+            today_tips, _ = await _build_tips_for_fixtures(client, today_fixtures)
 
         combined, _ = _dedupe_in_run(live_tips + today_tips)
         sent_total, _ = await _send_tips(client, combined, await count_sent_today())
