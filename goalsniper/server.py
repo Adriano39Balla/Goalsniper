@@ -4,12 +4,12 @@ import os
 import importlib
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional, Any, Dict, Tuple
+from typing import Optional, Any, Dict, Tuple, List
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Query, Response
 
-app = FastAPI(title="Goalsniper", version="1.6.1")
+app = FastAPI(title="Goalsniper", version="1.6.2")
 
 # -------------------------
 # env helpers
@@ -20,7 +20,6 @@ def _env(name: str, default: str = "") -> str:
 def _run_token() -> str:
     tok = _env("RUN_TOKEN", "")
     if not tok:
-        # don't crash process; surface clearly
         raise HTTPException(status_code=500, detail="RUN_TOKEN not set")
     return tok
 
@@ -75,8 +74,8 @@ async def root(request: Request):
 # -------------------------
 _scan_lock = asyncio.Lock()
 _scan_task: Optional[asyncio.Task] = None
-_last_run_started: Optional[str] = None
-_last_run_finished: Optional[str] = None
+_last_run_started: Optional[str] = None   # ISO time
+_last_run_finished: Optional[str] = None  # ISO time
 _last_run_result: Optional[Dict[str, Any]] = None
 _last_run_error: Optional[str] = None
 
@@ -105,10 +104,7 @@ async def _do_scan():
         _last_run_finished = datetime.now(timezone.utc).isoformat()
 
 def _kick_off_background_scan() -> Tuple[bool, str]:
-    """
-    Start a background scan if none is running.
-    Returns (started, reason). reason is '' when started is True.
-    """
+    """Start a background scan if none is running. Returns (started, reason)."""
     global _scan_task
     if _scan_task and not _scan_task.done():
         return False, "already_running"
@@ -249,16 +245,6 @@ async def telegram_webhook(request: Request, token: Optional[str] = None):
 
     return {"ok": True}
 
-@app.get("/feedback")
-async def feedback_list(token: str = Query(""), limit: int = Query(50)):
-    _auth_qs(token)
-    storage = _safe_import("goalsniper.storage")
-    tips = await storage.all_tips_with_feedback(limit)
-    return {
-        "count": len(tips),
-        "tips": tips
-    }
-
 # -------------------------
 # Daily digest
 # -------------------------
@@ -318,3 +304,102 @@ async def digest_get(
                 result["error"] = f"telegram: {e}"
 
     return result
+
+# -------------------------
+# Debug endpoints (browser‑friendly)
+# -------------------------
+@app.get("/debug/functions")
+async def debug_functions(token: str = Query("")):
+    _auth_qs(token)
+    scanner = _safe_import("goalsniper.scanner")
+    api     = _safe_import("goalsniper.api_football")
+    tips    = _safe_import("goalsniper.tips")
+
+    # Which functions scanner resolved
+    info = {
+        "scanner.builderFn": getattr(scanner, "FOUND_BUILDER_NAME", None),
+        "scanner.liveApiFn": getattr(scanner, "FOUND_LIVE_API_NAME", None),
+        "scanner.dateApiFn": getattr(scanner, "FOUND_DATE_API_NAME", None),
+        "api_has.get_current_leagues": callable(getattr(api, "get_current_leagues", None)),
+        "api_has.get_fixtures_by_date": callable(getattr(api, "get_fixtures_by_date", None)),
+        "api_has.get_live_fixtures": callable(getattr(api, "get_live_fixtures", None)),
+        "tips_has.generate_tips_for_fixture": callable(getattr(tips, "generate_tips_for_fixture", None)),
+    }
+    return info
+
+@app.get("/debug/filters")
+async def debug_filters(token: str = Query("")):
+    _auth_qs(token)
+    filters = _safe_import("goalsniper.filters")
+    eff = await filters.get_filters()
+    return {
+        "allowCountries": sorted(list(eff.get("allowCountries", set()))),
+        "allowLeagueKeywords": eff.get("allowLeagueKeywords", []),
+        "excludeKeywords": eff.get("excludeKeywords", []),
+    }
+
+@app.get("/debug/live-count")
+async def debug_live_count(token: str = Query("")):
+    _auth_qs(token)
+    api = _safe_import("goalsniper.api_football")
+    async with httpx.AsyncClient(timeout=20) as client:
+        try:
+            data = await api.get_live_fixtures(client)
+            return {"liveFixturesPassingFilters": len(data)}
+        except Exception as e:
+            return {"error": str(e)}
+
+@app.get("/debug/leagues-today")
+async def debug_leagues_today(token: str = Query(""), cap: int = Query(50)):
+    _auth_qs(token)
+    api = _safe_import("goalsniper.api_football")
+    filters = _safe_import("goalsniper.filters")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        leagues = await api.get_current_leagues(client)
+        eff = await filters.get_filters()
+
+        # filter leagues the same way scanner does
+        def allowed(row: Dict) -> bool:
+            lname = (row.get("leagueName") or "").upper()
+            if not lname:
+                return False
+            if eff["excludeKeywords"] and any(bad in lname for bad in eff["excludeKeywords"]):
+                return False
+            if eff["allowLeagueKeywords"] and not any(k in lname for k in eff["allowLeagueKeywords"]):
+                return False
+            c = (row.get("country") or "").upper()
+            if eff["allowCountries"] and c and c not in eff["allowCountries"]:
+                return False
+            return True
+
+        leagues_ok = [r for r in leagues if allowed(r)]
+        day = datetime.now(timezone.utc).date().isoformat()
+
+        out: List[Dict[str, Any]] = []
+        for row in leagues_ok[:max(1, int(cap))]:
+            lid = int(row.get("leagueId") or 0)
+            season = int(row.get("season") or 0)
+            try:
+                fixes = await api.get_fixtures_by_date(client, lid, season, day)
+                out.append({
+                    "leagueId": lid,
+                    "leagueName": row.get("leagueName"),
+                    "country": row.get("country"),
+                    "season": season,
+                    "fixturesToday": len(fixes),
+                })
+            except Exception as e:
+                out.append({
+                    "leagueId": lid,
+                    "leagueName": row.get("leagueName"),
+                    "country": row.get("country"),
+                    "season": season,
+                    "error": str(e),
+                })
+        return {
+            "allowedLeagues": len(leagues_ok),
+            "sampled": len(out),
+            "day": day,
+            "data": out,
+        }
