@@ -175,6 +175,22 @@ def _day_bounds_utc(d: datetime) -> Tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 @_with_conn
+def _all_tips_with_feedback_sync(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
+    cur = conn.execute("""
+        SELECT id, fixture_id, market, selection, probability, confidence,
+               league_id, season, sent_at, message_id, outcome
+        FROM tips
+        WHERE outcome IS NOT NULL
+        ORDER BY sent_at DESC
+        LIMIT ?
+    """, (int(limit),))
+    rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+async def all_tips_with_feedback(limit: int = 100) -> list[dict]:
+    return await asyncio.to_thread(_all_tips_with_feedback_sync, limit)
+
+@_with_conn
 def _daily_counts_sync(conn: sqlite3.Connection, start_iso: str, end_iso: str) -> dict:
     row = conn.execute(
         "SELECT COUNT(*) AS sent,"
