@@ -144,7 +144,6 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
         warn("No fixtures-by-date path available; skipping scheduled scan")
         return []
 
-    # Fetch once; filters module itself caches for TTL
     eff = await cfg_filters.get_filters()
     allow_keys = eff.get("allowLeagueKeywords", [])
     ex_keys    = eff.get("excludeKeywords", [])
@@ -327,6 +326,11 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: O
 # ---------- Entrypoint ----------
 async def run_scan_and_send() -> Dict[str, int]:
     started = datetime.now(timezone.utc)
+
+    # Warm resolvers so diagnostics always show FOUND_* names
+    _get_live_api()
+    _get_by_date_api()
+    _get_build_tips_fn()
 
     async with httpx.AsyncClient(timeout=30) as client:
         live_fixtures: List[Dict] = await _fetch_live(client) if LIVE_ENABLED else []
