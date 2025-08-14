@@ -25,7 +25,12 @@ def must(name: str) -> str:
     return v
 
 # ---------- required credentials ----------
-API_KEY = must("API_KEY")
+# Accept either API_KEY or APISPORTS_KEY (Railway used APISPORTS_KEY in your config)
+_API_KEY = os.getenv("API_KEY") or os.getenv("APISPORTS_KEY")
+if not _API_KEY:
+    raise RuntimeError("Missing required env: API_KEY (or APISPORTS_KEY)")
+API_KEY = _API_KEY
+
 TELEGRAM_BOT_TOKEN = must("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = must("TELEGRAM_CHAT_ID")
 RUN_TOKEN = must("RUN_TOKEN")
