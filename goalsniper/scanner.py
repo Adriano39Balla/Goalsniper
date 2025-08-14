@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import asyncio
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Callable, Optional, Tuple
 
 import httpx
@@ -143,6 +143,9 @@ async def _fetch_live(client: httpx.AsyncClient) -> List[Dict]:
     return out
 
 async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
+    """
+    Pulls fixtures across SCAN_DAYS (today .. today+SCAN_DAYS-1), respecting filters and caps.
+    """
     if MAX_TODAY_FIXTURES <= 0:
         return []
     get_leagues = getattr(api, "get_current_leagues", None)
@@ -183,17 +186,19 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
         return []
 
     out: List[Dict] = []
-    day = datetime.now(timezone.utc).date().isoformat()
+    start_day = datetime.now(timezone.utc).date()
+    days = [start_day + timedelta(days=offset) for offset in range(max(1, int(SCAN_DAYS)))]
+
     sem = asyncio.Semaphore(LEAGUE_SCAN_CONCURRENCY)
 
-    async def _pull_league(row: Dict):
+    async def _pull_league_day(row: Dict, day_iso: str):
         async with sem:
             try:
                 lid = int(row.get("leagueId") or 0)
                 season = int(row.get("season") or 0)
                 if not lid or not season:
                     return []
-                res = await _call_fn(by_date_fn, client, lid, season, day)
+                res = await _call_fn(by_date_fn, client, lid, season, day_iso)
                 return [f for f in (res or []) if _status(f) in NS_STATES]
             except Exception as e:
                 warn("fixtures_by_date failed:", str(e))
@@ -201,7 +206,13 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
             finally:
                 await asyncio.sleep(STATS_REQUEST_DELAY_MS / 1000.0)
 
-    tasks = [asyncio.create_task(_pull_league(row)) for row in leagues]
+    # schedule pulls: breadth-first by day to get near-term games first
+    tasks = []
+    for day in days:
+        day_iso = day.isoformat()
+        for row in leagues:
+            tasks.append(asyncio.create_task(_pull_league_day(row, day_iso)))
+
     for fut in asyncio.as_completed(tasks):
         if len(out) >= MAX_TODAY_FIXTURES:
             break
@@ -212,7 +223,7 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
             out.append(f)
 
     if SCANNER_DEBUG:
-        log(f"[scan] scheduled fixtures (NS): {len(out)}")
+        log(f"[scan] scheduled fixtures (NS) across {len(days)} day(s): {len(out)}")
     return out
 
 # ---------- Tip generation ----------
@@ -275,11 +286,6 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
 
 # ---------- Learning gate ----------
 async def _calibrate_and_filter(t: dict) -> Optional[dict]:
-    """
-    Returns:
-      - dict(t) with updated probability/confidence (+ 'soft': False/True)  OR
-      - None if rejected.
-    """
     try:
         p_raw = float(t.get("probability", 0.5))
         market = str(t.get("market", ""))
@@ -290,14 +296,12 @@ async def _calibrate_and_filter(t: dict) -> Optional[dict]:
         dyn_thr = await dynamic_conf_threshold(market)
         hard_thr = max(dyn_thr, MIN_CONFIDENCE_TO_SEND)
 
-        # Decide
         if conf >= hard_thr:
             t["probability"] = round(p_cal, 3)
             t["confidence"] = round(conf, 3)
             t["soft"] = False
             return t
 
-        # Soft window
         if SOFT_TIPS_PER_RUN > 0 and SOFT_MIN_CONF > 0.0 and conf >= SOFT_MIN_CONF:
             t["probability"] = round(p_cal, 3)
             t["confidence"] = round(conf, 3)
@@ -355,7 +359,6 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: O
             stats["low_conf"] += 1
             continue
 
-        # Enforce soft budget
         if tt.get("soft"):
             if soft_used >= SOFT_TIPS_PER_RUN:
                 if SCANNER_DEBUG:
@@ -410,3 +413,4 @@ async def run_scan_and_send() -> Dict[str, int]:
             "dateApiFn": FOUND_DATE_API_NAME,
         },
     }
+    
