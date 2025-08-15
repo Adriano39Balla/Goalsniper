@@ -25,7 +25,7 @@ def must(name: str) -> str:
     return v
 
 # ---------- required credentials ----------
-# Accept either API_KEY or APISPORTS_KEY (Railway commonly uses APISPORTS_KEY)
+# Accept either API_KEY or APISPORTS_KEY
 _API_KEY = os.getenv("API_KEY") or os.getenv("APISPORTS_KEY")
 if not _API_KEY:
     raise RuntimeError("Missing required env: API_KEY (or APISPORTS_KEY)")
@@ -43,7 +43,7 @@ PORT = int(os.getenv("PORT", "8080"))
 SCAN_DAYS = max(1, _int("SCAN_DAYS", "1"))
 
 MAX_TIPS_PER_RUN = max(1, _int("MAX_TIPS_PER_RUN", "25"))
-MIN_CONFIDENCE_TO_SEND = _float01("MIN_CONFIDENCE_TO_SEND", "0.78")
+MIN_CONFIDENCE_TO_SEND = _float01("MIN_CONFIDENCE_TO_SEND", "0.58")
 DAILY_TIP_CAP = max(1, _int("DAILY_TIP_CAP", "15"))
 
 DUPLICATE_SUPPRESS_FOREVER = _bool("DUPLICATE_SUPPRESS_FOREVER", "true")
@@ -51,11 +51,11 @@ DUPLICATE_SUPPRESS_MINUTES = _int("DUPLICATE_SUPPRESS_MINUTES", "360")
 
 LIVE_ENABLED = _bool("LIVE_ENABLED", "true")
 LIVE_MINUTE_MIN = _int("LIVE_MINUTE_MIN", "10")
-LIVE_MINUTE_MAX = _int("LIVE_MINUTE_MAX", "80")
-LIVE_MAX_FIXTURES = _int("LIVE_MAX_FIXTURES", "30")
+LIVE_MINUTE_MAX = _int("LIVE_MINUTE_MAX", "85")
+LIVE_MAX_FIXTURES = _int("LIVE_MAX_FIXTURES", "80")
 
-STATS_REQUEST_DELAY_MS = max(50, _int("STATS_REQUEST_DELAY_MS", "150"))
-MAX_CONCURRENT_REQUESTS = max(1, _int("MAX_CONCURRENT_REQUESTS", "4"))
+STATS_REQUEST_DELAY_MS = max(50, _int("STATS_REQUEST_DELAY_MS", "200"))
+MAX_CONCURRENT_REQUESTS = max(1, _int("MAX_CONCURRENT_REQUESTS", "6"))
 
 THROTTLE_TIPS_PER_WINDOW = max(1, _int("THROTTLE_TIPS_PER_WINDOW", "8"))
 THROTTLE_WINDOW_MINUTES = max(1, _int("THROTTLE_WINDOW_MINUTES", "10"))
@@ -69,12 +69,18 @@ CACHE_TTL_LIVE = max(0, _int("CACHE_TTL_LIVE", "90"))
 CACHE_TTL_TEAM_STATS = max(0, _int("CACHE_TTL_TEAM_STATS", "600"))
 CACHE_TTL_ODDS = max(0, _int("CACHE_TTL_ODDS", "600"))
 
-# Optional filters (empty => allow all; also mirrored in DB via filters.py)
+# ---------- league filters ----------
+# Empty allow-lists => allow all countries/leagues
 COUNTRY_FLAGS_ALLOW = os.getenv("COUNTRY_FLAGS_ALLOW", "")
 LEAGUE_ALLOW_KEYWORDS = os.getenv("LEAGUE_ALLOW_KEYWORDS", "")
+
+# Keep only the junk out (case-insensitive, matched in league names)
 EXCLUDE_KEYWORDS = os.getenv(
     "EXCLUDE_KEYWORDS",
-    "U19,U20,U21,U23,YOUTH,WOMEN,FRIENDLY,CLUB FRIENDLIES,RESERVE,AMATEUR,B-TEAM",
+    # friendlies + youth/reserve/academy/B teams + misc exhibitions
+    "FRIENDLY,FRIENDLIES,CLUB FRIENDLY,CLUB FRIENDLIES,TEST,TRIAL,"
+    "U17,U18,U19,U20,U21,U23,YOUTH,YTH,ACADEMY,RESERVE,RESERVES,B-TEAM,"
+    "ALL STARS,ALL-STARS,LEGENDS"
 )
 
 __all__ = [
