@@ -139,35 +139,6 @@ def format_tip_message(tip: dict) -> str:
     ]
     return "\n".join(lines)
 
-# --- MOTD (Match of the Day) --------------------------------------------------
-
-def format_motd_message(tip: dict) -> str:
-    """
-    Pretty MOTD message. Reuses the same fields a normal tip uses,
-    but adds the trophy header and a couple of extra numbers.
-    """
-    base = format_tip_message(tip).splitlines()
-    # Replace the header line
-    if base and base[0].startswith("⚽️"):
-        base[0] = "🏆 <b>Goalsniper — Match of the Day</b>"
-    # Add expected goals if available
-    xg = tip.get("expectedGoals")
-    if xg is not None:
-        # Insert above the status line (second to last before blank line)
-        for i, line in enumerate(base):
-            if line.startswith("🕒 ") or line.startswith("⏱️ "):
-                base.insert(i, f"🔮 <b>Model xG:</b> {xg:.2f}")
-                break
-    return "\n".join(base)
-
-async def send_motd(client: httpx.AsyncClient, tip: dict) -> int:
-    """
-    Sends a MOTD message (no buttons; we want a clean highlight).
-    Returns Telegram message_id or 0 on failure.
-    """
-    text = format_motd_message(tip)
-    return await send_text(client, text)
-
 async def send_text(client: httpx.AsyncClient, text: str, reply_markup: dict | None = None) -> int:
     """
     Safe sender:
@@ -254,3 +225,31 @@ async def send_tip_plain(client: httpx.AsyncClient, tip: dict) -> int:
     if not msg_id:
         warn("send_tip_plain: message_id=0 (Telegram rejected message)")
     return msg_id
+
+# --- MOTD (Match of the Day) --------------------------------------------------
+
+def format_motd_message(tip: dict) -> str:
+    """
+    Pretty MOTD message. Reuses the same fields a normal tip uses,
+    but adds the trophy header and a couple of extra numbers.
+    """
+    base = format_tip_message(tip).splitlines()
+    # Replace the header line
+    if base and base[0].startswith("⚽️"):
+        base[0] = "🏆 <b>Goalsniper — Match of the Day</b>"
+    # Add expected goals if available
+    xg = tip.get("expectedGoals")
+    if xg is not None:
+        for i, line in enumerate(base):
+            if line.startswith("🕒 ") or line.startswith("⏱️ "):
+                base.insert(i, f"🔮 <b>Model xG:</b> {xg:.2f}")
+                break
+    return "\n".join(base)
+
+async def send_motd(client: httpx.AsyncClient, tip: dict) -> int:
+    """
+    Sends a MOTD message (no buttons; we want a clean highlight).
+    Returns Telegram message_id or 0 on failure.
+    """
+    text = format_motd_message(tip)
+    return await send_text(client, text)
