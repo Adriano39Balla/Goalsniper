@@ -26,10 +26,10 @@ def must(name: str) -> str:
 
 # ---------- required credentials ----------
 # Accept either API_KEY or APISPORTS_KEY
-_API_KEY = os.getenv("API_KEY") or os.getenv("APISPORTS_KEY")
+API_KEY = os.getenv("API_KEY")
 if not _API_KEY:
-    raise RuntimeError("Missing required env: API_KEY (or APISPORTS_KEY)")
-API_KEY = _API_KEY
+    raise RuntimeError("Missing required env: API_KEY ")
+API_KEY = API_KEY
 
 TELEGRAM_BOT_TOKEN = must("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = must("TELEGRAM_CHAT_ID")
