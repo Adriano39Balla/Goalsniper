@@ -111,20 +111,6 @@ def _fmt_kickoff(tip: dict) -> str:
     except Exception:
         return str(ko)
 
-# Build a fake tip in the same structure as your real tips
-fake_tip = {
-    "fixtureId": 999999,
-    "leagueId": 12345,
-    "leagueName": "Test League",
-    "homeTeam": "Python FC",
-    "awayTeam": "Telegram United",
-    "market": "1X2",           # match result market
-    "selection": "HOME",       # HOME / DRAW / AWAY
-    "probability": 0.85,       # raw probability
-    "confidence": 0.70,        # must be float, >= min conf to send
-    "note": "This is a test match to verify Telegram tip delivery."
-}
-
 def format_tip_message(tip: dict) -> str:
     home = tip.get("home", "Home")
     away = tip.get("away", "Away")
