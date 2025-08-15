@@ -99,9 +99,13 @@ def get_historic_hit_rate(market: str, suggestion: str) -> Tuple[float, int]:
 
 # ─────────────────────────── Telegram helpers ─────────────────────────────────
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
-    if not TELEGRAM_CHAT_ID or not TELEGRAM_BOT_TOKEN:
-        logging.error("Missing Telegram credentials")
+    if not TELEGRAM_BOT_TOKEN:
+        logging.error("Missing TELEGRAM_BOT_TOKEN")
         return False
+    if not TELEGRAM_CHAT_ID:
+        logging.error("Missing TELEGRAM_CHAT_ID")
+        return False
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
@@ -109,13 +113,17 @@ def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
     }
     if inline_keyboard:
         payload["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard})
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        res = session.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=10)
+        res = session.post(url, data=payload, timeout=10)
         if not res.ok:
-            logging.error(f"[Telegram] Failed: {res.status_code} - {res.text}")
+            logging.error(f"[Telegram] sendMessage FAILED status={res.status_code} body={res.text}")
+        else:
+            logging.info("[Telegram] sendMessage OK")
         return res.ok
     except Exception as e:
-        logging.error(f"[Telegram] Exception: {e}")
+        logging.exception(f"[Telegram] Exception during sendMessage: {e}")
         return False
 
 def answer_callback(callback_id: str, text: str):
@@ -346,6 +354,24 @@ def manual_match_alert():
     match_alert()
     return jsonify({"status": "ok"})
 
+@app.route("/debug/format")
+def debug_format():
+    matches = fetch_live_matches()
+    if not matches:
+        return jsonify({"error": "no matches"}), 200
+    # pick first by index ?i=0
+    try:
+        i = int(request.args.get("i", 0))
+    except Exception:
+        i = 0
+    i = max(0, min(i, len(matches)-1))
+    try:
+        msg, kb, meta = format_human_tip(matches[i])
+        return jsonify({"fixture_id": meta["match_id"], "message": msg, "inline_keyboard": kb})
+    except Exception as e:
+        logging.exception("format_human_tip failed")
+        return jsonify({"error": f"format failed: {e}"}), 500
+
 # (3) Debug endpoint to see current scan results at a glance
 @app.route("/debug/scan")
 def debug_scan():
@@ -355,6 +381,21 @@ def debug_scan():
         "fixture_ids": [ (m.get("fixture",{}) or {}).get("id") for m in data ],
         "has_stats": [ bool(m.get("statistics")) for m in data ],
     })
+
+@app.route("/debug/send")
+def debug_send():
+    limit = int(request.args.get("n", 3))
+    sent = 0
+    matches = fetch_live_matches()
+    for m in matches[:limit]:
+        try:
+            msg, kb, _ = format_human_tip(m)
+            ok = send_telegram(msg, kb)
+            logging.info(f"[DEBUG/SEND] fixture={m.get('fixture',{}).get('id')} ok={ok}")
+            if ok: sent += 1
+        except Exception as e:
+            logging.exception("debug_send error")
+    return jsonify({"requested": limit, "sent": sent, "total_matches": len(matches)})
 
 # Telegram webhook for callback buttons
 @app.route("/telegram-webhook", methods=["POST"])
