@@ -39,6 +39,9 @@ session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
+CONF_THRESHOLD = int(os.getenv("CONF_THRESHOLD", "55"))  # send only if >= 55
+ALLOWED_SUGGESTIONS = {"Over 1.5 Goals", "Over 2.5 Goals", "Under 2.5 Goals", "BTTS"}
+
 # ───────────────────────────── DB helpers ─────────────────────────────────────
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
