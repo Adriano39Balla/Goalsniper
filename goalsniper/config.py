@@ -25,7 +25,7 @@ def must(name: str) -> str:
     return v
 
 # ---------- required credentials ----------
-# Accept either API_KEY or APISPORTS_KEY (Railway used APISPORTS_KEY in your config)
+# Accept either API_KEY or APISPORTS_KEY (Railway commonly uses APISPORTS_KEY)
 _API_KEY = os.getenv("API_KEY") or os.getenv("APISPORTS_KEY")
 if not _API_KEY:
     raise RuntimeError("Missing required env: API_KEY (or APISPORTS_KEY)")
