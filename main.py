@@ -1,11 +1,10 @@
 import os
 import json
 import time
-import math
 import logging
 import requests
 import sqlite3
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from typing import List, Dict, Any, Optional, Tuple
 from requests.adapters import HTTPAdapter, Retry
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -14,92 +13,64 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(
 
 app = Flask(__name__)
 
-# --- Env ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("API_KEY")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g. https://Goalsniper-backend.onrender.com
-BET_URL = os.getenv("BET_URL")
-WATCH_URL = os.getenv("WATCH_URL")
-
-# --- External APIs ---
 FOOTBALL_API_URL = "https://v3.football.api-sports.io/fixtures"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
-
-# --- DB ---
 DB_PATH = "tip_performance.db"
 
-# --- HTTP session with retries ---
+# Optional, no placeholders: only render these buttons if set
+BET_URL_TMPL = os.getenv("BET_URL")      # e.g. https://mybook.com/?match={home}-{away}
+WATCH_URL_TMPL = os.getenv("WATCH_URL")  # e.g. https://livescore.com/?fixture={fixture_id}
+
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
-# ---------------- DB ----------------
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS tips (
-                match_id INTEGER PRIMARY KEY,
-                league TEXT,
-                home TEXT,
-                away TEXT,
-                market TEXT,
-                suggestion TEXT,
-                confidence REAL,
-                score_at_tip TEXT,
-                minute INTEGER,
-                created_ts INTEGER
+            CREATE TABLE IF NOT EXISTS tip_stats (
+                match_id TEXT PRIMARY KEY,
+                tip TEXT,
+                score TEXT,
+                correct INTEGER
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                match_id INTEGER,
-                verdict INTEGER CHECK (verdict IN (0,1)),
-                created_ts INTEGER
-            )
-        """)
-        # Simple aggregates to "learn" from history without heavy ML.
-        conn.execute("""
-            CREATE VIEW IF NOT EXISTS v_tip_stats AS
-            SELECT market, suggestion,
-                   AVG(verdict) AS hit_rate,
-                   COUNT(*) AS n
-            FROM tips t
-            JOIN feedback f ON f.match_id = t.match_id
-            GROUP BY market, suggestion
-        """)
         conn.commit()
 
-# Lightweight helper to fetch historic hit rates for confidence tuning
-def get_historic_hit_rate(market: str, suggestion: str) -> Tuple[float, int]:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "SELECT COALESCE(hit_rate, 0.5), COALESCE(n, 0) FROM v_tip_stats WHERE market=? AND suggestion=?",
-            (market, suggestion),
-        )
-        row = cur.fetchone()
-        return (row[0], row[1]) if row else (0.5, 0)
+def _inline_buttons(match: Dict[str, Any], tip_text: str) -> Dict[str, Any]:
+    """Build an inline keyboard. ‘Correct/Wrong’ are callback buttons.
+    Bet/Watch links are added only if corresponding env vars are set."""
+    home = match["teams"]["home"]["name"]
+    away = match["teams"]["away"]["name"]
+    fid = match["fixture"]["id"]
 
-def save_tip(match_id: int, league: str, home: str, away: str,
-             market: str, suggestion: str, confidence: float,
-             score_at_tip: str, minute: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO tips(match_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, (match_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, int(time.time())))
-        conn.commit()
+    rows = [
+        [
+            {"text": "👍 Correct", "callback_data": json.dumps({"t": "correct", "id": fid, "tip": tip_text})},
+            {"text": "👎 Wrong",   "callback_data": json.dumps({"t": "wrong", "id": fid, "tip": tip_text})}
+        ]
+    ]
+    link_row = []
+    if BET_URL_TMPL:
+        try:
+            link_row.append({"text": "💰 Bet Now", "url": BET_URL_TMPL.format(home=home, away=away, fixture_id=fid)})
+        except Exception:
+            pass
+    if WATCH_URL_TMPL:
+        try:
+            link_row.append({"text": "📺 Watch Match", "url": WATCH_URL_TMPL.format(home=home, away=away, fixture_id=fid)})
+        except Exception:
+            pass
+    if link_row:
+        rows.append(link_row)
 
-def record_feedback(match_id: int, verdict: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT INTO feedback(match_id, verdict, created_ts) VALUES (?,?,?)",
-                     (match_id, verdict, int(time.time())))
-        conn.commit()
+    return {"inline_keyboard": rows}
 
-# ---------------- Telegram ----------------
-def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
+def send_telegram(message: str, match: Optional[Dict[str, Any]] = None, tip_text: str = "") -> bool:
     if not TELEGRAM_CHAT_ID or not TELEGRAM_BOT_TOKEN:
         logging.error("Missing Telegram credentials")
         return False
@@ -109,8 +80,8 @@ def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
         "text": message,
         "parse_mode": "HTML",
     }
-    if inline_keyboard:
-        payload["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard})
+    if match:
+        payload["reply_markup"] = json.dumps(_inline_buttons(match, tip_text))
 
     try:
         res = session.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=10)
@@ -121,11 +92,10 @@ def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
         logging.error(f"[Telegram] Exception: {e}")
         return False
 
-# ---------------- Football API ----------------
 def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     try:
         res = session.get(
-            f"https://v3.football.api-sports.io/fixtures/statistics",
+            "https://v3.football.api-sports.io/fixtures/statistics",
             headers=HEADERS,
             params={"fixture": fixture_id},
             timeout=10
@@ -144,9 +114,7 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
 
         filtered = []
         for m in matches:
-            status = (m.get("fixture", {}) or {}).get("status", {}) or {}
-            elapsed = status.get("elapsed")
-            # Skip if no minute or junk time
+            elapsed = m.get("fixture", {}).get("status", {}).get("elapsed")
             if elapsed is None or elapsed > 90:
                 continue
             fid = m.get("fixture", {}).get("id")
@@ -159,181 +127,126 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
         logging.error(f"API error: {e}")
         return []
 
-# ---------------- Tip logic (human-friendly) ----------------
-def build_stat_map(stats: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
-    out: Dict[str, Dict[str, float]] = {}
-    for team_block in stats:
-        team = (team_block.get("team") or {}).get("name")
-        metric_map: Dict[str, float] = {}
-        for item in team_block.get("statistics") or []:
-            typ, val = item.get("type"), item.get("value")
-            # Normalize numeric-ish values (e.g., "61%", None)
-            if isinstance(val, str) and val.endswith("%"):
-                try:
-                    val = float(val.replace("%", "").strip())
-                except Exception:
-                    val = 0
-            elif val is None:
-                val = 0
-            metric_map[typ] = float(val)
-        if team:
-            out[team] = metric_map
-    return out
+def _num(v) -> float:
+    try:
+        if isinstance(v, str) and v.endswith('%'):
+            return float(v[:-1])
+        return float(v or 0)
+    except Exception:
+        return 0.0
 
-def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float]:
-    """
-    Returns (market, suggestion, confidence[0-100])
+def _confidence_from_stats(s_home: Dict[str, Any], s_away: Dict[str, Any], score_h: int, score_a: int) -> float:
+    """Quick, explainable confidence 0–100 based on pressure/xG/score state."""
+    xg_h = _num(s_home.get("Expected Goals", 0))
+    xg_a = _num(s_away.get("Expected Goals", 0))
+    sot_h = _num(s_home.get("Shots on Target", 0))
+    sot_a = _num(s_away.get("Shots on Target", 0))
+    cor_h = _num(s_home.get("Corner Kicks", 0))
+    cor_a = _num(s_away.get("Corner Kicks", 0))
+    poss_h = _num(s_home.get("Ball Possession", 0))
+    poss_a = _num(s_away.get("Ball Possession", 0))
 
-    Markets supported for now to match your screenshot style:
-    - "Over/Under 2.5 Goals"
-    - "BTTS"
-    """
+    xg_total = xg_h + xg_a
+    pressure = (sot_h + sot_a) * 5 + (cor_h + cor_a) * 2
+    balance = abs(poss_h - poss_a)
+
+    raw = 0
+    raw += min(xg_total / 3.5, 1.0) * 45          # how open the game is
+    raw += min(pressure / 12.0, 1.0) * 35         # finishing pressure
+    raw += min(balance / 40.0, 1.0) * 10          # one-sided momentum
+    raw += min((score_h + score_a) / 3.0, 1.0) * 10  # goals already
+    return round(max(20.0, min(95.0, raw * 100.0 / 100.0)))  # clamp and avoid super low
+
+def _choose_tip(match: Dict[str, Any]) -> Tuple[str, int]:
+    """Return (tip_text, confidence%)."""
     home = match["teams"]["home"]["name"]
     away = match["teams"]["away"]["name"]
-    goals_home = match["goals"]["home"] or 0
-    goals_away = match["goals"]["away"] or 0
-    minute = match["fixture"]["status"]["elapsed"] or 0
+    score_home = match["goals"]["home"] or 0
+    score_away = match["goals"]["away"] or 0
+    stats = match["statistics"]
+    data = {s["team"]["name"]: {i["type"]: i["value"] for i in s["statistics"]} for s in stats}
+    if home not in data or away not in data:
+        return ("No clear edge", 40)
 
-    stats_map = build_stat_map(match["statistics"])
-    s_home = stats_map.get(home, {})
-    s_away = stats_map.get(away, {})
+    s_home = data[home]; s_away = data[away]
+    xg_h = _num(s_home.get("Expected Goals", 0)); xg_a = _num(s_away.get("Expected Goals", 0))
+    sot_h = _num(s_home.get("Shots on Target", 0)); sot_a = _num(s_away.get("Shots on Target", 0))
+    cor_h = _num(s_home.get("Corner Kicks", 0));   cor_a = _num(s_away.get("Corner Kicks", 0))
+    poss_h = _num(s_home.get("Ball Possession", 0)); poss_a = _num(s_away.get("Ball Possession", 0))
+    elapsed = match["fixture"]["status"]["elapsed"] or 0
 
-    # Features (robust to missing stats)
-    xg_sum = (s_home.get("Expected Goals", 0.0) + s_away.get("Expected Goals", 0.0))
-    shots_on = (s_home.get("Shots on Target", 0.0) + s_away.get("Shots on Target", 0.0))
-    big_chances = (s_home.get("Big Chances", 0.0) + s_away.get("Big Chances", 0.0))
-    corners = (s_home.get("Corner Kicks", 0.0) + s_away.get("Corner Kicks", 0.0))
-    total_goals = goals_home + goals_away
+    total_score = (score_home + score_away)
+    xg_total = xg_h + xg_a
+    sot_total = sot_h + sot_a
+    corners_total = cor_h + cor_a
 
-    # Simple interpretable rules -> pick market + base score
-    score = 50.0
-    market = "Over/Under 2.5 Goals"
-    suggestion = "Over 2.5 Goals"
+    # Simple, readable rules → one human tip
+    if xg_total >= 2.4 and total_score <= 2 and elapsed >= 25:
+        tip = "Over 2.5 Goals"
+    elif xg_total <= 1.6 and sot_total <= 3 and total_score <= 1 and elapsed >= 20:
+        tip = "Under 2.5 Goals"
+    elif total_score == 0 and xg_h < 0.6 and xg_a < 0.6 and sot_total <= 2:
+        tip = "BTTS: No"
+    else:
+        # Next goal leaning: pick side with higher pressure
+        press_h = sot_h*3 + cor_h*1 + (poss_h-50)*0.2
+        press_a = sot_a*3 + cor_a*1 + (poss_a-50)*0.2
+        tip = f"Next Goal: {home if press_h >= press_a else away}"
 
-    # Push towards Over if good chance creation but score still low
-    if xg_sum >= 2.0 and total_goals <= 2:
-        score += 18
-    if shots_on >= 6:
-        score += 10
-    if big_chances >= 3:
-        score += 8
-    if corners >= 10:
-        score += 5
+    conf = _confidence_from_stats(s_home, s_away, score_home, score_away)
+    return tip, conf
 
-    # Early minutes: reduce confidence naturally
-    if minute < 20:
-        score -= 8
-    if minute > 70 and total_goals <= 1:
-        # late & still low: favor Under and adjust market text
-        market = "Over/Under 2.5 Goals"
-        suggestion = "Under 2.5 Goals"
-        score = 55 + (70 - min(minute, 90)) * 0.2  # taper
-
-    # Low xG / few chances -> prefer BTTS No (defensive game vibe)
-    if xg_sum < 1.4 and shots_on < 4 and total_goals == 0 and minute > 35:
-        market = "BTTS"
-        suggestion = "No"
-        score = 62
-
-    # Clamp base to [35, 90]
-    score = max(35.0, min(90.0, score))
-
-    # "Learning" bump from historic accuracy of same-market suggestions
-    hist_rate, n = get_historic_hit_rate(market, suggestion)  # (0..1)
-    # Weight the bump by sample size (cap impact to ±7%)
-    bump = (hist_rate - 0.5) * 14.0 * min(1.0, n / 50.0)
-    final_conf = max(35.0, min(95.0, score + bump))
-
-    return market, suggestion, round(final_conf, 0)
-
-def format_human_tip(match: Dict[str, Any]) -> Tuple[str, list]:
-    """
-    Returns (message_text, inline_keyboard)
-    """
-    fixture = match["fixture"]
-    league_block = match.get("league") or {}
-    league = f"{league_block.get('country','')} - {league_block.get('name','')}".strip(" -")
-    minute = fixture["status"]["elapsed"] or 0
-    match_id = fixture["id"]
+def _format_human_message(match: Dict[str, Any], tip_text: str, conf: int) -> str:
     home = match["teams"]["home"]["name"]
     away = match["teams"]["away"]["name"]
-    g_home = match["goals"]["home"] or 0
-    g_away = match["goals"]["away"] or 0
+    league = match.get("league", {}).get("country", "") + " - " + match.get("league", {}).get("name", "")
+    elapsed = match["fixture"]["status"]["elapsed"] or 0
+    score_home = match["goals"]["home"] or 0
+    score_away = match["goals"]["away"] or 0
 
-    market, suggestion, confidence = decide_market(match)
-
-    # Persist tip so feedback can be learned
-    save_tip(
-        match_id=match_id,
-        league=league,
-        home=home,
-        away=away,
-        market=market,
-        suggestion=suggestion,
-        confidence=float(confidence),
-        score_at_tip=f"{g_home}-{g_away}",
-        minute=int(minute),
+    # Exactly like your target style
+    msg = (
+        "⚽ <b>New Tip!</b>\n"
+        f"<b>Match:</b> {home} vs {away}\n"
+        f"<b>Tip:</b> {tip_text}\n"
+        f"<b>Confidence:</b> {conf}%\n"
+        f"<b>Minute:</b> {elapsed}'  <b>Score:</b> {score_home}–{score_away}\n"
+        f"🏆 <b>League:</b> {league.strip(' - ')}"
     )
+    return msg
 
-    # Message like your 2nd screenshot
-    # Example:
-    # ⚽️ New Tip!
-    # Match: Lechia Gdansk vs Motor Lublin
-    # Tip: Over 2.5 Goals
-    # 📈 Confidence: 58%
-    # 🏆 League: Poland - Ekstraklasa
-    lines = [
-        "⚽️ <b>New Tip!</b>",
-        f"<b>Match:</b> {home} vs {away}",
-        f"<b>Tip:</b> {suggestion if market == 'BTTS' else suggestion}",
-        f"📈 <b>Confidence:</b> {int(confidence)}%",
-        f"🏆 <b>League:</b> {league}",
-    ]
-    msg = "\n".join(lines)
+def generate_tip(match: Dict[str, Any]) -> Optional[Tuple[str, str, int]]:
+    """Return (message, tip_text, confidence) or None if not enough data."""
+    try:
+        tip_text, conf = _choose_tip(match)
+        message = _format_human_message(match, tip_text, conf)
+        return message, tip_text, conf
+    except Exception as e:
+        logging.exception(f"Tip generation failed: {e}")
+        return None
 
-    # Inline buttons
-    keyboard = []
-    # Feedback (use URLs so we don't need Telegram webhook/callback handler)
-    if PUBLIC_BASE_URL:
-        keyboard.append([
-            {"text": "👍 Correct", "url": f"{PUBLIC_BASE_URL}/fb?match_id={match_id}&v=1"},
-            {"text": "👎 Wrong",   "url": f"{PUBLIC_BASE_URL}/fb?match_id={match_id}&v=0"},
-        ])
-    # Optional action links
-    action_row = []
-    if BET_URL:
-        action_row.append({"text": "💰 Bet Now", "url": BET_URL})
-    if WATCH_URL:
-        action_row.append({"text": "📺 Watch Match", "url": WATCH_URL})
-    if action_row:
-        keyboard.append(action_row)
-
-    return msg, keyboard
-
-# ---------------- Scheduler task ----------------
 last_heartbeat = 0
 def maybe_send_heartbeat():
     global last_heartbeat
     if time.time() - last_heartbeat > 1200:  # Every 20 mins
-        send_telegram("✅ Robi Superbrain is online and scanning matches…")
+        send_telegram("✅ Robi Superbrain is online and scanning matches...")
         last_heartbeat = time.time()
 
 def match_alert():
-    logging.info("🔍 Scanning live matches…")
+    logging.info("🔍 Scanning live matches...")
     matches = fetch_live_matches()
     logging.info(f"[SCAN] {len(matches)} matches after filtering")
     sent = 0
     for match in matches:
-        try:
-            msg, kb = format_human_tip(match)
-            if send_telegram(msg, kb):
-                sent += 1
-        except Exception as e:
-            logging.exception(f"Failed to format/send tip for fixture {match.get('fixture',{}).get('id')}: {e}")
+        result = generate_tip(match)
+        if not result:
+            continue
+        message, tip_text, _ = result
+        if send_telegram(message, match=match, tip_text=tip_text):
+            sent += 1
     logging.info(f"[TIP] Sent {sent} tips")
     maybe_send_heartbeat()
 
-# ---------------- Routes ----------------
 @app.route("/")
 def home():
     return "🤖 Robi Superbrain is active and watching the game."
@@ -343,26 +256,6 @@ def manual_match_alert():
     match_alert()
     return jsonify({"status": "ok"})
 
-@app.route("/fb")
-def feedback():
-    """
-    GET /fb?match_id=123&v=1   (1 = correct, 0 = wrong)
-    Stores feedback and replies with a tiny thank-you.
-    """
-    match_id = request.args.get("match_id", type=int)
-    verdict = request.args.get("v", type=int)
-    if match_id is None or verdict not in (0, 1):
-        return jsonify({"ok": False, "error": "bad params"}), 400
-    record_feedback(match_id, verdict)
-    txt = "🙏 Thanks for the feedback!"
-    # also acknowledge in chat (silent)
-    try:
-        send_telegram(f"📊 Feedback saved for match <code>{match_id}</code>: {'Correct' if verdict==1 else 'Wrong'}")
-    except Exception:
-        pass
-    return jsonify({"ok": True, "message": txt})
-
-# ---------------- Main ----------------
 if __name__ == "__main__":
     init_db()
     scheduler = BackgroundScheduler()
