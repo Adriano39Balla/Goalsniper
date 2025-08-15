@@ -16,16 +16,20 @@ app = Flask(__name__)
 # ── Env ───────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY            = os.getenv("API_KEY")  # used for API-Sports header
+
+# Separate keys: APISPORTS_KEY is used for API-Sports; API_KEY can remain your internal/admin key
+API_KEY        = os.getenv("API_KEY")                # optional internal key (kept for /feedback POST usage)
+APISPORTS_KEY  = os.getenv("APISPORTS_KEY", API_KEY) # fallback to API_KEY for backward compat
+
 PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL")  # e.g. https://your-service.up.railway.app
-BET_URL_TMPL       = os.getenv("BET_URL")      # optional; e.g. https://book.com/?fixture={fixture_id}
-WATCH_URL_TMPL     = os.getenv("WATCH_URL")    # optional; e.g. https://livescore.com/?fixture={fixture_id}
+BET_URL_TMPL       = os.getenv("BET_URL")          # e.g. https://book.com/?fixture={fixture_id}
+WATCH_URL_TMPL     = os.getenv("WATCH_URL")        # e.g. https://livescore.com/?fixture={fixture_id}
 WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")  # verify Telegram webhook
 
 # ── External APIs ─────────────────────────────────────────────────────────────
 FOOTBALL_API_URL = "https://v3.football.api-sports.io/fixtures"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}
+HEADERS          = {"x-apisports-key": APISPORTS_KEY, "Accept": "application/json"}
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 DB_PATH = "tip_performance.db"
@@ -130,29 +134,42 @@ def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
             params={"fixture": fixture_id},
             timeout=10
         )
-        res.raise_for_status()
+        if not res.ok:
+            logging.warning(f"[API] stats fixture={fixture_id} status={res.status_code} body={res.text[:200]}")
+            return None
         return res.json().get("response", [])
     except Exception as e:
         logging.warning(f"[SKIP] Stats fetch failed for {fixture_id}: {e}")
         return None
 
+# (1) Loosen the “must-have stats” filter and add API error logging
 def fetch_live_matches() -> List[Dict[str, Any]]:
     try:
         res = session.get(FOOTBALL_API_URL, headers=HEADERS, params={"live": "all"}, timeout=10)
-        res.raise_for_status()
+        if not res.ok:
+            logging.error(f"[API] fixtures status={res.status_code} body={res.text[:300]}")
+            return []
         matches = res.json().get("response", [])
         filtered = []
         for m in matches:
-            elapsed = (m.get("fixture", {}) or {}).get("status", {}).get("elapsed")
+            status = (m.get("fixture", {}) or {}).get("status", {}) or {}
+            elapsed = status.get("elapsed")
             if elapsed is None or elapsed > 90:
                 continue
-            fid = m.get("fixture", {}).get("id")
-            m["statistics"] = fetch_match_stats(fid) or []
-            if m["statistics"]:
-                filtered.append(m)
+
+            # Try to fetch stats, but don't require them
+            fid = (m.get("fixture", {}) or {}).get("id")
+            try:
+                stats = fetch_match_stats(fid)
+                m["statistics"] = stats or []
+            except Exception:
+                m["statistics"] = []
+            filtered.append(m)
+
+        logging.info(f"[FETCH] live={len(matches)} kept={len(filtered)}")
         return filtered
     except Exception as e:
-        logging.error(f"API error: {e}")
+        logging.exception("API error while fetching live fixtures")
         return []
 
 # ───────────────────────── Tip logic ──────────────────────────────────────────
@@ -164,6 +181,7 @@ def _num(v) -> float:
     except Exception:
         return 0.0
 
+# (2) Tip generator tolerant to missing stats (fallbacks included)
 def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float]:
     """
     Pick a human-friendly market/suggestion + confidence.
@@ -173,12 +191,27 @@ def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float]:
     away = match["teams"]["away"]["name"]
     gh = match["goals"]["home"] or 0
     ga = match["goals"]["away"] or 0
-    minute = match["fixture"]["status"]["elapsed"] or 0
+    minute = (match.get("fixture", {}).get("status", {}) or {}).get("elapsed") or 0
 
-    # Build stat dicts
-    stats = {s["team"]["name"]: {i["type"]: i["value"] for i in s["statistics"]} for s in match["statistics"]}
+    # Stats may be missing → build dict safely
+    stats_blocks = match.get("statistics") or []
+    stats: Dict[str, Dict[str, Any]] = {}
+    for s in stats_blocks:
+        tname = (s.get("team") or {}).get("name")
+        if not tname:
+            continue
+        stats[tname] = {i["type"]: i["value"] for i in (s.get("statistics") or [])}
+
+    if not stats:
+        # Sensible human fallbacks when detailed stats are missing
+        if minute >= 70 and gh + ga <= 1:
+            return "Over/Under 2.5 Goals", "Under 2.5 Goals", 58
+        elif minute >= 30 and gh + ga == 0:
+            return "BTTS", "No", 55
+        else:
+            return "Over/Under 2.5 Goals", "Over 1.5 Goals", 54
+
     sh, sa = stats.get(home, {}), stats.get(away, {})
-
     xg_sum   = _num(sh.get("Expected Goals", 0)) + _num(sa.get("Expected Goals", 0))
     sot_sum  = _num(sh.get("Shots on Target", 0)) + _num(sa.get("Shots on Target", 0))
     corners  = _num(sh.get("Corner Kicks", 0)) + _num(sa.get("Corner Kicks", 0))
@@ -221,7 +254,6 @@ def format_human_tip(match: Dict[str, Any]) -> Tuple[str, list, Dict[str, Any]]:
     fixture = match["fixture"]
     league_block = match.get("league") or {}
     league = f"{league_block.get('country','')} - {league_block.get('name','')}".strip(" -")
-    minute = fixture["status"]["elapsed"] or 0
     match_id = fixture["id"]
     home = match["teams"]["home"]["name"]
     away = match["teams"]["away"]["name"]
@@ -240,7 +272,7 @@ def format_human_tip(match: Dict[str, Any]) -> Tuple[str, list, Dict[str, Any]]:
         suggestion=suggestion,
         confidence=float(confidence),
         score_at_tip=f"{g_home}-{g_away}",
-        minute=int(minute),
+        minute=int((fixture.get("status") or {}).get("elapsed") or 0),
     )
 
     lines = [
@@ -271,7 +303,6 @@ def format_human_tip(match: Dict[str, Any]) -> Tuple[str, list, Dict[str, Any]]:
     if link_row:
         kb.append(link_row)
 
-    # meta is returned so caller doesn’t recompute
     meta = {"match_id": match_id}
     return msg, kb, meta
 
@@ -287,10 +318,17 @@ def match_alert():
     logging.info("🔍 Scanning live matches…")
     matches = fetch_live_matches()
     logging.info(f"[SCAN] {len(matches)} matches after filtering")
+    # (4) Extra logging when nothing returned
+    if not matches:
+        logging.warning("[SCAN] No matches returned – check APISPORTS_KEY/plan or time of day.")
+
     sent = 0
     for match in matches:
         try:
+            logging.info(f"[TIP] preparing fixture={match.get('fixture',{}).get('id')} has_stats={bool(match.get('statistics'))}")
             msg, kb, _meta = format_human_tip(match)
+            # (4) Log before sending each tip
+            logging.info(f"[TIP] sending fixture={match.get('fixture',{}).get('id')}")
             if send_telegram(msg, kb):
                 sent += 1
         except Exception as e:
@@ -307,6 +345,16 @@ def home():
 def manual_match_alert():
     match_alert()
     return jsonify({"status": "ok"})
+
+# (3) Debug endpoint to see current scan results at a glance
+@app.route("/debug/scan")
+def debug_scan():
+    data = fetch_live_matches()
+    return jsonify({
+        "count": len(data),
+        "fixture_ids": [ (m.get("fixture",{}) or {}).get("id") for m in data ],
+        "has_stats": [ bool(m.get("statistics")) for m in data ],
+    })
 
 # Telegram webhook for callback buttons
 @app.route("/telegram-webhook", methods=["POST"])
@@ -337,7 +385,7 @@ def telegram_webhook():
             pass
     return "ok"
 
-# Optional: server-side feedback API (if you want to label outcomes later)
+# Optional: server-side feedback API (admin use)
 @app.route("/feedback", methods=["POST"])
 def feedback_api():
     key = request.headers.get("X-API-Key") or request.args.get("key")
