@@ -45,7 +45,7 @@ MAX_LEAGUES_PER_RUN = max(1, int(os.getenv("MAX_LEAGUES_PER_RUN", "24")))
 # Soft window (optional): allow a few tips slightly below the hard minimum
 SOFT_MIN_CONF = float(os.getenv("SOFT_MIN_CONF", "0.0"))           # 0.00 disables
 SOFT_TIPS_PER_RUN = max(0, int(os.getenv("SOFT_TIPS_PER_RUN", "0")))
-SCANNER_DEBUG = (os.getenv("SCANNER_DEBUG", "0").strip() in ("1", "true", "yes", "on"))
+SCANNER_DEBUG = (os.getenv("SCANNER_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on"))
 
 # ---------- MOTD options ----------
 ENABLE_MOTD = (os.getenv("ENABLE_MOTD", "true").strip().lower() in ("1","true","yes","on"))
@@ -130,6 +130,15 @@ def _league_id(fx: Dict) -> int:
 
 def _season(fx: Dict) -> int:
     return int((fx.get("league", {}) or {}).get("season") or 0)
+
+def _short_fixture_label(fx: Dict) -> str:
+    lg = fx.get("league") or {}
+    t  = fx.get("teams") or {}
+    h  = (t.get("home") or {}).get("name") or "Home"
+    a  = (t.get("away") or {}).get("name") or "Away"
+    lid = int((lg.get("id") or 0))
+    seas = int((lg.get("season") or 0))
+    return f"{h} vs {a} | {lg.get('country') or ''} {lg.get('name') or ''} (L{lid}/S{seas})"
 
 # ---------- Fetchers ----------
 async def _fetch_live(client: httpx.AsyncClient) -> List[Dict]:
@@ -232,6 +241,10 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
 
     if SCANNER_DEBUG:
         log(f"[scan] scheduled fixtures (NS) across {len(days)} day(s): {len(out)}")
+        # List a sample of fixtures being considered
+        for f in out[:min(12, len(out))]:
+            log("   ↳", _short_fixture_label(f))
+
     return out
 
 # ---------- Tip generation ----------
@@ -289,8 +302,27 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
     stats["inrun_dedup_removed"] = removed
 
     if SCANNER_DEBUG:
-        log(f"[scan] raw tips={len(raw)} deduped={len(deduped)} removed={removed}")
+        log(f"[scan] raw tips={len(raw)} deduped={len(deduped)} removed_dupes={removed}")
+        # Show the first few raw (pre-calibration) tips
+        for t in deduped[:min(10, len(deduped))]:
+            log(f"   ↳ cand fixture={t.get('fixtureId')} {t.get('home')} vs {t.get('away')} | "
+                f"{t.get('market')} {t.get('selection')} p_raw={t.get('probability')}")
+
     return deduped, stats
+
+# ---------- Learning diagnostics ----------
+async def _analyze_tip(t: dict) -> Tuple[float, float, float, float]:
+    """
+    Returns (p_cal, conf, dyn_thr, hard_thr) for diagnostics.
+    """
+    p_raw = float(t.get("probability", 0.5))
+    market = str(t.get("market", ""))
+    league_id = t.get("leagueId")
+    p_cal = await calibrate_probability(market, p_raw, league_id)
+    conf = abs(p_cal - 0.5) * 2.0
+    dyn_thr = await dynamic_conf_threshold(market)
+    hard_thr = max(dyn_thr, MIN_CONFIDENCE_TO_SEND)
+    return float(p_cal), float(conf), float(dyn_thr), float(hard_thr)
 
 # ---------- Learning gate ----------
 async def _calibrate_and_filter(t: dict) -> Optional[dict]:
@@ -300,20 +332,16 @@ async def _calibrate_and_filter(t: dict) -> Optional[dict]:
       - None if rejected.
     """
     try:
-        p_raw = float(t.get("probability", 0.5))
-        market = str(t.get("market", ""))
-        league_id = t.get("leagueId")
-
-        p_cal = await calibrate_probability(market, p_raw, league_id)
-        conf = abs(p_cal - 0.5) * 2.0
-        dyn_thr = await dynamic_conf_threshold(market)
-        hard_thr = max(dyn_thr, MIN_CONFIDENCE_TO_SEND)
+        p_cal, conf, dyn_thr, hard_thr = await _analyze_tip(t)
 
         # Decide
         if conf >= hard_thr:
             t["probability"] = round(p_cal, 3)
             t["confidence"] = round(conf, 3)
             t["soft"] = False
+            if SCANNER_DEBUG:
+                log(f"[gate] OK  fixture={t.get('fixtureId')} {t.get('market')} {t.get('selection')} "
+                    f"p_cal={p_cal:.3f} conf={conf:.3f} thr_dyn={dyn_thr:.3f} thr_hard={hard_thr:.3f}")
             return t
 
         # Soft window
@@ -322,13 +350,14 @@ async def _calibrate_and_filter(t: dict) -> Optional[dict]:
             t["confidence"] = round(conf, 3)
             t["soft"] = True
             if SCANNER_DEBUG:
-                log(f"[gate] SOFT ok: {market} p_raw={p_raw:.3f} p_cal={p_cal:.3f} conf={conf:.3f} < hard={hard_thr:.3f} but >= soft={SOFT_MIN_CONF:.3f}")
+                log(f"[gate] SOFT fixture={t.get('fixtureId')} {t.get('market')} {t.get('selection')} "
+                    f"p_cal={p_cal:.3f} conf={conf:.3f} < hard={hard_thr:.3f} but >= soft={SOFT_MIN_CONF:.3f}")
             return t
 
         if SCANNER_DEBUG:
-            log(f"[gate] reject low_conf: {market} p_raw={p_raw:.3f} p_cal={p_cal:.3f} conf={conf:.3f} < hard={hard_thr:.3f}"
-                + (f" (soft={SOFT_MIN_CONF:.3f} not met)" if SOFT_MIN_CONF > 0 else ""))
-
+            log(f"[gate] REJ fixture={t.get('fixtureId')} {t.get('market')} {t.get('selection')} "
+                f"p_cal={p_cal:.3f} conf={conf:.3f} < hard={hard_thr:.3f} "
+                + (f"(soft={SOFT_MIN_CONF:.3f} not met)" if SOFT_MIN_CONF > 0 else ""))
         return None
     except Exception as e:
         warn("learning gate failed:", str(e))
@@ -343,15 +372,9 @@ def _market_priority(market: str) -> int:
         return len(MOTD_MARKET_ORDER) + 1
 
 async def _choose_motd(client: httpx.AsyncClient, tips: List[Dict]) -> Optional[Dict]:
-    """
-    From a list of raw tips (pre-calibration), return the single best MOTD candidate:
-      - non-live
-      - after calibration & thresholding
-      - highest confidence, then market priority, then higher expectedGoals
-    """
     candidates: List[Dict] = []
     for t in tips:
-        if t.get("live"):   # MOTD is for scheduled fixtures
+        if t.get("live"):
             continue
         tt = await _calibrate_and_filter(dict(t))  # copy, calibrate, add conf
         if not tt:
@@ -361,6 +384,8 @@ async def _choose_motd(client: httpx.AsyncClient, tips: List[Dict]) -> Optional[
         candidates.append(tt)
 
     if not candidates:
+        if SCANNER_DEBUG:
+            log("[motd] no candidate met the MOTD_MIN_CONF threshold")
         return None
 
     candidates.sort(
@@ -371,13 +396,13 @@ async def _choose_motd(client: httpx.AsyncClient, tips: List[Dict]) -> Optional[
         ),
         reverse=True,
     )
-    return candidates[0]
+    top = candidates[0]
+    if SCANNER_DEBUG:
+        log(f"[motd] candidate fixture={top.get('fixtureId')} {top.get('home')} vs {top.get('away')} | "
+            f"{top.get('market')} {top.get('selection')} conf={top.get('confidence')}")
+    return top
 
 async def _maybe_send_motd(client: httpx.AsyncClient, today_tips: List[Dict]) -> Optional[int]:
-    """
-    Sends a single MOTD once per UTC day, if enabled and not already sent.
-    Returns message_id or None.
-    """
     if not ENABLE_MOTD:
         return None
 
@@ -424,13 +449,19 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: O
     for t in tips:
         if used_today >= DAILY_TIP_CAP:
             stats["daily_cap_hits"] += 1
+            if SCANNER_DEBUG:
+                log(f"[gate] stop: daily cap reached ({DAILY_TIP_CAP})")
             break
         fid = _fixture_id(t)
         if DUPLICATE_SUPPRESS_FOREVER and await fixture_ever_sent(fid):
             stats["ever_sent_skipped"] += 1
+            if SCANNER_DEBUG:
+                log(f"[gate] skip: fixture {fid} was sent before (ever)")
             continue
         if await _recently_sent(fid):
             stats["ever_sent_skipped"] += 1
+            if SCANNER_DEBUG:
+                log(f"[gate] skip: fixture {fid} was sent recently")
             continue
 
         tt = await _calibrate_and_filter(t)
@@ -438,7 +469,6 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: O
             stats["low_conf"] += 1
             continue
 
-        # Enforce soft budget
         if tt.get("soft"):
             if soft_used >= SOFT_TIPS_PER_RUN:
                 if SCANNER_DEBUG:
@@ -451,6 +481,8 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: O
             sent += 1
             used_today += 1
             if sent >= MAX_TIPS_PER_RUN:
+                if SCANNER_DEBUG:
+                    log(f"[gate] stop: run cap reached ({MAX_TIPS_PER_RUN})")
                 break
 
     return sent, stats
@@ -468,7 +500,7 @@ async def run_scan_and_send() -> Dict[str, int]:
         if live_fixtures:
             live_tips, _ = await _build_tips_for_fixtures(client, live_fixtures)
         if today_fixtures:
-            today_tips, _ = await _build_tips_for_fixtures(client, today_tixtures := today_fixtures)  # keep name stable
+            today_tips, _ = await _build_tips_for_fixtures(client, today_fixtures)
 
         # Try sending MOTD highlight once per day (non-blocking on failure)
         if today_tips:
