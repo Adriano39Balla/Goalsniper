@@ -2,10 +2,10 @@ import os
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
-from config import API_FOOTBALL_API_KEY, LEAGUE_ID, SEASON, DATA_DIR
+from config import API_KEY, LEAGUE_ID, SEASON, DATA_DIR
 from utils import logger
 
-HEADERS = {'x-apisports-key': API_FOOTBALL_API_KEY}
+HEADERS = {'x-apisports-key': API_KEY}
 BASE_URL = 'https://v3.football.api-sports.io/'
 
 def fetch_fixtures(status=None, from_date=None, to_date=None, league_id=LEAGUE_ID, season=SEASON):
