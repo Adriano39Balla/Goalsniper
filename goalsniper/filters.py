@@ -1,4 +1,3 @@
-# goalsniper/filters.py
 from __future__ import annotations
 
 import os
@@ -16,44 +15,29 @@ from .config import (
 _TTL = int(os.getenv("FILTERS_CACHE_TTL", "60"))
 _cache: Tuple[float, Dict[str, object]] | None = None
 
-
 def _flag_to_iso2(flag: str) -> str:
-    """Convert emoji regional-indicator flags to ISO2; otherwise return uppercased input.
-
-    Note: some flags (e.g., Scotland 🏴) are tag-sequences (not RI pairs),
-    so this function will return the emoji unchanged; we handle those below.
-    """
     cps = [ord(c) - 0x1F1E6 for c in flag if 0x1F1E6 <= ord(c) <= 0x1F1FF]
     if len(cps) == 2:
         return chr(cps[0] + 65) + chr(cps[1] + 65)
-    return flag.upper()
-
+    return (flag or "").upper()
 
 def _norm_csv(csv: str) -> List[str]:
     return [s.strip() for s in (csv or "").split(",") if s.strip()]
 
-
 def _normalize_countries(raw: List[str]) -> Set[str]:
-    """Normalize countries to what API-Football returns in `league.country`."""
     out: Set[str] = set()
     for s in raw:
-        v = _flag_to_iso2(s)  # Emoji → ISO2 (if RI pair) or original string
-        u = v.upper()
-
-        # Scotland flag & aliases
-        if s in ("🏴", "SCOTLAND", "GB-SCT", "UK-SCOTLAND"):
-            out.update({"SCOTLAND", "GB", "UNITED KINGDOM", "UK"})
-            continue
-
+        u = _flag_to_iso2(s)
+        # basic aliases
         alias_map = {
-            "ENGLAND": {"ENGLAND", "GB", "UNITED KINGDOM", "UK"},
-            "SCOTLAND": {"SCOTLAND", "GB", "UNITED KINGDOM", "UK"},
-            "WALES": {"WALES", "GB", "UNITED KINGDOM", "UK"},
-            "NORTHERN IRELAND": {"NORTHERN IRELAND", "GB", "UNITED KINGDOM", "UK"},
             "USA": {"USA", "UNITED STATES", "US"},
             "UNITED STATES": {"USA", "UNITED STATES", "US"},
             "HOLLAND": {"NETHERLANDS", "HOLLAND"},
             "NETHERLANDS": {"NETHERLANDS", "HOLLAND"},
+            "ENGLAND": {"ENGLAND", "GB", "UNITED KINGDOM", "UK"},
+            "SCOTLAND": {"SCOTLAND", "GB", "UNITED KINGDOM", "UK"},
+            "WALES": {"WALES", "GB", "UNITED KINGDOM", "UK"},
+            "NORTHERN IRELAND": {"NORTHERN IRELAND", "GB", "UNITED KINGDOM", "UK"},
         }
         added = False
         for key, aliases in alias_map.items():
@@ -61,55 +45,34 @@ def _normalize_countries(raw: List[str]) -> Set[str]:
                 out.update(aliases)
                 added = True
                 break
-        if added:
-            continue
-
-        # UEFA / continental: EU/Europe implies EUROPE/UEFA/WORLD labels
-        if s in ("🇪🇺", "EU", "EUROPE") or u in ("EU", "EUROPE", "UEFA"):
-            out.update({"EUROPE", "UEFA", "WORLD"})
-            continue
-
-        out.add(u)
+        if not added:
+            out.add(u)
     return out
 
-
 def _expand_league_keywords(leagues: List[str]) -> List[str]:
-    """Add robust synonyms for UEFA comps & playoff/qualifier stages (uppercased)."""
     base = {s.upper() for s in leagues}
-
+    # keep UEFA synonyms if user adds any, otherwise empty means allow-all
     if any(k in base for k in ("UEFA CHAMPIONS LEAGUE", "CHAMPIONS LEAGUE", "UCL")):
         base.update({"UEFA CHAMPIONS LEAGUE", "CHAMPIONS LEAGUE", "UCL"})
-
     if any(k in base for k in ("UEFA EUROPA LEAGUE", "EUROPA LEAGUE", "UEL")):
         base.update({"UEFA EUROPA LEAGUE", "EUROPA LEAGUE", "UEL"})
-
     if any(k in base for k in ("UEFA EUROPA CONFERENCE", "EUROPA CONFERENCE", "UEFA CONFERENCE LEAGUE", "UECL")):
         base.update({"UEFA EUROPA CONFERENCE", "EUROPA CONFERENCE", "UEFA CONFERENCE LEAGUE", "UECL"})
-
-    if base & {"UEFA CHAMPIONS LEAGUE", "CHAMPIONS LEAGUE", "UCL",
-               "UEFA EUROPA LEAGUE", "EUROPA LEAGUE", "UEL",
-               "UEFA EUROPA CONFERENCE", "EUROPA CONFERENCE", "UEFA CONFERENCE LEAGUE", "UECL"}:
-        base.update({"QUALIFICATION", "QUALIFIERS", "PLAYOFF", "PLAY-OFF", "PRELIMINARY", "GROUP"})
-
+    if base & {"UCL","UEL","UECL","UEFA CHAMPIONS LEAGUE","UEFA EUROPA LEAGUE","UEFA EUROPA CONFERENCE"}:
+        base.update({"QUALIFICATION","QUALIFIERS","PLAYOFF","PLAY-OFF","PRELIMINARY","GROUP"})
     return sorted(base)
 
-
 def _fallback_env_or_default(db_value: str, env_value: str) -> str:
-    """
-    If DB value is non-empty, use it.
-    Else fall back to .env (config.py values).
-    """
     db_value = (db_value or "").strip()
     return db_value if db_value else (env_value or "").strip()
-
 
 async def get_filters() -> Dict[str, object]:
     """
     Returns:
       {
-        "allowCountries": set[str],
-        "allowLeagueKeywords": list[str] (UPPER),
-        "excludeKeywords": list[str] (UPPER),
+        "allowCountries": set[str],       # empty => allow all
+        "allowLeagueKeywords": list[str], # empty => allow all
+        "excludeKeywords": list[str],     # applied to league names (UPPER)
       }
     """
     global _cache
@@ -123,7 +86,6 @@ async def get_filters() -> Dict[str, object]:
         "EXCLUDE_KEYWORDS",
     ])
 
-    # CRITICAL: merge DB with .env defaults so empty DB != allow all
     countries_raw = _fallback_env_or_default(cfg.get("COUNTRY_FLAGS_ALLOW", ""), ENV_COUNTRY_FLAGS_ALLOW)
     leagues_raw   = _fallback_env_or_default(cfg.get("LEAGUE_ALLOW_KEYWORDS", ""), ENV_LEAGUE_ALLOW_KEYWORDS)
     exclude_raw   = _fallback_env_or_default(cfg.get("EXCLUDE_KEYWORDS", ""), ENV_EXCLUDE_KEYWORDS)
@@ -133,8 +95,8 @@ async def get_filters() -> Dict[str, object]:
     exclude   = [s.upper() for s in _norm_csv(exclude_raw)]
 
     filters = {
-        "allowCountries": countries,            # set[str]
-        "allowLeagueKeywords": leagues,         # list[str]
+        "allowCountries": countries,            # set[str]; empty => allow all
+        "allowLeagueKeywords": leagues,         # list[str]; empty => allow all
         "excludeKeywords": exclude,             # list[str]
     }
     _cache = (now, filters)
