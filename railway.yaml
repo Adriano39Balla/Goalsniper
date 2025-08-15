@@ -1,27 +1,36 @@
-# Railway service config for a FastAPI app served by Gunicorn+Uvicorn
-# Assumes your ASGI app is at app/main.py with variable `app`
-# i.e. import path: app.main:app
+# Railway config for Goalsniper (FastAPI via Gunicorn+Uvicorn)
 services:
   web:
     build:
       builder: "NIXPACKS"
       buildCommand: "pip install --no-cache-dir -r requirements.txt"
     startCommand: >
-      gunicorn app.main:app
+      gunicorn goalsniper.server:app
       -k uvicorn.workers.UvicornWorker
-      -w ${WEB_CONCURRENCY:-2}
+      -w ${WEB_CONCURRENCY:-1}
       -b 0.0.0.0:${PORT}
-      --timeout 60
-      --graceful-timeout 30
-      --keep-alive 5
+      --timeout 120
+      --graceful-timeout 20
       --log-level ${LOG_LEVEL:-info}
     env:
       PYTHONUNBUFFERED: "1"
-      PORT: "8000"           # Railway will override with its assigned port
-      WEB_CONCURRENCY: "2"   # tune up/down depending on CPU
       LOG_LEVEL: "info"
+      # DB_PATH should point to a persistent volume mounted at /data
+      DB_PATH: "/data/goalsniper.db"
+      TZ: "UTC"
     healthcheck:
       path: "/health"
       interval: 10
       timeout: 3
       retries: 3
+
+  cron:
+    build:
+      builder: "NIXPACKS"
+      buildCommand: "pip install --no-cache-dir -r requirements.txt"
+    startCommand: "python -m goalsniper.run_once"
+    schedule: "0 * * * *"   # hourly
+    env:
+      PYTHONUNBUFFERED: "1"
+      DB_PATH: "/data/goalsniper.db"
+      TZ: "UTC"
