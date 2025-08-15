@@ -351,9 +351,11 @@ def format_human_tip(match: Dict[str, Any],
     if any(stat.values()):
         stat_line = f"\n📊 xG H {stat['xg_h']:.2f} / A {stat['xg_a']:.2f} • SOT {int(stat['sot_h'])}–{int(stat['sot_a'])} • CK {int(stat['cor_h'])}–{int(stat['cor_a'])}"
 
+    # ⏱ Minute + live score added here
     lines = [
         "⚽️ <b>New Tip!</b>",
         f"<b>Match:</b> {home} vs {away}",
+        f"⏱ <b>Minute:</b> {minute}'  |  <b>Score:</b> {g_home}–{g_away}",
         f"<b>Tip:</b> {escape(suggestion)}",
         f"📈 <b>Confidence:</b> {int(confidence)}%",
         f"🏆 <b>League:</b> {league}{stat_line}",
@@ -417,7 +419,6 @@ def match_alert():
 
 def pick_match_of_the_day(fixtures: List[Dict[str,Any]]) -> Optional[Dict[str,Any]]:
     """Choose one fixture for MOTD: prioritize by league id list, otherwise earliest kickoff."""
-    # sort by priority index then kickoff time
     pri = {lid:i for i,lid in enumerate(LEAGUE_PRIORITY_IDS)}
     def key_fn(f):
         lg = (f.get("league") or {})
@@ -576,9 +577,10 @@ if __name__ == "__main__":
     init_db()
     scheduler = BackgroundScheduler()
     # Live scan every 5 minutes
-    scheduler.add_job(match_alert, "interval", minutes=5)
+    scheduler.add_job(match_alert, "interval", minutes=5, id="scan", replace_existing=True)
     # Match of the Day at 08:00 UTC daily
-    scheduler.add_job(send_match_of_the_day, CronTrigger(hour=8, minute=0, timezone="UTC"))
+    scheduler.add_job(send_match_of_the_day, CronTrigger(hour=8, minute=0, timezone="UTC"),
+                      id="motd", replace_existing=True)
     scheduler.start()
     logging.info("⏱️ Scheduler started (scan=5min, MOTD=08:00 UTC)")
     port = int(os.getenv("PORT", 5000))
