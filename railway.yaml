@@ -15,7 +15,6 @@ services:
     env:
       PYTHONUNBUFFERED: "1"
       LOG_LEVEL: "info"
-      # DB_PATH should point to a persistent volume mounted at /data
       DB_PATH: "/data/goalsniper.db"
       TZ: "UTC"
     healthcheck:
@@ -24,12 +23,25 @@ services:
       timeout: 3
       retries: 3
 
-  cron:
+  # Live match scanner every 10 minutes
+  cron_live:
     build:
       builder: "NIXPACKS"
       buildCommand: "pip install --no-cache-dir -r requirements.txt"
     startCommand: "python -m goalsniper.run_once"
-    schedule: "0 * * * *"   # hourly
+    schedule: "*/10 * * * *"
+    env:
+      PYTHONUNBUFFERED: "1"
+      DB_PATH: "/data/goalsniper.db"
+      TZ: "UTC"
+
+  # Match of the Day + daily summaries at midnight UTC
+  cron_daily:
+    build:
+      builder: "NIXPACKS"
+      buildCommand: "pip install --no-cache-dir -r requirements.txt"
+    startCommand: "python -m goalsniper.run_once --daily"
+    schedule: "0 0 * * *"
     env:
       PYTHONUNBUFFERED: "1"
       DB_PATH: "/data/goalsniper.db"
