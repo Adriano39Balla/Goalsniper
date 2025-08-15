@@ -17,6 +17,8 @@ from .storage import (
     fixture_ever_sent,
     count_sent_today,
     has_fixture_tip_recent,
+    get_config_bulk,   # MOTD state
+    set_config,        # MOTD state
 )
 from .config import (
     MIN_CONFIDENCE_TO_SEND,
@@ -44,6 +46,13 @@ MAX_LEAGUES_PER_RUN = max(1, int(os.getenv("MAX_LEAGUES_PER_RUN", "24")))
 SOFT_MIN_CONF = float(os.getenv("SOFT_MIN_CONF", "0.0"))           # 0.00 disables
 SOFT_TIPS_PER_RUN = max(0, int(os.getenv("SOFT_TIPS_PER_RUN", "0")))
 SCANNER_DEBUG = (os.getenv("SCANNER_DEBUG", "0").strip() in ("1", "true", "yes", "on"))
+
+# ---------- MOTD options ----------
+ENABLE_MOTD = (os.getenv("ENABLE_MOTD", "true").strip().lower() in ("1","true","yes","on"))
+MOTD_MIN_CONF = float(os.getenv("MOTD_MIN_CONF", "0.70"))
+MOTD_MARKET_ORDER = [s.strip().upper() for s in os.getenv(
+    "MOTD_MARKET_ORDER", "OVER_UNDER_2.5,BTTS,1X2,1ST_HALF_OU"
+).split(",") if s.strip()]
 
 # ---------- Status sets ----------
 FINISHED_STATES = {"FT", "AET", "PEN", "CANC", "PST", "ABD", "AWD", "WO"}
@@ -206,7 +215,6 @@ async def _fetch_today(client: httpx.AsyncClient) -> List[Dict]:
             finally:
                 await asyncio.sleep(STATS_REQUEST_DELAY_MS / 1000.0)
 
-    # schedule pulls: breadth-first by day to get near-term games first
     tasks = []
     for day in days:
         day_iso = day.isoformat()
@@ -286,6 +294,11 @@ async def _build_tips_for_fixtures(client: httpx.AsyncClient, fixtures: List[Dic
 
 # ---------- Learning gate ----------
 async def _calibrate_and_filter(t: dict) -> Optional[dict]:
+    """
+    Returns:
+      - dict(t) with updated probability/confidence (+ 'soft': False/True)  OR
+      - None if rejected.
+    """
     try:
         p_raw = float(t.get("probability", 0.5))
         market = str(t.get("market", ""))
@@ -296,12 +309,14 @@ async def _calibrate_and_filter(t: dict) -> Optional[dict]:
         dyn_thr = await dynamic_conf_threshold(market)
         hard_thr = max(dyn_thr, MIN_CONFIDENCE_TO_SEND)
 
+        # Decide
         if conf >= hard_thr:
             t["probability"] = round(p_cal, 3)
             t["confidence"] = round(conf, 3)
             t["soft"] = False
             return t
 
+        # Soft window
         if SOFT_TIPS_PER_RUN > 0 and SOFT_MIN_CONF > 0.0 and conf >= SOFT_MIN_CONF:
             t["probability"] = round(p_cal, 3)
             t["confidence"] = round(conf, 3)
@@ -318,6 +333,70 @@ async def _calibrate_and_filter(t: dict) -> Optional[dict]:
     except Exception as e:
         warn("learning gate failed:", str(e))
         return None
+
+# ---------- MOTD helpers ----------
+def _market_priority(market: str) -> int:
+    m = (market or "").upper()
+    try:
+        return MOTD_MARKET_ORDER.index(m)
+    except ValueError:
+        return len(MOTD_MARKET_ORDER) + 1
+
+async def _choose_motd(client: httpx.AsyncClient, tips: List[Dict]) -> Optional[Dict]:
+    """
+    From a list of raw tips (pre-calibration), return the single best MOTD candidate:
+      - non-live
+      - after calibration & thresholding
+      - highest confidence, then market priority, then higher expectedGoals
+    """
+    candidates: List[Dict] = []
+    for t in tips:
+        if t.get("live"):   # MOTD is for scheduled fixtures
+            continue
+        tt = await _calibrate_and_filter(dict(t))  # copy, calibrate, add conf
+        if not tt:
+            continue
+        if float(tt.get("confidence", 0.0)) < MOTD_MIN_CONF:
+            continue
+        candidates.append(tt)
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda x: (
+            float(x.get("confidence", 0.0)),
+            -_market_priority(x.get("market")),
+            float(x.get("expectedGoals") or 0.0),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+async def _maybe_send_motd(client: httpx.AsyncClient, today_tips: List[Dict]) -> Optional[int]:
+    """
+    Sends a single MOTD once per UTC day, if enabled and not already sent.
+    Returns message_id or None.
+    """
+    if not ENABLE_MOTD:
+        return None
+
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    cfg = await get_config_bulk(["MOTD_LAST_DATE"])
+    last = (cfg.get("MOTD_LAST_DATE") or "").strip()
+    if last == today_utc:
+        return None  # already sent today
+
+    motd = await _choose_motd(client, today_tips or [])
+    if not motd:
+        return None
+
+    from .telegram import send_motd
+    msg_id = await send_motd(client, motd)
+    if msg_id:
+        await set_config("MOTD_LAST_DATE", today_utc)
+        log(f"[motd] sent message_id={msg_id} fixture={motd.get('fixtureId')} {motd.get('market')} {motd.get('selection')}")
+    return msg_id or None
 
 # ---------- Sending ----------
 async def _send_one(client: httpx.AsyncClient, tip: Dict) -> bool:
@@ -359,6 +438,7 @@ async def _send_tips(client: httpx.AsyncClient, tips: List[Dict], start_count: O
             stats["low_conf"] += 1
             continue
 
+        # Enforce soft budget
         if tt.get("soft"):
             if soft_used >= SOFT_TIPS_PER_RUN:
                 if SCANNER_DEBUG:
@@ -388,7 +468,14 @@ async def run_scan_and_send() -> Dict[str, int]:
         if live_fixtures:
             live_tips, _ = await _build_tips_for_fixtures(client, live_fixtures)
         if today_fixtures:
-            today_tips, _ = await _build_tips_for_fixtures(client, today_fixtures)
+            today_tips, _ = await _build_tips_for_fixtures(client, today_tixtures := today_fixtures)  # keep name stable
+
+        # Try sending MOTD highlight once per day (non-blocking on failure)
+        if today_tips:
+            try:
+                await _maybe_send_motd(client, today_tips)
+            except Exception as e:
+                warn("MOTD send failed:", str(e))
 
         combined, _ = _dedupe_in_run(live_tips + today_tips)
         sent_total, send_stats = await _send_tips(client, combined, await count_sent_today())
@@ -413,4 +500,3 @@ async def run_scan_and_send() -> Dict[str, int]:
             "dateApiFn": FOUND_DATE_API_NAME,
         },
     }
-    
