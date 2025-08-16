@@ -6,7 +6,7 @@ import logging
 import requests
 import sqlite3
 from html import escape
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, date
 from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
 from requests.adapters import HTTPAdapter, Retry
@@ -31,7 +31,7 @@ CONF_THRESHOLD_BASE = int(os.getenv("CONF_THRESHOLD", "55"))   # base floor
 MAX_TIPS_PER_SCAN   = int(os.getenv("MAX_TIPS_PER_SCAN", "8"))
 DUP_COOLDOWN_MIN    = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 
-# Dynamic threshold targeting 2–15 tips per day (can disable via env)
+# Dynamic threshold targeting 2–15 tips/day
 DYN_BAND_STR        = os.getenv("DYNAMIC_TARGET_BAND", "2,15")
 try:
     DYN_MIN, DYN_MAX = [int(x) for x in DYN_BAND_STR.split(",")]
@@ -39,15 +39,16 @@ except Exception:
     DYN_MIN, DYN_MAX = 2, 15
 DYN_ENABLE          = os.getenv("DYNAMIC_ENABLE", "1") not in ("0","false","False","no","NO")
 
-# Late windows (can tweak per taste)
+# Late windows (per-market)
 O25_LATE_MINUTE     = int(os.getenv("O25_LATE_MINUTE", "88"))
 O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))  # allow O2.5 at 88'+ only if ≥2 goals
 BTTS_LATE_MINUTE    = int(os.getenv("BTTS_LATE_MINUTE", "88"))
 
-# MOTD leagues priority
-LEAGUE_PRIORITY_IDS = [
-    int(x) for x in (os.getenv("MOTD_LEAGUE_IDS", "39,140,135,78,61,2").split(",")) if x.strip().isdigit()
-]
+# MOTD leagues priority + predictor knobs
+LEAGUE_PRIORITY_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS", "39,140,135,78,61,2").split(",")) if x.strip().isdigit()]
+MOTD_PREDICT        = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
+MOTD_MIN_SAMPLES    = int(os.getenv("MOTD_MIN_SAMPLES", "30"))
+MOTD_CONF_MIN       = int(os.getenv("MOTD_CONF_MIN", "65"))      # require ≥65% to display lean
 
 # Allowed tips (NO Over 1.5)
 ALLOWED_SUGGESTIONS = {"Over 2.5 Goals", "Under 2.5 Goals", "BTTS: Yes", "BTTS: No"}
@@ -70,8 +71,11 @@ CAL_CACHE: Dict[str, Any] = {"ts": 0, "bins": []}  # calibration cache
 # ── DB ────────────────────────────────────────────────────────────────────────
 DB_PATH = "tip_performance.db"
 
+def db_conn():
+    return sqlite3.connect(DB_PATH)
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with db_conn() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS tips (
             match_id INTEGER,
@@ -90,17 +94,14 @@ def init_db():
         conn.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_id INTEGER,
+            match_id INTEGER UNIQUE,         -- unique to upsert final label
             verdict  INTEGER CHECK (verdict IN (0,1)),
             created_ts INTEGER
         )""")
-        # unique per match to avoid double-counting; manual can upsert & override auto
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_feedback_match ON feedback(match_id)")
         conn.execute("""
         CREATE VIEW IF NOT EXISTS v_tip_stats AS
           SELECT t.market, t.suggestion, AVG(f.verdict) AS hit_rate, COUNT(*) AS n
-          FROM tips t
-          JOIN feedback f ON f.match_id = t.match_id
+          FROM tips t JOIN feedback f ON f.match_id = t.match_id
           GROUP BY t.market, t.suggestion
         """)
         conn.execute("""
@@ -117,8 +118,16 @@ def init_db():
         )""")
         conn.commit()
 
-def db_conn():
-    return sqlite3.connect(DB_PATH)
+def set_setting(key: str, value: str):
+    with db_conn() as conn:
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        conn.commit()
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with db_conn() as conn:
+        cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
 
 def save_tip(match_id: int, league_id: int, league: str, home: str, away: str,
              market: str, suggestion: str, confidence: float,
@@ -133,13 +142,12 @@ def save_tip(match_id: int, league_id: int, league: str, home: str, away: str,
             conn.execute("""
               INSERT OR REPLACE INTO tip_snapshots(match_id, created_ts, payload)
               VALUES (?,?,?)
-            """, (match_id, now, json.dumps(snapshot)[:200000]))  # guard size
+            """, (match_id, now, json.dumps(snapshot)[:200000]))
         conn.commit()
 
 def upsert_feedback(match_id: int, verdict: int, ts: Optional[int] = None):
     if ts is None: ts = int(time.time())
     with db_conn() as conn:
-        # Upsert using the unique index on match_id
         conn.execute("""
           INSERT INTO feedback(match_id, verdict, created_ts)
           VALUES (?,?,?)
@@ -166,17 +174,6 @@ def recent_tip_exists(match_id: int, cooldown_min: int) -> bool:
     with db_conn() as conn:
         cur = conn.execute("SELECT 1 FROM tips WHERE match_id=? AND created_ts>=? LIMIT 1", (match_id, cutoff))
         return cur.fetchone() is not None
-
-def set_setting(key: str, value: str):
-    with db_conn() as conn:
-        conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
-        conn.commit()
-
-def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    with db_conn() as conn:
-        cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
-        row = cur.fetchone()
-        return row[0] if row else default
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
@@ -255,28 +252,15 @@ def fetch_today_fixtures_utc() -> List[Dict[str, Any]]:
 def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
     if not ids:
         return {}
-    # API-Football supports comma-separated 'ids'
     js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(i) for i in ids), "timezone": "UTC"})
     resp = js.get("response", []) if isinstance(js, dict) else []
-    out = {}
-    for fx in resp:
-        out[(fx.get("fixture") or {}).get("id")] = fx
-    return out
+    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
 
-# ── Tip logic & calibration ───────────────────────────────────────────────────
-def _num(v) -> float:
-    try:
-        if isinstance(v, str) and v.endswith('%'):
-            return float(v[:-1])
-        return float(v or 0)
-    except Exception:
-        return 0.0
-
+# ── Calibration ───────────────────────────────────────────────────────────────
 def compute_calibration_bins(cache_secs: int = 600):
     now = time.time()
     if now - CAL_CACHE["ts"] < cache_secs and CAL_CACHE["bins"]:
         return CAL_CACHE["bins"]
-    # bins of width 5 from 50..95
     bins = [(50,54),(55,59),(60,64),(65,69),(70,74),(75,79),(80,84),(85,100)]
     results = []
     with db_conn() as conn:
@@ -293,7 +277,6 @@ def compute_calibration_bins(cache_secs: int = 600):
     return results
 
 def calibrate_confidence(p: float) -> float:
-    """Map raw % to empirical bin hit-rate if we have enough samples (>=30)."""
     bins = compute_calibration_bins()
     for b in bins:
         if b["lo"] <= p <= b["hi"]:
@@ -302,11 +285,17 @@ def calibrate_confidence(p: float) -> float:
             break
     return p
 
+# ── Tip logic ─────────────────────────────────────────────────────────────────
+def _num(v) -> float:
+    try:
+        if isinstance(v, str) and v.endswith('%'):
+            return float(v[:-1])
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
 def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, float]]:
-    """
-    Allowed suggestions: Over 2.5, Under 2.5, BTTS: Yes, BTTS: No
-    Returns (market, suggestion, confidence, statline)
-    """
+    """Allowed: Over 2.5, Under 2.5, BTTS: Yes, BTTS: No"""
     home_name = match["teams"]["home"]["name"]
     away_name = match["teams"]["away"]["name"]
     gh = match["goals"]["home"] or 0
@@ -341,37 +330,30 @@ def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, flo
         conf = 55
         return "Over/Under 2.5 Goals", "Over 2.5 Goals", conf, {"xg_h":0,"xg_a":0,"sot_h":0,"sot_a":0,"cor_h":0,"cor_a":0}
 
-    # Signals
     if xg_sum >= 2.4 and total_goals <= 2 and minute >= 25: score += 18
     if sot_sum >= 6: score += 10
     if corners >= 10: score += 5
     if minute < 20: score -= 8
 
-    # BTTS: Yes if both producing
+    # BTTS rules
     if minute >= 25 and xg_h >= 0.9 and xg_a >= 0.9 and sot_h >= 3 and sot_a >= 3 and total_goals <= 3:
         market, suggestion, score = "BTTS", "Yes", max(score, 62)
-
-    # Quiet → BTTS: No
     if xg_sum < 1.4 and sot_sum < 4 and total_goals == 0 and minute > 35:
         market, suggestion, score = "BTTS", "No", 62
-
-    # Late & still low → Under 2.5 (unless already BTTS: Yes)
     if minute > 70 and total_goals <= 1 and suggestion != "BTTS: Yes":
         market, suggestion = "Over/Under 2.5 Goals", "Under 2.5 Goals"
         score = max(score, 62)
 
-    # History bump
     score = max(35.0, min(90.0, score))
     hist_rate, n = get_historic_hit_rate(market, suggestion)
     bump = (hist_rate - 0.5) * 14.0 * min(1.0, n / 50.0)  # cap ±7%
     raw_conf = round(max(35.0, min(95.0, score + bump)))
-
-    # Calibrate to make % honest
     cal_conf = calibrate_confidence(raw_conf)
+
     statline = {"xg_h": xg_h, "xg_a": xg_a, "sot_h": sot_h, "sot_a": sot_a, "cor_h": cor_h, "cor_a": cor_a}
     return market, suggestion, cal_conf, statline
 
-# ── Guards: settled/impossible & late windows ─────────────────────────────────
+# Guards
 def is_settled_or_impossible(suggestion: str, gh: int, ga: int) -> bool:
     total = gh + ga
     both_scored = (gh > 0 and ga > 0)
@@ -407,7 +389,6 @@ def get_effective_threshold() -> int:
     return CONF_THRESHOLD_BASE
 
 def adjust_threshold_if_needed():
-    """Gentle controller to keep daily volume within DYN_MIN..DYN_MAX."""
     if not DYN_ENABLE:
         return
     since = int(time.time()) - 24*3600
@@ -438,14 +419,12 @@ def format_human_tip(match: Dict[str, Any],
 
     market, suggestion, confidence, stat = chosen if chosen else decide_market(match)
 
-    # Gates
     eff_threshold = get_effective_threshold()
     if suggestion not in ALLOWED_SUGGESTIONS or confidence < eff_threshold:
         return "", [], {"match_id": match_id, "skip": True, "confidence": confidence}
     if is_settled_or_impossible(suggestion, g_home, g_away) or is_too_late(suggestion, int(minute), g_home, g_away):
         return "", [], {"match_id": match_id, "skip": True, "confidence": confidence}
 
-    # Persist + snapshot for training
     snapshot = {
         "minute": int(minute), "gh": g_home, "ga": g_away,
         "league_id": int(league_id), "market": market, "suggestion": suggestion,
@@ -472,14 +451,14 @@ def format_human_tip(match: Dict[str, Any],
         {"text": "👍 Correct", "callback_data": json.dumps({"t": "correct", "id": match_id})},
         {"text": "👎 Wrong",   "callback_data": json.dumps({"t": "wrong",   "id": match_id})},
     ]]
-    link_row = []
+    row = []
     if BET_URL_TMPL:
-        try: link_row.append({"text": "💰 Bet Now", "url": BET_URL_TMPL.format(home=home, away=away, fixture_id=match_id)})
+        try: row.append({"text": "💰 Bet Now", "url": BET_URL_TMPL.format(home=home, away=away, fixture_id=match_id)})
         except Exception: pass
     if WATCH_URL_TMPL:
-        try: link_row.append({"text": "📺 Watch Match", "url": WATCH_URL_TMPL.format(home=home, away=away, fixture_id=match_id)})
+        try: row.append({"text": "📺 Watch Match", "url": WATCH_URL_TMPL.format(home=home, away=away, fixture_id=match_id)})
         except Exception: pass
-    if link_row: kb.append(link_row)
+    if row: kb.append(row)
 
     meta = {"match_id": match_id, "league_id": int(league_id), "confidence": confidence}
     return msg, kb, meta
@@ -506,9 +485,8 @@ def match_alert():
             continue
         if is_settled_or_impossible(suggestion, gh, ga) or is_too_late(suggestion, minute, gh, ga):
             continue
-
         msg, kb, meta = format_human_tip(match, chosen)
-        if meta.get("skip"):  # defensive
+        if meta.get("skip"):
             continue
         logging.info(f"[TIP] sending fixture={fid} conf={meta['confidence']} suggestion={suggestion}")
         if send_telegram(msg, kb):
@@ -519,7 +497,6 @@ def match_alert():
 
 # ── Auto-labeler ──────────────────────────────────────────────────────────────
 def autolabel_unscored():
-    """Find tips (last 36h) without feedback, fetch FT results, label once."""
     since = int(time.time()) - 36*3600
     with db_conn() as conn:
         cur = conn.execute("""
@@ -527,11 +504,8 @@ def autolabel_unscored():
           WHERE created_ts>=? AND match_id NOT IN (SELECT match_id FROM feedback)
         """, (since,))
         ids = [r[0] for r in cur.fetchall()]
-
     if not ids:
         return
-
-    # batch in chunks of ~20 ids to be polite with API
     for i in range(0, len(ids), 20):
         batch = ids[i:i+20]
         fx = fetch_fixtures_by_ids(batch)
@@ -539,11 +513,10 @@ def autolabel_unscored():
             m = fx.get(fid)
             if not m: continue
             status = ((m.get("fixture") or {}).get("status") or {}).get("short")
-            if status not in ("FT","AET","PEN"):  # finished
+            if status not in ("FT","AET","PEN"):
                 continue
             gh = (m.get("goals") or {}).get("home") or 0
             ga = (m.get("goals") or {}).get("away") or 0
-            # find last suggestion we sent for this fixture (max created_ts)
             with db_conn() as conn:
                 cur = conn.execute("""
                   SELECT suggestion FROM tips WHERE match_id=? ORDER BY created_ts DESC LIMIT 1
@@ -552,7 +525,6 @@ def autolabel_unscored():
                 if not row: 
                     continue
                 s = row[0]
-            # compute verdict
             total = gh + ga
             verdict = None
             if s == "Over 2.5 Goals": verdict = 1 if total >= 3 else 0
@@ -561,9 +533,39 @@ def autolabel_unscored():
             elif s == "BTTS: No": verdict = 1 if (gh == 0 or ga == 0) else 0
             if verdict is not None and not feedback_exists(fid):
                 upsert_feedback(fid, verdict)
+                CAL_CACHE["ts"] = 0  # invalidate calibration cache
                 logging.info(f"[AUTO] Labeled match {fid} -> {verdict}")
 
-# ── MOTD ──────────────────────────────────────────────────────────────────────
+# ── MOTD (with prior-based lean ≥ MOTD_CONF_MIN) ──────────────────────────────
+def get_best_prior_for_league(league_id: int, min_samples: int) -> Optional[Tuple[str, str, float, int]]:
+    with db_conn() as conn:
+        cur = conn.execute("""
+            SELECT t.market, t.suggestion, AVG(f.verdict) AS hit, COUNT(*) AS n
+            FROM tips t JOIN feedback f ON f.match_id = t.match_id
+            WHERE t.league_id = ?
+            GROUP BY t.market, t.suggestion
+            HAVING n >= ?
+            ORDER BY hit DESC, n DESC
+            LIMIT 1
+        """, (int(league_id), int(min_samples)))
+        row = cur.fetchone()
+        if not row: return None
+        return (row[0], row[1], float(row[2] or 0.5), int(row[3] or 0))
+
+def get_best_prior_global(min_samples: int) -> Optional[Tuple[str, str, float, int]]:
+    with db_conn() as conn:
+        cur = conn.execute("""
+            SELECT t.market, t.suggestion, AVG(f.verdict) AS hit, COUNT(*) AS n
+            FROM tips t JOIN feedback f ON f.match_id = t.match_id
+            GROUP BY t.market, t.suggestion
+            HAVING n >= ?
+            ORDER BY hit DESC, n DESC
+            LIMIT 1
+        """, (int(min_samples),))
+        row = cur.fetchone()
+        if not row: return None
+        return (row[0], row[1], float(row[2] or 0.5), int(row[3] or 0))
+
 def pick_match_of_the_day(fixtures: List[Dict[str,Any]]) -> Optional[Dict[str,Any]]:
     pri = {lid:i for i,lid in enumerate(LEAGUE_PRIORITY_IDS)}
     fixtures = [f for f in fixtures if (f.get("fixture") or {}).get("status",{}).get("short") in ("NS","TBD")]
@@ -583,20 +585,40 @@ def send_match_of_the_day():
     if not motd:
         logging.info("[MOTD] No suitable fixture found for today.")
         return
-    lg = motd.get("league") or {}; fx = motd.get("fixture") or {}
+
+    lg = motd.get("league") or {}
+    fx = motd.get("fixture") or {}
     home = escape((motd.get("teams") or {}).get("home",{}).get("name",""))
     away = escape((motd.get("teams") or {}).get("away",{}).get("name",""))
     league = escape(f"{lg.get('country','')} - {lg.get('name','')}".strip(" -"))
+    league_id = lg.get("id") or 0
     ts = fx.get("timestamp")
     when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if ts else "TBD"
     fid = fx.get("id")
 
-    msg = "\n".join([
+    lines = [
         "🌟 <b>Match of the Day</b>",
         f"<b>Match:</b> {home} vs {away}",
         f"🗓 <b>Kickoff:</b> {when}",
         f"🏆 <b>League:</b> {league}",
-    ])
+    ]
+
+    if MOTD_PREDICT:
+        prior = get_best_prior_for_league(int(league_id), MOTD_MIN_SAMPLES) or \
+                get_best_prior_global(MOTD_MIN_SAMPLES)
+        if prior:
+            pm_market, pm_suggestion, pm_hit, pm_n = prior
+            pct = int(round(pm_hit * 100))
+            if pm_suggestion in ALLOWED_SUGGESTIONS and pct >= MOTD_CONF_MIN:
+                lines.append(f"🔮 <b>Lean:</b> {escape(pm_suggestion)}")
+                lines.append(f"📈 <b>Confidence:</b> {pct}% <i>(prior, n={pm_n})</i>")
+            else:
+                logging.info(f"[MOTD] Prior insufficient or not allowed (suggestion={pm_suggestion}, pct={pct}).")
+        else:
+            logging.info("[MOTD] No prior available; skipping lean.")
+
+    msg = "\n".join(lines)
+
     kb = []
     row = []
     if BET_URL_TMPL:
@@ -606,8 +628,9 @@ def send_match_of_the_day():
         try: row.append({"text": "📺 Watch (when live)", "url": WATCH_URL_TMPL.format(home=home, away=away, fixture_id=fid)})
         except Exception: pass
     if row: kb.append(row)
+
     send_telegram(msg, kb)
-    logging.info(f"[MOTD] Sent for fixture={fid}")
+    logging.info(f"[MOTD] Sent for fixture={fid} (predict={MOTD_PREDICT})")
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -624,7 +647,6 @@ def motd_route():
     send_match_of_the_day()
     return jsonify({"status": "ok"})
 
-# Debug routes
 @app.route("/debug/scan")
 def debug_scan():
     data = fetch_live_matches()
@@ -683,8 +705,8 @@ def telegram_webhook():
         verdict = 1 if payload.get("t") == "correct" else 0
         match_id = int(payload.get("id"))
         upsert_feedback(match_id, verdict)
-        answer_callback(cq["id"], "Thanks! Feedback recorded ✅" if verdict else "Got it. Marked as wrong ❌")
         CAL_CACHE["ts"] = 0  # invalidate calibration cache on new label
+        answer_callback(cq["id"], "Thanks! Feedback recorded ✅" if verdict else "Got it. Marked as wrong ❌")
     except Exception:
         logging.exception("webhook error")
         try: answer_callback(cq.get("id",""), "Sorry, couldn’t record feedback.")
@@ -739,6 +761,9 @@ def stats_config():
         "DYN_MIN": DYN_MIN, "DYN_MAX": DYN_MAX,
         "O25_LATE_MINUTE": O25_LATE_MINUTE, "O25_LATE_MIN_GOALS": O25_LATE_MIN_GOALS,
         "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
+        "MOTD_PREDICT": MOTD_PREDICT,
+        "MOTD_MIN_SAMPLES": MOTD_MIN_SAMPLES,
+        "MOTD_CONF_MIN": MOTD_CONF_MIN,
         "APISPORTS_KEY_set": bool(APISPORTS_KEY),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
     })
@@ -751,10 +776,10 @@ if __name__ == "__main__":
     scheduler.add_job(match_alert, "interval", minutes=5, id="scan", replace_existing=True)
     # MOTD 08:00 UTC
     scheduler.add_job(send_match_of_the_day, CronTrigger(hour=8, minute=0, timezone="UTC"),
-                      id="motd", replace_existing=True)
+                      id="motd", replace_existing=True, misfire_grace_time=3600, coalesce=True)
     # Auto-label every 15 minutes
     scheduler.add_job(autolabel_unscored, "interval", minutes=15, id="autolabel", replace_existing=True)
-    # Dynamic threshold once a day at 23:59 UTC
+    # Dynamic threshold daily
     scheduler.add_job(adjust_threshold_if_needed, CronTrigger(hour=23, minute=59, timezone="UTC"),
                       id="dynthresh", replace_existing=True)
 
