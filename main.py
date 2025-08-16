@@ -28,10 +28,10 @@ WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 # Core knobs
 CONF_THRESHOLD     = int(os.getenv("CONF_THRESHOLD", "60"))     # send only if >= 60%
-MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "8"))   # soft cap per scan (set 0 to disable)
+MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))   # soft cap per scan (set 0 to disable)
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))   # don't resend same fixture within N min
 
-# Dynamic threshold targeting 2–15 tips/day
+# Dynamic threshold targeting 2–30 tips/day
 DYN_BAND_STR        = os.getenv("DYNAMIC_TARGET_BAND", "2,15")
 try:
     DYN_MIN, DYN_MAX = [int(x) for x in DYN_BAND_STR.split(",")]
