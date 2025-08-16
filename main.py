@@ -27,9 +27,9 @@ WATCH_URL_TMPL     = os.getenv("WATCH_URL")
 WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 # Core knobs
-CONF_THRESHOLD_BASE = int(os.getenv("CONF_THRESHOLD", "55"))   # base floor
-MAX_TIPS_PER_SCAN   = int(os.getenv("MAX_TIPS_PER_SCAN", "8"))
-DUP_COOLDOWN_MIN    = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
+CONF_THRESHOLD     = int(os.getenv("CONF_THRESHOLD", "60"))     # send only if >= 60%
+MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "8"))   # soft cap per scan (set 0 to disable)
+DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))   # don't resend same fixture within N min
 
 # Dynamic threshold targeting 2–15 tips/day
 DYN_BAND_STR        = os.getenv("DYNAMIC_TARGET_BAND", "2,15")
