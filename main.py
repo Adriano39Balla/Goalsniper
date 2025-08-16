@@ -8,6 +8,7 @@ import logging
 import requests
 import sqlite3
 from html import escape
+from zoneinfo import ZoneInfo
 from datetime import datetime, timezone, date
 from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
@@ -950,23 +951,42 @@ def stats_config():
         "HEARTBEAT_ENABLE": HEARTBEAT_ENABLE,
     })
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
+# ── Entrypoint ──────────────────────────────────────────────────────────────── 
 if __name__ == "__main__":
     init_db()
     scheduler = BackgroundScheduler()
-    # Live scan every 5 minutes
-    scheduler.add_job(match_alert, "interval", minutes=5, id="scan", replace_existing=True)
+
+    # Live scan every 5 minutes, ONLY between 07:00 and 21:59 Europe/Berlin
+    scheduler.add_job(
+        match_alert,
+        CronTrigger(minute="*/5", hour="7-21", timezone=ZoneInfo("Europe/Berlin")),
+        id="scan", replace_existing=True
+    )
+
     # MOTD 08:00 UTC
-    scheduler.add_job(send_match_of_the_day, CronTrigger(hour=8, minute=0, timezone="UTC"),
-                      id="motd", replace_existing=True, misfire_grace_time=3600, coalesce=True)
-    # Auto-label every 15 minutes
-    scheduler.add_job(autolabel_unscored, "interval", minutes=15, id="autolabel", replace_existing=True)
-    # Dynamic threshold daily
-    scheduler.add_job(adjust_threshold_if_needed, CronTrigger(hour=23, minute=59, timezone="UTC"),
-                      id="dynthresh", replace_existing=True)
+    scheduler.add_job(
+        send_match_of_the_day,
+        CronTrigger(hour=8, minute=0, timezone="UTC"),
+        id="motd", replace_existing=True,
+        misfire_grace_time=3600, coalesce=True
+    )
+
+    # Auto-label every 15 minutes (still useful at night since it's DB-driven, not heavy)
+    scheduler.add_job(
+        autolabel_unscored,
+        "interval", minutes=15,
+        id="autolabel", replace_existing=True
+    )
+
+    # Dynamic threshold daily at 23:59 UTC
+    scheduler.add_job(
+        adjust_threshold_if_needed,
+        CronTrigger(hour=23, minute=59, timezone="UTC"),
+        id="dynthresh", replace_existing=True
+    )
 
     scheduler.start()
-    logging.info("⏱️ Scheduler started (scan=5m, autolabel=15m, MOTD=08:00 UTC, dyn=23:59 UTC)")
+    logging.info("⏱️ Scheduler started (scan=07:00–21:59 Berlin every 5m, autolabel=15m, MOTD=08:00 UTC, dyn=23:59 UTC)")
     port = int(os.getenv("PORT", 5000))
     logging.info("✅ Robi Superbrain started.")
     app.run(host="0.0.0.0", port=port)
