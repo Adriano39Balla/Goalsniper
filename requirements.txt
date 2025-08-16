@@ -1,5 +1,6 @@
 Flask==2.3.3
 requests==2.31.0
+scikit-learn==1.5.1
 pytz==2024.1
 gunicorn==21.2.0
 APScheduler==3.10.4
