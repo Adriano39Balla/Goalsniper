@@ -49,6 +49,12 @@ O25_LATE_MINUTE     = int(os.getenv("O25_LATE_MINUTE", "88"))
 O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))  # allow O2.5 at 88'+ only if ≥2 goals
 BTTS_LATE_MINUTE    = int(os.getenv("BTTS_LATE_MINUTE", "88"))
 
+# === NEW: Data sufficiency & anti-trivial guards ===
+ONLY_MODEL_MODE         = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false","False","no","NO")
+REQUIRE_STATS_MINUTE    = int(os.getenv("REQUIRE_STATS_MINUTE", "30"))   # after this minute, require live stats
+REQUIRE_DATA_FIELDS     = int(os.getenv("REQUIRE_DATA_FIELDS", "1"))     # min count among {xG,SOT,CK} present
+UNDER_SUPPRESS_AFTER_MIN= int(os.getenv("UNDER_SUPPRESS_AFTER_MIN", "85"))
+
 # MOTD leagues priority (tie-breaker only) + predictor knobs
 LEAGUE_PRIORITY_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS", "39,140,135,78,61,2").split(",")) if x.strip().isdigit()]
 MOTD_PREDICT        = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
@@ -97,7 +103,6 @@ def init_db():
             sent_ok   INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts)
         )""")
-        # add sent_ok if missing (older deployments)
         try:
             conn.execute("ALTER TABLE tips ADD COLUMN sent_ok INTEGER DEFAULT 1")
         except Exception:
@@ -109,7 +114,6 @@ def init_db():
             verdict  INTEGER CHECK (verdict IN (0,1)),
             created_ts INTEGER
         )""")
-        # Latest tip per match/market to avoid overcounting
         conn.execute("DROP VIEW IF EXISTS v_tip_stats")
         conn.execute("""
         CREATE VIEW IF NOT EXISTS v_tip_stats AS
@@ -299,7 +303,6 @@ def compute_calibration_bins(cache_secs: int = 600):
     return results
 
 def calibrate_confidence(pct: float) -> float:
-    """pct is 0..100"""
     bins = compute_calibration_bins()
     for b in bins:
         if b["lo"] <= pct <= b["hi"]:
@@ -309,15 +312,6 @@ def calibrate_confidence(pct: float) -> float:
     return pct
 
 # ── Learned model (logistic) support ──────────────────────────────────────────
-# Store in settings key "model_coeffs" as JSON:
-# {
-#   "O25": {"features": ["minute","goals_sum","xg_sum","sot_sum","cor_sum"], "coef": [w1,...], "intercept": w0},
-#   "BTTS_YES": {"features": [...], "coef": [...], "intercept": w0}
-# }
-# Notes:
-# - We'll predict P(Over2.5) and P(BTTS Yes). Complements yield Under2.5 and BTTS No.
-# - If model missing, we fall back to (lightly) the heuristic, but still pass through calibration and priors.
-
 def _load_model():
     raw = get_setting("model_coeffs")
     if not raw:
@@ -388,26 +382,36 @@ def predict_with_model(model: Dict[str, Any], feat: Dict[str, float]) -> Optiona
         logging.exception("[MODEL] Prediction error")
         return None
 
+# === NEW: data sufficiency checks ===
+def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
+    """After REQUIRE_STATS_MINUTE, require at least N of {xg_sum, sot_sum, cor_sum} to be > 0."""
+    if minute < REQUIRE_STATS_MINUTE:
+        return True
+    fields = [feat.get("xg_sum", 0.0), feat.get("sot_sum", 0.0), feat.get("cor_sum", 0.0)]
+    nonzero = sum(1 for v in fields if (v or 0) > 0)
+    return nonzero >= max(0, REQUIRE_DATA_FIELDS)
+
 # ── Tip logic (learned-first, heuristic-fallback) ─────────────────────────────
 def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, float]]:
     """Return (market, suggestion, confidence_pct, features_snapshot)"""
-    # Extract features
     feat = extract_features(match)
     minute = int(feat["minute"])
     gh = int(feat["goals_h"]); ga = int(feat["goals_a"])
     total_goals = gh + ga
 
-    # Try learned models
+    # Hard gate: require stats coverage after threshold minute
+    if not stats_coverage_ok(feat, minute):
+        # Signal to caller by returning 0 confidence with a default suggestion (will be skipped)
+        return "Over/Under 2.5 Goals", "Over 2.5 Goals", 0.0, feat
+
     models = _load_model()
-    p_o25 = None
-    p_btts = None
-    if "O25" in models:
-        p_o25 = predict_with_model(models["O25"], feat)
-    if "BTTS_YES" in models:
-        p_btts = predict_with_model(models["BTTS_YES"], feat)
+    if ONLY_MODEL_MODE and not models:
+        return "Over/Under 2.5 Goals", "Over 2.5 Goals", 0.0, feat
+
+    p_o25 = predict_with_model(models["O25"], feat) if "O25" in models else None
+    p_btts = predict_with_model(models["BTTS_YES"], feat) if "BTTS_YES" in models else None
 
     candidates: List[Tuple[str, str, float]] = []
-    # If learned probs present, use them
     if p_o25 is not None:
         candidates.append(("Over/Under 2.5 Goals", "Over 2.5 Goals", p_o25))
         candidates.append(("Over/Under 2.5 Goals", "Under 2.5 Goals", 1.0 - p_o25))
@@ -417,7 +421,6 @@ def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, flo
 
     # If no learned model at all, fallback to lightweight heuristic (legacy)
     if not candidates:
-        # Heuristic score (kept minimal; will still calibrate)
         xg_sum = feat["xg_sum"]; sot_sum = feat["sot_sum"]; corners = feat["cor_sum"]
         score = 50.0
         if xg_sum >= 2.4 and total_goals <= 2 and minute >= 25: score += 18
@@ -425,7 +428,6 @@ def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, flo
         if corners >= 10: score += 5
         if minute < 20: score -= 8
 
-        # BTTS rules
         if minute >= 25 and feat["xg_h"] >= 0.9 and feat["xg_a"] >= 0.9 and feat["sot_h"] >= 3 and feat["sot_a"] >= 3 and total_goals <= 3:
             market, suggestion, base = "BTTS", "Yes", max(score, 62)
         elif feat["xg_sum"] < 1.4 and sot_sum < 4 and total_goals == 0 and minute > 35:
@@ -435,15 +437,14 @@ def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, flo
         else:
             market, suggestion, base = "Over/Under 2.5 Goals", "Over 2.5 Goals", score
 
-        # Historic bump and calibration
         base = max(35.0, min(90.0, base))
         hist_rate, n = get_historic_hit_rate(market, suggestion)
-        bump = (hist_rate - 0.5) * 14.0 * min(1.0, n / 50.0)  # cap ±7%
+        bump = (hist_rate - 0.5) * 14.0 * min(1.0, n / 50.0)
         raw_conf_pct = round(max(35.0, min(95.0, base + bump)))
         cal_conf_pct = calibrate_confidence(raw_conf_pct)
         return market, suggestion, cal_conf_pct, feat
 
-    # Learned candidates path: pick the best allowed
+    # Learned candidates: pick the best allowed
     allowed = []
     for market, sugg, p in candidates:
         if market == "BTTS" and sugg == "Yes":
@@ -456,20 +457,13 @@ def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, flo
             allowed.append((market, suggestion, float(p)))
 
     if not allowed:
-        # should not happen, but fallback
-        return "Over/Under 2.5 Goals", "Over 2.5 Goals", 55.0, feat
+        return "Over/Under 2.5 Goals", "Over 2.5 Goals", 0.0, feat
 
-    # Choose the market with max probability
     market, suggestion, prob = max(allowed, key=lambda x: x[2])
-
-    # Convert to calibrated confidence
     raw_pct = int(round(prob * 100))
-    # add a small historic prior bump (league-agnostic) for stability
     hist_rate, n = get_historic_hit_rate(market, suggestion)
     raw_pct = int(round(min(95.0, max(35.0, raw_pct + (hist_rate - 0.5) * 10.0 * min(1.0, n / 50.0)))))
-
     cal_pct = calibrate_confidence(raw_pct)
-
     return market, suggestion, cal_pct, feat
 
 # Guards
@@ -482,12 +476,20 @@ def is_settled_or_impossible(suggestion: str, gh: int, ga: int) -> bool:
     if suggestion == "BTTS: No":        return both_scored
     return False
 
-def is_too_late(suggestion: str, minute: int, gh: int, ga: int) -> bool:
+def is_too_late(suggestion: str, minute: int, gh: int, ga: int, feat: Optional[Dict[str,float]]=None) -> bool:
     total = gh + ga
     if suggestion == "Over 2.5 Goals" and minute >= O25_LATE_MINUTE and total < O25_LATE_MIN_GOALS:
         return True
     if suggestion == "BTTS: Yes" and minute >= BTTS_LATE_MINUTE and (gh == 0 or ga == 0):
         return True
+    # === NEW: suppress trivial late Unders without evidence ===
+    if suggestion == "Under 2.5 Goals" and minute >= UNDER_SUPPRESS_AFTER_MIN:
+        xg_sum = (feat or {}).get("xg_sum", 0.0)
+        sot_sum = (feat or {}).get("sot_sum", 0.0)
+        cor_sum = (feat or {}).get("cor_sum", 0.0)
+        # if we basically have no attacking evidence, don't spam a trivial Under
+        if (xg_sum + sot_sum) < 0.2 and cor_sum == 0.0:
+            return True
     return False
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
@@ -523,13 +525,11 @@ def adjust_threshold_if_needed():
     eff = get_effective_threshold()
     new_eff = eff
 
-    # volume logic (existing)
     if count_24h > DYN_MAX:
         new_eff = min(80, new_eff + 2)
     elif count_24h < DYN_MIN:
         new_eff = max(50, new_eff - 2)
 
-    # optional hit-rate targeting
     if hr is not None:
         if hr < DYN_TARGET_HITRATE and new_eff < 80:
             new_eff += 1
@@ -544,7 +544,6 @@ def adjust_threshold_if_needed():
 
 def build_tip_message(match: Dict[str, Any],
                       chosen: Optional[Tuple[str,str,float,Dict[str,float]]] = None) -> Tuple[str, list, Dict[str, Any], Dict[str, Any]]:
-    """Return (message, inline_keyboard, meta, snapshot) WITHOUT saving; caller saves after send."""
     fixture = match["fixture"]; league_block = match.get("league") or {}
     league_id = league_block.get("id") or 0
     league = escape(f"{league_block.get('country','')} - {league_block.get('name','')}".strip(" -"))
@@ -559,7 +558,7 @@ def build_tip_message(match: Dict[str, Any],
     if suggestion not in ALLOWED_SUGGESTIONS or confidence < eff_threshold:
         return "", [], {"match_id": match_id, "skip": True, "confidence": confidence}, {}
 
-    if is_settled_or_impossible(suggestion, g_home, g_away) or is_too_late(suggestion, int(minute), g_home, g_away):
+    if is_settled_or_impossible(suggestion, g_home, g_away) or is_too_late(suggestion, int(minute), g_home, g_away, stat):
         return "", [], {"match_id": match_id, "skip": True, "confidence": confidence}, {}
 
     stat_line = ""
@@ -615,12 +614,12 @@ def match_alert():
             continue
 
         chosen = decide_market(match)
-        market, suggestion, conf, _ = chosen
+        market, suggestion, conf, feat = chosen
         gh = match["goals"]["home"] or 0; ga = match["goals"]["away"] or 0
         minute = int((match.get("fixture", {}) or {}).get("status", {}).get("elapsed") or 0)
         if suggestion not in ALLOWED_SUGGESTIONS or conf < get_effective_threshold():
             continue
-        if is_settled_or_impossible(suggestion, gh, ga) or is_too_late(suggestion, minute, gh, ga):
+        if is_settled_or_impossible(suggestion, gh, ga) or is_too_late(suggestion, minute, gh, ga, feat):
             continue
 
         msg, kb, meta, snapshot = build_tip_message(match, chosen)
@@ -634,7 +633,6 @@ def match_alert():
                      snapshot=snapshot, sent_ok=1)
             sent += 1
         else:
-            # record attempt as not sent (optional)
             save_tip(meta["match_id"], int(meta["league_id"]), meta["league"], meta["home"], meta["away"],
                      market, suggestion, float(meta["confidence"]), meta["score_at_tip"], int(meta["minute"]),
                      snapshot=snapshot, sent_ok=0)
@@ -726,7 +724,6 @@ def get_best_prior_global(min_samples: int) -> Optional[Tuple[str, str, float, i
         return (row[0], row[1], float(row[2] or 0.5), int(row[3] or 0))
 
 def pick_match_of_the_day(fixtures: List[Dict[str,Any]]) -> Optional[Dict[str,Any]]:
-    # Consider only not-started fixtures
     fixtures = [f for f in fixtures if (f.get("fixture") or {}).get("status",{}).get("short") in ("NS","TBD")]
     if not fixtures: return None
 
@@ -741,12 +738,10 @@ def pick_match_of_the_day(fixtures: List[Dict[str,Any]]) -> Optional[Dict[str,An
         pct = int(round(pm_hit * 100))
         if pm_suggestion in ALLOWED_SUGGESTIONS and pct >= MOTD_CONF_MIN:
             ts = (f.get("fixture") or {}).get("timestamp") or 10**12
-            # league priority used only as tiebreaker
             pri_index = (LEAGUE_PRIORITY_IDS.index(lid) + 1) if lid in LEAGUE_PRIORITY_IDS else (len(LEAGUE_PRIORITY_IDS) + 2)
             candidates.append((pm_hit, pm_n, -pri_index, ts, f, pm_suggestion, pct))
     if not candidates:
         return None
-    # Highest hit, then largest n, then league priority (lower pri_index wins), then earliest kickoff
     candidates.sort(key=lambda t: (-t[0], -t[1], t[2], t[3]))
     best = candidates[0][4]
     return best
@@ -849,12 +844,12 @@ def debug_send():
     matches = fetch_live_matches()
     for m in matches[:limit]:
         chosen = decide_market(m)
-        market, suggestion, conf, _ = chosen
+        market, suggestion, conf, feat = chosen
         gh = m["goals"]["home"] or 0; ga = m["goals"]["away"] or 0
         minute = int((m.get("fixture", {}) or {}).get("status", {}).get("elapsed") or 0)
         if suggestion not in ALLOWED_SUGGESTIONS or conf < get_effective_threshold():
             continue
-        if is_settled_or_impossible(suggestion, gh, ga) or is_too_late(suggestion, minute, gh, ga):
+        if is_settled_or_impossible(suggestion, gh, ga) or is_too_late(suggestion, minute, gh, ga, feat):
             continue
         msg, kb, meta, snapshot = build_tip_message(m, chosen)
         if meta.get("skip"): continue
@@ -943,6 +938,10 @@ def stats_config():
         "DYN_TARGET_HITRATE": DYN_TARGET_HITRATE,
         "O25_LATE_MINUTE": O25_LATE_MINUTE, "O25_LATE_MIN_GOALS": O25_LATE_MIN_GOALS,
         "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
+        "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
+        "REQUIRE_STATS_MINUTE": REQUIRE_STATS_MINUTE,
+        "REQUIRE_DATA_FIELDS": REQUIRE_DATA_FIELDS,
+        "UNDER_SUPPRESS_AFTER_MIN": UNDER_SUPPRESS_AFTER_MIN,
         "MOTD_PREDICT": MOTD_PREDICT,
         "MOTD_MIN_SAMPLES": MOTD_MIN_SAMPLES,
         "MOTD_CONF_MIN": MOTD_CONF_MIN,
