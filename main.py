@@ -454,33 +454,43 @@ def stats_config():
     })
 
 # ── Entrypoint / Scheduler ────────────────────────────────────────────────────
-scheduler = None
-
 if __name__ == "__main__":
     if not API_KEY:
         logging.error("API_KEY is not set — live fetch will return 0 matches.")
     init_db()
+
     scheduler = BackgroundScheduler()
 
     if HARVEST_MODE:
         # Sun–Thu, 09:00–21:59 Europe/Berlin every 2 min (no night pings)
         scheduler.add_job(
             harvest_scan,
-            CronTrigger(day_of_week="sun-thu", hour="9-21", minute="*/2", timezone=ZoneInfo("Europe/Berlin")),
-            id="harvest", replace_existing=True
+            CronTrigger(
+                day_of_week="sun,mon,tue,wed,thu",   # ← was "sun-thu" (invalid range)
+                hour="9-21",
+                minute="*/2",
+                timezone=ZoneInfo("Europe/Berlin"),
+            ),
+            id="harvest",
+            replace_existing=True,
         )
-        # Backfill results every 15m
+
+        # Backfill results every 15 min
         scheduler.add_job(
             backfill_results_from_snapshots,
-            "interval", minutes=15,
-            id="backfill", replace_existing=True
+            "interval",
+            minutes=15,
+            id="backfill",
+            replace_existing=True,
         )
+
     else:
-        # (When you flip to production, add match_alert + sends here)
+        # (optional) production jobs go here later
         pass
 
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
+
     port = int(os.getenv("PORT", 5000))
     logging.info("✅ Robi Superbrain started.")
     app.run(host="0.0.0.0", port=port)
