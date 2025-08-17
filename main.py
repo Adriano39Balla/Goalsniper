@@ -33,35 +33,22 @@ CONF_THRESHOLD     = int(os.getenv("CONF_THRESHOLD", "60"))     # send only if >
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))  # soft cap per scan (set 0 to disable)
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))   # don't resend same fixture within N min
 
-# Dynamic threshold targeting 2–15 tips/day (optional)
-DYN_BAND_STR        = os.getenv("DYNAMIC_TARGET_BAND", "2,15")
-try:
-    DYN_MIN, DYN_MAX = [int(x) for x in DYN_BAND_STR.split(",")]
-except Exception:
-    DYN_MIN, DYN_MAX = 2, 15
-DYN_ENABLE          = os.getenv("DYNAMIC_ENABLE", "1") not in ("0","false","False","no","NO")
-DYN_TARGET_HITRATE  = float(os.getenv("DYN_TARGET_HITRATE", "0.56"))  # optional, 0..1
-
 # Late windows (per-market)
 O25_LATE_MINUTE     = int(os.getenv("O25_LATE_MINUTE", "88"))
-O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))  # allow O2.5 at 88'+ only if ≥2 goals
+O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))
 BTTS_LATE_MINUTE    = int(os.getenv("BTTS_LATE_MINUTE", "88"))
 
-# Data sufficiency & anti-trivial guards
-ONLY_MODEL_MODE         = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false","False","no","NO")
-REQUIRE_STATS_MINUTE    = int(os.getenv("REQUIRE_STATS_MINUTE", "30"))   # after this minute, require live stats
-REQUIRE_DATA_FIELDS     = int(os.getenv("REQUIRE_DATA_FIELDS", "1"))     # min count among {xG,SOT,CK,POS} present
-UNDER_SUPPRESS_AFTER_MIN= int(os.getenv("UNDER_SUPPRESS_AFTER_MIN", "85"))
+# === Data sufficiency & anti-trivial guards (tightened) ===
+ONLY_MODEL_MODE          = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false","False","no","NO")
+REQUIRE_STATS_MINUTE     = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))   # stricter: start enforcing at 35'
+REQUIRE_DATA_FIELDS      = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))     # need at least two of {xG,SOT,CK}
+UNDER_SUPPRESS_AFTER_MIN = int(os.getenv("UNDER_SUPPRESS_AFTER_MIN", "82"))
 
-# Harvest mode (collect features quickly without sending messages)
-HARVEST_MODE           = os.getenv("HARVEST_MODE", "0") not in ("0","false","False","no","NO")
-HARVEST_MAX_PER_SCAN   = int(os.getenv("HARVEST_MAX_PER_SCAN", "50"))
-
-# MOTD leagues priority + predictor knobs
+# MOTD
 LEAGUE_PRIORITY_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS", "39,140,135,78,61,2").split(",")) if x.strip().isdigit()]
 MOTD_PREDICT        = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
 MOTD_MIN_SAMPLES    = int(os.getenv("MOTD_MIN_SAMPLES", "30"))
-MOTD_CONF_MIN       = int(os.getenv("MOTD_CONF_MIN", "65"))      # require ≥65% to display lean
+MOTD_CONF_MIN       = int(os.getenv("MOTD_CONF_MIN", "65"))
 
 # Allowed tips (NO Over 1.5)
 ALLOWED_SUGGESTIONS = {"Over 2.5 Goals", "Under 2.5 Goals", "BTTS: Yes", "BTTS: No"}
@@ -79,12 +66,12 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ── In-memory caches ──────────────────────────────────────────────────────────
 STATS_CACHE: Dict[int, Tuple[float, list]] = {}  # fixture_id -> (timestamp, stats_response)
-EVENTS_CACHE: Dict[int, Tuple[float, list]] = {} # fixture_id -> (timestamp, events_response)
-CAL_CACHE: Dict[str, Any] = {"ts": 0, "bins": []}  # calibration cache
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 DB_PATH = "tip_performance.db"
-def db_conn(): return sqlite3.connect(DB_PATH)
+
+def db_conn():
+    return sqlite3.connect(DB_PATH)
 
 def init_db():
     with db_conn() as conn:
@@ -104,8 +91,10 @@ def init_db():
             sent_ok   INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts)
         )""")
-        try: conn.execute("ALTER TABLE tips ADD COLUMN sent_ok INTEGER DEFAULT 1")
-        except Exception: pass
+        try:
+            conn.execute("ALTER TABLE tips ADD COLUMN sent_ok INTEGER DEFAULT 1")
+        except Exception:
+            pass
         conn.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,73 +102,32 @@ def init_db():
             verdict  INTEGER CHECK (verdict IN (0,1)),
             created_ts INTEGER
         )""")
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS tip_snapshots (
-            match_id INTEGER,
-            created_ts INTEGER,
-            payload TEXT,
-            PRIMARY KEY (match_id, created_ts)
-        )""")
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )""")
-        # View for historic hit rate
         conn.execute("DROP VIEW IF EXISTS v_tip_stats")
         conn.execute("""
-        CREATE VIEW v_tip_stats AS
+        CREATE VIEW IF NOT EXISTS v_tip_stats AS
         SELECT t.market, t.suggestion,
                AVG(f.verdict) AS hit_rate,
                COUNT(DISTINCT t.match_id) AS n
         FROM (
           SELECT match_id, market, suggestion, MAX(created_ts) AS last_ts
-          FROM tips GROUP BY match_id, market, suggestion
+          FROM tips
+          GROUP BY match_id, market, suggestion
         ) lt
         JOIN tips t ON t.match_id=lt.match_id AND t.created_ts=lt.last_ts
         JOIN feedback f ON f.match_id = t.match_id
         GROUP BY t.market, t.suggestion
         """)
-        # Match results to store final outcomes (used by training script too)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS match_results (
-            match_id   INTEGER PRIMARY KEY,
-            final_goals_h INTEGER,
-            final_goals_a INTEGER,
-            btts_yes      INTEGER,
-            updated_ts    INTEGER
-        )""")
         conn.commit()
-
-def set_setting(key: str, value: str):
-    with db_conn() as conn:
-        conn.execute(
-            "INSERT INTO settings(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        conn.commit()
-
-def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    with db_conn() as conn:
-        cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
-        row = cur.fetchone()
-        return row[0] if row else default
 
 def save_tip(match_id: int, league_id: int, league: str, home: str, away: str,
              market: str, suggestion: str, confidence: float,
-             score_at_tip: str, minute: int, snapshot: Optional[dict] = None, sent_ok: int = 1):
+             score_at_tip: str, minute: int, sent_ok: int = 1):
     now = int(time.time())
     with db_conn() as conn:
         conn.execute("""
           INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, (match_id, league_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, now, sent_ok))
-        if snapshot:
-            conn.execute("""
-              INSERT OR REPLACE INTO tip_snapshots(match_id, created_ts, payload)
-              VALUES (?,?,?)
-            """, (match_id, now, json.dumps(snapshot)[:200000]))
         conn.commit()
 
 def upsert_feedback(match_id: int, verdict: int, ts: Optional[int] = None):
@@ -192,11 +140,6 @@ def upsert_feedback(match_id: int, verdict: int, ts: Optional[int] = None):
         """, (match_id, verdict, ts))
         conn.commit()
 
-def feedback_exists(match_id: int) -> bool:
-    with db_conn() as conn:
-        cur = conn.execute("SELECT 1 FROM feedback WHERE match_id=? LIMIT 1", (match_id,))
-        return cur.fetchone() is not None
-
 def get_historic_hit_rate(market: str, suggestion: str) -> Tuple[float, int]:
     with db_conn() as conn:
         cur = conn.execute(
@@ -205,6 +148,12 @@ def get_historic_hit_rate(market: str, suggestion: str) -> Tuple[float, int]:
         )
         row = cur.fetchone()
         return (row[0], row[1]) if row else (0.5, 0)
+
+def recent_tip_exists(match_id: int, cooldown_min: int) -> bool:
+    cutoff = int(time.time()) - cooldown_min * 60
+    with db_conn() as conn:
+        cur = conn.execute("SELECT 1 FROM tips WHERE match_id=? AND created_ts>=? LIMIT 1", (match_id, cutoff))
+        return cur.fetchone() is not None
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
@@ -245,6 +194,7 @@ def _api_get(url: str, params: dict, timeout: int = 15):
         return None
 
 def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
+    # 90s cache
     now = time.time()
     if fixture_id in STATS_CACHE:
         ts, data = STATS_CACHE[fixture_id]
@@ -254,17 +204,6 @@ def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     stats = js.get("response", []) if isinstance(js, dict) else None
     STATS_CACHE[fixture_id] = (now, stats or [])
     return stats
-
-def fetch_match_events(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
-    now = time.time()
-    if fixture_id in EVENTS_CACHE:
-        ts, data = EVENTS_CACHE[fixture_id]
-        if now - ts < 90:
-            return data
-    js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fixture_id})
-    events = js.get("response", []) if isinstance(js, dict) else None
-    EVENTS_CACHE[fixture_id] = (now, events or [])
-    return events
 
 def fetch_live_matches() -> List[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"live": "all"})
@@ -282,11 +221,6 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
             m["statistics"] = stats or []
         except Exception:
             m["statistics"] = []
-        try:
-            events = fetch_match_events(fid)
-            m["events"] = events or []
-        except Exception:
-            m["events"] = []
         filtered.append(m)
     logging.info(f"[FETCH] live={len(matches)} kept={len(filtered)}")
     return filtered
@@ -296,54 +230,24 @@ def fetch_today_fixtures_utc() -> List[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"date": today_utc.isoformat(), "timezone": "UTC"})
     return js.get("response", []) if isinstance(js, dict) else []
 
-def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    if not ids: return {}
-    js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(i) for i in ids), "timezone": "UTC"})
-    resp = js.get("response", []) if isinstance(js, dict) else []
-    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
-
-# ── Calibration ───────────────────────────────────────────────────────────────
-def compute_calibration_bins(cache_secs: int = 600):
-    now = time.time()
-    if now - CAL_CACHE["ts"] < cache_secs and CAL_CACHE["bins"]:
-        return CAL_CACHE["bins"]
-    bins = [(50,54),(55,59),(60,64),(65,69),(70,74),(75,79),(80,84),(85,100)]
-    results = []
-    with db_conn() as conn:
-        for lo, hi in bins:
-            cur = conn.execute("""
-              SELECT COUNT(*), AVG(f.verdict)
-              FROM tips t JOIN feedback f ON f.match_id = t.match_id
-              WHERE t.confidence BETWEEN ? AND ?
-            """, (lo, hi))
-            n, hr = cur.fetchone()
-            hr = hr if hr is not None else 0.5
-            results.append({"lo": lo, "hi": hi, "n": n or 0, "hit": float(hr)})
-    CAL_CACHE.update({"ts": now, "bins": results})
-    return results
-
-def calibrate_confidence(pct: float) -> float:
-    bins = compute_calibration_bins()
-    for b in bins:
-        if b["lo"] <= pct <= b["hi"]:
-            if b["n"] >= 30:
-                return round(b["hit"] * 100.0)
-            break
-    return pct
-
-# ── Learned model (logistic) support ──────────────────────────────────────────
+# ── Model & features ──────────────────────────────────────────────────────────
 def _load_model():
-    raw = get_setting("model_coeffs")
-    if not raw: return {}
+    with db_conn() as conn:
+        cur = conn.execute("SELECT value FROM settings WHERE key='model_coeffs'")
+        row = cur.fetchone()
+        if not row:
+            return {}
     try:
-        return json.loads(raw)
+        return json.loads(row[0])
     except Exception:
         logging.exception("[MODEL] Failed to load model_coeffs JSON")
         return {}
 
 def _sigmoid(z: float) -> float:
-    try: return 1.0 / (1.0 + math.exp(-z))
-    except OverflowError: return 0.0 if z < 0 else 1.0
+    try:
+        return 1.0 / (1.0 + math.exp(-z))
+    except OverflowError:
+        return 0.0 if z < 0 else 1.0
 
 def _num(v) -> float:
     try:
@@ -359,8 +263,6 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     gh = match["goals"]["home"] or 0
     ga = match["goals"]["away"] or 0
     minute = int((match.get("fixture", {}).get("status", {}) or {}).get("elapsed") or 0)
-
-    # statistics
     stats_blocks = match.get("statistics") or []
     stats: Dict[str, Dict[str, Any]] = {}
     for s in stats_blocks:
@@ -371,61 +273,19 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     xg_h = _num(sh.get("Expected Goals", 0)); xg_a = _num(sa.get("Expected Goals", 0))
     sot_h = _num(sh.get("Shots on Target", 0)); sot_a = _num(sa.get("Shots on Target", 0))
     cor_h = _num(sh.get("Corner Kicks", 0));   cor_a = _num(sa.get("Corner Kicks", 0))
-    pos_h = _num(sh.get("Ball Possession", 0));pos_a = _num(sa.get("Ball Possession", 0))
-
-    # events → red cards
-    red_h = 0; red_a = 0
-    for ev in (match.get("events") or []):
-        try:
-            etype = (ev.get("type") or "").lower()
-            edetail = (ev.get("detail") or "").lower()
-            tname = (ev.get("team") or {}).get("name") or ""
-            if etype == "card" and "red" in edetail:
-                if tname == home_name: red_h += 1
-                elif tname == away_name: red_a += 1
-        except Exception:
-            continue
-
-    feat = {
+    pos_h = _num(sh.get("Ball Possession", 0)); pos_a = _num(sa.get("Ball Possession", 0))
+    red_h = _num(sh.get("Red Cards", 0));       red_a = _num(sa.get("Red Cards", 0))
+    return {
         "minute": float(minute),
-        "goals_h": float(gh),
-        "goals_a": float(ga),
-        "goals_sum": float(gh + ga),
-        "goals_diff": float(gh - ga),
-        "xg_h": float(xg_h),
-        "xg_a": float(xg_a),
-        "xg_sum": float(xg_h + xg_a),
-        "xg_diff": float(xg_h - xg_a),
-        "sot_h": float(sot_h),
-        "sot_a": float(sot_a),
-        "sot_sum": float(sot_h + sot_a),
-        "cor_h": float(cor_h),
-        "cor_a": float(cor_a),
-        "cor_sum": float(cor_h + cor_a),
-        "pos_h": float(pos_h),
-        "pos_a": float(pos_a),
-        "pos_diff": float(pos_h - pos_a),
-        "red_h": float(red_h),
-        "red_a": float(red_a),
-        "red_diff": float(red_h - red_a),
+        "goals_h": float(gh), "goals_a": float(ga),
+        "goals_sum": float(gh + ga), "goals_diff": float(gh - ga),
+        "xg_h": float(xg_h), "xg_a": float(xg_a), "xg_sum": float(xg_h + xg_a),
+        "sot_h": float(sot_h), "sot_a": float(sot_a), "sot_sum": float(sot_h + sot_a),
+        "cor_h": float(cor_h), "cor_a": float(cor_a), "cor_sum": float(cor_h + cor_a),
+        "pos_h": float(pos_h), "pos_a": float(pos_a),
+        "red_h": float(red_h), "red_a": float(red_a),
     }
-    return feat
 
-# data sufficiency
-def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
-    """After REQUIRE_STATS_MINUTE, require at least N of {xg_sum, sot_sum, cor_sum, pos_h/pos_a} to be present."""
-    if minute < REQUIRE_STATS_MINUTE:
-        return True
-    fields = [
-        feat.get("xg_sum", 0.0),
-        feat.get("sot_sum", 0.0),
-        feat.get("cor_sum", 0.0),
-        max(feat.get("pos_h", 0.0), feat.get("pos_a", 0.0))
-    ]
-    nonzero = sum(1 for v in fields if (v or 0) > 0)
-    return nonzero >= max(0, REQUIRE_DATA_FIELDS)
-
-# ── Tip logic (learned-first, heuristic-fallback) ─────────────────────────────
 def predict_with_model(model: Dict[str, Any], feat: Dict[str, float]) -> Optional[float]:
     try:
         names = model["features"]
@@ -437,15 +297,38 @@ def predict_with_model(model: Dict[str, Any], feat: Dict[str, float]) -> Optiona
         logging.exception("[MODEL] Prediction error")
         return None
 
+# === Data sufficiency / “no free wins” gates ================================
+def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
+    """After REQUIRE_STATS_MINUTE, require >= REQUIRE_DATA_FIELDS non-zero among {xg_sum,sot_sum,cor_sum}."""
+    if minute < REQUIRE_STATS_MINUTE:
+        return True
+    fields = [feat.get("xg_sum", 0.0), feat.get("sot_sum", 0.0), feat.get("cor_sum", 0.0)]
+    nonzero = sum(1 for v in fields if (v or 0) > 0)
+    return nonzero >= max(0, REQUIRE_DATA_FIELDS)
+
+def has_intensity_trigger(feat: Dict[str, float]) -> bool:
+    """Require at least one sign there’s actual pressure."""
+    return (feat.get("xg_sum", 0.0) >= 0.6) or (feat.get("sot_sum", 0.0) >= 3.0) or (feat.get("cor_sum", 0.0) >= 6.0)
+
+# ── Tip logic (model-first, heuristic-fallback, with guards) ─────────────────
 def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, float]]:
-    """Return (market, suggestion, confidence_pct, features_snapshot)"""
     feat = extract_features(match)
     minute = int(feat["minute"])
     gh = int(feat["goals_h"]); ga = int(feat["goals_a"])
     total_goals = gh + ga
 
-    # gate: require stats coverage after threshold minute
+    # Hard stops
+    if minute >= 90:
+        return "Over/Under 2.5 Goals", "Under 2.5 Goals", 0.0, feat  # never send at 90'
+    if minute >= 30 and feat["xg_sum"] == 0 and feat["sot_sum"] == 0 and feat["cor_sum"] == 0:
+        return "Over/Under 2.5 Goals", "Over 2.5 Goals", 0.0, feat
+
+    # Stats coverage gate (after 35')
     if not stats_coverage_ok(feat, minute):
+        return "Over/Under 2.5 Goals", "Over 2.5 Goals", 0.0, feat
+
+    # Require at least one intensity trigger any time after 15'
+    if minute >= 15 and not has_intensity_trigger(feat):
         return "Over/Under 2.5 Goals", "Over 2.5 Goals", 0.0, feat
 
     models = _load_model()
@@ -453,30 +336,29 @@ def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, flo
         logging.warning("[MODEL] ONLY_MODEL_MODE is ON but no model loaded.")
         return "Over/Under 2.5 Goals", "Over 2.5 Goals", 0.0, feat
 
-    p_o25 = predict_with_model(models.get("O25", {}), feat) if "O25" in models else None
-    p_btts = predict_with_model(models.get("BTTS_YES", {}), feat) if "BTTS_YES" in models else None
+    p_o25 = predict_with_model(models.get("O25", {}), feat) if models.get("O25") else None
+    p_btts = predict_with_model(models.get("BTTS_YES", {}), feat) if models.get("BTTS_YES") else None
 
     candidates: List[Tuple[str, str, float]] = []
     if p_o25 is not None:
         candidates.append(("Over/Under 2.5 Goals", "Over 2.5 Goals", p_o25))
         candidates.append(("Over/Under 2.5 Goals", "Under 2.5 Goals", 1.0 - p_o25))
     if p_btts is not None:
-        candidates.append(("BTTS", "Yes", p_btts))
-        candidates.append(("BTTS", "No", 1.0 - p_btts))
+        candidates.append(("BTTS", "BTTS: Yes", p_btts))
+        candidates.append(("BTTS", "BTTS: No", 1.0 - p_btts))
 
-    # fallback heuristics if no models
     if not candidates:
-        xg_sum = feat["xg_sum"]; sot_sum = feat["sot_sum"]; corners = feat["cor_sum"]
+        # light heuristic if no model JSON is present
         score = 50.0
-        if xg_sum >= 2.4 and total_goals <= 2 and minute >= 25: score += 18
-        if sot_sum >= 6: score += 10
-        if corners >= 10: score += 5
+        if feat["xg_sum"] >= 2.4 and total_goals <= 2 and minute >= 25: score += 18
+        if feat["sot_sum"] >= 6: score += 10
+        if feat["cor_sum"] >= 10: score += 5
         if minute < 20: score -= 8
 
         if minute >= 25 and feat["xg_h"] >= 0.9 and feat["xg_a"] >= 0.9 and feat["sot_h"] >= 3 and feat["sot_a"] >= 3 and total_goals <= 3:
-            market, suggestion, base = "BTTS", "Yes", max(score, 62)
-        elif feat["xg_sum"] < 1.4 and sot_sum < 4 and total_goals == 0 and minute > 35:
-            market, suggestion, base = "BTTS", "No", 62
+            market, suggestion, base = "BTTS", "BTTS: Yes", max(score, 62)
+        elif feat["xg_sum"] < 1.4 and feat["sot_sum"] < 4 and total_goals == 0 and minute > 35:
+            market, suggestion, base = "BTTS", "BTTS: No", 62
         elif minute > 70 and total_goals <= 1:
             market, suggestion, base = "Over/Under 2.5 Goals", "Under 2.5 Goals", max(score, 62)
         else:
@@ -486,28 +368,20 @@ def decide_market(match: Dict[str, Any]) -> Tuple[str, str, float, Dict[str, flo
         hist_rate, n = get_historic_hit_rate(market, suggestion)
         bump = (hist_rate - 0.5) * 14.0 * min(1.0, n / 50.0)
         raw_conf_pct = round(max(35.0, min(95.0, base + bump)))
-        cal_conf_pct = calibrate_confidence(raw_conf_pct)
-        return market, suggestion, cal_conf_pct, feat
+        return market, suggestion, raw_conf_pct, feat
 
-    # choose the best allowed learned candidate
-    allowed = []
-    for market, sugg, p in candidates:
-        suggestion = "BTTS: Yes" if (market == "BTTS" and sugg == "Yes") else \
-                    ("BTTS: No" if (market == "BTTS" and sugg == "No") else sugg)
-        if suggestion in ALLOWED_SUGGESTIONS:
-            allowed.append((market, suggestion, float(p)))
-
+    # choose best candidate among allowed
+    allowed = [(m, s, float(p)) for (m, s, p) in candidates if s in ALLOWED_SUGGESTIONS]
     if not allowed:
         return "Over/Under 2.5 Goals", "Over 2.5 Goals", 0.0, feat
 
     market, suggestion, prob = max(allowed, key=lambda x: x[2])
-    raw_pct = int(round(prob * 100))
+    raw_pct = int(round(min(95.0, max(35.0, prob * 100.0))))
     hist_rate, n = get_historic_hit_rate(market, suggestion)
     raw_pct = int(round(min(95.0, max(35.0, raw_pct + (hist_rate - 0.5) * 10.0 * min(1.0, n / 50.0)))))
-    cal_pct = calibrate_confidence(raw_pct)
-    return market, suggestion, cal_pct, feat
+    return market, suggestion, raw_pct, feat
 
-# Guards
+# Guards for “too late” or “already decided”
 def is_settled_or_impossible(suggestion: str, gh: int, ga: int) -> bool:
     total = gh + ga
     both_scored = (gh > 0 and ga > 0)
@@ -523,25 +397,18 @@ def is_too_late(suggestion: str, minute: int, gh: int, ga: int, feat: Optional[D
         return True
     if suggestion == "BTTS: Yes" and minute >= BTTS_LATE_MINUTE and (gh == 0 or ga == 0):
         return True
-    # suppress trivial late Unders without evidence
+    # suppress trivial “Under 2.5” very late without evidence
     if suggestion == "Under 2.5 Goals" and minute >= UNDER_SUPPRESS_AFTER_MIN:
         xg_sum = (feat or {}).get("xg_sum", 0.0)
         sot_sum = (feat or {}).get("sot_sum", 0.0)
         cor_sum = (feat or {}).get("cor_sum", 0.0)
-        if (xg_sum + sot_sum) < 0.2 and cor_sum == 0.0:
+        if (xg_sum + sot_sum) < 0.8 and cor_sum < 4:
             return True
     return False
 
-# ── Messaging ─────────────────────────────────────────────────────────────────
-def get_effective_threshold() -> int:
-    v = get_setting("conf_threshold_override", None)
-    if v is not None:
-        try: return int(v)
-        except ValueError: pass
-    return CONF_THRESHOLD
-
+# ── Message builder & sender ─────────────────────────────────────────────────
 def build_tip_message(match: Dict[str, Any],
-                      chosen: Optional[Tuple[str,str,float,Dict[str,float]]] = None) -> Tuple[str, list, Dict[str, Any], Dict[str, Any]]:
+                      chosen: Optional[Tuple[str,str,float,Dict[str,float]]] = None) -> Tuple[str, list, Dict[str, Any]]:
     fixture = match["fixture"]; league_block = match.get("league") or {}
     league_id = league_block.get("id") or 0
     league = escape(f"{league_block.get('country','')} - {league_block.get('name','')}".strip(" -"))
@@ -552,24 +419,22 @@ def build_tip_message(match: Dict[str, Any],
 
     market, suggestion, confidence, stat = chosen if chosen else decide_market(match)
 
-    eff_threshold = get_effective_threshold()
-    if suggestion not in ALLOWED_SUGGESTIONS or confidence < eff_threshold:
-        return "", [], {"match_id": match_id, "skip": True, "confidence": confidence}, {}
-
+    if suggestion not in ALLOWED_SUGGESTIONS or confidence < CONF_THRESHOLD:
+        return "", [], {"skip": True}
     if is_settled_or_impossible(suggestion, g_home, g_away) or is_too_late(suggestion, int(minute), g_home, g_away, stat):
-        return "", [], {"match_id": match_id, "skip": True, "confidence": confidence}, {}
+        return "", [], {"skip": True}
 
+    # stats line (xG / SOT / CK / POS / RED)
     stat_line = ""
-    if any(stat.values()):
+    if any([stat.get("xg_h",0), stat.get("xg_a",0), stat.get("sot_h",0), stat.get("sot_a",0), stat.get("cor_h",0), stat.get("cor_a",0)]):
+        pos_h = int(stat.get("pos_h",0)); pos_a = int(stat.get("pos_a",0))
+        red_h = int(stat.get("red_h",0)); red_a = int(stat.get("red_a",0))
         stat_line = (
-            f"\n📊 xG H {stat.get('xg_h',0):.2f} / A {stat.get('xg_a',0):.2f}"
-            f" • SOT {int(stat.get('sot_h',0))}–{int(stat.get('sot_a',0))}"
-            f" • CK {int(stat.get('cor_h',0))}–{int(stat.get('cor_a',0))}"
+            f"\n🇮🇹 xG H {stat.get('xg_h',0):.2f} / A {stat.get('xg_a',0):.2f} • "
+            f"SOT {int(stat.get('sot_h',0))}–{int(stat.get('sot_a',0))} • "
+            f"CK {int(stat.get('cor_h',0))}–{int(stat.get('cor_a',0))} • "
+            f"POS {pos_h}%–{pos_a}% • RED {red_h}–{red_a}"
         )
-        if stat.get("pos_h",0) or stat.get("pos_a",0):
-            stat_line += f" • POS {int(stat.get('pos_h',0))}%–{int(stat.get('pos_a',0))}%"
-        if stat.get("red_h",0) or stat.get("red_a",0):
-            stat_line += f" • RED {int(stat.get('red_h',0))}–{int(stat.get('red_a',0))}"
 
     lines = [
         "⚽️ <b>New Tip!</b>",
@@ -594,21 +459,12 @@ def build_tip_message(match: Dict[str, Any],
         except Exception: pass
     if row: kb.append(row)
 
-    snapshot = {
-        "minute": int(minute), "gh": g_home, "ga": g_away,
-        "league_id": int(league_id), "market": market, "suggestion": suggestion,
-        "confidence": int(confidence),
-        "stat": {
-            "xg_h": stat.get("xg_h",0), "xg_a": stat.get("xg_a",0),
-            "sot_h": stat.get("sot_h",0), "sot_a": stat.get("sot_a",0),
-            "cor_h": stat.get("cor_h",0), "cor_a": stat.get("cor_a",0),
-            "pos_h": stat.get("pos_h",0), "pos_a": stat.get("pos_a",0),
-            "red_h": stat.get("red_h",0), "red_a": stat.get("red_a",0),
-        }
+    meta = {
+        "match_id": match_id, "league_id": int(league_id), "league": league,
+        "home": home, "away": away, "confidence": int(confidence),
+        "score_at_tip": f"{g_home}-{g_away}", "minute": int(minute)
     }
-    meta = {"match_id": match_id, "league_id": int(league_id), "confidence": confidence,
-            "league": league, "home": home, "away": away, "score_at_tip": f"{g_home}-{g_away}", "minute": int(minute)}
-    return msg, kb, meta, snapshot
+    return msg, kb, meta
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
 last_heartbeat = 0
@@ -617,12 +473,6 @@ def maybe_send_heartbeat():
     if HEARTBEAT_ENABLE and time.time() - last_heartbeat > 1200:
         send_telegram("✅ Robi Superbrain is online and scanning…")
         last_heartbeat = time.time()
-
-def recent_tip_exists(match_id: int, cooldown_min: int) -> bool:
-    cutoff = int(time.time()) - cooldown_min * 60
-    with db_conn() as conn:
-        cur = conn.execute("SELECT 1 FROM tips WHERE match_id=? AND created_ts>=? LIMIT 1", (match_id, cutoff))
-        return cur.fetchone() is not None
 
 def match_alert():
     logging.info("🔍 Scanning live matches…")
@@ -644,151 +494,35 @@ def match_alert():
         market, suggestion, conf, feat = chosen
         gh = match["goals"]["home"] or 0; ga = match["goals"]["away"] or 0
         minute = int((match.get("fixture", {}) or {}).get("status", {}).get("elapsed") or 0)
-        if suggestion not in ALLOWED_SUGGESTIONS or conf < get_effective_threshold():
+
+        if suggestion not in ALLOWED_SUGGESTIONS or conf < CONF_THRESHOLD:
             continue
         if is_settled_or_impossible(suggestion, gh, ga) or is_too_late(suggestion, minute, gh, ga, feat):
             continue
 
-        msg, kb, meta, snapshot = build_tip_message(match, chosen)
-        if meta.get("skip"):
+        msg, kb, meta = build_tip_message(match, chosen)
+        if not msg:
             continue
         logging.info(f"[TIP] sending fixture={fid} conf={meta['confidence']} suggestion={suggestion}")
         ok = send_telegram(msg, kb)
+        save_tip(meta["match_id"], int(meta["league_id"]), meta["league"], meta["home"], meta["away"],
+                 market, suggestion, float(meta["confidence"]), meta["score_at_tip"], int(meta["minute"]),
+                 sent_ok=1 if ok else 0)
         if ok:
-            save_tip(meta["match_id"], int(meta["league_id"]), meta["league"], meta["home"], meta["away"],
-                     market, suggestion, float(meta["confidence"]), meta["score_at_tip"], int(meta["minute"]),
-                     snapshot=snapshot, sent_ok=1)
             sent += 1
-        else:
-            save_tip(meta["match_id"], int(meta["league_id"]), meta["league"], meta["home"], meta["away"],
-                     market, suggestion, float(meta["confidence"]), meta["score_at_tip"], int(meta["minute"]),
-                     snapshot=snapshot, sent_ok=0)
 
     logging.info(f"[TIP] Sent={sent}")
     maybe_send_heartbeat()
 
-# Harvest (collect snapshots, no send)
-def harvest_scan():
-    matches = fetch_live_matches()
-    kept = 0
-    for m in matches:
-        if HARVEST_MAX_PER_SCAN and kept >= HARVEST_MAX_PER_SCAN:
-            break
-        feat = extract_features(m)
-        minute = int(feat.get("minute", 0))
-        if not stats_coverage_ok(feat, minute):
-            continue
-        fx = m.get("fixture", {}) or {}
-        lg = m.get("league", {}) or {}
-        fid = int(fx.get("id"))
-        league_id = lg.get("id") or 0
-        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-        home = (m.get("teams") or {}).get("home", {}).get("name","")
-        away = (m.get("teams") or {}).get("away", {}).get("name","")
-        gh = (m.get("goals") or {}).get("home") or 0
-        ga = (m.get("goals") or {}).get("away") or 0
-        snapshot = {
-            "minute": minute, "gh": gh, "ga": ga,
-            "league_id": int(league_id), "market": "HARVEST", "suggestion": "HARVEST",
-            "confidence": 0,
-            "stat": {
-                "xg_h": feat.get("xg_h",0), "xg_a": feat.get("xg_a",0),
-                "sot_h": feat.get("sot_h",0), "sot_a": feat.get("sot_a",0),
-                "cor_h": feat.get("cor_h",0), "cor_a": feat.get("cor_a",0),
-                "pos_h": feat.get("pos_h",0), "pos_a": feat.get("pos_a",0),
-                "red_h": feat.get("red_h",0), "red_a": feat.get("red_a",0),
-            }
-        }
-        save_tip(fid, int(league_id), league, home, away,
-                 "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute,
-                 snapshot=snapshot, sent_ok=0)
-        kept += 1
-    logging.info(f"[HARVEST] snapshots_saved={kept} live={len(matches)}")
-
-# auto-label unscored tips when matches finish
-def autolabel_unscored():
-    since = int(time.time()) - 36*3600
-    with db_conn() as conn:
-        cur = conn.execute("""
-          SELECT DISTINCT match_id FROM tips
-          WHERE created_ts>=? AND match_id NOT IN (SELECT match_id FROM feedback)
-        """, (since,))
-        ids = [r[0] for r in cur.fetchall()]
-    if not ids: return
-    for i in range(0, len(ids), 20):
-        batch = ids[i:i+20]
-        fx = fetch_fixtures_by_ids(batch)
-        for fid in batch:
-            m = fx.get(fid)
-            if not m: continue
-            status = ((m.get("fixture") or {}).get("status") or {}).get("short")
-            if status not in ("FT","AET","PEN", "PST","CANC","ABD","AWD","WO"):
-                continue
-            gh = (m.get("goals") or {}).get("home") or 0
-            ga = (m.get("goals") or {}).get("away") or 0
-            # store final result for training script reuse
-            with db_conn() as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts)
-                    VALUES (?,?,?,?,?)
-                """, (int(fid), int(gh), int(ga), 1 if (int(gh)>0 and int(ga)>0) else 0, int(time.time())))
-                conn.commit()
-            # verdict based on last suggestion
-            with db_conn() as conn:
-                cur = conn.execute("""
-                  SELECT suggestion FROM tips WHERE match_id=? ORDER BY created_ts DESC LIMIT 1
-                """, (fid,))
-                row = cur.fetchone()
-            if not row: 
-                continue
-            s = row[0]
-            total = gh + ga
-            verdict = None
-            if s == "Over 2.5 Goals": verdict = 1 if total >= 3 else 0
-            elif s == "Under 2.5 Goals": verdict = 1 if total <= 2 else 0
-            elif s == "BTTS: Yes": verdict = 1 if (gh > 0 and ga > 0) else 0
-            elif s == "BTTS: No": verdict = 1 if (gh == 0 or ga == 0) else 0
-            if verdict is not None and not feedback_exists(fid):
-                upsert_feedback(fid, verdict)
-                CAL_CACHE["ts"] = 0
-                logging.info(f"[AUTO] Labeled match {fid} -> {verdict}")
-
-# dynamic threshold
-def adjust_threshold_if_needed():
-    if not DYN_ENABLE: return
-    since = int(time.time()) - 24*3600
-    with db_conn() as conn:
-        cur = conn.execute("SELECT COUNT(*) FROM tips WHERE created_ts>=? AND sent_ok=1", (since,))
-        count_24h = cur.fetchone()[0]
-        cur = conn.execute("""
-          SELECT AVG(f.verdict)
-          FROM tips t JOIN feedback f ON f.match_id = t.match_id
-          WHERE t.created_ts>=? AND t.sent_ok=1
-        """, (since,))
-        hr = cur.fetchone()[0]
-    eff = get_effective_threshold()
-    new_eff = eff
-    if count_24h > DYN_MAX:
-        new_eff = min(80, new_eff + 2)
-    elif count_24h < DYN_MIN:
-        new_eff = max(50, new_eff - 2)
-    if hr is not None:
-        if hr < DYN_TARGET_HITRATE and new_eff < 80: new_eff += 1
-        elif hr > DYN_TARGET_HITRATE and new_eff > 50: new_eff -= 1
-    if new_eff != eff:
-        set_setting("conf_threshold_override", str(new_eff))
-        logging.info(f"[DYN] tips_24h={count_24h} hr={hr} adjust {eff} -> {new_eff}")
-    else:
-        logging.info(f"[DYN] tips_24h={count_24h} hr={hr} keep {eff}")
-
-# ── MOTD ──────────────────────────────────────────────────────────────────────
+# ── MOTD (unchanged selection; will include prior-based lean if configured) ──
 def get_best_prior_for_league(league_id: int, min_samples: int) -> Optional[Tuple[str, str, float, int]]:
     with db_conn() as conn:
         cur = conn.execute("""
             SELECT t.market, t.suggestion, AVG(f.verdict) AS hit, COUNT(DISTINCT t.match_id) AS n
             FROM (
               SELECT match_id, market, suggestion, MAX(created_ts) AS last_ts
-              FROM tips GROUP BY match_id, market, suggestion
+              FROM tips
+              GROUP BY match_id, market, suggestion
             ) lt
             JOIN tips t ON t.match_id=lt.match_id AND t.created_ts=lt.last_ts
             JOIN feedback f ON f.match_id = t.match_id
@@ -808,7 +542,8 @@ def get_best_prior_global(min_samples: int) -> Optional[Tuple[str, str, float, i
             SELECT t.market, t.suggestion, AVG(f.verdict) AS hit, COUNT(DISTINCT t.match_id) AS n
             FROM (
               SELECT match_id, market, suggestion, MAX(created_ts) AS last_ts
-              FROM tips GROUP BY match_id, market, suggestion
+              FROM tips
+              GROUP BY match_id, market, suggestion
             ) lt
             JOIN tips t ON t.match_id=lt.match_id AND t.created_ts=lt.last_ts
             JOIN feedback f ON f.match_id = t.match_id
@@ -825,20 +560,19 @@ def pick_match_of_the_day(fixtures: List[Dict[str,Any]]) -> Optional[Dict[str,An
     fixtures = [f for f in fixtures if (f.get("fixture") or {}).get("status",{}).get("short") in ("NS","TBD")]
     if not fixtures: return None
     candidates = []
-    pri = {lid:i for i,lid in enumerate(LEAGUE_PRIORITY_IDS)}
     for f in fixtures:
-        lg = (f.get("league") or {})
-        lid = lg.get("id") or 0
+        lg = (f.get("league") or {}); lid = lg.get("id") or 0
         prior = get_best_prior_for_league(int(lid), MOTD_MIN_SAMPLES) or get_best_prior_global(MOTD_MIN_SAMPLES)
-        if not prior: continue
+        if not prior:
+            continue
         pm_market, pm_suggestion, pm_hit, pm_n = prior
         pct = int(round(pm_hit * 100))
         if pm_suggestion in ALLOWED_SUGGESTIONS and pct >= MOTD_CONF_MIN:
             ts = (f.get("fixture") or {}).get("timestamp") or 10**12
-            pri_index = pri.get(lid, len(LEAGUE_PRIORITY_IDS)+1)
-            candidates.append((pm_hit, pm_n, pri_index, ts, f, pm_suggestion, pct))
-    if not candidates: return None
-    # highest hit, more samples, higher priority league, earliest kickoff
+            pri_index = (LEAGUE_PRIORITY_IDS.index(lid) + 1) if lid in LEAGUE_PRIORITY_IDS else (len(LEAGUE_PRIORITY_IDS) + 2)
+            candidates.append((pm_hit, pm_n, -pri_index, ts, f))
+    if not candidates:
+        return None
     candidates.sort(key=lambda t: (-t[0], -t[1], t[2], t[3]))
     return candidates[0][4]
 
@@ -848,15 +582,14 @@ def send_match_of_the_day():
     if not motd:
         logging.info("[MOTD] No suitable fixture found for today.")
         return
-    lg = motd.get("league") or {}
-    fx = motd.get("fixture") or {}
+    lg = motd.get("league") or {}; fx = motd.get("fixture") or {}
     home = escape((motd.get("teams") or {}).get("home",{}).get("name",""))
     away = escape((motd.get("teams") or {}).get("away",{}).get("name",""))
     league = escape(f"{lg.get('country','')} - {lg.get('name','')}".strip(" -"))
     league_id = lg.get("id") or 0
-    ts = fx.get("timestamp")
-    when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if ts else "TBD"
+    ts = fx.get("timestamp"); when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if ts else "TBD"
     fid = fx.get("id")
+
     lines = [
         "🌟 <b>Match of the Day</b>",
         f"<b>Match:</b> {home} vs {away}",
@@ -871,10 +604,6 @@ def send_match_of_the_day():
             if pm_suggestion in ALLOWED_SUGGESTIONS and pct >= MOTD_CONF_MIN:
                 lines.append(f"🔮 <b>Lean:</b> {escape(pm_suggestion)}")
                 lines.append(f"📈 <b>Confidence:</b> {pct}% <i>(prior, n={pm_n})</i>")
-            else:
-                logging.info(f"[MOTD] Prior insufficient or not allowed (suggestion={pm_suggestion}, pct={pct}).")
-        else:
-            logging.info("[MOTD] No prior available; skipping lean.")
     msg = "\n".join(lines)
     kb = []
     row = []
@@ -886,7 +615,7 @@ def send_match_of_the_day():
         except Exception: pass
     if row: kb.append(row)
     send_telegram(msg, kb)
-    logging.info(f"[MOTD] Sent for fixture={fid} (predict={MOTD_PREDICT})")
+    logging.info(f"[MOTD] Sent for fixture={fid}")
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -903,37 +632,13 @@ def motd_route():
     send_match_of_the_day()
     return jsonify({"status": "ok"})
 
-# Harvest on-demand
-@app.route("/harvest")
-def harvest_route():
-    if not HARVEST_MODE:
-        return jsonify({"enabled": False, "saved": 0})
-    harvest_scan()
-    return jsonify({"enabled": True, "ok": True})
-
-# Debug routes
 @app.route("/debug/scan")
 def debug_scan():
     data = fetch_live_matches()
     return jsonify({
         "count": len(data),
         "fixture_ids": [ (m.get("fixture",{}) or {}).get("id") for m in data ],
-        "has_stats": [ bool(m.get("statistics")) for m in data ],
     })
-
-@app.route("/debug/format")
-def debug_format():
-    matches = fetch_live_matches()
-    if not matches:
-        return jsonify({"error": "no matches"}), 200
-    i = 0
-    try: i = int(request.args.get("i", 0))
-    except Exception: pass
-    i = max(0, min(i, len(matches)-1))
-    chosen = decide_market(matches[i])
-    msg, kb, meta, snapshot = build_tip_message(matches[i], chosen)
-    return jsonify({"fixture_id": meta.get("match_id"), "confidence": meta.get("confidence"),
-                    "message": msg, "inline_keyboard": kb, "snapshot": snapshot})
 
 @app.route("/debug/send")
 def debug_send():
@@ -945,25 +650,20 @@ def debug_send():
         market, suggestion, conf, feat = chosen
         gh = m["goals"]["home"] or 0; ga = m["goals"]["away"] or 0
         minute = int((m.get("fixture", {}) or {}).get("status", {}).get("elapsed") or 0)
-        if suggestion not in ALLOWED_SUGGESTIONS or conf < get_effective_threshold():
+        if suggestion not in ALLOWED_SUGGESTIONS or conf < CONF_THRESHOLD:
             continue
         if is_settled_or_impossible(suggestion, gh, ga) or is_too_late(suggestion, minute, gh, ga, feat):
             continue
-        msg, kb, meta, snapshot = build_tip_message(m, chosen)
-        if meta.get("skip"): continue
+        msg, kb, meta = build_tip_message(m, chosen)
+        if not msg: continue
         ok = send_telegram(msg, kb)
-        logging.info(f"[DEBUG/SEND] fixture={m.get('fixture',{}).get('id')} ok={ok}")
-        if ok:
-            save_tip(meta["match_id"], int(meta["league_id"]), meta["league"], meta["home"], meta["away"],
-                     market, suggestion, float(meta["confidence"]), meta["score_at_tip"], int(meta["minute"]),
-                     snapshot=snapshot, sent_ok=1)
-            sent += 1
-        else:
-            save_tip(meta["match_id"], int(meta["league_id"]), meta["league"], meta["home"], meta["away"],
-                     market, suggestion, float(meta["confidence"]), meta["score_at_tip"], int(meta["minute"]),
-                     snapshot=snapshot, sent_ok=0)
+        save_tip(meta["match_id"], int(meta["league_id"]), meta["league"], meta["home"], meta["away"],
+                 market, suggestion, float(meta["confidence"]), meta["score_at_tip"], int(meta["minute"]),
+                 sent_ok=1 if ok else 0)
+        if ok: sent += 1
     return jsonify({"requested": limit, "sent": sent, "total_matches": len(matches)})
 
+# Telegram webhook for callback buttons
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
     if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
@@ -977,7 +677,6 @@ def telegram_webhook():
         verdict = 1 if payload.get("t") == "correct" else 0
         match_id = int(payload.get("id"))
         upsert_feedback(match_id, verdict)
-        CAL_CACHE["ts"] = 0  # invalidate calibration cache on new label
         answer_callback(cq["id"], "Thanks! Feedback recorded ✅" if verdict else "Got it. Marked as wrong ❌")
     except Exception:
         logging.exception("webhook error")
@@ -985,99 +684,39 @@ def telegram_webhook():
         except Exception: pass
     return "ok"
 
-# Admin: stats (protected)
+# Admin: quick config dump
 def _require_api_key():
     key = request.headers.get("X-API-Key") or request.args.get("key")
     if not API_KEY or key != API_KEY:
         abort(401)
-
-@app.route("/stats/hitrate")
-def stats_hitrate():
-    _require_api_key()
-    with db_conn() as conn:
-        cur = conn.execute("""
-          SELECT market, suggestion, ROUND(hit_rate*100,1), n
-          FROM v_tip_stats ORDER BY n DESC, hit_rate DESC
-        """)
-        rows = [{"market": r[0], "suggestion": r[1], "hit_rate_pct": r[2], "n": r[3]} for r in cur.fetchall()]
-    return jsonify({"rows": rows})
-
-@app.route("/stats/calibration")
-def stats_calibration():
-    _require_api_key()
-    return jsonify({"bins": compute_calibration_bins()})
-
-@app.route("/stats/volume")
-def stats_volume():
-    _require_api_key()
-    with db_conn() as conn:
-        since = int(time.time()) - 24*3600
-        cur = conn.execute("SELECT COUNT(*) FROM tips WHERE created_ts>=? AND sent_ok=1", (since,))
-        n = cur.fetchone()[0]
-        cur = conn.execute("""
-          SELECT suggestion, COUNT(*)
-          FROM tips WHERE created_ts>=? AND sent_ok=1
-          GROUP BY suggestion ORDER BY COUNT(*) DESC
-        """, (since,))
-        per = [{"suggestion": r[0], "count": r[1]} for r in cur.fetchall()]
-    return jsonify({"last_24h": n, "by_suggestion": per, "threshold_effective": get_effective_threshold()})
 
 @app.route("/stats/config")
 def stats_config():
     _require_api_key()
     return jsonify({
         "CONF_THRESHOLD": CONF_THRESHOLD,
-        "threshold_effective": get_effective_threshold(),
         "MAX_TIPS_PER_SCAN": MAX_TIPS_PER_SCAN,
         "DUP_COOLDOWN_MIN": DUP_COOLDOWN_MIN,
-        "DYN_ENABLE": DYN_ENABLE,
-        "DYN_MIN": DYN_MIN, "DYN_MAX": DYN_MAX,
-        "DYN_TARGET_HITRATE": DYN_TARGET_HITRATE,
-        "O25_LATE_MINUTE": O25_LATE_MINUTE, "O25_LATE_MIN_GOALS": O25_LATE_MIN_GOALS,
-        "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
-        "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
         "REQUIRE_STATS_MINUTE": REQUIRE_STATS_MINUTE,
         "REQUIRE_DATA_FIELDS": REQUIRE_DATA_FIELDS,
         "UNDER_SUPPRESS_AFTER_MIN": UNDER_SUPPRESS_AFTER_MIN,
-        "MOTD_PREDICT": MOTD_PREDICT,
-        "MOTD_MIN_SAMPLES": MOTD_MIN_SAMPLES,
-        "MOTD_CONF_MIN": MOTD_CONF_MIN,
+        "O25_LATE_MINUTE": O25_LATE_MINUTE,
+        "O25_LATE_MIN_GOALS": O25_LATE_MIN_GOALS,
+        "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
+        "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
         "APISPORTS_KEY_set": bool(APISPORTS_KEY),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
-        "HEARTBEAT_ENABLE": HEARTBEAT_ENABLE,
-        "HARVEST_MODE": HARVEST_MODE,
     })
-
-@app.route("/debug/jobs")
-def debug_jobs():
-    try:
-        jobs = [{"id": j.id, "next": j.next_run_time.isoformat() if j.next_run_time else None}
-                for j in scheduler.get_jobs()]
-        return jsonify({"jobs": jobs})
-    except Exception:
-        return jsonify({"error": "scheduler not ready"}), 500
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if not APISPORTS_KEY:
-        logging.error("APISPORTS_KEY is not set — live fetch will return 0 matches.")
     init_db()
     scheduler = BackgroundScheduler()
-    # Live scan every 5 minutes
     scheduler.add_job(match_alert, "interval", minutes=5, id="scan", replace_existing=True)
-    # MOTD 08:00 UTC
     scheduler.add_job(send_match_of_the_day, CronTrigger(hour=8, minute=0, timezone="UTC"),
                       id="motd", replace_existing=True, misfire_grace_time=3600, coalesce=True)
-    # Auto-label every 15 minutes
-    scheduler.add_job(autolabel_unscored, "interval", minutes=15, id="autolabel", replace_existing=True)
-    # Dynamic threshold daily
-    scheduler.add_job(adjust_threshold_if_needed, CronTrigger(hour=23, minute=59, timezone="UTC"),
-                      id="dynthresh", replace_existing=True)
-    # Harvest (optional)
-    if HARVEST_MODE:
-        scheduler.add_job(harvest_scan, "interval", minutes=1, id="harvest", replace_existing=True)
     scheduler.start()
-    logging.info("⏱️ Scheduler started (scan=5m, autolabel=15m, MOTD=08:00 UTC, dyn=23:59 UTC, harvest=%s)", HARVEST_MODE)
+    logging.info("⏱️ Scheduler started (scan=5m, MOTD=08:00 UTC)")
     port = int(os.getenv("PORT", 5000))
     logging.info("✅ Robi Superbrain started.")
     app.run(host="0.0.0.0", port=port)
