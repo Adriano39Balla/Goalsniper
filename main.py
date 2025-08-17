@@ -798,19 +798,33 @@ if __name__ == "__main__":
     init_db()
     scheduler = BackgroundScheduler()
 
-    # Schedules: Harvest (Sun–Thu, Berlin) vs Production (Fri–Sat, Berlin)
-    if HARVEST_MODE:
-        scheduler.add_job(
-            match_alert,
-            CronTrigger(day_of_week="sun-thu", hour="9-21", minute="*/2", timezone=ZoneInfo("Europe/Berlin")),
-            id="scan", replace_existing=True
-        )
-    else:
-        scheduler.add_job(
-            match_alert,
-            CronTrigger(day_of_week="fri-sat", hour="7-21", minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
-            id="scan", replace_existing=True
-        )
+     # Scanning windows (Europe/Berlin). Night pause saves credits.
+if HARVEST_MODE:
+    # Busy-window harvest: every 2 minutes, 09:00–21:59 Berlin, Sun→Thu
+    scheduler.add_job(
+        match_alert,
+        CronTrigger(day_of_week="sun,mon,tue,wed,thu",
+                    hour="9-21", minute="*/2",
+                    timezone=ZoneInfo("Europe/Berlin")),
+        id="scan", replace_existing=True
+    )
+else:
+    # Production: every 5 minutes, 07:00–21:59 Berlin, Fri/Sat
+    scheduler.add_job(
+        match_alert,
+        CronTrigger(day_of_week="fri,sat",
+                    hour="7-21", minute="*/5",
+                    timezone=ZoneInfo("Europe/Berlin")),
+        id="scan", replace_existing=True
+    )
+    # If you also want weekdays in production, uncomment this:
+    # scheduler.add_job(
+    #     match_alert,
+    #     CronTrigger(day_of_week="mon,tue,wed,thu",
+    #                 hour="7-21", minute="*/5",
+    #                 timezone=ZoneInfo("Europe/Berlin")),
+    #     id="scan_week", replace_existing=True
+    # )
 
     # MOTD 08:00 UTC
     scheduler.add_job(
