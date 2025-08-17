@@ -360,14 +360,11 @@ def harvest_scan():
     logging.info(f"[HARVEST] snapshots_saved={saved} live={len(matches)}")
 
 # ── Backfill final results for harvested match_ids ────────────────────────────
-def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    if not ids: return {}
-    js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(i) for i in ids), "timezone": "UTC"})
-    resp = js.get("response", []) if isinstance(js, dict) else []
-    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
-
-def backfill_results_from_snapshots():
-    since = int(time.time()) - 48*3600  # only last 48h snapshots
+def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
+    """
+    Returns: (updated, checked)
+    """
+    since = int(time.time()) - int(hours) * 3600
     with db_conn() as conn:
         cur = conn.execute("""
             SELECT DISTINCT match_id FROM tip_snapshots
@@ -377,8 +374,10 @@ def backfill_results_from_snapshots():
         ids = [r[0] for r in cur.fetchall()]
 
     if not ids:
-        return
+        logging.info("[RESULTS] nothing to backfill in the last %sh", hours)
+        return 0, 0
 
+    updated = 0
     B = 20
     for i in range(0, len(ids), B):
         batch = ids[i:i+B]
@@ -386,7 +385,8 @@ def backfill_results_from_snapshots():
         with db_conn() as conn:
             for fid in batch:
                 m = fx.get(fid)
-                if not m: continue
+                if not m: 
+                    continue
                 status = ((m.get("fixture") or {}).get("status") or {}).get("short")
                 if status not in ("FT","AET","PEN","PST","CANC","ABD","AWD","WO"):
                     continue
@@ -396,8 +396,10 @@ def backfill_results_from_snapshots():
                     INSERT OR REPLACE INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts)
                     VALUES (?,?,?,?,?)
                 """, (int(fid), int(gh), int(ga), 1 if (int(gh)>0 and int(ga)>0) else 0, int(time.time())))
+                updated += 1
             conn.commit()
-    logging.info(f"[RESULTS] backfilled={len(ids)}")
+    logging.info(f"[RESULTS] backfilled updated={updated} checked={len(ids)} (window={hours}h)")
+    return updated, len(ids)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -409,6 +411,16 @@ def home():
 def harvest_route():
     harvest_scan()
     return jsonify({"ok": True})
+
+@app.route("/backfill")
+def backfill_route():
+    _require_api_key()
+    try:
+        hours = int(request.args.get("hours", 48))
+    except Exception:
+        hours = 48
+    updated, checked = backfill_results_from_snapshots(hours=hours)
+    return jsonify({"ok": True, "hours": hours, "checked": checked, "updated": updated})
 
 @app.route("/stats/snapshots_count")
 def snapshots_count():
@@ -486,7 +498,7 @@ if __name__ == "__main__":
         scheduler.add_job(
             harvest_scan,
             CronTrigger(
-                day_of_week="sun,mon,tue,wed,thu",   # ← was "sun-thu" (invalid range)
+                day_of_week="sun,mon,tue,wed,thu",
                 hour="9-21",
                 minute="*/2",
                 timezone=ZoneInfo("Europe/Berlin"),
