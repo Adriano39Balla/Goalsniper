@@ -258,32 +258,53 @@ def _num(v) -> float:
         return 0.0
 
 def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
+    """Safer feature extraction with POS + reds and precomputed red_sum/red_diff."""
     home_name = match["teams"]["home"]["name"]
     away_name = match["teams"]["away"]["name"]
-    gh = match["goals"]["home"] or 0
-    ga = match["goals"]["away"] or 0
+    gh = int(match["goals"]["home"] or 0)
+    ga = int(match["goals"]["away"] or 0)
     minute = int((match.get("fixture", {}).get("status", {}) or {}).get("elapsed") or 0)
+
+    # per-team stats
     stats_blocks = match.get("statistics") or []
     stats: Dict[str, Dict[str, Any]] = {}
     for s in stats_blocks:
         tname = (s.get("team") or {}).get("name")
         if tname:
             stats[tname] = {i["type"]: i["value"] for i in (s.get("statistics") or [])}
+
     sh = stats.get(home_name, {}); sa = stats.get(away_name, {})
-    xg_h = _num(sh.get("Expected Goals", 0)); xg_a = _num(sa.get("Expected Goals", 0))
+
+    def pct(v):
+        try:
+            return float(str(v).replace('%', '').strip() or 0)
+        except Exception:
+            return 0.0
+
+    xg_h = _num(sh.get("Expected Goals", 0));   xg_a = _num(sa.get("Expected Goals", 0))
     sot_h = _num(sh.get("Shots on Target", 0)); sot_a = _num(sa.get("Shots on Target", 0))
-    cor_h = _num(sh.get("Corner Kicks", 0));   cor_a = _num(sa.get("Corner Kicks", 0))
-    pos_h = _num(sh.get("Ball Possession", 0)); pos_a = _num(sa.get("Ball Possession", 0))
+    cor_h = _num(sh.get("Corner Kicks", 0));    cor_a = _num(sa.get("Corner Kicks", 0))
+    pos_h = pct(sh.get("Ball Possession", 0));  pos_a = pct(sa.get("Ball Possession", 0))
+
+    # reds from team stats (API sometimes provides)
     red_h = _num(sh.get("Red Cards", 0));       red_a = _num(sa.get("Red Cards", 0))
+
     return {
         "minute": float(minute),
         "goals_h": float(gh), "goals_a": float(ga),
         "goals_sum": float(gh + ga), "goals_diff": float(gh - ga),
-        "xg_h": float(xg_h), "xg_a": float(xg_a), "xg_sum": float(xg_h + xg_a),
+
+        "xg_h": float(xg_h), "xg_a": float(xg_a),
+        "xg_sum": float(xg_h + xg_a), "xg_diff": float(xg_h - xg_a),
+
         "sot_h": float(sot_h), "sot_a": float(sot_a), "sot_sum": float(sot_h + sot_a),
         "cor_h": float(cor_h), "cor_a": float(cor_a), "cor_sum": float(cor_h + cor_a),
+
         "pos_h": float(pos_h), "pos_a": float(pos_a),
+
         "red_h": float(red_h), "red_a": float(red_a),
+        "red_sum": float(red_h + red_a),
+        "red_diff": float(red_h - red_a),
     }
 
 def predict_with_model(model: Dict[str, Any], feat: Dict[str, float]) -> Optional[float]:
@@ -391,19 +412,44 @@ def is_settled_or_impossible(suggestion: str, gh: int, ga: int) -> bool:
     if suggestion == "BTTS: No":        return both_scored
     return False
 
-def is_too_late(suggestion: str, minute: int, gh: int, ga: int, feat: Optional[Dict[str,float]]=None) -> bool:
+def is_too_late(suggestion: str, minute: int, gh: int, ga: int, feat: Optional[Dict[str,float]] = None) -> bool:
+    """
+    Stronger late-game guards:
+    - Never send settled/impossible recs (defensive duplication).
+    - Suppress late Unders if there's any meaningful pressure or any red card.
+    - Suppress very-late Unders by default unless the game is extremely quiet.
+    - Mild brake for late BTTS:Yes when one side shows zero attacking signs.
+    """
+    feat = feat or {}
     total = gh + ga
-    if suggestion == "Over 2.5 Goals" and minute >= O25_LATE_MINUTE and total < O25_LATE_MIN_GOALS:
-        return True
-    if suggestion == "BTTS: Yes" and minute >= BTTS_LATE_MINUTE and (gh == 0 or ga == 0):
-        return True
-    # suppress trivial “Under 2.5” very late without evidence
-    if suggestion == "Under 2.5 Goals" and minute >= UNDER_SUPPRESS_AFTER_MIN:
-        xg_sum = (feat or {}).get("xg_sum", 0.0)
-        sot_sum = (feat or {}).get("sot_sum", 0.0)
-        cor_sum = (feat or {}).get("cor_sum", 0.0)
-        if (xg_sum + sot_sum) < 0.8 and cor_sum < 4:
+
+    xg_sum = float(feat.get("xg_sum", 0.0))
+    sot_sum = float(feat.get("sot_sum", 0.0))
+    cor_sum = float(feat.get("cor_sum", 0.0))
+    red_sum = float(feat.get("red_sum", 0.0))
+
+    # Settled/impossible
+    if suggestion == "Over 2.5 Goals" and total >= 3:  return True
+    if suggestion == "Under 2.5 Goals" and total >= 3: return True
+    both_scored = (gh > 0 and ga > 0)
+    if suggestion == "BTTS: Yes" and both_scored:      return True
+    if suggestion == "BTTS: No"  and both_scored:      return True
+
+    # Late UNDER rules
+    if suggestion == "Under 2.5 Goals":
+        if minute >= 80 and red_sum >= 1:
             return True
+        if minute >= 80 and (xg_sum >= 1.0 or sot_sum >= 2 or cor_sum >= 6):
+            return True
+        if minute >= 88:
+            if not (total <= 1 and xg_sum < 0.8 and sot_sum <= 1 and cor_sum <= 4 and red_sum == 0):
+                return True
+
+    # Late BTTS: Yes needs signs of life from both sides
+    if suggestion == "BTTS: Yes" and minute >= 85:
+        if (gh == 0 and float(feat.get("sot_h", 0)) == 0) or (ga == 0 and float(feat.get("sot_a", 0)) == 0):
+            return True
+
     return False
 
 # ── Message builder & sender ─────────────────────────────────────────────────
