@@ -410,6 +410,26 @@ def harvest_route():
     harvest_scan()
     return jsonify({"ok": True})
 
+@app.route("/stats/snapshots_count")
+def snapshots_count():
+    _require_api_key()
+    with db_conn() as conn:
+        snap = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
+        tips = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+        res  = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
+        unlabeled = conn.execute("""
+            SELECT COUNT(DISTINCT s.match_id)
+            FROM tip_snapshots s
+            LEFT JOIN match_results r ON r.match_id = s.match_id
+            WHERE r.match_id IS NULL
+        """).fetchone()[0]
+    return jsonify({
+        "tip_snapshots": int(snap),
+        "tips_rows": int(tips),           # includes HARVEST rows with sent_ok=0
+        "match_results": int(res),
+        "unlabeled_match_ids": int(unlabeled)
+    })
+
 @app.route("/debug/env")
 def debug_env():
     def mark(val): return {"set": bool(val), "len": len(val) if val else 0}
