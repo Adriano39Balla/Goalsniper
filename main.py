@@ -21,8 +21,8 @@ app = Flask(__name__)
 # ── Env ───────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY            = os.getenv("API_KEY")                  # admin endpoints
-APISPORTS_KEY      = os.getenv("APISPORTS_KEY")            # API-Football
+API_KEY            = os.getenv("API_KEY")
+APISPORTS_KEY      = os.getenv("APISPORTS_KEY") or os.getenv("API_KEY")
 PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL")
 BET_URL_TMPL       = os.getenv("BET_URL")
 WATCH_URL_TMPL     = os.getenv("WATCH_URL")
