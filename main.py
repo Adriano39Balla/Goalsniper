@@ -715,6 +715,22 @@ def send_match_of_the_day():
     logging.info(f"[MOTD] Sent for fixture={fid}")
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True, "time_utc": datetime.utcnow().isoformat()+"Z"})
+
+@app.route("/debug/env")
+def debug_env():
+    def mark(val):  # mask secrets but show presence/length
+        if not val: return {"set": False}
+        return {"set": True, "len": len(val)}
+    return jsonify({
+        "APISPORTS_KEY": mark(os.getenv("APISPORTS_KEY")),
+        "API_KEY":       mark(os.getenv("API_KEY")),
+        "TELEGRAM_BOT_TOKEN": mark(os.getenv("TELEGRAM_BOT_TOKEN")),
+        "TELEGRAM_CHAT_ID":   mark(os.getenv("TELEGRAM_CHAT_ID")),
+    })
+
 @app.route("/")
 def home():
     return "🤖 Robi Superbrain is active and learning."
