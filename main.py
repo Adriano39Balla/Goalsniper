@@ -5,6 +5,7 @@ import math
 import logging
 import requests
 import sqlite3
+import subprocess, shlex
 from html import escape
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
@@ -55,6 +56,11 @@ MOTD_CONF_MIN       = int(os.getenv("MOTD_CONF_MIN", "65"))
 
 ALLOWED_SUGGESTIONS = {"Over 2.5 Goals", "Under 2.5 Goals", "BTTS: Yes", "BTTS: No"}
 
+# ── Training env (nightly) ────────────────────────────────────────────────────
+TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
+TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
+TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
+
 # ── External APIs ─────────────────────────────────────────────────────────────
 BASE_URL         = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
@@ -93,6 +99,12 @@ def init_db():
             sent_ok   INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts)
         )""")
+        # backward-compat add
+        try:
+            conn.execute("ALTER TABLE tips ADD COLUMN sent_ok INTEGER DEFAULT 1")
+        except Exception:
+            pass
+
         conn.execute("""
         CREATE TABLE IF NOT EXISTS tip_snapshots (
             match_id INTEGER,
@@ -179,6 +191,9 @@ def answer_callback(callback_id: str, text: str):
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 def _api_get(url: str, params: dict, timeout: int = 15):
+    if not API_KEY:
+        logging.error("[API] API_KEY not set; skipping request to %s", url)
+        return None
     try:
         res = session.get(url, headers=HEADERS, params=params, timeout=timeout)
         if not res.ok:
@@ -348,7 +363,7 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
         conn.commit()
 
 # ── Harvest scan (no sends) ───────────────────────────────────────────────────
-def harvest_scan():
+def harvest_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
     saved = 0
     for m in matches:
@@ -358,12 +373,14 @@ def harvest_scan():
         save_snapshot_from_match(m, feat)
         saved += 1
     logging.info(f"[HARVEST] snapshots_saved={saved} live={len(matches)}")
+    return saved, len(matches)
 
 # ── Backfill final results for harvested match_ids ────────────────────────────
 def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
     """
     Returns: (updated, checked)
     """
+    hours = max(1, min(int(hours), 168))  # clamp to 1..168h
     since = int(time.time()) - int(hours) * 3600
     with db_conn() as conn:
         cur = conn.execute("""
@@ -378,14 +395,14 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
         return 0, 0
 
     updated = 0
-    B = 20
+    B = 25
     for i in range(0, len(ids), B):
         batch = ids[i:i+B]
         fx = fetch_fixtures_by_ids(batch)
         with db_conn() as conn:
             for fid in batch:
                 m = fx.get(fid)
-                if not m: 
+                if not m:
                     continue
                 status = ((m.get("fixture") or {}).get("status") or {}).get("short")
                 if status not in ("FT","AET","PEN","PST","CANC","ABD","AWD","WO"):
@@ -398,8 +415,54 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
                 """, (int(fid), int(gh), int(ga), 1 if (int(gh)>0 and int(ga)>0) else 0, int(time.time())))
                 updated += 1
             conn.commit()
+        time.sleep(0.25)  # be nice to the API
     logging.info(f"[RESULTS] backfilled updated={updated} checked={len(ids)} (window={hours}h)")
     return updated, len(ids)
+
+# ── Nightly training job ──────────────────────────────────────────────────────
+def retrain_models_job():
+    if not TRAIN_ENABLE:
+        logging.info("[TRAIN] skipped (TRAIN_ENABLE=0)")
+        return {"ok": False, "skipped": True, "reason": "TRAIN_ENABLE=0"}
+
+    cmd = (
+        f"python -u train_models.py "
+        f"--db {DB_PATH} "
+        f"--min-minute {TRAIN_MIN_MINUTE} "
+        f"--test-size {TRAIN_TEST_SIZE}"
+    )
+    logging.info(f"[TRAIN] starting: {cmd}")
+    try:
+        proc = subprocess.run(
+            shlex.split(cmd),
+            capture_output=True,
+            text=True,
+            timeout=900  # 15 min safety
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
+
+        # Optional short ping to Telegram
+        try:
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                summary = "✅ Nightly training OK" if proc.returncode == 0 else "❌ Nightly training failed"
+                tail = "\n".join(out.splitlines()[-3:]) if out else ""
+                send_telegram(f"{summary}\n{tail[:900]}")
+        except Exception:
+            pass
+
+        return {"ok": proc.returncode == 0, "code": proc.returncode, "stdout": out[-2000:], "stderr": err[-1000:]}
+    except subprocess.TimeoutExpired:
+        logging.error("[TRAIN] timed out (15 min)")
+        try: send_telegram("❌ Nightly training timed out after 15 min.")
+        except Exception: pass
+        return {"ok": False, "timeout": True}
+    except Exception as e:
+        logging.exception(f"[TRAIN] exception: {e}")
+        try: send_telegram(f"❌ Nightly training crashed: {e}")
+        except Exception: pass
+        return {"ok": False, "error": str(e)}
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -409,8 +472,9 @@ def home():
 
 @app.route("/harvest")
 def harvest_route():
-    harvest_scan()
-    return jsonify({"ok": True})
+    _require_api_key()  # protect; remove if you want public
+    saved, live_seen = harvest_scan()
+    return jsonify({"ok": True, "live_seen": live_seen, "snapshots_saved": saved})
 
 @app.route("/backfill")
 def backfill_route():
@@ -419,8 +483,15 @@ def backfill_route():
         hours = int(request.args.get("hours", 48))
     except Exception:
         hours = 48
+    hours = max(1, min(hours, 168))
     updated, checked = backfill_results_from_snapshots(hours=hours)
     return jsonify({"ok": True, "hours": hours, "checked": checked, "updated": updated})
+
+@app.route("/train", methods=["POST", "GET"])
+def train_route():
+    _require_api_key()
+    result = retrain_models_job()
+    return jsonify(result)
 
 @app.route("/stats/snapshots_count")
 def snapshots_count():
@@ -450,15 +521,9 @@ def debug_env():
         "TELEGRAM_BOT_TOKEN": mark(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID":   mark(TELEGRAM_CHAT_ID),
         "HARVEST_MODE":       HARVEST_MODE,
-    })
-
-@app.route("/debug/scan")
-def debug_scan():
-    data = fetch_live_matches()
-    return jsonify({
-        "count": len(data),
-        "fixture_ids": [ (m.get("fixture",{}) or {}).get("id") for m in data ],
-        "has_stats": [ bool(m.get("statistics")) for m in data ],
+        "TRAIN_ENABLE":       TRAIN_ENABLE,
+        "TRAIN_MIN_MINUTE":   TRAIN_MIN_MINUTE,
+        "TRAIN_TEST_SIZE":    TRAIN_TEST_SIZE,
     })
 
 def _require_api_key():
@@ -483,6 +548,9 @@ def stats_config():
         "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
         "API_KEY_set": bool(API_KEY),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
+        "TRAIN_ENABLE": TRAIN_ENABLE,
+        "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
+        "TRAIN_TEST_SIZE": TRAIN_TEST_SIZE,
     })
 
 # ── Entrypoint / Scheduler ────────────────────────────────────────────────────
@@ -516,9 +584,15 @@ if __name__ == "__main__":
             replace_existing=True,
         )
 
-    else:
-        # (optional) production jobs go here later
-        pass
+    # Nightly training every day at 03:00 Europe/Berlin (works in both modes)
+    scheduler.add_job(
+        retrain_models_job,
+        CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+        id="train",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
 
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
