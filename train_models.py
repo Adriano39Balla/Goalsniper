@@ -11,7 +11,7 @@ FEATURES = [
     "xg_h","xg_a","xg_sum","xg_diff",
     "sot_h","sot_a","sot_sum",
     "cor_h","cor_a","cor_sum",
-    "pos_h","pos_a","pos_diff",
+    "pos_h","pos_a","pos_diff","pos_missing",
     "red_h","red_a","red_sum"
 ]
 
@@ -57,6 +57,7 @@ def load_data(db_path: str, min_minute: int = 15):
         f["sot_sum"] = f["sot_h"] + f["sot_a"]
         f["cor_sum"] = f["cor_h"] + f["cor_a"]
         f["pos_diff"] = f["pos_h"] - f["pos_a"]
+        f["pos_missing"] = 1.0 if (f["pos_h"] == 0.0 and f["pos_a"] == 0.0) else 0.0
         f["red_sum"] = f["red_h"] + f["red_a"]
         f["label_o25"] = 1 if (int(row["final_goals_h"] or 0) + int(row["final_goals_a"] or 0)) >= 3 else 0
         f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
@@ -95,7 +96,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="tip_performance.db")
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=15)
-    ap.add_argument("--test-size", type=float, default=0.2)
+    ap.add_argument("--test-size", type=float, default=0.25)
     ap.add_argument("--min-rows", type=int, default=150)
     args = ap.parse_args()
 
