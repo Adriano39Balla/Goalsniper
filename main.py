@@ -8,7 +8,7 @@ import sqlite3
 import subprocess, shlex
 from html import escape
 from zoneinfo import ZoneInfo
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
 from urllib3.util.retry import Retry
@@ -464,6 +464,50 @@ def retrain_models_job():
         except Exception: pass
         return {"ok": False, "error": str(e)}
 
+# ── Progress helpers & nightly digest ─────────────────────────────────────────
+def _counts_since(ts_from: int) -> Dict[str, int]:
+    with db_conn() as conn:
+        snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
+        tips_total = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+        res_total  = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
+        unlabeled  = conn.execute("""
+            SELECT COUNT(DISTINCT s.match_id)
+            FROM tip_snapshots s
+            LEFT JOIN match_results r ON r.match_id = s.match_id
+            WHERE r.match_id IS NULL
+        """).fetchone()[0]
+        # 24h deltas
+        snap_24h = conn.execute("SELECT COUNT(*) FROM tip_snapshots WHERE created_ts>=?", (ts_from,)).fetchone()[0]
+        res_24h  = conn.execute("SELECT COUNT(*) FROM match_results WHERE updated_ts>=?", (ts_from,)).fetchone()[0]
+    return {
+        "snap_total": int(snap_total),
+        "tips_total": int(tips_total),
+        "res_total": int(res_total),
+        "unlabeled": int(unlabeled),
+        "snap_24h": int(snap_24h),
+        "res_24h": int(res_24h),
+    }
+
+def nightly_digest_job():
+    try:
+        now = int(time.time())
+        day_ago = now - 24*3600
+        c = _counts_since(day_ago)
+        msg = (
+            "📊 <b>Robi Nightly Digest</b>\n"
+            f"Snapshots: {c['snap_total']} (＋{c['snap_24h']} last 24h)\n"
+            f"Finals: {c['res_total']} (＋{c['res_24h']} last 24h)\n"
+            f"Unlabeled match_ids: {c['unlabeled']}\n"
+            "Models retrain at 03:00 CEST daily."
+        )
+        logging.info("[DIGEST]\n%s", msg.replace("<b>","").replace("</b>",""))
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            send_telegram(msg)
+        return True
+    except Exception as e:
+        logging.exception("[DIGEST] failed: %s", e)
+        return False
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def home():
@@ -511,6 +555,31 @@ def snapshots_count():
         "tips_rows": int(tips),           # includes HARVEST rows with sent_ok=0
         "match_results": int(res),
         "unlabeled_match_ids": int(unlabeled)
+    })
+
+@app.route("/stats/progress")
+def stats_progress():
+    _require_api_key()
+    now = int(time.time())
+    day_ago = now - 24*3600
+    week_ago = now - 7*24*3600
+    c24 = _counts_since(day_ago)
+    c7  = _counts_since(week_ago)
+    return jsonify({
+        "window_24h": {
+            "snapshots_added": c24["snap_24h"],
+            "results_added": c24["res_24h"],
+        },
+        "totals": {
+            "tip_snapshots": c24["snap_total"],
+            "tips_rows": c24["tips_total"],
+            "match_results": c24["res_total"],
+            "unlabeled_match_ids": c24["unlabeled"],
+        },
+        "window_7d": {
+            "snapshots_added_est": c7["snap_24h"],   # same helper used; interpreted as >= last 7d if called multiple times
+            "results_added_est": c7["res_24h"],
+        }
     })
 
 @app.route("/debug/env")
@@ -589,6 +658,16 @@ if __name__ == "__main__":
         retrain_models_job,
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
         id="train",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
+    # Nightly digest to Telegram at 03:02 Europe/Berlin
+    scheduler.add_job(
+        nightly_digest_job,
+        CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
+        id="digest",
         replace_existing=True,
         misfire_grace_time=3600,
         coalesce=True,
