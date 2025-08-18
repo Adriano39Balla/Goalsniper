@@ -6,7 +6,7 @@ import logging
 import requests
 import sqlite3
 import subprocess, shlex
-from html import escape as html_escape
+from html import escape
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
@@ -22,8 +22,7 @@ app = Flask(__name__)
 # ── Env ───────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY            = os.getenv("API_KEY")  # API-Football key only
-ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY")  # separate admin key for our endpoints
+API_KEY            = os.getenv("API_KEY")  # single key for API-Football + admin
 PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL")
 BET_URL_TMPL       = os.getenv("BET_URL")
 WATCH_URL_TMPL     = os.getenv("WATCH_URL")
@@ -66,16 +65,11 @@ TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
 BASE_URL         = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}  # API-Football
+HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}  # single key
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
 session = requests.Session()
-retries = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504],
-    respect_retry_after_header=True,
-)
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ── In-memory caches ──────────────────────────────────────────────────────────
@@ -85,15 +79,7 @@ CAL_CACHE: Dict[str, Any] = {"ts": 0, "bins": []}
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 DB_PATH = "tip_performance.db"
-
-def db_conn():
-    # Safer SQLite settings for concurrent scheduler + HTTP
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)  # autocommit mode
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def db_conn(): return sqlite3.connect(DB_PATH)
 
 def init_db():
     with db_conn() as conn:
@@ -146,10 +132,6 @@ def init_db():
             btts_yes      INTEGER,
             updated_ts    INTEGER
         )""")
-
-        # Indices & views
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
         conn.execute("DROP VIEW IF EXISTS v_tip_stats")
         conn.execute("""
         CREATE VIEW v_tip_stats AS
@@ -186,13 +168,13 @@ def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Missing Telegram credentials")
         return False
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": html_escape(message), "parse_mode": "HTML"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     if inline_keyboard:
         payload["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard})
     try:
         res = session.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=10)
         if not res.ok:
-            logging.error(f"[Telegram] sendMessage FAILED status={res.status_code} body={res.text[:300]}")
+            logging.error(f"[Telegram] sendMessage FAILED status={res.status_code} body={res.text}")
         else:
             logging.info("[Telegram] sendMessage OK")
         return res.ok
@@ -217,17 +199,6 @@ def _api_get(url: str, params: dict, timeout: int = 15):
         if not res.ok:
             logging.error(f"[API] {url} status={res.status_code} body={res.text[:300]}")
             return None
-
-        # Optional: rate limit telemetry
-        h = {k.lower(): v for k, v in res.headers.items()}
-        try:
-            rem = int(h.get("x-ratelimit-remaining", "-1"))
-            if 0 <= rem <= 2:
-                reset = h.get("x-ratelimit-reset") or h.get("ratelimit-reset")
-                logging.warning(f"[API] Low remaining quota: {rem} (reset={reset})")
-        except Exception:
-            pass
-
         return res.json()
     except Exception as e:
         logging.exception(f"[API] error {url}: {e}")
@@ -237,7 +208,7 @@ def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     now = time.time()
     if fixture_id in STATS_CACHE:
         ts, data = STATS_CACHE[fixture_id]
-        if now - ts < 60:
+        if now - ts < 90:
             return data
     js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fixture_id})
     stats = js.get("response", []) if isinstance(js, dict) else None
@@ -248,7 +219,7 @@ def fetch_match_events(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     now = time.time()
     if fixture_id in EVENTS_CACHE:
         ts, data = EVENTS_CACHE[fixture_id]
-        if now - ts < 60:
+        if now - ts < 90:
             return data
     js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fixture_id})
     evs = js.get("response", []) if isinstance(js, dict) else None
@@ -299,18 +270,6 @@ def _pos_pct(v) -> float:
     except Exception:
         return 0.0
 
-def _get_stat(stats_dict: Dict[str, Any], *keys: str, default=0) -> Any:
-    """Accept common variants and case-insensitive matches."""
-    for k in keys:
-        if k in stats_dict:
-            return stats_dict[k]
-    lower = {str(k).lower(): v for k, v in stats_dict.items()}
-    for k in keys:
-        lk = str(k).lower()
-        if lk in lower:
-            return lower[lk]
-    return default
-
 def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     home_name = match["teams"]["home"]["name"]
     away_name = match["teams"]["away"]["name"]
@@ -324,18 +283,10 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
         if tname:
             stats[tname] = {i["type"]: i["value"] for i in (s.get("statistics") or [])}
     sh = stats.get(home_name, {}); sa = stats.get(away_name, {})
-
-    xg_h = _num(_get_stat(sh, "Expected Goals", "xG", "expected_goals"))
-    xg_a = _num(_get_stat(sa, "Expected Goals", "xG", "expected_goals"))
-
-    sot_h = _num(_get_stat(sh, "Shots on Target", "shots_on_target", "SOT"))
-    sot_a = _num(_get_stat(sa, "Shots on Target", "shots_on_target", "SOT"))
-
-    cor_h = _num(_get_stat(sh, "Corner Kicks", "Corners", "corner_kicks"))
-    cor_a = _num(_get_stat(sa, "Corner Kicks", "Corners", "corner_kicks"))
-
-    pos_h = _pos_pct(_get_stat(sh, "Ball Possession", "Possession", "ball_possession"))
-    pos_a = _pos_pct(_get_stat(sa, "Ball Possession", "Possession", "ball_possession"))
+    xg_h = _num(sh.get("Expected Goals", 0)); xg_a = _num(sa.get("Expected Goals", 0))
+    sot_h = _num(sh.get("Shots on Target", 0)); sot_a = _num(sa.get("Shots on Target", 0))
+    cor_h = _num(sh.get("Corner Kicks", 0));   cor_a = _num(sa.get("Corner Kicks", 0))
+    pos_h = _pos_pct(sh.get("Ball Possession", 0)); pos_a = _pos_pct(sa.get("Ball Possession", 0))
 
     # count red cards from events
     red_h = 0; red_a = 0
@@ -421,9 +372,6 @@ def harvest_scan() -> Tuple[int, int]:
             continue
         save_snapshot_from_match(m, feat)
         saved += 1
-    set_setting("last_harvest_ts", str(int(time.time())))
-    set_setting("last_harvest_saved", str(saved))
-    set_setting("last_harvest_live_seen", str(len(matches)))
     logging.info(f"[HARVEST] snapshots_saved={saved} live={len(matches)}")
     return saved, len(matches)
 
@@ -444,14 +392,10 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
 
     if not ids:
         logging.info("[RESULTS] nothing to backfill in the last %sh", hours)
-        set_setting("last_backfill_ts", str(int(time.time())))
-        set_setting("last_backfill_updated", "0")
-        set_setting("last_backfill_checked", "0")
         return 0, 0
 
     updated = 0
     B = 25
-    finished_status = {"FT","AET","PEN"}  # only finalize truly finished games
     for i in range(0, len(ids), B):
         batch = ids[i:i+B]
         fx = fetch_fixtures_by_ids(batch)
@@ -461,7 +405,7 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
                 if not m:
                     continue
                 status = ((m.get("fixture") or {}).get("status") or {}).get("short")
-                if status not in finished_status:
+                if status not in ("FT","AET","PEN","PST","CANC","ABD","AWD","WO"):
                     continue
                 gh = (m.get("goals") or {}).get("home") or 0
                 ga = (m.get("goals") or {}).get("away") or 0
@@ -473,9 +417,6 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
             conn.commit()
         time.sleep(0.25)  # be nice to the API
     logging.info(f"[RESULTS] backfilled updated={updated} checked={len(ids)} (window={hours}h)")
-    set_setting("last_backfill_ts", str(int(time.time())))
-    set_setting("last_backfill_updated", str(updated))
-    set_setting("last_backfill_checked", str(len(ids)))
     return updated, len(ids)
 
 # ── Nightly training job ──────────────────────────────────────────────────────
@@ -502,12 +443,6 @@ def retrain_models_job():
         err = (proc.stderr or "").strip()
         logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
 
-        try:
-            set_setting("last_train_ts", str(int(time.time())))
-            set_setting("last_train_rc", str(proc.returncode))
-        except Exception:
-            pass
-
         # Optional short ping to Telegram
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -520,34 +455,16 @@ def retrain_models_job():
         return {"ok": proc.returncode == 0, "code": proc.returncode, "stdout": out[-2000:], "stderr": err[-1000:]}
     except subprocess.TimeoutExpired:
         logging.error("[TRAIN] timed out (15 min)")
-        try:
-            set_setting("last_train_ts", str(int(time.time())))
-            set_setting("last_train_rc", "124")  # timeout
-        except Exception:
-            pass
         try: send_telegram("❌ Nightly training timed out after 15 min.")
         except Exception: pass
         return {"ok": False, "timeout": True}
     except Exception as e:
         logging.exception(f"[TRAIN] exception: {e}")
-        try:
-            set_setting("last_train_ts", str(int(time.time())))
-            set_setting("last_train_rc", "1")
-        except Exception:
-            pass
         try: send_telegram(f"❌ Nightly training crashed: {e}")
         except Exception: pass
         return {"ok": False, "error": str(e)}
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-@app.after_request
-def add_security_headers(resp):
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
 @app.route("/")
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
@@ -598,11 +515,9 @@ def snapshots_count():
 
 @app.route("/debug/env")
 def debug_env():
-    _require_api_key()
     def mark(val): return {"set": bool(val), "len": len(val) if val else 0}
     return jsonify({
         "API_KEY":            mark(API_KEY),
-        "ADMIN_API_KEY":      {"set": bool(ADMIN_API_KEY)},  # don't expose length
         "TELEGRAM_BOT_TOKEN": mark(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID":   mark(TELEGRAM_CHAT_ID),
         "HARVEST_MODE":       HARVEST_MODE,
@@ -613,7 +528,7 @@ def debug_env():
 
 def _require_api_key():
     key = request.headers.get("X-API-Key") or request.args.get("key")
-    if not ADMIN_API_KEY or key != ADMIN_API_KEY:
+    if not API_KEY or key != API_KEY:
         abort(401)
 
 @app.route("/stats/config")
@@ -632,44 +547,16 @@ def stats_config():
         "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
         "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
         "API_KEY_set": bool(API_KEY),
-        "ADMIN_API_KEY_set": bool(ADMIN_API_KEY),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
         "TRAIN_ENABLE": TRAIN_ENABLE,
         "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
         "TRAIN_TEST_SIZE": TRAIN_TEST_SIZE,
     })
 
-@app.route("/healthz")
-def healthz():
-    # Very light health check: DB reachable
-    try:
-        with db_conn() as conn:
-            conn.execute("SELECT 1")
-        return jsonify({"ok": True}), 200
-    except Exception as e:
-        logging.exception("healthz failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/readyz")
-def readyz():
-    # Readiness: show last scheduler runs
-    def to_int(name, default=0):
-        try:
-            return int(get_setting(name, str(default)) or default)
-        except Exception:
-            return default
-    return jsonify({
-        "harvest": {"last_ts": to_int("last_harvest_ts"), "last_saved": to_int("last_harvest_saved"), "last_live_seen": to_int("last_harvest_live_seen")},
-        "backfill": {"last_ts": to_int("last_backfill_ts"), "last_updated": to_int("last_backfill_updated"), "last_checked": to_int("last_backfill_checked")},
-        "train": {"last_ts": to_int("last_train_ts"), "last_rc": to_int("last_train_rc", -999)},
-    })
-
 # ── Entrypoint / Scheduler ────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not API_KEY:
         logging.error("API_KEY is not set — live fetch will return 0 matches.")
-    if not ADMIN_API_KEY:
-        logging.error("ADMIN_API_KEY is not set — admin endpoints will return 401.")
     init_db()
 
     scheduler = BackgroundScheduler()
@@ -707,16 +594,9 @@ if __name__ == "__main__":
         coalesce=True,
     )
 
-    try:
-        scheduler.start()
-        logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
+    scheduler.start()
+    logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
 
-        port = int(os.getenv("PORT", 5000))
-        logging.info("✅ Robi Superbrain started.")
-        app.run(host="0.0.0.0", port=port, use_reloader=False)
-    finally:
-        try:
-            scheduler.shutdown(wait=False)
-            logging.info("🛑 Scheduler stopped")
-        except Exception:
-            pass
+    port = int(os.getenv("PORT", 5000))
+    logging.info("✅ Robi Superbrain started.")
+    app.run(host="0.0.0.0", port=port)
