@@ -6,11 +6,15 @@ Nightly trainer for Robi:
 - Loads latest snapshots + final results from SQLite
 - Engineers features consistently with main.py
 - Trains two logistic models: Over 2.5 (O25) and BTTS: Yes
-- (Optionally) calibrates probabilities via Platt scaling
+- Optional Platt calibration and/or K-fold CV metrics
 - Persists compact, framework-free coefficients to settings.model_coeffs
-- (Optionally) exports the same JSON blob to a file for external use
+- (Optionally) persists metrics to settings.model_metrics_latest
+- (Optionally) exports the same JSON blob to a file
 
-Exit code 0 on success; non-zero on failure or insufficient data.
+Exit code:
+  0  success
+  2  not enough labeled data
+  3  below min-rows threshold
 """
 
 import argparse
@@ -30,7 +34,7 @@ from sklearn.metrics import (
     accuracy_score,
     roc_auc_score
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
 RANDOM_STATE = 42
 
@@ -42,6 +46,8 @@ FEATURES = [
     "pos_h","pos_a","pos_diff",
     "red_h","red_a","red_sum"
 ]
+
+# ---------------------------------------------------------------------------
 
 def _safe_float(x, default=0.0) -> float:
     try:
@@ -154,23 +160,29 @@ def to_coeffs(model: LogisticRegression, feature_names) -> Dict[str, Any]:
 
 def maybe_calibrate(base_model: LogisticRegression, Xtr, ytr, method: str | None):
     """
-    Wraps the base model in a CalibratedClassifierCV if method is provided.
-    Supported: 'sigmoid' (Platt) or 'isotonic'. Returns (clf, calibrated_flag).
+    Wrap base model in CalibratedClassifierCV if method provided.
+    Supported: 'sigmoid' (Platt) or 'isotonic'.
+    Returns (clf, calibrated_flag).
     """
     if method is None:
         return base_model, False
     if len(np.unique(ytr)) < 2:
-        # Can't calibrate on single-class folds
         return base_model, False
     cal = CalibratedClassifierCV(base_model, method=method, cv=3)
     cal.fit(Xtr, ytr)
     return cal, True
 
+def _majority_acc(y: np.ndarray) -> float:
+    """Accuracy of naive majority-class classifier (baseline)."""
+    p = y.mean()
+    return max(p, 1.0 - p)
+
 def train_and_eval(
     df: pd.DataFrame,
     label_col: str,
     test_size: float,
-    calibrate: str | None
+    calibrate: str | None,
+    cv_folds: int = 0
 ) -> Tuple[Any, Dict[str, Any]]:
     X = df[FEATURES].values
     y = df[label_col].values.astype(int)
@@ -180,6 +192,7 @@ def train_and_eval(
     has_neg = (len(y) - y.sum()) > 0
     strat = y if (has_pos and has_neg) else None
 
+    # Holdout split
     Xtr, Xte, ytr, yte = train_test_split(
         X, y, test_size=test_size, random_state=RANDOM_STATE, stratify=strat
     )
@@ -193,28 +206,50 @@ def train_and_eval(
     try:
         pte = clf.predict_proba(Xte)[:, 1]
     except NotFittedError:
-        # Shouldn't happen, but guard anyway
         clf.fit(Xtr, ytr)
         pte = clf.predict_proba(Xte)[:, 1]
 
+    # Holdout metrics
     metrics = {
         "brier": float(brier_score_loss(yte, pte)),
         "acc": float(accuracy_score(yte, (pte >= 0.5).astype(int))),
         "auc": float(roc_auc_score(yte, pte)) if (has_pos and has_neg) else None,
         "n": int(len(yte)),
         "prevalence": float(y.mean()),
+        "majority_acc": float(_majority_acc(y)),
         "calibrated": bool(calibrated),
         "calibration_method": calibrate if calibrated else None,
     }
 
-    # If we calibrated, the inner estimator has the coeffs we want to serialize
-    # because main.py scoring path is via coefficients (framework-free).
-    # CalibratedClassifierCV uses sigmoid/isotonic on top, which cannot be represented
-    # with just coefficients. So we always serialize the *base* LR coefficients
-    # for deterministic, lightweight runtime scoring. Calibrated probabilities are only for metrics.
+    # Optional CV metrics
+    cv_report = None
+    if cv_folds and cv_folds > 1 and (has_pos and has_neg):
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+        briers, accs, aucs = [], [], []
+        for tr, te in skf.split(X, y):
+            m = fit_lr_or_none(X[tr], y[tr])
+            if m is None:
+                continue
+            pp = m.predict_proba(X[te])[:, 1]
+            briers.append(brier_score_loss(y[te], pp))
+            accs.append(accuracy_score(y[te], (pp >= 0.5).astype(int)))
+            aucs.append(roc_auc_score(y[te], pp))
+        if briers:
+            cv_report = {
+                "folds": cv_folds,
+                "brier_mean": float(np.mean(briers)),
+                "brier_std": float(np.std(briers)),
+                "acc_mean": float(np.mean(accs)),
+                "acc_std": float(np.std(accs)),
+                "auc_mean": float(np.mean(aucs)),
+                "auc_std": float(np.std(aucs)),
+            }
+            metrics["cv"] = cv_report
+
+    # Always serialize base LR coefficients for runtime scoring (lightweight)
     serializable = to_coeffs(base, FEATURES)
 
-    return clf, {"metrics": metrics, "serializable": serializable}
+    return clf, {"metrics": metrics, "serializable": serializable, "cv": cv_report}
 
 def save_blob_to_settings(db_path: str, key: str, blob: Dict[str, Any]) -> None:
     con = sqlite3.connect(db_path)
@@ -229,15 +264,26 @@ def save_blob_to_settings(db_path: str, key: str, blob: Dict[str, Any]) -> None:
     finally:
         con.close()
 
+def _print_top_coeffs(name: str, coeffs: Dict[str, Any], k: int = 8) -> None:
+    feats = coeffs["features"]
+    vals = coeffs["coef"]
+    pairs = sorted(zip(feats, vals), key=lambda t: abs(t[1]), reverse=True)[:k]
+    pretty = ", ".join([f"{f}={v:+.3f}" for f, v in pairs])
+    print(f"[{name}] top | {pretty} | intercept={coeffs['intercept']:+.3f}")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="tip_performance.db")
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=15)
     ap.add_argument("--test-size", type=float, default=0.25)
     ap.add_argument("--min-rows", type=int, default=150)
-    ap.add_argument("--calibrate", choices=["sigmoid", "isotonic"], default="sigmoid")
+    ap.add_argument("--calibrate", choices=["sigmoid", "isotonic", "none"], default="sigmoid")
+    ap.add_argument("--cv", type=int, default=0, help="If >1, run Stratified K-fold CV with this many folds (report only).")
     ap.add_argument("--export-path", default=None, help="Optional path to write model_coeffs JSON")
+    ap.add_argument("--store-metrics", type=int, default=1, help="Also store latest metrics in settings.model_metrics_latest")
     args = ap.parse_args()
+
+    calibrate = None if args.calibrate == "none" else args.calibrate
 
     # Load
     df_o25, df_btts = load_data(args.db, args.min_minute)
@@ -254,9 +300,9 @@ def main():
         print(f"Need more data: {n} < min-rows {args.min_rows}.")
         raise SystemExit(3)
 
-    # Train + evaluate
-    _, o25 = train_and_eval(df_o25, "label_o25", args.test_size, args.calibrate)
-    _, btts = train_and_eval(df_btts, "label_btts", args.test_size, args.calibrate)
+    # Train + evaluate (holdout + optional CV)
+    _, o25 = train_and_eval(df_o25, "label_o25", args.test_size, calibrate, args.cv)
+    _, btts = train_and_eval(df_btts, "label_btts", args.test_size, calibrate, args.cv)
 
     # Assemble blob for settings (coeffs + metadata + metrics)
     trained_at = datetime.utcnow().isoformat() + "Z"
@@ -281,18 +327,33 @@ def main():
             "class_weight": "balanced",
             "solver": "liblinear",
             "random_state": RANDOM_STATE,
+            "calibration": calibrate if calibrate else None,
+            "cv_folds": int(args.cv) if args.cv else 0,
         }
     }
 
     # Persist in DB (what main.py consumes)
     save_blob_to_settings(args.db, "model_coeffs", blob)
     print("Saved model_coeffs in settings.")
+    _print_top_coeffs("O25", blob["O25"])
+    _print_top_coeffs("BTTS_YES", blob["BTTS_YES"])
 
     # Optional export to file for external inspection/debug
     if args.export_path:
         with open(args.export_path, "w", encoding="utf-8") as f:
             json.dump(blob, f, ensure_ascii=False, indent=2)
         print(f"Exported model_coeffs to {os.path.abspath(args.export_path)}")
+
+    # Also store metrics-only (optional toggle)
+    if args.store_metrics:
+        metrics_only = {
+            "trained_at_utc": trained_at,
+            "metrics": blob["metrics"],
+            "training_counts": blob["training_counts"],
+            "hyperparams": blob["hyperparams"],
+        }
+        save_blob_to_settings(args.db, "model_metrics_latest", metrics_only)
+        print("Saved model_metrics_latest in settings.")
 
     # Tail-friendly summary (main.py logs the last few lines)
     print(json.dumps({
