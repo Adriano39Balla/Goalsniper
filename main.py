@@ -22,7 +22,8 @@ app = Flask(__name__)
 # ── Env ───────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY            = os.getenv("API_KEY")  # single key for API-Football + admin
+API_KEY            = os.getenv("API_KEY")  # API-Football key
+ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY")  # separate admin key for our endpoints
 PUBLIC_BASE_URL    = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 BET_URL_TMPL       = os.getenv("BET_URL")
 WATCH_URL_TMPL     = os.getenv("WATCH_URL")
@@ -65,14 +66,19 @@ TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
 BASE_URL         = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}  # single key
+HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}  # provider key
 
 # Live/in-play statuses (per API-FOOTBALL tutorial)
 INPLAY_STATUSES = ["1H","HT","2H","ET","BT","P"]
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
 session = requests.Session()
-retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+retries = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    respect_retry_after_header=True,
+)
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ── In-memory caches ──────────────────────────────────────────────────────────
@@ -81,8 +87,19 @@ EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 CAL_CACHE: Dict[str, Any] = {"ts": 0, "bins": []}
 
 # ── DB ────────────────────────────────────────────────────────────────────────
-DB_PATH = "tip_performance.db"
-def db_conn(): return sqlite3.connect(DB_PATH)
+DB_PATH = os.getenv("DB_PATH", "tip_performance.db")
+
+def db_conn():
+    # Safer SQLite settings for concurrent scheduler + HTTP
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)  # autocommit-ish
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except Exception:
+        pass
+    return conn
 
 def init_db():
     with db_conn() as conn:
@@ -134,6 +151,9 @@ def init_db():
             btts_yes      INTEGER,
             updated_ts    INTEGER
         )""")
+        # Indices & view
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
         conn.execute("DROP VIEW IF EXISTS v_tip_stats")
         conn.execute("""
         CREATE VIEW v_tip_stats AS
@@ -170,7 +190,7 @@ def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Missing Telegram credentials")
         return False
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": escape(message), "parse_mode": "HTML"}
     if inline_keyboard:
         payload["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard})
     try:
@@ -201,6 +221,13 @@ def _api_get(url: str, params: dict, timeout: int = 15):
         if not res.ok:
             logging.error(f"[API] {url} status={res.status_code} body={res.text[:300]}")
             return None
+        # optional rate-limit telemetry
+        try:
+            rem = int(res.headers.get("X-RateLimit-Remaining", "-1"))
+            if 0 <= rem <= 2:
+                logging.warning(f"[API] Low remaining quota: {rem}")
+        except Exception:
+            pass
         return res.json()
     except Exception as e:
         logging.exception(f"[API] error %s: %s", url, e)
@@ -251,13 +278,45 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     logging.info(f"[FETCH] live={len(matches)} kept={len(out)}")
     return out
 
-# Hyphen-joined bulk fetch (max 20 ids) — per API-FOOTBALL tutorial
+# ── Fixtures fetch (robust): chunk 20 + 1-by-1 fallback ───────────────────────
+MAX_IDS_PER_REQ = 20
+
+def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    if not ids:
+        return out
+    for i in range(0, len(ids), MAX_IDS_PER_REQ):
+        chunk = ids[i:i+MAX_IDS_PER_REQ]
+        js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(x) for x in chunk), "timezone": "UTC"})
+        resp = js.get("response", []) if isinstance(js, dict) else []
+        for fx in resp:
+            fid = (fx.get("fixture") or {}).get("id")
+            if fid:
+                out[int(fid)] = fx
+        # Fallback 1-by-1 for any missing from this chunk
+        missing = [fid for fid in chunk if fid not in out]
+        for fid in missing:
+            js1 = _api_get(FOOTBALL_API_URL, {"id": fid, "timezone": "UTC"})
+            r1 = (js1.get("response") if isinstance(js1, dict) else []) or []
+            if r1:
+                out[int(fid)] = r1[0]
+        time.sleep(0.15)
+    return out
+
+# Hyphen-joined bulk fetch (kept for league snapshot path)
 def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
     if not ids: return {}
-    param_val = "-".join(str(i) for i in ids)
-    js = _api_get(FOOTBALL_API_URL, {"ids": param_val, "timezone": "UTC"})
-    resp = js.get("response", []) if isinstance(js, dict) else []
-    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
+    out: Dict[int, Dict[str, Any]] = {}
+    for i in range(0, len(ids), MAX_IDS_PER_REQ):
+        chunk = ids[i:i+MAX_IDS_PER_REQ]
+        js = _api_get(FOOTBALL_API_URL, {"ids": "-".join(str(x) for x in chunk), "timezone": "UTC"})
+        resp = js.get("response", []) if isinstance(js, dict) else []
+        for fx in resp:
+            fid = (fx.get("fixture") or {}).get("id")
+            if fid:
+                out[int(fid)] = fx
+        time.sleep(0.15)
+    return out
 
 # ── Features / snapshots ─────────────────────────────────────────────────────
 def _num(v) -> float:
@@ -421,7 +480,7 @@ def create_synthetic_snapshots_for_league(
 
     saved = 0
     processed = 0
-    for group in _chunk(ids, 20):
+    for group in _chunk(ids, MAX_IDS_PER_REQ):
         bulk = fetch_fixtures_by_ids_hyphen(group)
         for fid in group:
             m = bulk.get(fid)
@@ -439,7 +498,7 @@ def create_synthetic_snapshots_for_league(
     logging.info(f"[SYNTH] league={league_id} season={season} processed={processed} saved={saved}")
     return {"ok": True, "league": league_id, "season": season, "requested": len(ids), "processed": processed, "saved": saved}
 
-# ── Backfill final results (hyphen bulk & chunk=20) ───────────────────────────
+# ── Backfill final results ────────────────────────────────────────────────────
 def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
     """
     Returns: (updated, checked)
@@ -459,17 +518,21 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
         return 0, 0
 
     updated = 0
-    checked = 0
-    for group in _chunk(ids, 20):  # API max 20
-        bulk = fetch_fixtures_by_ids_hyphen(group)
+    finished_status = {"FT","AET","PEN"}
+    B = MAX_IDS_PER_REQ
+
+    for i in range(0, len(ids), B):
+        batch = ids[i:i+B]
+        fx = fetch_fixtures_by_ids(batch)
         with db_conn() as conn:
-            for fid in group:
-                checked += 1
-                m = bulk.get(fid)
+            for fid in batch:
+                m = fx.get(fid)
                 if not m:
+                    logging.warning(f"[RESULTS] fixture {fid} not returned by API")
                     continue
                 status = ((m.get("fixture") or {}).get("status") or {}).get("short")
-                if status not in ("FT","AET","PEN","PST","CANC","ABD","AWD","WO"):
+                if status not in finished_status:
+                    logging.info(f"[RESULTS] fixture {fid} status={status} (not finished)")
                     continue
                 gh = (m.get("goals") or {}).get("home") or 0
                 ga = (m.get("goals") or {}).get("away") or 0
@@ -479,9 +542,49 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
                 """, (int(fid), int(gh), int(ga), 1 if (int(gh)>0 and int(ga)>0) else 0, int(time.time())))
                 updated += 1
             conn.commit()
-        time.sleep(0.25)  # be nice to the API
-    logging.info(f"[RESULTS] backfilled updated={updated} checked={checked} (window={hours}h)")
-    return updated, checked
+        time.sleep(0.25)
+    logging.info(f"[RESULTS] backfilled updated={updated} checked={len(ids)} (window={hours}h)")
+    return updated, len(ids)
+
+# Helpers for full/backstop backfill
+def _list_unlabeled_ids(limit: Optional[int] = None) -> List[int]:
+    with db_conn() as conn:
+        sql = """
+            SELECT DISTINCT s.match_id
+            FROM tip_snapshots s
+            LEFT JOIN match_results r ON r.match_id = s.match_id
+            WHERE r.match_id IS NULL
+            ORDER BY s.match_id
+        """
+        rows = conn.execute(sql + (" LIMIT ?" if limit else ""), ((limit,) if limit else ())).fetchall()
+    return [r[0] for r in rows]
+
+def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
+    if not ids: return (0,0)
+    updated = 0
+    finished_status = {"FT","AET","PEN"}
+    for i in range(0, len(ids), MAX_IDS_PER_REQ):
+        batch = ids[i:i+MAX_IDS_PER_REQ]
+        fx = fetch_fixtures_by_ids(batch)
+        with db_conn() as conn:
+            for fid in batch:
+                m = fx.get(fid)
+                if not m:
+                    logging.warning(f"[RESULTS] fixture {fid} not returned by API")
+                    continue
+                status = ((m.get("fixture") or {}).get("status") or {}).get("short")
+                if status not in finished_status:
+                    continue
+                gh = (m.get("goals") or {}).get("home") or 0
+                ga = (m.get("goals") or {}).get("away") or 0
+                conn.execute("""
+                    INSERT OR REPLACE INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts)
+                    VALUES (?,?,?,?,?)
+                """, (int(fid), int(gh), int(ga), 1 if (int(gh)>0 and int(ga)>0) else 0, int(time.time())))
+                updated += 1
+            conn.commit()
+        time.sleep(0.25)
+    return updated, len(ids)
 
 # ── Nightly training job ──────────────────────────────────────────────────────
 def retrain_models_job():
@@ -639,7 +742,7 @@ def _run_bulk_leagues(leagues: List[Dict[str, str]], seasons: List[int]) -> Dict
                     f"{base_url}/harvest/league_snapshots",
                     params={
                         "league": lid, "season": s,
-                        "limit": 200, "include_inplay": 0, "delay_ms": 1000, "key": API_KEY
+                        "limit": 200, "include_inplay": 0, "delay_ms": 1000, "key": ADMIN_API_KEY
                     },
                     timeout=120
                 )
@@ -702,6 +805,14 @@ def harvest_scan() -> Tuple[int, int]:
     return saved, live_seen
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+@app.after_request
+def add_security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
 @app.route("/harvest/bulk_leagues", methods=["POST"])
 def harvest_bulk_leagues_post():
     _require_api_key()
@@ -784,6 +895,49 @@ def backfill_route():
     updated, checked = backfill_results_from_snapshots(hours=hours)
     return jsonify({"ok": True, "hours": hours, "checked": checked, "updated": updated})
 
+@app.route("/backfill/all")
+def backfill_all_unlabeled_route():
+    _require_api_key()
+    limit = request.args.get("limit")
+    ids = _list_unlabeled_ids(int(limit) if (limit and str(limit).isdigit()) else None)
+    updated, checked = _backfill_for_ids(ids)
+    return jsonify({"ok": True, "mode": "all_unlabeled", "checked": checked, "updated": updated})
+
+@app.route("/debug/backfill_preview")
+def debug_backfill_preview():
+    _require_api_key()
+    hours = request.args.get("hours")
+    if hours is not None:
+        try:
+            h = max(1, min(int(hours), 168))
+        except Exception:
+            abort(400)
+        since = int(time.time()) - h * 3600
+        with db_conn() as conn:
+            cur = conn.execute("""
+                SELECT DISTINCT match_id FROM tip_snapshots
+                WHERE created_ts >= ?
+                  AND match_id NOT IN (SELECT match_id FROM match_results)
+                ORDER BY match_id
+            """, (since,))
+            ids = [r[0] for r in cur.fetchall()]
+    else:
+        ids = _list_unlabeled_ids(int(request.args.get("limit", "0")) or None)
+
+    fx = fetch_fixtures_by_ids(ids)
+    finished_status = {"FT","AET","PEN"}
+    out = []
+    for fid in ids:
+        m = fx.get(fid)
+        if not m:
+            out.append({"match_id": fid, "fetched": False})
+            continue
+        st = ((m.get("fixture") or {}).get("status") or {}).get("short")
+        gh = (m.get("goals") or {}).get("home")
+        ga = (m.get("goals") or {}).get("away")
+        out.append({"match_id": fid, "fetched": True, "status": st, "goals_h": gh, "goals_a": ga, "will_update": st in finished_status})
+    return jsonify({"count": len(ids), "candidates": out})
+
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
     _require_api_key()
@@ -831,20 +985,23 @@ def stats_progress():
 
 @app.route("/debug/env")
 def debug_env():
+    _require_api_key()
     def mark(val): return {"set": bool(val), "len": len(val) if val else 0}
     return jsonify({
         "API_KEY":            mark(API_KEY),
+        "ADMIN_API_KEY":      {"set": bool(ADMIN_API_KEY)},
         "TELEGRAM_BOT_TOKEN": mark(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID":   mark(TELEGRAM_CHAT_ID),
         "HARVEST_MODE":       HARVEST_MODE,
         "TRAIN_ENABLE":       TRAIN_ENABLE,
         "TRAIN_MIN_MINUTE":   TRAIN_MIN_MINUTE,
         "TRAIN_TEST_SIZE":    TRAIN_TEST_SIZE,
+        "DB_PATH":            DB_PATH,
     })
 
 def _require_api_key():
     key = request.headers.get("X-API-Key") or request.args.get("key")
-    if not API_KEY or key != API_KEY:
+    if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
 @app.route("/stats/config")
@@ -863,6 +1020,7 @@ def stats_config():
         "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
         "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
         "API_KEY_set": bool(API_KEY),
+        "ADMIN_API_KEY_set": bool(ADMIN_API_KEY),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
         "TRAIN_ENABLE": TRAIN_ENABLE,
         "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
@@ -873,6 +1031,8 @@ def stats_config():
 if __name__ == "__main__":
     if not API_KEY:
         logging.error("API_KEY is not set — live fetch will return 0 matches.")
+    if not ADMIN_API_KEY:
+        logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
     init_db()
 
     scheduler = BackgroundScheduler()
