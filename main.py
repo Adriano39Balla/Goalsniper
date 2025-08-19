@@ -6,7 +6,7 @@ import logging
 import requests
 import sqlite3
 import subprocess, shlex
-from html import escape as html_escape
+from html import escape
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
@@ -22,9 +22,8 @@ app = Flask(__name__)
 # ── Env ───────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY            = os.getenv("API_KEY")              # API-Football key only
-ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY")        # separate admin key for our endpoints
-PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL")
+API_KEY            = os.getenv("API_KEY")  # single key for API-Football + admin
+PUBLIC_BASE_URL    = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 BET_URL_TMPL       = os.getenv("BET_URL")
 WATCH_URL_TMPL     = os.getenv("WATCH_URL")
 WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
@@ -66,19 +65,14 @@ TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
 BASE_URL         = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}  # API-Football
+HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}  # single key
 
-# Live/in-play statuses per API-FOOTBALL docs/tutorial
+# Live/in-play statuses (per API-FOOTBALL tutorial)
 INPLAY_STATUSES = ["1H","HT","2H","ET","BT","P"]
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
 session = requests.Session()
-retries = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504],
-    respect_retry_after_header=True,
-)
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # ── In-memory caches ──────────────────────────────────────────────────────────
@@ -87,19 +81,8 @@ EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 CAL_CACHE: Dict[str, Any] = {"ts": 0, "bins": []}
 
 # ── DB ────────────────────────────────────────────────────────────────────────
-DB_PATH = os.getenv("DB_PATH", "tip_performance.db")
-
-def db_conn():
-    # Safer SQLite settings for concurrent scheduler + HTTP
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)  # autocommit-like
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-    except Exception:
-        pass
-    return conn
+DB_PATH = "tip_performance.db"
+def db_conn(): return sqlite3.connect(DB_PATH)
 
 def init_db():
     with db_conn() as conn:
@@ -119,7 +102,6 @@ def init_db():
             sent_ok   INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts)
         )""")
-        # backward-compat add
         try:
             conn.execute("ALTER TABLE tips ADD COLUMN sent_ok INTEGER DEFAULT 1")
         except Exception:
@@ -152,9 +134,6 @@ def init_db():
             btts_yes      INTEGER,
             updated_ts    INTEGER
         )""")
-        # Indices / view
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
         conn.execute("DROP VIEW IF EXISTS v_tip_stats")
         conn.execute("""
         CREATE VIEW v_tip_stats AS
@@ -191,7 +170,7 @@ def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Missing Telegram credentials")
         return False
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": html_escape(message), "parse_mode": "HTML"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     if inline_keyboard:
         payload["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard})
     try:
@@ -222,15 +201,6 @@ def _api_get(url: str, params: dict, timeout: int = 15):
         if not res.ok:
             logging.error(f"[API] {url} status={res.status_code} body={res.text[:300]}")
             return None
-
-        # Optional: rate-limit telemetry
-        try:
-            rem = int(res.headers.get("X-RateLimit-Remaining", "-1"))
-            if 0 <= rem <= 2:
-                logging.warning(f"[API] Low remaining quota: {rem}")
-        except Exception:
-            pass
-
         return res.json()
     except Exception as e:
         logging.exception(f"[API] error {url}: {e}")
@@ -240,7 +210,7 @@ def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     now = time.time()
     if fixture_id in STATS_CACHE:
         ts, data = STATS_CACHE[fixture_id]
-        if now - ts < 60:
+        if now - ts < 90:
             return data
     js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fixture_id})
     stats = js.get("response", []) if isinstance(js, dict) else None
@@ -251,7 +221,7 @@ def fetch_match_events(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     now = time.time()
     if fixture_id in EVENTS_CACHE:
         ts, data = EVENTS_CACHE[fixture_id]
-        if now - ts < 60:
+        if now - ts < 90:
             return data
     js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fixture_id})
     evs = js.get("response", []) if isinstance(js, dict) else None
@@ -281,53 +251,19 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     logging.info(f"[FETCH] live={len(matches)} kept={len(out)}")
     return out
 
-# API-Football cap per request
-MAX_IDS_PER_REQ = 20
-
 def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    """
-    Robust fetch by ids with chunking (20), plus 1-by-1 fallback for any missing.
-    """
-    out: Dict[int, Dict[str, Any]] = {}
-    if not ids:
-        return out
+    if not ids: return {}
+    js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(i) for i in ids), "timezone": "UTC"})
+    resp = js.get("response", []) if isinstance(js, dict) else []
+    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
 
-    for i in range(0, len(ids), MAX_IDS_PER_REQ):
-        chunk = ids[i:i+MAX_IDS_PER_REQ]
-        js = _api_get(FOOTBALL_API_URL, {
-            "ids": ",".join(str(i) for i in chunk),
-            "timezone": "UTC"
-        })
-        resp = js.get("response", []) if isinstance(js, dict) else []
-        for fx in resp:
-            fid = (fx.get("fixture") or {}).get("id")
-            if fid:
-                out[int(fid)] = fx
-
-        # Fallback for missing from this chunk
-        missing = [fid for fid in chunk if fid not in out]
-        for fid in missing:
-            js1 = _api_get(FOOTBALL_API_URL, {"id": fid, "timezone": "UTC"})
-            r1 = (js1.get("response") if isinstance(js1, dict) else []) or []
-            if r1:
-                out[int(fid)] = r1[0]
-        time.sleep(0.15)
-    return out
-
-# Optional hyphen-joined variant (kept for historical endpoints; still chunk to 20)
+# Hyphen-joined bulk fetch (max 20 ids)
 def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    out: Dict[int, Dict[str, Any]] = {}
-    if not ids: return out
-    for i in range(0, len(ids), MAX_IDS_PER_REQ):
-        chunk = ids[i:i+MAX_IDS_PER_REQ]
-        js = _api_get(FOOTBALL_API_URL, {"ids": "-".join(str(x) for x in chunk), "timezone": "UTC"})
-        resp = js.get("response", []) if isinstance(js, dict) else []
-        for fx in resp:
-            fid = (fx.get("fixture") or {}).get("id")
-            if fid:
-                out[int(fid)] = fx
-        time.sleep(0.15)
-    return out
+    if not ids: return {}
+    param_val = "-".join(str(i) for i in ids)
+    js = _api_get(FOOTBALL_API_URL, {"ids": param_val, "timezone": "UTC"})
+    resp = js.get("response", []) if isinstance(js, dict) else []
+    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
 
 # ── Features / snapshots ─────────────────────────────────────────────────────
 def _num(v) -> float:
@@ -429,25 +365,11 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
             INSERT OR REPLACE INTO tip_snapshots(match_id, created_ts, payload)
             VALUES (?,?,?)
         """, (fid, now, json.dumps(snapshot)[:200000]))
-        # also record a tips row for bookkeeping (sent_ok=0)
         conn.execute("""
             INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now, 0))
         conn.commit()
-
-# ── Harvest scan (no sends) ───────────────────────────────────────────────────
-def harvest_scan() -> Tuple[int, int]:
-    matches = fetch_live_matches()
-    saved = 0
-    for m in matches:
-        feat = extract_features(m)
-        if not stats_coverage_ok(feat, int(feat.get("minute", 0))):
-            continue
-        save_snapshot_from_match(m, feat)
-        saved += 1
-    logging.info(f"[HARVEST] snapshots_saved={saved} live={len(matches)}")
-    return saved, len(matches)
 
 # ── Historical utility: chunking and league fixture pull ───────────────────────
 def _chunk(seq: List[int], size: int) -> List[List[int]]:
@@ -505,8 +427,7 @@ def create_synthetic_snapshots_for_league(
 
     saved = 0
     processed = 0
-    chunks = _chunk(ids, MAX_IDS_PER_REQ)
-    for group in chunks:
+    for group in _chunk(ids, 20):
         bulk = fetch_fixtures_by_ids_hyphen(group)
         for fid in group:
             m = bulk.get(fid)
@@ -517,8 +438,6 @@ def create_synthetic_snapshots_for_league(
             feat = extract_features(m)
             minute = int(((m.get("fixture", {}) or {}).get("status", {}) or {}).get("elapsed") or 90)
             feat["minute"] = float(min(120, max(0, minute)))
-            if not stats_coverage_ok(feat, int(feat.get("minute", 0))):
-                logging.debug(f"[SYNTH] weak coverage fid={fid} minute={feat.get('minute')}")
             save_snapshot_from_match(m, feat)
             saved += 1
         time.sleep(max(0, sleep_ms_between_chunks) / 1000.0)
@@ -526,12 +445,15 @@ def create_synthetic_snapshots_for_league(
     logging.info(f"[SYNTH] league={league_id} season={season} processed={processed} saved={saved}")
     return {"ok": True, "league": league_id, "season": season, "requested": len(ids), "processed": processed, "saved": saved}
 
-# ── Backfill final results for harvested match_ids ────────────────────────────
+# ── Backfill final results ────────────────────────────────────────────────────
+def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    if not ids: return {}
+    js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(i) for i in ids), "timezone": "UTC"})
+    resp = js.get("response", []) if isinstance(js, dict) else []
+    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
+
 def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
-    """
-    Returns: (updated, checked)
-    """
-    hours = max(1, min(int(hours), 168))  # clamp 1..168h
+    hours = max(1, min(int(hours), 168))
     since = int(time.time()) - int(hours) * 3600
     with db_conn() as conn:
         cur = conn.execute("""
@@ -546,9 +468,7 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
         return 0, 0
 
     updated = 0
-    finished_status = {"FT","AET","PEN"}  # only truly finished games
-    B = MAX_IDS_PER_REQ  # 20
-
+    B = 25
     for i in range(0, len(ids), B):
         batch = ids[i:i+B]
         fx = fetch_fixtures_by_ids(batch)
@@ -556,11 +476,9 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
             for fid in batch:
                 m = fx.get(fid)
                 if not m:
-                    logging.warning(f"[RESULTS] fixture {fid} not returned by API")
                     continue
                 status = ((m.get("fixture") or {}).get("status") or {}).get("short")
-                if status not in finished_status:
-                    logging.info(f"[RESULTS] fixture {fid} status={status} (not finished)")
+                if status not in ("FT","AET","PEN","PST","CANC","ABD","AWD","WO"):
                     continue
                 gh = (m.get("goals") or {}).get("home") or 0
                 ga = (m.get("goals") or {}).get("away") or 0
@@ -570,7 +488,7 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
                 """, (int(fid), int(gh), int(ga), 1 if (int(gh)>0 and int(ga)>0) else 0, int(time.time())))
                 updated += 1
             conn.commit()
-        time.sleep(0.25)  # be nice to the API
+        time.sleep(0.25)
     logging.info(f"[RESULTS] backfilled updated={updated} checked={len(ids)} (window={hours}h)")
     return updated, len(ids)
 
@@ -592,13 +510,12 @@ def retrain_models_job():
             shlex.split(cmd),
             capture_output=True,
             text=True,
-            timeout=900  # 15 min safety
+            timeout=900
         )
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
         logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
 
-        # Optional short ping to Telegram
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                 summary = "✅ Nightly training OK" if proc.returncode == 0 else "❌ Nightly training failed"
@@ -662,7 +579,105 @@ def nightly_digest_job():
         logging.exception("[DIGEST] failed: %s", e)
         return False
 
+# ── Shared helper for bulk leagues ────────────────────────────────────────────
+def _resolve_league_id(name: str, country: str) -> Optional[int]:
+    js = _api_get(f"{BASE_URL}/leagues", {"name": name, "country": country})
+    if not isinstance(js, dict):
+        return None
+    for item in js.get("response", []):
+        league = item.get("league") or {}
+        if league.get("name") == name:
+            return league.get("id")
+    try:
+        return (js.get("response", [])[0].get("league") or {}).get("id")
+    except Exception:
+        return None
+
+def _run_bulk_leagues(leagues: List[Dict[str, str]], seasons: List[int]) -> Dict[str, Any]:
+    results = []
+    base_url = PUBLIC_BASE_URL or request.host_url.rstrip("/")
+    for L in leagues:
+        nm = L.get("name"); ct = L.get("country")
+        lid = _resolve_league_id(nm, ct)
+        if not lid:
+            results.append({"name": nm, "country": ct, "ok": False, "reason": "not_found"})
+            continue
+
+        league_summary = {"name": nm, "country": ct, "league_id": lid, "seasons": []}
+        for s in seasons:
+            try:
+                r = session.get(
+                    f"{base_url}/harvest/league_snapshots",
+                    params={
+                        "league": lid, "season": s,
+                        "limit": 200, "include_inplay": 0, "delay_ms": 1000, "key": API_KEY
+                    },
+                    timeout=120
+                )
+                resp = r.json() if r.ok else {"ok": False, "error": f"http {r.status_code}"}
+            except Exception as e:
+                resp = {"ok": False, "error": str(e)}
+            league_summary["seasons"].append({"season": s, "result": resp})
+        results.append(league_summary)
+    return {"ok": True, "count": len(results), "results": results}
+
 # ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/harvest/bulk_leagues", methods=["POST"])
+def harvest_bulk_leagues_post():
+    _require_api_key()
+    body = request.get_json(silent=True) or {}
+    leagues = body.get("leagues") or []
+    seasons = body.get("seasons") or [2024]
+    if not leagues:
+        leagues = [
+            {"name":"Premier League","country":"England"},
+            {"name":"La Liga","country":"Spain"},
+            {"name":"Serie A","country":"Italy"},
+            {"name":"Bundesliga","country":"Germany"},
+            {"name":"Ligue 1","country":"France"},
+            {"name":"Championship","country":"England"},
+            {"name":"Segunda División","country":"Spain"},
+            {"name":"Serie B","country":"Italy"},
+            {"name":"2. Bundesliga","country":"Germany"},
+            {"name":"Ligue 2","country":"France"},
+            {"name":"Primeira Liga","country":"Portugal"},
+            {"name":"Eredivisie","country":"Netherlands"},
+            {"name":"Pro League","country":"Belgium"},
+            {"name":"Bundesliga","country":"Austria"},
+            {"name":"Super League","country":"Switzerland"},
+            {"name":"Superliga","country":"Denmark"},
+            {"name":"Premiership","country":"Scotland"},
+            {"name":"Série A","country":"Brazil"},
+            {"name":"Liga Profesional Argentina","country":"Argentina"},
+            {"name":"MLS","country":"USA"},
+            {"name":"Liga MX","country":"Mexico"},
+            {"name":"J1 League","country":"Japan"},
+            {"name":"K League 1","country":"South Korea"},
+            {"name":"Saudi Professional League","country":"Saudi Arabia"},
+            {"name":"Süper Lig","country":"Turkey"},
+            {"name":"Premier League","country":"Russia"},
+            {"name":"Premier League","country":"Ukraine"},
+            {"name":"A-League","country":"Australia"},
+            {"name":"Série B","country":"Brazil"},
+            {"name":"UEFA Champions League","country":"World"},
+            {"name":"UEFA Europa League","country":"World"},
+            {"name":"FA Cup","country":"England"},
+            {"name":"League Cup","country":"England"},
+            {"name":"Women's Super League","country":"England"},
+        ]
+    return jsonify(_run_bulk_leagues(leagues, seasons))
+
+# Convenience GET so you can trigger from browser:
+# /harvest/bulk_leagues?key=...&seasons=2023,2024
+@app.route("/harvest/bulk_leagues", methods=["GET"])
+def harvest_bulk_leagues_get():
+    _require_api_key()
+    seasons_q = (request.args.get("seasons") or "").strip()
+    seasons = [int(s) for s in seasons_q.split(",") if s.strip().isdigit()] or [2024]
+    # GET uses the same default curated list
+    leagues = []
+    return jsonify(_run_bulk_leagues(leagues, seasons))
+
 @app.route("/")
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
@@ -670,11 +685,10 @@ def home():
 
 @app.route("/harvest")
 def harvest_route():
-    _require_api_key()  # protect; remove if you want public
+    _require_api_key()
     saved, live_seen = harvest_scan()
     return jsonify({"ok": True, "live_seen": live_seen, "snapshots_saved": saved})
 
-# NEW: list all fixture IDs for a league/season (per tutorial Step 1)
 @app.route("/harvest/league_ids")
 def harvest_league_ids_route():
     _require_api_key()
@@ -693,7 +707,6 @@ def harvest_league_ids_route():
     ids = get_fixture_ids_for_league(league, season, statuses)
     return jsonify({"ok": True, "league": league, "season": season, "statuses": "-".join(statuses), "count": len(ids), "ids": ids})
 
-# NEW: build synthetic snapshots from historical fixtures
 @app.route("/harvest/league_snapshots")
 def harvest_league_snapshots_route():
     _require_api_key()
@@ -708,7 +721,6 @@ def harvest_league_snapshots_route():
     limit_param = request.args.get("limit")
     limit = int(limit_param) if (limit_param and str(limit_param).isdigit()) else None
     delay_ms = int(request.args.get("delay_ms", 1000))
-
     summary = create_synthetic_snapshots_for_league(
         league_id=league,
         season=season,
@@ -751,7 +763,7 @@ def snapshots_count():
         """).fetchone()[0]
     return jsonify({
         "tip_snapshots": int(snap),
-        "tips_rows": int(tips),           # includes HARVEST rows with sent_ok=0
+        "tips_rows": int(tips),
         "match_results": int(res),
         "unlabeled_match_ids": int(unlabeled)
     })
@@ -765,41 +777,32 @@ def stats_progress():
     c24 = _counts_since(day_ago)
     c7  = _counts_since(week_ago)
     return jsonify({
-        "window_24h": {
-            "snapshots_added": c24["snap_24h"],
-            "results_added": c24["res_24h"],
-        },
+        "window_24h": {"snapshots_added": c24["snap_24h"], "results_added": c24["res_24h"]},
         "totals": {
             "tip_snapshots": c24["snap_total"],
             "tips_rows": c24["tips_total"],
             "match_results": c24["res_total"],
             "unlabeled_match_ids": c24["unlabeled"],
         },
-        "window_7d": {
-            "snapshots_added_est": c7["snap_24h"],
-            "results_added_est": c7["res_24h"],
-        }
+        "window_7d": {"snapshots_added_est": c7["snap_24h"], "results_added_est": c7["res_24h"]},
     })
 
 @app.route("/debug/env")
 def debug_env():
-    _require_api_key()
     def mark(val): return {"set": bool(val), "len": len(val) if val else 0}
     return jsonify({
         "API_KEY":            mark(API_KEY),
-        "ADMIN_API_KEY":      {"set": bool(ADMIN_API_KEY)},
         "TELEGRAM_BOT_TOKEN": mark(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID":   mark(TELEGRAM_CHAT_ID),
         "HARVEST_MODE":       HARVEST_MODE,
         "TRAIN_ENABLE":       TRAIN_ENABLE,
         "TRAIN_MIN_MINUTE":   TRAIN_MIN_MINUTE,
         "TRAIN_TEST_SIZE":    TRAIN_TEST_SIZE,
-        "DB_PATH":            os.getenv("DB_PATH", "tip_performance.db"),
     })
 
 def _require_api_key():
     key = request.headers.get("X-API-Key") or request.args.get("key")
-    if not ADMIN_API_KEY or key != ADMIN_API_KEY:
+    if not API_KEY or key != API_KEY:
         abort(401)
 
 @app.route("/stats/config")
@@ -818,7 +821,6 @@ def stats_config():
         "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
         "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
         "API_KEY_set": bool(API_KEY),
-        "ADMIN_API_KEY_set": bool(ADMIN_API_KEY),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
         "TRAIN_ENABLE": TRAIN_ENABLE,
         "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
@@ -829,14 +831,11 @@ def stats_config():
 if __name__ == "__main__":
     if not API_KEY:
         logging.error("API_KEY is not set — live fetch will return 0 matches.")
-    if not ADMIN_API_KEY:
-        logging.error("ADMIN_API_KEY is not set — admin endpoints will return 401.")
     init_db()
 
     scheduler = BackgroundScheduler()
 
     if HARVEST_MODE:
-        # Sun–Thu, 09:00–21:59 Europe/Berlin every 2 min (no night pings)
         scheduler.add_job(
             harvest_scan,
             CronTrigger(
@@ -848,8 +847,6 @@ if __name__ == "__main__":
             id="harvest",
             replace_existing=True,
         )
-
-        # Backfill results every 15 min
         scheduler.add_job(
             backfill_results_from_snapshots,
             "interval",
@@ -858,7 +855,6 @@ if __name__ == "__main__":
             replace_existing=True,
         )
 
-    # Nightly training every day at 03:00 Europe/Berlin (works in both modes)
     scheduler.add_job(
         retrain_models_job,
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
@@ -867,8 +863,6 @@ if __name__ == "__main__":
         misfire_grace_time=3600,
         coalesce=True,
     )
-
-    # Nightly digest to Telegram at 03:02 Europe/Berlin
     scheduler.add_job(
         nightly_digest_job,
         CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
