@@ -621,6 +621,98 @@ def nightly_digest_job():
         return False
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/harvest/bulk_leagues", methods=["POST"])
+def harvest_bulk_leagues():
+    _require_api_key()
+    body = request.get_json(silent=True) or {}
+    leagues = body.get("leagues") or []
+    seasons = body.get("seasons") or [2024]
+
+    # Default to the curated list if none provided
+    if not leagues:
+        leagues = [
+            {"name":"Premier League","country":"England"},
+            {"name":"La Liga","country":"Spain"},
+            {"name":"Serie A","country":"Italy"},
+            {"name":"Bundesliga","country":"Germany"},
+            {"name":"Ligue 1","country":"France"},
+            {"name":"Championship","country":"England"},
+            {"name":"Segunda División","country":"Spain"},
+            {"name":"Serie B","country":"Italy"},
+            {"name":"2. Bundesliga","country":"Germany"},
+            {"name":"Ligue 2","country":"France"},
+            {"name":"Primeira Liga","country":"Portugal"},
+            {"name":"Eredivisie","country":"Netherlands"},
+            {"name":"Pro League","country":"Belgium"},
+            {"name":"Bundesliga","country":"Austria"},
+            {"name":"Super League","country":"Switzerland"},
+            {"name":"Superliga","country":"Denmark"},
+            {"name":"Premiership","country":"Scotland"},
+            {"name":"Série A","country":"Brazil"},
+            {"name":"Liga Profesional Argentina","country":"Argentina"},
+            {"name":"MLS","country":"USA"},
+            {"name":"Liga MX","country":"Mexico"},
+            {"name":"J1 League","country":"Japan"},
+            {"name":"K League 1","country":"South Korea"},
+            {"name":"Saudi Professional League","country":"Saudi Arabia"},
+            {"name":"Süper Lig","country":"Turkey"},
+            {"name":"Premier League","country":"Russia"},
+            {"name":"Premier League","country":"Ukraine"},
+            {"name":"A-League","country":"Australia"},
+            {"name":"Série B","country":"Brazil"},
+            {"name":"UEFA Champions League","country":"World"},
+            {"name":"UEFA Europa League","country":"World"},
+            {"name":"FA Cup","country":"England"},
+            {"name":"League Cup","country":"England"},
+            {"name":"Women's Super League","country":"England"},
+        ]
+
+    def resolve_league_id(name: str, country: str) -> Optional[int]:
+        js = _api_get(f"{BASE_URL}/leagues", {"name": name, "country": country})
+        if not isinstance(js, dict):
+            return None
+        for item in js.get("response", []):
+            league = item.get("league") or {}
+            # Prefer current 'type' (League/Cup) matching intention
+            if league.get("name") == name:
+                return league.get("id")
+        # fallback: first match
+        try:
+            return (js.get("response", [])[0].get("league") or {}).get("id")
+        except Exception:
+            return None
+
+    results = []
+    for L in leagues:
+        nm = L.get("name"); ct = L.get("country")
+        lid = resolve_league_id(nm, ct)
+        if not lid:
+            results.append({"name": nm, "country": ct, "ok": False, "reason": "not_found"})
+            continue
+
+        league_summary = {"name": nm, "country": ct, "league_id": lid, "seasons": []}
+        for s in seasons:
+            # call your existing snapshots harvester internally
+            resp = _api_get(f"{PUBLIC_BASE_URL}/harvest/league_snapshots", {
+                "league": lid, "season": s, "limit": 200, "include_inplay": 0, "delay_ms": 1000, "key": API_KEY
+            })
+            # If PUBLIC_BASE_URL isn't set, fall back to direct function with requests
+            if resp is None:
+                try:
+                    r = session.get(
+                        f"{request.host_url.rstrip('/')}/harvest/league_snapshots",
+                        params={"league": lid, "season": s, "limit": 200, "include_inplay": 0, "delay_ms": 1000, "key": API_KEY},
+                        timeout=60
+                    )
+                    resp = r.json() if r.ok else {"ok": False, "error": f"http {r.status_code}"}
+                except Exception as e:
+                    resp = {"ok": False, "error": str(e)}
+
+            league_summary["seasons"].append({"season": s, "result": resp})
+        results.append(league_summary)
+
+    return jsonify({"ok": True, "count": len(results), "results": results})
+
 @app.route("/")
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
