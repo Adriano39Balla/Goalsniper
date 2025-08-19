@@ -440,18 +440,12 @@ def create_synthetic_snapshots_for_league(
             feat["minute"] = float(min(120, max(0, minute)))
             save_snapshot_from_match(m, feat)
             saved += 1
-        time.sleep(max(0, sleep_ms_between_chunks) / 1000.0)
+        time.sleep(0.25 if sleep_ms_between_chunks < 250 else max(0, sleep_ms_between_chunks) / 1000.0)
 
     logging.info(f"[SYNTH] league={league_id} season={season} processed={processed} saved={saved}")
     return {"ok": True, "league": league_id, "season": season, "requested": len(ids), "processed": processed, "saved": saved}
 
 # ── Backfill final results ────────────────────────────────────────────────────
-def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    if not ids: return {}
-    js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(i) for i in ids), "timezone": "UTC"})
-    resp = js.get("response", []) if isinstance(js, dict) else []
-    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
-
 def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
     hours = max(1, min(int(hours), 168))
     since = int(time.time()) - int(hours) * 3600
@@ -579,6 +573,58 @@ def nightly_digest_job():
         logging.exception("[DIGEST] failed: %s", e)
         return False
 
+# ── Harvest scan (NEW) ───────────────────────────────────────────────────────
+def harvest_scan() -> Tuple[int, int]:
+    """
+    Pull in-play fixtures, ensure basic data sufficiency, snapshot them,
+    and throttle duplicates/cadence. Returns (saved, live_seen).
+    """
+    matches = fetch_live_matches()
+    live_seen = len(matches)
+    if live_seen == 0:
+        logging.info("[HARVEST] no live matches")
+        return 0, 0
+
+    saved = 0
+    now_ts = int(time.time())
+
+    with db_conn() as conn:
+        for m in matches:
+            try:
+                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                if not fid:
+                    continue
+
+                # cooldown – avoid writing multiple rows per match too frequently
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
+                    dup = conn.execute(
+                        "SELECT 1 FROM tips WHERE match_id=? AND created_ts>=? LIMIT 1",
+                        (fid, cutoff)
+                    ).fetchone()
+                    if dup:
+                        continue
+
+                feat = extract_features(m)
+                minute = int(feat.get("minute", 0))
+
+                # require some live stats after a given minute (configurable)
+                if not stats_coverage_ok(feat, minute):
+                    continue
+
+                save_snapshot_from_match(m, feat)
+                saved += 1
+
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break
+
+            except Exception as e:
+                logging.exception(f"[HARVEST] failure on match: {e}")
+                continue
+
+    logging.info(f"[HARVEST] saved={saved} live_seen={live_seen}")
+    return saved, live_seen
+
 # ── Shared helper for bulk leagues ────────────────────────────────────────────
 def _resolve_league_id(name: str, country: str) -> Optional[int]:
     js = _api_get(f"{BASE_URL}/leagues", {"name": name, "country": country})
@@ -667,14 +713,11 @@ def harvest_bulk_leagues_post():
         ]
     return jsonify(_run_bulk_leagues(leagues, seasons))
 
-# Convenience GET so you can trigger from browser:
-# /harvest/bulk_leagues?key=...&seasons=2023,2024
 @app.route("/harvest/bulk_leagues", methods=["GET"])
 def harvest_bulk_leagues_get():
     _require_api_key()
     seasons_q = (request.args.get("seasons") or "").strip()
     seasons = [int(s) for s in seasons_q.split(",") if s.strip().isdigit()] or [2024]
-    # GET uses the same default curated list
     leagues = []
     return jsonify(_run_bulk_leagues(leagues, seasons))
 
