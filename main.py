@@ -67,6 +67,9 @@ FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}  # single key
 
+# Live/in-play statuses per API-FOOTBALL docs/tutorial
+INPLAY_STATUSES = ["1H","HT","2H","ET","BT","P"]
+
 # ── HTTP session ──────────────────────────────────────────────────────────────
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
@@ -165,7 +168,7 @@ def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
 
 # ── Telegram (unused in harvest, but kept) ────────────────────────────────────
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN or not TELELEGRAM_CHAT_ID:
         logging.error("Missing Telegram credentials")
         return False
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
@@ -174,7 +177,7 @@ def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
     try:
         res = session.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=10)
         if not res.ok:
-            logging.error(f"[Telegram] sendMessage FAILED status={res.status_code} body={res.text}")
+            logging.error(f"[Telegram] sendMessage FAILED status={res.status_code} body={res.text[:300]}")
         else:
             logging.info("[Telegram] sendMessage OK")
         return res.ok
@@ -252,6 +255,15 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
 def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
     if not ids: return {}
     js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(i) for i in ids), "timezone": "UTC"})
+    resp = js.get("response", []) if isinstance(js, dict) else []
+    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
+
+# Added: API tutorial-style hyphen-joined bulk fetch (max 20 per call)
+def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    if not ids: return {}
+    # API docs/tutorial indicate max 20 and hyphen-separated
+    param_val = "-".join(str(i) for i in ids)
+    js = _api_get(FOOTBALL_API_URL, {"ids": param_val, "timezone": "UTC"})
     resp = js.get("response", []) if isinstance(js, dict) else []
     return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
 
@@ -374,6 +386,106 @@ def harvest_scan() -> Tuple[int, int]:
         saved += 1
     logging.info(f"[HARVEST] snapshots_saved={saved} live={len(matches)}")
     return saved, len(matches)
+
+# ── Historical utility: chunking and league fixture pull ───────────────────────
+def _chunk(seq: List[int], size: int) -> List[List[int]]:
+    size = max(1, int(size))
+    return [seq[i:i+size] for i in range(0, len(seq), size)]
+
+def get_fixture_ids_for_league(league_id: int, season: int, statuses: List[str]) -> List[int]:
+    """
+    Step 1 of tutorial: fetch all fixture IDs for league/season filtered by statuses.
+    """
+    status_param = "-".join(statuses) if statuses else "FT-AET-PEN"
+    params = {
+        "league": league_id,
+        "season": season,
+        "status": status_param,
+        "timezone": "UTC",
+    }
+    js = _api_get(FOOTBALL_API_URL, params)
+    if not isinstance(js, dict):
+        return []
+    ids: List[int] = []
+    for item in (js.get("response") or []):
+        fx = item.get("fixture") or {}
+        fid = fx.get("id")
+        if fid:
+            ids.append(int(fid))
+    logging.info(f"[LEAGUE_IDS] league={league_id} season={season} statuses={status_param} -> {len(ids)} ids")
+    return ids
+
+def _ensure_events_stats_present(m: Dict[str, Any], fid: int) -> Dict[str, Any]:
+    """If bulk payload didn't include events/statistics, fetch them."""
+    if not m.get("statistics"):
+        try:
+            m["statistics"] = fetch_match_stats(fid) or []
+        except Exception:
+            m["statistics"] = []
+    if not m.get("events"):
+        try:
+            m["events"] = fetch_match_events(fid) or []
+        except Exception:
+            m["events"] = []
+    return m
+
+def create_synthetic_snapshots_for_league(
+    league_id: int,
+    season: int,
+    include_inplay: bool = False,
+    extra_statuses: Optional[List[str]] = None,
+    max_per_run: Optional[int] = None,
+    sleep_ms_between_chunks: int = 1000,
+) -> Dict[str, Any]:
+    """
+    End-to-end: league -> ids -> chunk (20) -> bulk fetch -> save synthetic snapshots.
+    Returns summary counts.
+    """
+    # Step 1: statuses
+    base_statuses = ["FT","AET","PEN"]
+    if include_inplay:
+        base_statuses += INPLAY_STATUSES
+    if extra_statuses:
+        for s in extra_statuses:
+            if s not in base_statuses:
+                base_statuses.append(s)
+    ids = get_fixture_ids_for_league(league_id, season, base_statuses)
+    if not ids:
+        return {"ok": True, "league": league_id, "season": season, "requested": 0, "processed": 0, "saved": 0}
+    if max_per_run is not None and max_per_run > 0:
+        ids = ids[:max_per_run]
+
+    saved = 0
+    processed = 0
+    chunks = _chunk(ids, 20)
+    for group in chunks:
+        # Step 3: bulk fetch; tutorial uses hyphen-separated ids with max 20
+        bulk = fetch_fixtures_by_ids_hyphen(group)
+        for fid in group:
+            m = bulk.get(fid)
+            if not m:
+                continue
+            processed += 1
+            # Some bulk responses contain events/statistics; if not, fetch them
+            m = _ensure_events_stats_present(m, fid)
+            feat = extract_features(m)
+
+            # For completed games the elapsed may be > 90 or None. Set minute sane for synthetic rows.
+            minute = int(((m.get("fixture", {}) or {}).get("status", {}) or {}).get("elapsed") or 90)
+            feat["minute"] = float(min(120, max(0, minute)))
+
+            # For historical "synthetic" snapshots we want stats coverage; but allow saving even if early-minute rule would exclude
+            if not stats_coverage_ok(feat, int(feat.get("minute", 0))):
+                # Try best-effort: if finished game but missing some stats, still save the snapshot to not waste the label
+                logging.debug(f"[SYNTH] weak coverage fid={fid} minute={feat.get('minute')}")
+            save_snapshot_from_match(m, feat)
+            saved += 1
+
+        # Rate-limit friendly delay
+        time.sleep(max(0, sleep_ms_between_chunks) / 1000.0)
+
+    logging.info(f"[SYNTH] league={league_id} season={season} processed={processed} saved={saved}")
+    return {"ok": True, "league": league_id, "season": season, "requested": len(ids), "processed": processed, "saved": saved}
 
 # ── Backfill final results for harvested match_ids ────────────────────────────
 def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
@@ -520,6 +632,52 @@ def harvest_route():
     saved, live_seen = harvest_scan()
     return jsonify({"ok": True, "live_seen": live_seen, "snapshots_saved": saved})
 
+# NEW: list all fixture IDs for a league/season (per tutorial Step 1)
+@app.route("/harvest/league_ids")
+def harvest_league_ids_route():
+    _require_api_key()
+    try:
+        league = int(request.args.get("league"))
+        season = int(request.args.get("season"))
+    except Exception:
+        abort(400)
+    # statuses query param like: FT-AET-PEN-1H-HT-2H ...
+    statuses_param = request.args.get("statuses", "")
+    include_inplay = request.args.get("include_inplay", "0") not in ("0","false","False","no","NO")
+    statuses: List[str] = [s for s in statuses_param.split("-") if s] if statuses_param else ["FT","AET","PEN"]
+    if include_inplay:
+        for s in INPLAY_STATUSES:
+            if s not in statuses:
+                statuses.append(s)
+    ids = get_fixture_ids_for_league(league, season, statuses)
+    return jsonify({"ok": True, "league": league, "season": season, "statuses": "-".join(statuses), "count": len(ids), "ids": ids})
+
+# NEW: build synthetic snapshots from historical fixtures
+@app.route("/harvest/league_snapshots")
+def harvest_league_snapshots_route():
+    _require_api_key()
+    try:
+        league = int(request.args.get("league"))
+        season = int(request.args.get("season"))
+    except Exception:
+        abort(400)
+    include_inplay = request.args.get("include_inplay", "0") not in ("0","false","False","no","NO")
+    statuses_param = request.args.get("statuses", "")
+    extra_statuses = [s for s in statuses_param.split("-") if s] if statuses_param else None
+    limit_param = request.args.get("limit")
+    limit = int(limit_param) if (limit_param and str(limit_param).isdigit()) else None
+    delay_ms = int(request.args.get("delay_ms", 1000))
+
+    summary = create_synthetic_snapshots_for_league(
+        league_id=league,
+        season=season,
+        include_inplay=include_inplay,
+        extra_statuses=extra_statuses,
+        max_per_run=limit,
+        sleep_ms_between_chunks=delay_ms,
+    )
+    return jsonify(summary)
+
 @app.route("/backfill")
 def backfill_route():
     _require_api_key()
@@ -610,7 +768,7 @@ def stats_config():
         "DUP_COOLDOWN_MIN": DUP_COOLDOWN_MIN,
         "REQUIRE_STATS_MINUTE": REQUIRE_STATS_MINUTE,
         "REQUIRE_DATA_FIELDS": REQUIRE_DATA_FIELDS,
-        "UNDER_SUPPRESS_AFTER_MIN": UNDER_SUPPRESS_AFTER_MIN,
+        "UNDER_SUPPRESS_AFTER_MINUTE": UNDER_SUPPRESS_AFTER_MIN,
         "O25_LATE_MINUTE": O25_LATE_MINUTE,
         "O25_LATE_MIN_GOALS": O25_LATE_MIN_GOALS,
         "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
