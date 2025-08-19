@@ -650,6 +650,57 @@ def _run_bulk_leagues(leagues: List[Dict[str, str]], seasons: List[int]) -> Dict
         results.append(league_summary)
     return {"ok": True, "count": len(results), "results": results}
 
+def harvest_scan() -> Tuple[int, int]:
+    """
+    Pull in-play fixtures, ensure basic data sufficiency, snapshot them,
+    and throttle duplicates/cadence. Returns (saved, live_seen).
+    """
+    matches = fetch_live_matches()
+    live_seen = len(matches)
+    if live_seen == 0:
+        logging.info("[HARVEST] no live matches")
+        return 0, 0
+
+    saved = 0
+    now_ts = int(time.time())
+
+    with db_conn() as conn:
+        for m in matches:
+            try:
+                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                if not fid:
+                    continue
+
+                # cooldown – avoid writing multiple rows per match too frequently
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
+                    dup = conn.execute(
+                        "SELECT 1 FROM tips WHERE match_id=? AND created_ts>=? LIMIT 1",
+                        (fid, cutoff)
+                    ).fetchone()
+                    if dup:
+                        continue
+
+                feat = extract_features(m)
+                minute = int(feat.get("minute", 0))
+
+                # require some live stats after a given minute (configurable)
+                if not stats_coverage_ok(feat, minute):
+                    continue
+
+                save_snapshot_from_match(m, feat)
+                saved += 1
+
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break
+
+            except Exception as e:
+                logging.exception(f"[HARVEST] failure on match: {e}")
+                continue
+
+    logging.info(f"[HARVEST] saved={saved} live_seen={live_seen}")
+    return saved, live_seen
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/harvest/bulk_leagues", methods=["POST"])
 def harvest_bulk_leagues_post():
