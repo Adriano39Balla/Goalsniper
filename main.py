@@ -165,7 +165,7 @@ def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
         row = cur.fetchone()
         return row[0] if row else default
 
-# ── Telegram (unused in harvest, but kept) ────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Missing Telegram credentials")
@@ -203,7 +203,7 @@ def _api_get(url: str, params: dict, timeout: int = 15):
             return None
         return res.json()
     except Exception as e:
-        logging.exception(f"[API] error {url}: {e}")
+        logging.exception(f"[API] error %s: %s", url, e)
         return None
 
 def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
@@ -365,7 +365,7 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
         """, (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now, 0))
         conn.commit()
 
-# ── Historical utility: chunking and league fixture pull ───────────────────────
+# ── Historical utility & league pull ──────────────────────────────────────────
 def _chunk(seq: List[int], size: int) -> List[List[int]]:
     size = max(1, int(size))
     return [seq[i:i+size] for i in range(0, len(seq), size)]
@@ -439,7 +439,7 @@ def create_synthetic_snapshots_for_league(
     logging.info(f"[SYNTH] league={league_id} season={season} processed={processed} saved={saved}")
     return {"ok": True, "league": league_id, "season": season, "requested": len(ids), "processed": processed, "saved": saved}
 
-# ── Backfill final results (FIXED: use hyphen bulk & chunk=20) ────────────────
+# ── Backfill final results (hyphen bulk & chunk=20) ───────────────────────────
 def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
     """
     Returns: (updated, checked)
