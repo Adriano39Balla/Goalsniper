@@ -251,13 +251,7 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     logging.info(f"[FETCH] live={len(matches)} kept={len(out)}")
     return out
 
-def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    if not ids: return {}
-    js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(i) for i in ids), "timezone": "UTC"})
-    resp = js.get("response", []) if isinstance(js, dict) else []
-    return { (fx.get("fixture") or {}).get("id"): fx for fx in resp }
-
-# Hyphen-joined bulk fetch (max 20 ids)
+# Hyphen-joined bulk fetch (max 20 ids) — per API-FOOTBALL tutorial
 def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
     if not ids: return {}
     param_val = "-".join(str(i) for i in ids)
@@ -440,13 +434,16 @@ def create_synthetic_snapshots_for_league(
             feat["minute"] = float(min(120, max(0, minute)))
             save_snapshot_from_match(m, feat)
             saved += 1
-        time.sleep(0.25 if sleep_ms_between_chunks < 250 else max(0, sleep_ms_between_chunks) / 1000.0)
+        time.sleep(max(0, sleep_ms_between_chunks) / 1000.0)
 
     logging.info(f"[SYNTH] league={league_id} season={season} processed={processed} saved={saved}")
     return {"ok": True, "league": league_id, "season": season, "requested": len(ids), "processed": processed, "saved": saved}
 
-# ── Backfill final results ────────────────────────────────────────────────────
+# ── Backfill final results (FIXED: use hyphen bulk & chunk=20) ────────────────
 def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
+    """
+    Returns: (updated, checked)
+    """
     hours = max(1, min(int(hours), 168))
     since = int(time.time()) - int(hours) * 3600
     with db_conn() as conn:
@@ -462,13 +459,13 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
         return 0, 0
 
     updated = 0
-    B = 25
-    for i in range(0, len(ids), B):
-        batch = ids[i:i+B]
-        fx = fetch_fixtures_by_ids(batch)
+    checked = 0
+    for group in _chunk(ids, 20):  # API max 20
+        bulk = fetch_fixtures_by_ids_hyphen(group)
         with db_conn() as conn:
-            for fid in batch:
-                m = fx.get(fid)
+            for fid in group:
+                checked += 1
+                m = bulk.get(fid)
                 if not m:
                     continue
                 status = ((m.get("fixture") or {}).get("status") or {}).get("short")
@@ -482,9 +479,9 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
                 """, (int(fid), int(gh), int(ga), 1 if (int(gh)>0 and int(ga)>0) else 0, int(time.time())))
                 updated += 1
             conn.commit()
-        time.sleep(0.25)
-    logging.info(f"[RESULTS] backfilled updated={updated} checked={len(ids)} (window={hours}h)")
-    return updated, len(ids)
+        time.sleep(0.25)  # be nice to the API
+    logging.info(f"[RESULTS] backfilled updated={updated} checked={checked} (window={hours}h)")
+    return updated, checked
 
 # ── Nightly training job ──────────────────────────────────────────────────────
 def retrain_models_job():
@@ -573,58 +570,6 @@ def nightly_digest_job():
         logging.exception("[DIGEST] failed: %s", e)
         return False
 
-# ── Harvest scan (NEW) ───────────────────────────────────────────────────────
-def harvest_scan() -> Tuple[int, int]:
-    """
-    Pull in-play fixtures, ensure basic data sufficiency, snapshot them,
-    and throttle duplicates/cadence. Returns (saved, live_seen).
-    """
-    matches = fetch_live_matches()
-    live_seen = len(matches)
-    if live_seen == 0:
-        logging.info("[HARVEST] no live matches")
-        return 0, 0
-
-    saved = 0
-    now_ts = int(time.time())
-
-    with db_conn() as conn:
-        for m in matches:
-            try:
-                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-                if not fid:
-                    continue
-
-                # cooldown – avoid writing multiple rows per match too frequently
-                if DUP_COOLDOWN_MIN > 0:
-                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
-                    dup = conn.execute(
-                        "SELECT 1 FROM tips WHERE match_id=? AND created_ts>=? LIMIT 1",
-                        (fid, cutoff)
-                    ).fetchone()
-                    if dup:
-                        continue
-
-                feat = extract_features(m)
-                minute = int(feat.get("minute", 0))
-
-                # require some live stats after a given minute (configurable)
-                if not stats_coverage_ok(feat, minute):
-                    continue
-
-                save_snapshot_from_match(m, feat)
-                saved += 1
-
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
-
-            except Exception as e:
-                logging.exception(f"[HARVEST] failure on match: {e}")
-                continue
-
-    logging.info(f"[HARVEST] saved={saved} live_seen={live_seen}")
-    return saved, live_seen
-
 # ── Shared helper for bulk leagues ────────────────────────────────────────────
 def _resolve_league_id(name: str, country: str) -> Optional[int]:
     js = _api_get(f"{BASE_URL}/leagues", {"name": name, "country": country})
@@ -640,40 +585,7 @@ def _resolve_league_id(name: str, country: str) -> Optional[int]:
         return None
 
 def _run_bulk_leagues(leagues: List[Dict[str, str]], seasons: List[int]) -> Dict[str, Any]:
-    results = []
-    base_url = PUBLIC_BASE_URL or request.host_url.rstrip("/")
-    for L in leagues:
-        nm = L.get("name"); ct = L.get("country")
-        lid = _resolve_league_id(nm, ct)
-        if not lid:
-            results.append({"name": nm, "country": ct, "ok": False, "reason": "not_found"})
-            continue
-
-        league_summary = {"name": nm, "country": ct, "league_id": lid, "seasons": []}
-        for s in seasons:
-            try:
-                r = session.get(
-                    f"{base_url}/harvest/league_snapshots",
-                    params={
-                        "league": lid, "season": s,
-                        "limit": 200, "include_inplay": 0, "delay_ms": 1000, "key": API_KEY
-                    },
-                    timeout=120
-                )
-                resp = r.json() if r.ok else {"ok": False, "error": f"http {r.status_code}"}
-            except Exception as e:
-                resp = {"ok": False, "error": str(e)}
-            league_summary["seasons"].append({"season": s, "result": resp})
-        results.append(league_summary)
-    return {"ok": True, "count": len(results), "results": results}
-
-# ── Routes ────────────────────────────────────────────────────────────────────
-@app.route("/harvest/bulk_leagues", methods=["POST"])
-def harvest_bulk_leagues_post():
-    _require_api_key()
-    body = request.get_json(silent=True) or {}
-    leagues = body.get("leagues") or []
-    seasons = body.get("seasons") or [2024]
+    # Default curated set if none were provided
     if not leagues:
         leagues = [
             {"name":"Premier League","country":"England"},
@@ -711,14 +623,50 @@ def harvest_bulk_leagues_post():
             {"name":"League Cup","country":"England"},
             {"name":"Women's Super League","country":"England"},
         ]
+    results = []
+    base_url = PUBLIC_BASE_URL or request.host_url.rstrip("/")
+    for L in leagues:
+        nm = L.get("name"); ct = L.get("country")
+        lid = _resolve_league_id(nm, ct)
+        if not lid:
+            results.append({"name": nm, "country": ct, "ok": False, "reason": "not_found"})
+            continue
+
+        league_summary = {"name": nm, "country": ct, "league_id": lid, "seasons": []}
+        for s in seasons:
+            try:
+                r = session.get(
+                    f"{base_url}/harvest/league_snapshots",
+                    params={
+                        "league": lid, "season": s,
+                        "limit": 200, "include_inplay": 0, "delay_ms": 1000, "key": API_KEY
+                    },
+                    timeout=120
+                )
+                resp = r.json() if r.ok else {"ok": False, "error": f"http {r.status_code}"}
+            except Exception as e:
+                resp = {"ok": False, "error": str(e)}
+            league_summary["seasons"].append({"season": s, "result": resp})
+        results.append(league_summary)
+    return {"ok": True, "count": len(results), "results": results}
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/harvest/bulk_leagues", methods=["POST"])
+def harvest_bulk_leagues_post():
+    _require_api_key()
+    body = request.get_json(silent=True) or {}
+    leagues = body.get("leagues") or []
+    seasons = body.get("seasons") or [2024]
     return jsonify(_run_bulk_leagues(leagues, seasons))
 
+# Convenience GET so you can trigger from browser:
+# /harvest/bulk_leagues?key=...&seasons=2023,2024
 @app.route("/harvest/bulk_leagues", methods=["GET"])
 def harvest_bulk_leagues_get():
     _require_api_key()
     seasons_q = (request.args.get("seasons") or "").strip()
     seasons = [int(s) for s in seasons_q.split(",") if s.strip().isdigit()] or [2024]
-    leagues = []
+    leagues = []  # will use curated defaults
     return jsonify(_run_bulk_leagues(leagues, seasons))
 
 @app.route("/")
@@ -879,6 +827,7 @@ if __name__ == "__main__":
     scheduler = BackgroundScheduler()
 
     if HARVEST_MODE:
+        # Sun–Thu, 09:00–21:59 Europe/Berlin every 2 min (no night pings)
         scheduler.add_job(
             harvest_scan,
             CronTrigger(
@@ -890,6 +839,7 @@ if __name__ == "__main__":
             id="harvest",
             replace_existing=True,
         )
+        # Backfill results every 15 min
         scheduler.add_job(
             backfill_results_from_snapshots,
             "interval",
@@ -898,6 +848,7 @@ if __name__ == "__main__":
             replace_existing=True,
         )
 
+    # Nightly training every day at 03:00 Europe/Berlin (works in both modes)
     scheduler.add_job(
         retrain_models_job,
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
@@ -906,6 +857,8 @@ if __name__ == "__main__":
         misfire_grace_time=3600,
         coalesce=True,
     )
+
+    # Nightly digest to Telegram at 03:02 Europe/Berlin
     scheduler.add_job(
         nightly_digest_job,
         CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
