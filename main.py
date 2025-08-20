@@ -278,13 +278,55 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     logging.info(f"[FETCH] live={len(matches)} kept={len(out)}")
     return out
 
-# ── Fixtures fetch (robust): chunk 20 + 1-by-1 fallback ───────────────────────
+# ── Fixtures fetch (robust): chunk 20 + fallback ─────────────────────────────
 MAX_IDS_PER_REQ = 20
+
+def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """
+    Comma-joined bulk (max 20) with one retry and per-ID fallback.
+    Used by backfill/results paths.
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    if not ids:
+        return out
+
+    for i in range(0, len(ids), MAX_IDS_PER_REQ):
+        chunk = ids[i:i + MAX_IDS_PER_REQ]
+
+        # Try bulk up to 2 attempts
+        resp_ok = False
+        for _ in range(2):
+            js = _api_get(FOOTBALL_API_URL, {"ids": ",".join(str(x) for x in chunk), "timezone": "UTC"})
+            resp = js.get("response", []) if isinstance(js, dict) else []
+            for fx in resp:
+                fid = (fx.get("fixture") or {}).get("id")
+                if fid:
+                    out[int(fid)] = fx
+            missing = [fid for fid in chunk if fid not in out]
+            if not missing:
+                resp_ok = True
+                break
+            time.sleep(0.35)
+
+        # Per-ID fallback
+        if not resp_ok:
+            for fid in missing:
+                js1 = _api_get(FOOTBALL_API_URL, {"id": fid, "timezone": "UTC"})
+                r1 = (js1.get("response") if isinstance(js1, dict) else []) or []
+                if r1:
+                    out[int(fid)] = r1[0]
+                else:
+                    logging.warning("[FETCH] single-id fallback still missing fixture %s", fid)
+
+        time.sleep(0.15)
+
+    return out
 
 def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
     """
     Robust bulk fetch (hyphen-joined, max 20) with one retry and per-ID fallback.
     API-FOOTBALL sometimes omits some fixtures from the bulk response.
+    Used by the league snapshot path.
     """
     if not ids:
         return {}
@@ -295,7 +337,7 @@ def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
 
         # Try bulk up to 2 attempts (helps with transient hiccups / rate-limit)
         resp_ok = False
-        for attempt in range(2):
+        for _ in range(2):
             js = _api_get(
                 FOOTBALL_API_URL,
                 {"ids": "-".join(str(x) for x in chunk), "timezone": "UTC"}
@@ -323,21 +365,6 @@ def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
 
         time.sleep(0.15)  # be nice to the API overall
 
-    return out
-
-# Hyphen-joined bulk fetch (kept for league snapshot path)
-def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    if not ids: return {}
-    out: Dict[int, Dict[str, Any]] = {}
-    for i in range(0, len(ids), MAX_IDS_PER_REQ):
-        chunk = ids[i:i+MAX_IDS_PER_REQ]
-        js = _api_get(FOOTBALL_API_URL, {"ids": "-".join(str(x) for x in chunk), "timezone": "UTC"})
-        resp = js.get("response", []) if isinstance(js, dict) else []
-        for fx in resp:
-            fid = (fx.get("fixture") or {}).get("id")
-            if fid:
-                out[int(fid)] = fx
-        time.sleep(0.15)
     return out
 
 # ── Features / snapshots ─────────────────────────────────────────────────────
@@ -504,24 +531,25 @@ def create_synthetic_snapshots_for_league(
     processed = 0
     for group in _chunk(ids, MAX_IDS_PER_REQ):
         bulk = fetch_fixtures_by_ids_hyphen(group)
-for fid in group:
-    m = bulk.get(fid)
-    if not m:
-        # extra safety: one-by-one fallback
-        single = fetch_fixtures_by_ids([fid]).get(fid)
-        if single:
-            m = single
-        else:
-            logging.warning("[SYNTH] fixture %s not returned by API (bulk+single)", fid)
-            continue
+        for fid in group:
+            m = bulk.get(fid)
+            if not m:
+                # extra safety: one-by-one fallback
+                single = fetch_fixtures_by_ids([fid]).get(fid)
+                if single:
+                    m = single
+                else:
+                    logging.warning("[SYNTH] fixture %s not returned by API (bulk+single)", fid)
+                    continue
 
-    processed += 1
-    m = _ensure_events_stats_present(m, fid)
-    feat = extract_features(m)
-    minute = int(((m.get("fixture", {}) or {}).get("status", {}) or {}).get("elapsed") or 90)
-    feat["minute"] = float(min(120, max(0, minute)))
-    save_snapshot_from_match(m, feat)
-    saved += 1
+            processed += 1
+            m = _ensure_events_stats_present(m, fid)
+            feat = extract_features(m)
+            minute = int(((m.get("fixture", {}) or {}).get("status", {}) or {}).get("elapsed") or 90)
+            feat["minute"] = float(min(120, max(0, minute)))
+            save_snapshot_from_match(m, feat)
+            saved += 1
+        time.sleep(max(0, sleep_ms_between_chunks) / 1000.0)
 
     logging.info(f"[SYNTH] league={league_id} season={season} processed={processed} saved={saved}")
     return {"ok": True, "league": league_id, "season": season, "requested": len(ids), "processed": processed, "saved": saved}
