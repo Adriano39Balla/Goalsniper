@@ -17,7 +17,7 @@ from app.utils import setup_logging
 def create_app() -> Flask:
     setup_logging(logging.INFO)
     app = Flask(__name__)
-    app.register_blueprint(routes)
+    app.register_blueprint(routes_bp)
     return app
 
 
