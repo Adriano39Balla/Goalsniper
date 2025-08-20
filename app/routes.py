@@ -1,30 +1,18 @@
-#!/usr/bin/env python3
 """
-main.py
+routes.py
 
-Flask entrypoint for Goalsniper.
-- Creates the app instance
-- Registers blueprints
-- Runs in Railway
+Defines Flask API routes for Goalsniper.
+Currently includes:
+- /train [POST] : Trigger model training for all configured markets
 """
 
-from flask import Flask
-from app.routes import bp as routes_bp  # ✅ import the blueprint correctly
+from flask import Blueprint
+from app.training import training_route
 
+# ✅ Define blueprint
+bp = Blueprint("routes", __name__)
 
-def create_app():
-    """Application factory for Flask."""
-    app = Flask(__name__)
-
-    # Register all blueprints
-    app.register_blueprint(routes_bp)
-
-    return app
-
-
-# Railway / Gunicorn will look for "app"
-app = create_app()
-
-if __name__ == "__main__":
-    # For local dev only
-    app.run(host="0.0.0.0", port=5000, debug=True)
+@bp.route("/train", methods=["POST"])
+def train():
+    """Trigger model training for all markets."""
+    return training_route()
