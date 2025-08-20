@@ -1,78 +1,45 @@
-# app/training.py
-import json
-import logging
+"""
+app/training.py
+
+Wrapper around train_models.py for Flask routes.
+Runs training via subprocess and returns results.
+"""
+
 import subprocess
-import sys
-from datetime import datetime
-from typing import Dict, Any, Optional
+import json
+from flask import jsonify
 
-from app.db import db_conn
-
-
-def run_training(export_path: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Trigger the training pipeline by calling train_models.py as a subprocess.
-    Returns parsed JSON summary of the training run.
-    """
-    cmd = [sys.executable, "train_models.py", "--db", "tip_performance.db"]
-
-    if export_path:
-        cmd.extend(["--export-path", export_path])
-
-    logging.info(f"[TRAIN] running: {' '.join(cmd)}")
-
+def run_training():
+    """Run train_models.py as subprocess and parse JSON output."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        stdout = result.stdout.strip()
+        result = subprocess.run(
+            ["python", "train_models.py", "--db", "tip_performance.db"],
+            capture_output=True, text=True, check=True
+        )
+        # Logs from training (stdout)
+        logs = result.stdout.strip().splitlines()
 
-        # Last line of stdout should be JSON summary (from train_models.py)
-        lines = stdout.splitlines()
-        last_line = lines[-1] if lines else "{}"
+        # Last line should be JSON summary
+        summary = {}
         try:
-            summary = json.loads(last_line)
-        except Exception:
-            logging.warning("[TRAIN] failed to parse summary JSON, fallback to empty.")
-            summary = {"ok": False, "raw": stdout}
+            summary = json.loads(logs[-1])
+        except json.JSONDecodeError:
+            # fallback: training didn’t output JSON
+            summary = {"ok": False, "error": "Could not parse training output"}
 
-        # Save into models table (for versioning)
-        _persist_model_version(summary)
+        return {
+            "ok": True,
+            "logs": logs,
+            "summary": summary
+        }
 
-        return summary
     except subprocess.CalledProcessError as e:
-        logging.error(f"[TRAIN] subprocess failed: {e.stderr}")
-        return {"ok": False, "error": e.stderr}
-    except Exception as e:
-        logging.exception("[TRAIN] error")
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "error": e.stderr or str(e)
+        }
 
-
-def _persist_model_version(summary: Dict[str, Any]):
-    """
-    Persist training result into models table for version history.
-    Keeps settings.model_coeffs as well for backward compatibility.
-    """
-    if not summary.get("ok"):
-        return
-
-    trained_at = summary.get("trained_at_utc", datetime.utcnow().isoformat())
-    metrics = summary.get("metrics") or {}
-    counts = summary.get("counts") or {}
-
-    # Insert into models table
-    with db_conn() as conn:
-        try:
-            conn.execute("""
-                INSERT INTO models(market, trained_at, coeffs, metrics, hyperparams, active)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                "all",  # placeholder, you can later split O25 vs BTTS
-                trained_at,
-                json.dumps(summary, ensure_ascii=False),
-                json.dumps(metrics, ensure_ascii=False),
-                json.dumps({"counts": counts}, ensure_ascii=False),
-                1
-            ))
-            conn.commit()
-            logging.info(f"[TRAIN] persisted model version at {trained_at}")
-        except Exception as e:
-            logging.exception(f"[TRAIN] persist failed: {e}")
+# Flask route handler
+def training_route():
+    result = run_training()
+    return jsonify(result)
