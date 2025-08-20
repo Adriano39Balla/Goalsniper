@@ -11,6 +11,7 @@ import os
 import logging
 from flask import Flask
 from app.routes import bp as routes_bp
+from app.routes import routes
 from app.utils import setup_logging
 
 
