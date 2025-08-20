@@ -1,32 +1,30 @@
+#!/usr/bin/env python3
 """
-routes.py
+main.py
 
-Defines Flask API routes for Goalsniper.
-Includes:
-- /harvest [POST] : Harvest new snapshots from API
-- /backfill [POST]: Backfill historical results into DB
-- /train [POST]   : Trigger model training for all configured markets
+Flask entrypoint for Goalsniper.
+- Creates the app instance
+- Registers blueprints
+- Runs in Railway
 """
 
-from flask import Blueprint
-from app.training import training_route
-from app.harvest import harvest_route
-from app.backfill import backfill_route
+from flask import Flask
+from app.routes import bp as routes_bp  # ✅ import the blueprint correctly
 
-# ✅ Define blueprint
-bp = Blueprint("routes", __name__)
 
-@bp.route("/harvest", methods=["POST"])
-def harvest():
-    """Harvest new snapshots from API."""
-    return harvest_route()
+def create_app():
+    """Application factory for Flask."""
+    app = Flask(__name__)
 
-@bp.route("/backfill", methods=["POST"])
-def backfill():
-    """Backfill historical match results into DB."""
-    return backfill_route()
+    # Register all blueprints
+    app.register_blueprint(routes_bp)
 
-@bp.route("/train", methods=["POST"])
-def train():
-    """Trigger model training for all markets."""
-    return training_route()
+    return app
+
+
+# Railway / Gunicorn will look for "app"
+app = create_app()
+
+if __name__ == "__main__":
+    # For local dev only
+    app.run(host="0.0.0.0", port=5000, debug=True)
