@@ -3,26 +3,22 @@ import json
 import logging
 import time
 from typing import Dict, Any, List
+from flask import Blueprint, jsonify
 
 from app.db import db_conn
 from app.features import extract_features, stats_coverage_ok
 from app.api_client import fetch_live_matches, fetch_fixtures_by_ids
 
+bp = Blueprint("harvest", __name__)
 
 def save_snapshot_from_match(match: Dict[str, Any], min_minute: int = 15, require_stats_minute: int = 10, require_data_fields: int = 2) -> bool:
-    """
-    Extract features and persist a snapshot of a live match.
-    Returns True if snapshot was saved, False if skipped.
-    """
     try:
         fixture = match.get("fixture") or {}
         fid = int(fixture.get("id"))
         minute = int((fixture.get("status") or {}).get("elapsed") or 0)
 
-        # Extract features
         feats = extract_features(match)
 
-        # Check coverage
         if not stats_coverage_ok(feats, minute, require_stats_minute, require_data_fields):
             logging.debug(f"[SNAP] skipping match {fid}: insufficient stats coverage")
             return False
@@ -62,10 +58,6 @@ def save_snapshot_from_match(match: Dict[str, Any], min_minute: int = 15, requir
 
 
 def harvest_scan(min_minute: int = 15) -> int:
-    """
-    Scan live matches and persist snapshots.
-    Returns count of new snapshots saved.
-    """
     matches = fetch_live_matches()
     saved = 0
     for m in matches:
@@ -77,10 +69,6 @@ def harvest_scan(min_minute: int = 15) -> int:
 
 
 def create_synthetic_snapshots_for_league(league_id: int, season: int, match_ids: List[int]) -> int:
-    """
-    Create synthetic snapshots (e.g. at FT) for given matches in a league.
-    Useful for backfilling older games.
-    """
     if not match_ids:
         return 0
 
@@ -119,3 +107,14 @@ def create_synthetic_snapshots_for_league(league_id: int, season: int, match_ids
 
     logging.info(f"[HARVEST] synthetic snapshots saved={saved}")
     return saved
+
+
+# ✅ Route for API + Scheduler
+def harvest_route():
+    saved = harvest_scan()
+    return jsonify({"ok": True, "snapshots_saved": saved})
+
+
+@bp.route("/harvest", methods=["POST"])
+def harvest_api():
+    return harvest_route()
