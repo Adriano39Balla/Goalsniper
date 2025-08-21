@@ -2,15 +2,14 @@
 import logging
 import time
 from typing import List, Dict, Any
+from flask import Blueprint, jsonify
 
 from app.db import db_conn
 from app.api_client import fetch_fixtures_by_ids
 
+bp = Blueprint("backfill", __name__)
 
 def _list_unlabeled_ids(limit: int = 50) -> List[int]:
-    """
-    Find match_ids that exist in tip_snapshots but have no final result in match_results.
-    """
     with db_conn() as conn:
         cur = conn.execute("""
             SELECT DISTINCT s.match_id
@@ -24,9 +23,6 @@ def _list_unlabeled_ids(limit: int = 50) -> List[int]:
 
 
 def _backfill_for_ids(ids: List[int]) -> int:
-    """
-    Fetch final results from API for given fixture IDs and insert into match_results.
-    """
     if not ids:
         return 0
 
@@ -43,7 +39,6 @@ def _backfill_for_ids(ids: List[int]) -> int:
                 if gh is None or ga is None:
                     continue
 
-                # Derive BTTS (both teams scored at least once)
                 btts_yes = 1 if (gh > 0 and ga > 0) else 0
 
                 conn.execute("""
@@ -61,10 +56,6 @@ def _backfill_for_ids(ids: List[int]) -> int:
 
 
 def backfill_results_from_snapshots(batch_size: int = 50) -> int:
-    """
-    Backfill results for all matches in tip_snapshots that are missing final outcomes.
-    Runs in batches until no more missing.
-    """
     total = 0
     while True:
         ids = _list_unlabeled_ids(limit=batch_size)
@@ -75,3 +66,14 @@ def backfill_results_from_snapshots(batch_size: int = 50) -> int:
         if inserted == 0:
             break
     return total
+
+
+# ✅ Route for API + Scheduler
+def backfill_route():
+    inserted = backfill_results_from_snapshots()
+    return jsonify({"ok": True, "results_inserted": inserted})
+
+
+@bp.route("/backfill", methods=["POST"])
+def backfill_api():
+    return backfill_route()
