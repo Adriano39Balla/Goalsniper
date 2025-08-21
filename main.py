@@ -1100,7 +1100,7 @@ if __name__ == "__main__":
             CronTrigger(
                 day_of_week="sun,mon,tue,wed,thu",
                 hour="9-21",
-                minute="*/2",
+                minute="*/5",
                 timezone=ZoneInfo("Europe/Berlin"),
             ),
             id="harvest",
