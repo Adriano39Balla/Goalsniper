@@ -865,15 +865,20 @@ def harvest_scan() -> Tuple[int, int]:
 def stats_overall():
     _require_api_key()
     with db_conn() as conn:
+        # Total snapshots ever
         total_snaps = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
+
+        # Total final results ever
         total_results = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
 
+        # Distinct matches with both snapshot(s) and a final result
         fully_labeled = conn.execute("""
             SELECT COUNT(DISTINCT s.match_id)
             FROM tip_snapshots s
             INNER JOIN match_results r ON r.match_id = s.match_id
         """).fetchone()[0]
 
+        # Distinct matches that still have no result
         unlabeled = conn.execute("""
             SELECT COUNT(DISTINCT s.match_id)
             FROM tip_snapshots s
@@ -881,9 +886,9 @@ def stats_overall():
             WHERE r.match_id IS NULL
         """).fetchone()[0]
 
-        # ✅ Check the right timestamp column
+        # Since when are we harvesting? (first/last snapshot timestamps)
         row = conn.execute("""
-            SELECT MIN(ts), MAX(ts) FROM tip_snapshots
+            SELECT MIN(created_ts), MAX(created_ts) FROM tip_snapshots
         """).fetchone()
         first_ts = int(row[0]) if row and row[0] else None
         last_ts  = int(row[1]) if row and row[1] else None
