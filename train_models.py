@@ -1,7 +1,3 @@
-My train_models.py
-
-
-
 #!/usr/bin/env python3
 """
 train_models.py
