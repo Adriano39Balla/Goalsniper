@@ -1,15 +1,19 @@
+My train_models.py
+
+
+
 #!/usr/bin/env python3
 """
 train_models.py
 
-Nightly trainer for Goalsniper:
+Nightly trainer for Robi:
 - Loads latest snapshots + final results from SQLite
-- Engineers features consistently
-- Trains logistic models for each market defined in app/markets.py
+- Engineers features consistently with main.py
+- Trains two logistic models: Over 2.5 (O25) and BTTS: Yes
 - Optional Platt calibration and/or K-fold CV metrics
 - Persists compact, framework-free coefficients to settings.model_coeffs
-- Persists metrics to settings.model_metrics_latest
-- Optionally exports JSON blob to a file
+- (Optionally) persists metrics to settings.model_metrics_latest
+- (Optionally) exports the same JSON blob to a file
 
 Exit code:
   0  success
@@ -36,9 +40,6 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split, StratifiedKFold
 
-from app.markets import MARKETS
-from app.utils import safe_float
-
 RANDOM_STATE = 42
 
 FEATURES = [
@@ -52,6 +53,12 @@ FEATURES = [
 
 # ---------------------------------------------------------------------------
 
+def _safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
 def _ensure_settings_table(con: sqlite3.Connection) -> None:
     con.execute("""
         CREATE TABLE IF NOT EXISTS settings (
@@ -61,10 +68,10 @@ def _ensure_settings_table(con: sqlite3.Connection) -> None:
     """)
     con.commit()
 
-def _df_from_rows(rows: pd.DataFrame, min_minute: int) -> pd.DataFrame:
-    """Build feature DataFrame with labels for all defined markets."""
+def _df_from_rows(rows: pd.DataFrame, min_minute: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build feature DataFrames for O2.5 and BTTS labels."""
     if rows.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     feats = []
     for _, row in rows.iterrows():
@@ -76,14 +83,14 @@ def _df_from_rows(rows: pd.DataFrame, min_minute: int) -> pd.DataFrame:
         stat = (p.get("stat") or {})
         f = {
             "match_id": int(row["match_id"]),
-            "minute": safe_float(p.get("minute", 0)),
-            "goals_h": safe_float(p.get("gh", 0)),
-            "goals_a": safe_float(p.get("ga", 0)),
-            "xg_h": safe_float(stat.get("xg_h", 0)), "xg_a": safe_float(stat.get("xg_a", 0)),
-            "sot_h": safe_float(stat.get("sot_h", 0)), "sot_a": safe_float(stat.get("sot_a", 0)),
-            "cor_h": safe_float(stat.get("cor_h", 0)), "cor_a": safe_float(stat.get("cor_a", 0)),
-            "pos_h": safe_float(stat.get("pos_h", 0)), "pos_a": safe_float(stat.get("pos_a", 0)),
-            "red_h": safe_float(stat.get("red_h", 0)), "red_a": safe_float(stat.get("red_a", 0)),
+            "minute": _safe_float(p.get("minute", 0)),
+            "goals_h": _safe_float(p.get("gh", 0)),
+            "goals_a": _safe_float(p.get("ga", 0)),
+            "xg_h": _safe_float(stat.get("xg_h", 0)), "xg_a": _safe_float(stat.get("xg_a", 0)),
+            "sot_h": _safe_float(stat.get("sot_h", 0)), "sot_a": _safe_float(stat.get("sot_a", 0)),
+            "cor_h": _safe_float(stat.get("cor_h", 0)), "cor_a": _safe_float(stat.get("cor_a", 0)),
+            "pos_h": _safe_float(stat.get("pos_h", 0)), "pos_a": _safe_float(stat.get("pos_a", 0)),
+            "red_h": _safe_float(stat.get("red_h", 0)), "red_a": _safe_float(stat.get("red_a", 0)),
         }
         f["goals_sum"] = f["goals_h"] + f["goals_a"]
         f["goals_diff"] = f["goals_h"] - f["goals_a"]
@@ -96,15 +103,15 @@ def _df_from_rows(rows: pd.DataFrame, min_minute: int) -> pd.DataFrame:
 
         gh_f = int(row.get("final_goals_h") or 0)
         ga_f = int(row.get("final_goals_a") or 0)
+        btts_yes = 1 if int(row.get("btts_yes") or 0) == 1 else 0
 
-        # Generate labels for all markets
-        for market, cfg in MARKETS.items():
-            f[cfg["label"]] = cfg["label_fn"](gh_f, ga_f)
+        f["label_o25"] = 1 if (gh_f + ga_f) >= 3 else 0
+        f["label_btts"] = btts_yes
 
         feats.append(f)
 
     if not feats:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     df = pd.DataFrame(feats)
 
@@ -113,9 +120,12 @@ def _df_from_rows(rows: pd.DataFrame, min_minute: int) -> pd.DataFrame:
     df["minute"] = df["minute"].clip(0, 120)
 
     df = df[df["minute"] >= float(min_minute)].copy()
-    return df if not df.empty else pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
-def load_data(db_path: str, min_minute: int = 15) -> pd.DataFrame:
+    return df[FEATURES + ["label_o25"]], df[FEATURES + ["label_btts"]]
+
+def load_data(db_path: str, min_minute: int = 15) -> Tuple[pd.DataFrame, pd.DataFrame]:
     con = sqlite3.connect(db_path)
     try:
         q = """
@@ -130,11 +140,13 @@ def load_data(db_path: str, min_minute: int = 15) -> pd.DataFrame:
         JOIN match_results r ON r.match_id=l.match_id
         """
         rows = pd.read_sql_query(q, con)
-        return _df_from_rows(rows, min_minute)
+        df_o25, df_btts = _df_from_rows(rows, min_minute)
+        return df_o25, df_btts
     finally:
         con.close()
 
 def fit_lr_or_none(X: np.ndarray, y: np.ndarray) -> LogisticRegression | None:
+    # Single-class guard (can happen after split/filters)
     if len(np.unique(y)) < 2:
         return None
     model = LogisticRegression(
@@ -151,6 +163,11 @@ def to_coeffs(model: LogisticRegression, feature_names) -> Dict[str, Any]:
     return {"features": list(feature_names), "coef": coef, "intercept": intercept}
 
 def maybe_calibrate(base_model: LogisticRegression, Xtr, ytr, method: str | None):
+    """
+    Wrap base model in CalibratedClassifierCV if method provided.
+    Supported: 'sigmoid' (Platt) or 'isotonic'.
+    Returns (clf, calibrated_flag).
+    """
     if method is None:
         return base_model, False
     if len(np.unique(ytr)) < 2:
@@ -160,6 +177,7 @@ def maybe_calibrate(base_model: LogisticRegression, Xtr, ytr, method: str | None
     return cal, True
 
 def _majority_acc(y: np.ndarray) -> float:
+    """Accuracy of naive majority-class classifier (baseline)."""
     p = y.mean()
     return max(p, 1.0 - p)
 
@@ -173,10 +191,12 @@ def train_and_eval(
     X = df[FEATURES].values
     y = df[label_col].values.astype(int)
 
+    # Stratify only if both classes present
     has_pos = y.sum() > 0
     has_neg = (len(y) - y.sum()) > 0
     strat = y if (has_pos and has_neg) else None
 
+    # Holdout split
     Xtr, Xte, ytr, yte = train_test_split(
         X, y, test_size=test_size, random_state=RANDOM_STATE, stratify=strat
     )
@@ -193,6 +213,7 @@ def train_and_eval(
         clf.fit(Xtr, ytr)
         pte = clf.predict_proba(Xte)[:, 1]
 
+    # Holdout metrics
     metrics = {
         "brier": float(brier_score_loss(yte, pte)),
         "acc": float(accuracy_score(yte, (pte >= 0.5).astype(int))),
@@ -204,6 +225,7 @@ def train_and_eval(
         "calibration_method": calibrate if calibrated else None,
     }
 
+    # Optional CV metrics
     cv_report = None
     if cv_folds and cv_folds > 1 and (has_pos and has_neg):
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
@@ -220,12 +242,17 @@ def train_and_eval(
             cv_report = {
                 "folds": cv_folds,
                 "brier_mean": float(np.mean(briers)),
+                "brier_std": float(np.std(briers)),
                 "acc_mean": float(np.mean(accs)),
+                "acc_std": float(np.std(accs)),
                 "auc_mean": float(np.mean(aucs)),
+                "auc_std": float(np.std(aucs)),
             }
             metrics["cv"] = cv_report
 
+    # Always serialize base LR coefficients for runtime scoring (lightweight)
     serializable = to_coeffs(base, FEATURES)
+
     return clf, {"metrics": metrics, "serializable": serializable, "cv": cv_report}
 
 def save_blob_to_settings(db_path: str, key: str, blob: Dict[str, Any]) -> None:
@@ -255,42 +282,49 @@ def main():
     ap.add_argument("--test-size", type=float, default=0.25)
     ap.add_argument("--min-rows", type=int, default=150)
     ap.add_argument("--calibrate", choices=["sigmoid", "isotonic", "none"], default="sigmoid")
-    ap.add_argument("--cv", type=int, default=0)
-    ap.add_argument("--export-path", default=None)
-    ap.add_argument("--store-metrics", type=int, default=1)
+    ap.add_argument("--cv", type=int, default=0, help="If >1, run Stratified K-fold CV with this many folds (report only).")
+    ap.add_argument("--export-path", default=None, help="Optional path to write model_coeffs JSON")
+    ap.add_argument("--store-metrics", type=int, default=1, help="Also store latest metrics in settings.model_metrics_latest")
     args = ap.parse_args()
 
     calibrate = None if args.calibrate == "none" else args.calibrate
 
-    # Load data
-    df = load_data(args.db, args.min_minute)
-    if df.empty:
+    # Load
+    df_o25, df_btts = load_data(args.db, args.min_minute)
+    if df_o25.empty or df_btts.empty:
         print("Not enough labeled data yet.")
         raise SystemExit(2)
 
-    n = min(len(df), *(len(df[df[cfg["label"]].notnull()]) for cfg in MARKETS.values()))
+    n_o25, n_btts = len(df_o25), len(df_btts)
+    n = min(n_o25, n_btts)
+    print(f"Samples O2.5={n_o25} | BTTS={n_btts}")
+    print(f"O2.5 positive rate={df_o25['label_o25'].mean():.3f} | "
+          f"BTTS positive rate={df_btts['label_btts'].mean():.3f}")
     if n < args.min_rows:
         print(f"Need more data: {n} < min-rows {args.min_rows}.")
         raise SystemExit(3)
 
-    print(f"Samples={len(df)}")
-    for market, cfg in MARKETS.items():
-        print(f"{market} positive rate={df[cfg['label']].mean():.3f}")
+    # Train + evaluate (holdout + optional CV)
+    _, o25 = train_and_eval(df_o25, "label_o25", args.test_size, calibrate, args.cv)
+    _, btts = train_and_eval(df_btts, "label_btts", args.test_size, calibrate, args.cv)
 
-    # Train all markets
-    trained = {}
-    for market, cfg in MARKETS.items():
-        _, result = train_and_eval(df, cfg["label"], args.test_size, calibrate, args.cv)
-        trained[market] = result
-
+    # Assemble blob for settings (coeffs + metadata + metrics)
     trained_at = datetime.utcnow().isoformat() + "Z"
     blob = {
-        "models": {m: r["serializable"] for m, r in trained.items()},
+        "O25": o25["serializable"],
+        "BTTS_YES": btts["serializable"],
         "trained_at_utc": trained_at,
         "model_version": f"lr@{trained_at}",
         "features": FEATURES,
-        "metrics": {m: r["metrics"] for m, r in trained.items()},
-        "training_counts": {m: len(df) for m in MARKETS.keys()},
+        "metrics": {
+            "o25": o25["metrics"],
+            "btts": btts["metrics"],
+        },
+        "training_counts": {
+            "o25": int(n_o25),
+            "btts": int(n_btts),
+            "min_used": int(min(n_o25, n_btts))
+        },
         "hyperparams": {
             "min_minute": int(args.min_minute),
             "test_size": float(args.test_size),
@@ -302,16 +336,19 @@ def main():
         }
     }
 
+    # Persist in DB (what main.py consumes)
     save_blob_to_settings(args.db, "model_coeffs", blob)
     print("Saved model_coeffs in settings.")
-    for market, r in trained.items():
-        _print_top_coeffs(market, r["serializable"])
+    _print_top_coeffs("O25", blob["O25"])
+    _print_top_coeffs("BTTS_YES", blob["BTTS_YES"])
 
+    # Optional export to file for external inspection/debug
     if args.export_path:
         with open(args.export_path, "w", encoding="utf-8") as f:
             json.dump(blob, f, ensure_ascii=False, indent=2)
         print(f"Exported model_coeffs to {os.path.abspath(args.export_path)}")
 
+    # Also store metrics-only (optional toggle)
     if args.store_metrics:
         metrics_only = {
             "trained_at_utc": trained_at,
@@ -322,10 +359,15 @@ def main():
         save_blob_to_settings(args.db, "model_metrics_latest", metrics_only)
         print("Saved model_metrics_latest in settings.")
 
+    # Tail-friendly summary (main.py logs the last few lines)
     print(json.dumps({
         "ok": True,
         "trained_at_utc": trained_at,
-        "metrics": blob["metrics"],
+        "counts": {"o25": n_o25, "btts": n_btts},
+        "metrics": {
+            "o25": o25["metrics"],
+            "btts": btts["metrics"]
+        }
     }, ensure_ascii=False))
 
 if __name__ == "__main__":
