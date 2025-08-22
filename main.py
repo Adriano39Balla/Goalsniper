@@ -915,41 +915,58 @@ def stats_config():
 
 # ── Entrypoint / Scheduler ────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
-    if not ADMIN_API_KEY: logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
+    if not API_KEY:
+        logging.error("API_KEY is not set — live fetch will return 0 matches.")
+    if not ADMIN_API_KEY:
+        logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
     init_db()
 
-    scheduler.add_job(
-    harvest_scan,
-    CronTrigger(
-        minute="*/10",               # every 10 minutes
-        timezone=ZoneInfo("Europe/Berlin")
-    ),
-    id="harvest",
-    replace_existing=True,
-)
-    # Backfill job: runs every 15 minutes
-scheduler.add_job(
-    backfill_results_job,
-    "interval",
-    minutes=15,
-    id="backfill",
-    replace_existing=True
-)
+    scheduler = BackgroundScheduler()
 
-scheduler.add_job(
+    # 24/7 harvest every 10 minutes (Europe/Berlin)
+    if HARVEST_MODE:
+        scheduler.add_job(
+            harvest_scan,
+            CronTrigger(
+                minute="*/10",
+                timezone=ZoneInfo("Europe/Berlin"),
+            ),
+            id="harvest",
+            replace_existing=True,
+        )
+
+        # Backfill final results every 15 minutes
+        scheduler.add_job(
+            backfill_results_from_snapshots,
+            "interval",
+            minutes=15,
+            id="backfill",
+            replace_existing=True,
+        )
+
+    # Nightly training at 03:00 Europe/Berlin
+    scheduler.add_job(
         retrain_models_job,
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-        id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True, )
+        id="train",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
 
- scheduler.add_job(
+    # Nightly digest at 03:02 Europe/Berlin
+    scheduler.add_job(
         nightly_digest_job,
         CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
-        id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True,
-)
+        id="digest",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
 
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
+
     port = int(os.getenv("PORT", 5000))
     logging.info("✅ Robi Superbrain started.")
     app.run(host="0.0.0.0", port=port)
