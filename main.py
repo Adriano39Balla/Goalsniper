@@ -919,14 +919,15 @@ if __name__ == "__main__":
     if not ADMIN_API_KEY: logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
     init_db()
 
-    scheduler = BackgroundScheduler()
-    if HARVEST_MODE:
-        # every 2 min during daytime, Europe/Berlin
-        scheduler.add_job(
-            harvest_scan,
-            CronTrigger(day_of_week="sun,mon,tue,wed,thu", hour="9-21", minute="*/2", timezone=ZoneInfo("Europe/Berlin")),
-            id="harvest", replace_existing=True,
-        )
+    scheduler.add_job(
+    harvest_scan,
+    CronTrigger(
+        minute="*/10",               # every 10 minutes
+        timezone=ZoneInfo("Europe/Berlin")
+    ),
+    id="harvest",
+    replace_existing=True,
+)
         scheduler.add_job(backfill_results_from_snapshots, "interval", minutes=15, id="backfill", replace_existing=True)
 
     scheduler.add_job(
