@@ -27,8 +27,6 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY            = os.getenv("API_KEY")
 ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY")
 PUBLIC_BASE_URL    = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
-BET_URL_TMPL       = os.getenv("BET_URL")
-WATCH_URL_TMPL     = os.getenv("WATCH_URL")
 WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 HEARTBEAT_ENABLE   = os.getenv("HEARTBEAT_ENABLE", "1") not in ("0","false","False","no","NO")
 
@@ -517,7 +515,48 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
 
 # ── Training job placeholder (trainer still SQLite-based) ─────────────────────
 def retrain_models_job():
-    return {"ok": False, "skipped": True, "reason": "trainer not ported to Postgres yet"}
+    # Always run if enabled
+    if not TRAIN_ENABLE:
+        return {"ok": False, "skipped": True, "reason": "TRAIN_ENABLE=0"}
+
+    # Call the Postgres trainer with DATABASE_URL
+    cmd = (
+        f"python -u train_models.py "
+        f"--db-url \"{os.getenv('DATABASE_URL','')}\" "
+        f"--min-minute {TRAIN_MIN_MINUTE} "
+        f"--test-size {TRAIN_TEST_SIZE}"
+    )
+    logging.info(f"[TRAIN] starting: {cmd}")
+    try:
+        proc = subprocess.run(
+            shlex.split(cmd),
+            capture_output=True,
+            text=True,
+            timeout=900
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
+
+        # (optional) telegram summary
+        try:
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                summary = "✅ Nightly training OK" if proc.returncode == 0 else "❌ Nightly training failed"
+                tail = "\n".join(out.splitlines()[-3:]) if out else ""
+                session.post(f"{TELEGRAM_API_URL}/sendMessage",
+                             data={"chat_id": TELEGRAM_CHAT_ID, "text": summary + "\n" + tail[:900]},
+                             timeout=10)
+        except Exception:
+            pass
+
+        return {"ok": proc.returncode == 0, "code": proc.returncode,
+                "stdout": out[-2000:], "stderr": err[-1000:]}
+    except subprocess.TimeoutExpired:
+        logging.error("[TRAIN] timed out (15 min)")
+        return {"ok": False, "timeout": True}
+    except Exception as e:
+        logging.exception(f"[TRAIN] exception: {e}")
+        return {"ok": False, "error": str(e)}
 
 # ── Simple stats ──────────────────────────────────────────────────────────────
 def _counts_since(ts_from: int) -> Dict[str, int]:
