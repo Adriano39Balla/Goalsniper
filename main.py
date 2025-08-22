@@ -928,14 +928,21 @@ if __name__ == "__main__":
     id="harvest",
     replace_existing=True,
 )
-        scheduler.add_job(backfill_results_from_snapshots, "interval", minutes=15, id="backfill", replace_existing=True)
+    # Backfill job: runs every 15 minutes
+scheduler.add_job(
+    backfill_results_job,
+    "interval",
+    minutes=15,
+    id="backfill",
+    replace_existing=True
+)
 
-    scheduler.add_job(
+scheduler.add_job(
         retrain_models_job,
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
         id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True,
     )
-    scheduler.add_job(
+ scheduler.add_job(
         nightly_digest_job,
         CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
         id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True,
