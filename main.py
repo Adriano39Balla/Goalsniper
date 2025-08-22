@@ -940,13 +940,13 @@ scheduler.add_job(
 scheduler.add_job(
         retrain_models_job,
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-        id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True,
-    )
+        id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True, )
+
  scheduler.add_job(
         nightly_digest_job,
         CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
         id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True,
-    )
+)
 
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
