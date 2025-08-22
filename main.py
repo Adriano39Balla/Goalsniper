@@ -687,6 +687,71 @@ def _require_api_key():
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
+@app.route("/harvest/league_multiseason")
+def harvest_league_multiseason():
+    """
+    Example:
+      /harvest/league_multiseason?league=2&seasons=2021,2022,2023,2024,2025&key=YOUR_ADMIN_KEY
+    Optional:
+      &limit=200            # max fixtures to process per season (None = all)
+      &include_inplay=0     # 1 to also include in-play statuses in synth pull
+      &statuses=FT-AET-PEN  # extra statuses to add (hyphen-separated)
+      &delay_ms=1000        # sleep between 20-id chunks (ms)
+      &sleep_between_seasons_ms=2000  # pause between seasons (ms)
+    """
+    _require_api_key()
+
+    # --- required params ---
+    try:
+        league = int(request.args.get("league"))
+    except Exception:
+        abort(400, "league must be an integer")
+
+    seasons_param = (request.args.get("seasons") or "").strip()
+    seasons = [int(s) for s in seasons_param.split(",") if s.strip().isdigit()]
+    if not seasons:
+        abort(400, "seasons must be a comma-separated list of integers")
+
+    # --- options/knobs ---
+    include_inplay = request.args.get("include_inplay", "0") not in ("0","false","False","no","NO")
+    statuses_param = request.args.get("statuses", "")
+    extra_statuses = [s for s in statuses_param.split("-") if s] if statuses_param else None
+
+    limit_param = request.args.get("limit")
+    limit = int(limit_param) if (limit_param and str(limit_param).isdigit()) else None
+
+    delay_ms = int(request.args.get("delay_ms", 1000))
+    sleep_between_seasons_ms = int(request.args.get("sleep_between_seasons_ms", 2000))
+
+    # --- run seasons one by one ---
+    out = []
+    total_req = total_proc = total_saved = 0
+    for season in seasons:
+        summary = create_synthetic_snapshots_for_league(
+            league_id=league,
+            season=season,
+            include_inplay=include_inplay,
+            extra_statuses=extra_statuses,
+            max_per_run=limit,
+            sleep_ms_between_chunks=delay_ms,
+        )
+        # accumulate totals safely
+        total_req   += int(summary.get("requested", 0))
+        total_proc  += int(summary.get("processed", 0))
+        total_saved += int(summary.get("saved", 0))
+        out.append({"season": season, "result": summary})
+
+        # quota‑friendly pause between seasons
+        time.sleep(max(0, sleep_between_seasons_ms) / 1000.0)
+
+    return jsonify({
+        "ok": True,
+        "league": league,
+        "seasons": seasons,
+        "total": {"requested": total_req, "processed": total_proc, "saved": total_saved},
+        "results": out,
+    })
+
 @app.route("/harvest")
 def harvest_route():
     _require_api_key()
