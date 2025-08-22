@@ -4,7 +4,6 @@ import time
 import math
 import logging
 import requests
-import sqlite3
 import subprocess, shlex
 from html import escape
 from zoneinfo import ZoneInfo
@@ -15,6 +14,8 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 app = Flask(__name__)
@@ -25,8 +26,6 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY            = os.getenv("API_KEY")  # API-Football key
 ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY")  # separate admin key for our endpoints
 PUBLIC_BASE_URL    = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
-BET_URL_TMPL       = os.getenv("BET_URL")
-WATCH_URL_TMPL     = os.getenv("WATCH_URL")
 WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 HEARTBEAT_ENABLE   = os.getenv("HEARTBEAT_ENABLE", "1") not in ("0","false","False","no","NO")
 
@@ -86,27 +85,19 @@ STATS_CACHE: Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 CAL_CACHE: Dict[str, Any] = {"ts": 0, "bins": []}
 
-# ── DB ────────────────────────────────────────────────────────────────────────
-DB_PATH = os.getenv("DB_PATH", "tip_performance.db")
+# ── DB (Postgres) ─────────────────────────────────────────────────────────────
+DB_URL = os.getenv("DB_URL")  # full connection string from Supabase
 
 def db_conn():
-    # Safer SQLite settings for concurrent scheduler + HTTP
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)  # autocommit-ish
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-    except Exception:
-        pass
-    return conn
+    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
 
 def init_db():
     with db_conn() as conn:
-        conn.execute("""
+        cur = conn.cursor()
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS tips (
-            match_id INTEGER,
-            league_id INTEGER,
+            match_id BIGINT,
+            league_id BIGINT,
             league   TEXT,
             home     TEXT,
             away     TEXT,
@@ -115,75 +106,55 @@ def init_db():
             confidence REAL,
             score_at_tip TEXT,
             minute    INTEGER,
-            created_ts INTEGER,
+            created_ts BIGINT,
             sent_ok   INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts)
         )""")
-        try:
-            conn.execute("ALTER TABLE tips ADD COLUMN sent_ok INTEGER DEFAULT 1")
-        except Exception:
-            pass
 
-        conn.execute("""
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS tip_snapshots (
-            match_id INTEGER,
-            created_ts INTEGER,
+            match_id BIGINT,
+            created_ts BIGINT,
             payload TEXT,
             PRIMARY KEY (match_id, created_ts)
         )""")
-        conn.execute("""
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_id INTEGER UNIQUE,
+            id SERIAL PRIMARY KEY,
+            match_id BIGINT UNIQUE,
             verdict  INTEGER CHECK (verdict IN (0,1)),
-            created_ts INTEGER
+            created_ts BIGINT
         )""")
-        conn.execute("""
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )""")
-        conn.execute("""
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS match_results (
-            match_id   INTEGER PRIMARY KEY,
+            match_id   BIGINT PRIMARY KEY,
             final_goals_h INTEGER,
             final_goals_a INTEGER,
             btts_yes      INTEGER,
-            updated_ts    INTEGER
+            updated_ts    BIGINT
         )""")
-        # Indices & view
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
-        conn.execute("DROP VIEW IF EXISTS v_tip_stats")
-        conn.execute("""
-        CREATE VIEW v_tip_stats AS
-        SELECT t.market, t.suggestion,
-               AVG(f.verdict) AS hit_rate,
-               COUNT(DISTINCT t.match_id) AS n
-        FROM (
-          SELECT match_id, market, suggestion, MAX(created_ts) AS last_ts
-          FROM tips GROUP BY match_id, market, suggestion
-        ) lt
-        JOIN tips t ON t.match_id=lt.match_id AND t.created_ts=lt.last_ts
-        JOIN feedback f ON f.match_id = t.match_id
-        GROUP BY t.market, t.suggestion
-        """)
         conn.commit()
 
 def set_setting(key: str, value: str):
     with db_conn() as conn:
-        conn.execute(
-            "INSERT INTO settings(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO settings(key,value) VALUES(%s,%s)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, value))
         conn.commit()
 
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
     with db_conn() as conn:
-        cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
         row = cur.fetchone()
-        return row[0] if row else default
+        return row["value"] if row else default
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
