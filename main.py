@@ -1,19 +1,20 @@
 import os
 import json
 import time
+import math
 import logging
 import requests
+import psycopg2
 import subprocess, shlex
 from html import escape
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional, Tuple
 from flask import Flask, jsonify, request, abort
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-
-import psycopg2
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App
@@ -44,6 +45,13 @@ ONLY_MODEL_MODE          = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false"
 REQUIRE_STATS_MINUTE     = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
 REQUIRE_DATA_FIELDS      = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
 
+LEAGUE_PRIORITY_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS", "39,140,135,78,61,2").split(",")) if x.strip().isdigit()]
+MOTD_PREDICT        = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
+MOTD_MIN_SAMPLES    = int(os.getenv("MOTD_MIN_SAMPLES", "30"))
+MOTD_CONF_MIN       = int(os.getenv("MOTD_CONF_MIN", "65"))
+
+ALLOWED_SUGGESTIONS = {"Over 2.5 Goals", "Under 2.5 Goals", "BTTS: Yes", "BTTS: No"}
+
 TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
@@ -68,6 +76,7 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 # ── Caches ────────────────────────────────────────────────────────────────────
 STATS_CACHE: Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
+CAL_CACHE: Dict[str, Any] = {"ts": 0, "bins": []}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Postgres adapter (tiny convenience wrapper)
@@ -443,7 +452,7 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
 
     updated = 0
     finished_status = {"FT","AET","PEN"}
-    for group in _chunk(ids, MAX_IDS_PER_REQ):
+    for group in _chunk(ids, 20):
         fx = fetch_fixtures_by_ids(group)
         with db_conn() as conn:
             for fid in group:
@@ -515,8 +524,8 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
 
 # ── Training job placeholder (trainer still SQLite-based) ─────────────────────
 def retrain_models_job():
-    # Always run if enabled
     if not TRAIN_ENABLE:
+        logging.info("[TRAIN] skipped (TRAIN_ENABLE=0)")
         return {"ok": False, "skipped": True, "reason": "TRAIN_ENABLE=0"}
 
     # Call the Postgres trainer with DATABASE_URL
@@ -581,6 +590,181 @@ def _counts_since(ts_from: int) -> Dict[str, int]:
         "res_24h": int(res_24h),
     }
 
+def nightly_digest_job():
+    try:
+        now = int(time.time())
+        day_ago = now - 24*3600
+        c = _counts_since(day_ago)
+        msg = (
+            "📊 <b>Robi Nightly Digest</b>\n"
+            f"Snapshots: {c['snap_total']} (＋{c['snap_24h']} last 24h)\n"
+            f"Finals: {c['res_total']} (＋{c['res_24h']} last 24h)\n"
+            f"Unlabeled match_ids: {c['unlabeled']}\n"
+            "Models retrain at 03:00 CEST daily."
+        )
+        logging.info("[DIGEST]\n%s", msg.replace("<b>","").replace("</b>",""))
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            send_telegram(msg)
+        return True
+    except Exception as e:
+        logging.exception("[DIGEST] failed: %s", e)
+        return False
+
+def _resolve_league_id(name: str, country: str) -> Optional[int]:
+    js = _api_get(f"{BASE_URL}/leagues", {"name": name, "country": country})
+    if not isinstance(js, dict):
+        return None
+    for item in js.get("response", []):
+        league = item.get("league") or {}
+        if league.get("name") == name:
+            return league.get("id")
+    try:
+        return (js.get("response", [])[0].get("league") or {}).get("id")
+    except Exception:
+        return None
+
+def harvest_scan() -> Tuple[int, int]:
+    """
+    Pull in-play fixtures, ensure basic data sufficiency, snapshot them,
+    and throttle duplicates/cadence. Returns (saved, live_seen).
+    """
+    matches = fetch_live_matches()
+    live_seen = len(matches)
+    if live_seen == 0:
+        logging.info("[HARVEST] no live matches")
+        return 0, 0
+
+    saved = 0
+    now_ts = int(time.time())
+
+    with db_conn() as conn:
+        for m in matches:
+            try:
+                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                if not fid:
+                    continue
+
+                # cooldown – avoid writing multiple rows per match too frequently
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
+                    dup = conn.execute(
+
+def _run_bulk_leagues(leagues: List[Dict[str, str]], seasons: List[int]) -> Dict[str, Any]:
+    if not leagues:
+        leagues = [
+            {"name":"Premier League","country":"England"},
+            {"name":"La Liga","country":"Spain"},
+            {"name":"Serie A","country":"Italy"},
+            {"name":"Bundesliga","country":"Germany"},
+            {"name":"Ligue 1","country":"France"},
+            {"name":"Championship","country":"England"},
+            {"name":"Segunda División","country":"Spain"},
+            {"name":"Serie B","country":"Italy"},
+            {"name":"2. Bundesliga","country":"Germany"},
+            {"name":"Ligue 2","country":"France"},
+            {"name":"Primeira Liga","country":"Portugal"},
+            {"name":"Eredivisie","country":"Netherlands"},
+            {"name":"Pro League","country":"Belgium"},
+            {"name":"Bundesliga","country":"Austria"},
+            {"name":"Super League","country":"Switzerland"},
+            {"name":"Superliga","country":"Denmark"},
+            {"name":"Premiership","country":"Scotland"},
+            {"name":"Série A","country":"Brazil"},
+            {"name":"Liga Profesional Argentina","country":"Argentina"},
+            {"name":"MLS","country":"USA"},
+            {"name":"Liga MX","country":"Mexico"},
+            {"name":"J1 League","country":"Japan"},
+            {"name":"K League 1","country":"South Korea"},
+            {"name":"Saudi Professional League","country":"Saudi Arabia"},
+            {"name":"Süper Lig","country":"Turkey"},
+            {"name":"Premier League","country":"Russia"},
+            {"name":"Premier League","country":"Ukraine"},
+            {"name":"A-League","country":"Australia"},
+            {"name":"Série B","country":"Brazil"},
+            {"name":"UEFA Champions League","country":"World"},
+            {"name":"UEFA Europa League","country":"World"},
+            {"name":"FA Cup","country":"England"},
+            {"name":"League Cup","country":"England"},
+            {"name":"Women's Super League","country":"England"},
+        ]
+    results = []
+    base_url = PUBLIC_BASE_URL or request.host_url.rstrip("/")
+    for L in leagues:
+        nm = L.get("name"); ct = L.get("country")
+        lid = _resolve_league_id(nm, ct)
+        if not lid:
+            results.append({"name": nm, "country": ct, "ok": False, "reason": "not_found"})
+            continue
+
+        league_summary = {"name": nm, "country": ct, "league_id": lid, "seasons": []}
+        for s in seasons:
+            try:
+                r = session.get(
+                    f"{base_url}/harvest/league_snapshots",
+                    params={
+                        "league": lid, "season": s,
+                        "limit": 200, "include_inplay": 0, "delay_ms": 1000, "key": API_KEY
+                    },
+                    timeout=120
+                )
+                resp = r.json() if r.ok else {"ok": False, "error": f"http {r.status_code}"}
+            except Exception as e:
+                resp = {"ok": False, "error": str(e)}
+            league_summary["seasons"].append({"season": s, "result": resp})
+        results.append(league_summary)
+    return {"ok": True, "count": len(results), "results": results}
+
+def harvest_scan() -> Tuple[int, int]:
+    """
+    Pull in-play fixtures, ensure basic data sufficiency, snapshot them,
+    and throttle duplicates/cadence. Returns (saved, live_seen).
+    """
+    matches = fetch_live_matches()
+    live_seen = len(matches)
+    if live_seen == 0:
+        logging.info("[HARVEST] no live matches")
+        return 0, 0
+
+    saved = 0
+    now_ts = int(time.time())
+
+    with db_conn() as conn:
+        for m in matches:
+            try:
+                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                if not fid:
+                    continue
+
+                # cooldown – avoid writing multiple rows per match too frequently
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
+                    dup = conn.execute(
+                        "SELECT 1 FROM tips WHERE match_id=? AND created_ts>=? LIMIT 1",
+                        (fid, cutoff)
+                    ).fetchone()
+                    if dup:
+                        continue
+
+                feat = extract_features(m)
+                minute = int(feat.get("minute", 0))
+
+                # require some live stats after a given minute (configurable)
+                if not stats_coverage_ok(feat, minute):
+                    continue
+
+                save_snapshot_from_match(m, feat)
+                saved += 1
+
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break
+
+            except Exception as e:
+                logging.exception(f"[HARVEST] failure on match: {e}")
+                continue
+
+    logging.info(f"[HARVEST] saved={saved} live_seen={live_seen}")
+    return saved, live_seen
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.after_request
 def add_security_headers(resp):
@@ -589,6 +773,24 @@ def add_security_headers(resp):
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+@app.route("/harvest/bulk_leagues", methods=["POST"])
+def harvest_bulk_leagues_post():
+    _require_api_key()
+    body = request.get_json(silent=True) or {}
+    leagues = body.get("leagues") or []
+    seasons = body.get("seasons") or [2024]
+    return jsonify(_run_bulk_leagues(leagues, seasons))
+
+# Convenience GET so you can trigger from browser:
+# /harvest/bulk_leagues?key=...&seasons=2023,2024
+@app.route("/harvest/bulk_leagues", methods=["GET"])
+def harvest_bulk_leagues_get():
+    _require_api_key()
+    seasons_q = (request.args.get("seasons") or "").strip()
+    seasons = [int(s) for s in seasons_q.split(",") if s.strip().isdigit()] or [2024]
+    leagues = []  # will use curated defaults
+    return jsonify(_run_bulk_leagues(leagues, seasons))
 
 @app.route("/")
 def home():
@@ -758,6 +960,28 @@ def debug_env():
         "DB": "Postgres",
     })
 
+@app.route("/stats/config")
+def stats_config():
+    _require_api_key()
+    return jsonify({
+        "HARVEST_MODE": HARVEST_MODE,
+        "CONF_THRESHOLD": CONF_THRESHOLD,
+        "MAX_TIPS_PER_SCAN": MAX_TIPS_PER_SCAN,
+        "DUP_COOLDOWN_MIN": DUP_COOLDOWN_MIN,
+        "REQUIRE_STATS_MINUTE": REQUIRE_STATS_MINUTE,
+        "REQUIRE_DATA_FIELDS": REQUIRE_DATA_FIELDS,
+        "UNDER_SUPPRESS_AFTER_MIN": UNDER_SUPPRESS_AFTER_MIN,
+        "O25_LATE_MINUTE": O25_LATE_MINUTE,
+        "O25_LATE_MIN_GOALS": O25_LATE_MIN_GOALS,
+        "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
+        "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
+        "API_KEY_set": bool(API_KEY),
+        "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
+        "TRAIN_ENABLE": TRAIN_ENABLE,
+        "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
+        "TRAIN_TEST_SIZE": TRAIN_TEST_SIZE,
+    })
+
 # ── Entrypoint / Scheduler ────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
@@ -767,6 +991,7 @@ if __name__ == "__main__":
     scheduler = BackgroundScheduler()
     if HARVEST_MODE:
         scheduler.add_job(
+            harvest_scan,
             fetch_live_matches,  # tick
             CronTrigger(day_of_week="sun,mon,tue,wed,thu", hour="9-21", minute="*/2", timezone=ZoneInfo("Europe/Berlin")),
             id="tick", replace_existing=True,
@@ -779,5 +1004,7 @@ if __name__ == "__main__":
         id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True,
     )
     scheduler.start()
+    logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
     port = int(os.getenv("PORT", 5000))
+    logging.info("✅ Robi Superbrain started.")
     app.run(host="0.0.0.0", port=port)
