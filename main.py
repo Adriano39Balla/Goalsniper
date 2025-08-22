@@ -86,7 +86,7 @@ EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 CAL_CACHE: Dict[str, Any] = {"ts": 0, "bins": []}
 
 # ── DB (Postgres) ─────────────────────────────────────────────────────────────
-DB_URL = os.getenv("DB_URL")  # full connection string from Supabase
+DB_URL = os.getenv("postgresql://postgres@db.fbjmtyfunjsgaxossuhj.supabase.co:5432/postgres")  # full connection string from Supabase
 
 def db_conn():
     return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
