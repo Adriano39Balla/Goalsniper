@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-train_models.py
+train_models.py  (Postgres / Supabase)
 
 Nightly trainer for Robi:
-- Loads latest snapshots + final results from SQLite
+- Loads latest snapshots + final results from Postgres (Supabase)
 - Engineers features consistently with main.py
 - Trains two logistic models: Over 2.5 (O25) and BTTS: Yes
 - Optional Platt calibration and/or K-fold CV metrics
@@ -20,20 +20,17 @@ Exit code:
 import argparse
 import json
 import os
-import sqlite3
 from datetime import datetime
 from typing import Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
+import psycopg2
+
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.exceptions import NotFittedError
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    brier_score_loss,
-    accuracy_score,
-    roc_auc_score
-)
+from sklearn.metrics import brier_score_loss, accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split, StratifiedKFold
 
 RANDOM_STATE = 42
@@ -47,22 +44,20 @@ FEATURES = [
     "red_h","red_a","red_sum"
 ]
 
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _pg_connect(dsn: str):
+    if "sslmode=" not in dsn:
+        dsn = dsn + ("&" if "?" in dsn else "?") + "sslmode=require"
+    return psycopg2.connect(dsn)
 
 def _safe_float(x, default=0.0) -> float:
     try:
         return float(x)
     except Exception:
         return float(default)
-
-def _ensure_settings_table(con: sqlite3.Connection) -> None:
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    con.commit()
 
 def _df_from_rows(rows: pd.DataFrame, min_minute: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Build feature DataFrames for O2.5 and BTTS labels."""
@@ -121,28 +116,23 @@ def _df_from_rows(rows: pd.DataFrame, min_minute: int) -> Tuple[pd.DataFrame, pd
 
     return df[FEATURES + ["label_o25"]], df[FEATURES + ["label_btts"]]
 
-def load_data(db_path: str, min_minute: int = 15) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    con = sqlite3.connect(db_path)
-    try:
-        q = """
-        WITH latest AS (
-          SELECT match_id, MAX(created_ts) AS ts
-          FROM tip_snapshots GROUP BY match_id
-        )
-        SELECT l.match_id, s.created_ts, s.payload,
-               r.final_goals_h, r.final_goals_a, r.btts_yes
-        FROM latest l
-        JOIN tip_snapshots s ON s.match_id=l.match_id AND s.created_ts=l.ts
-        JOIN match_results r ON r.match_id=l.match_id
-        """
+def load_data_pg(dsn: str, min_minute: int = 15) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    q = """
+    WITH latest AS (
+      SELECT match_id, MAX(created_ts) AS ts
+      FROM tip_snapshots GROUP BY match_id
+    )
+    SELECT l.match_id, s.created_ts, s.payload,
+           r.final_goals_h, r.final_goals_a, r.btts_yes
+    FROM latest l
+    JOIN tip_snapshots s ON s.match_id=l.match_id AND s.created_ts=l.ts
+    JOIN match_results r ON r.match_id=l.match_id
+    """
+    with _pg_connect(dsn) as con:
         rows = pd.read_sql_query(q, con)
-        df_o25, df_btts = _df_from_rows(rows, min_minute)
-        return df_o25, df_btts
-    finally:
-        con.close()
+    return _df_from_rows(rows, min_minute)
 
 def fit_lr_or_none(X: np.ndarray, y: np.ndarray) -> LogisticRegression | None:
-    # Single-class guard (can happen after split/filters)
     if len(np.unique(y)) < 2:
         return None
     model = LogisticRegression(
@@ -159,11 +149,6 @@ def to_coeffs(model: LogisticRegression, feature_names) -> Dict[str, Any]:
     return {"features": list(feature_names), "coef": coef, "intercept": intercept}
 
 def maybe_calibrate(base_model: LogisticRegression, Xtr, ytr, method: str | None):
-    """
-    Wrap base model in CalibratedClassifierCV if method provided.
-    Supported: 'sigmoid' (Platt) or 'isotonic'.
-    Returns (clf, calibrated_flag).
-    """
     if method is None:
         return base_model, False
     if len(np.unique(ytr)) < 2:
@@ -173,7 +158,6 @@ def maybe_calibrate(base_model: LogisticRegression, Xtr, ytr, method: str | None
     return cal, True
 
 def _majority_acc(y: np.ndarray) -> float:
-    """Accuracy of naive majority-class classifier (baseline)."""
     p = y.mean()
     return max(p, 1.0 - p)
 
@@ -187,12 +171,10 @@ def train_and_eval(
     X = df[FEATURES].values
     y = df[label_col].values.astype(int)
 
-    # Stratify only if both classes present
     has_pos = y.sum() > 0
     has_neg = (len(y) - y.sum()) > 0
     strat = y if (has_pos and has_neg) else None
 
-    # Holdout split
     Xtr, Xte, ytr, yte = train_test_split(
         X, y, test_size=test_size, random_state=RANDOM_STATE, stratify=strat
     )
@@ -209,7 +191,6 @@ def train_and_eval(
         clf.fit(Xtr, ytr)
         pte = clf.predict_proba(Xte)[:, 1]
 
-    # Holdout metrics
     metrics = {
         "brier": float(brier_score_loss(yte, pte)),
         "acc": float(accuracy_score(yte, (pte >= 0.5).astype(int))),
@@ -221,8 +202,6 @@ def train_and_eval(
         "calibration_method": calibrate if calibrated else None,
     }
 
-    # Optional CV metrics
-    cv_report = None
     if cv_folds and cv_folds > 1 and (has_pos and has_neg):
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
         briers, accs, aucs = [], [], []
@@ -235,7 +214,7 @@ def train_and_eval(
             accs.append(accuracy_score(y[te], (pp >= 0.5).astype(int)))
             aucs.append(roc_auc_score(y[te], pp))
         if briers:
-            cv_report = {
+            metrics["cv"] = {
                 "folds": cv_folds,
                 "brier_mean": float(np.mean(briers)),
                 "brier_std": float(np.std(briers)),
@@ -244,25 +223,25 @@ def train_and_eval(
                 "auc_mean": float(np.mean(aucs)),
                 "auc_std": float(np.std(aucs)),
             }
-            metrics["cv"] = cv_report
 
-    # Always serialize base LR coefficients for runtime scoring (lightweight)
     serializable = to_coeffs(base, FEATURES)
+    return clf, {"metrics": metrics, "serializable": serializable}
 
-    return clf, {"metrics": metrics, "serializable": serializable, "cv": cv_report}
-
-def save_blob_to_settings(db_path: str, key: str, blob: Dict[str, Any]) -> None:
-    con = sqlite3.connect(db_path)
-    try:
-        _ensure_settings_table(con)
+def save_blob_to_settings_pg(dsn: str, key: str, blob: Dict[str, Any]) -> None:
+    with _pg_connect(dsn) as con:
         cur = con.cursor()
         cur.execute("""
-            INSERT INTO settings(key, value) VALUES(?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cur.execute("""
+            INSERT INTO settings(key, value)
+            VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """, (key, json.dumps(blob)))
-        con.commit()
-    finally:
-        con.close()
+        cur.close()
 
 def _print_top_coeffs(name: str, coeffs: Dict[str, Any], k: int = 8) -> None:
     feats = coeffs["features"]
@@ -271,22 +250,30 @@ def _print_top_coeffs(name: str, coeffs: Dict[str, Any], k: int = 8) -> None:
     pretty = ", ".join([f"{f}={v:+.3f}" for f, v in pairs])
     print(f"[{name}] top | {pretty} | intercept={coeffs['intercept']:+.3f}")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="tip_performance.db")
+    ap.add_argument("--db-url", default=os.getenv("DATABASE_URL"), help="Postgres DSN (Supabase)")
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=15)
     ap.add_argument("--test-size", type=float, default=0.25)
     ap.add_argument("--min-rows", type=int, default=150)
     ap.add_argument("--calibrate", choices=["sigmoid", "isotonic", "none"], default="sigmoid")
-    ap.add_argument("--cv", type=int, default=0, help="If >1, run Stratified K-fold CV with this many folds (report only).")
+    ap.add_argument("--cv", type=int, default=0, help="If >1, run Stratified K-fold CV (report only).")
     ap.add_argument("--export-path", default=None, help="Optional path to write model_coeffs JSON")
     ap.add_argument("--store-metrics", type=int, default=1, help="Also store latest metrics in settings.model_metrics_latest")
     args = ap.parse_args()
 
+    if not args.db_url:
+        print("DATABASE_URL is required (Supabase Postgres).")
+        raise SystemExit(2)
+
     calibrate = None if args.calibrate == "none" else args.calibrate
 
     # Load
-    df_o25, df_btts = load_data(args.db, args.min_minute)
+    df_o25, df_btts = load_data_pg(args.db_url, args.min_minute)
     if df_o25.empty or df_btts.empty:
         print("Not enough labeled data yet.")
         raise SystemExit(2)
@@ -300,11 +287,10 @@ def main():
         print(f"Need more data: {n} < min-rows {args.min_rows}.")
         raise SystemExit(3)
 
-    # Train + evaluate (holdout + optional CV)
+    # Train + evaluate
     _, o25 = train_and_eval(df_o25, "label_o25", args.test_size, calibrate, args.cv)
     _, btts = train_and_eval(df_btts, "label_btts", args.test_size, calibrate, args.cv)
 
-    # Assemble blob for settings (coeffs + metadata + metrics)
     trained_at = datetime.utcnow().isoformat() + "Z"
     blob = {
         "O25": o25["serializable"],
@@ -312,15 +298,8 @@ def main():
         "trained_at_utc": trained_at,
         "model_version": f"lr@{trained_at}",
         "features": FEATURES,
-        "metrics": {
-            "o25": o25["metrics"],
-            "btts": btts["metrics"],
-        },
-        "training_counts": {
-            "o25": int(n_o25),
-            "btts": int(n_btts),
-            "min_used": int(min(n_o25, n_btts))
-        },
+        "metrics": {"o25": o25["metrics"], "btts": btts["metrics"]},
+        "training_counts": {"o25": int(n_o25), "btts": int(n_btts), "min_used": int(n)},
         "hyperparams": {
             "min_minute": int(args.min_minute),
             "test_size": float(args.test_size),
@@ -332,19 +311,17 @@ def main():
         }
     }
 
-    # Persist in DB (what main.py consumes)
-    save_blob_to_settings(args.db, "model_coeffs", blob)
+    # Persist in Postgres settings
+    save_blob_to_settings_pg(args.db_url, "model_coeffs", blob)
     print("Saved model_coeffs in settings.")
     _print_top_coeffs("O25", blob["O25"])
     _print_top_coeffs("BTTS_YES", blob["BTTS_YES"])
 
-    # Optional export to file for external inspection/debug
     if args.export_path:
         with open(args.export_path, "w", encoding="utf-8") as f:
             json.dump(blob, f, ensure_ascii=False, indent=2)
         print(f"Exported model_coeffs to {os.path.abspath(args.export_path)}")
 
-    # Also store metrics-only (optional toggle)
     if args.store_metrics:
         metrics_only = {
             "trained_at_utc": trained_at,
@@ -352,18 +329,14 @@ def main():
             "training_counts": blob["training_counts"],
             "hyperparams": blob["hyperparams"],
         }
-        save_blob_to_settings(args.db, "model_metrics_latest", metrics_only)
+        save_blob_to_settings_pg(args.db_url, "model_metrics_latest", metrics_only)
         print("Saved model_metrics_latest in settings.")
 
-    # Tail-friendly summary (main.py logs the last few lines)
     print(json.dumps({
         "ok": True,
         "trained_at_utc": trained_at,
         "counts": {"o25": n_o25, "btts": n_btts},
-        "metrics": {
-            "o25": o25["metrics"],
-            "btts": btts["metrics"]
-        }
+        "metrics": {"o25": o25["metrics"], "btts": btts["metrics"]}
     }, ensure_ascii=False))
 
 if __name__ == "__main__":
