@@ -3,7 +3,6 @@ import json
 import time
 import logging
 import requests
-import sqlite3
 import subprocess, shlex
 from html import escape
 from zoneinfo import ZoneInfo
@@ -13,6 +12,8 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+import psycopg2
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App
@@ -49,9 +50,10 @@ TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False",
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
 
-# External DB URL (Postgres) or fallback to local SQLite
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://user:pwd@host:5432/dbname
-DB_PATH = os.getenv("DB_PATH", "tip_performance.db")  # ignored if DATABASE_URL is set
+# Postgres (Supabase) — REQUIRED
+DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://user:pwd@host:6543/db?sslmode=require
+if not DATABASE_URL:
+    raise SystemExit("DATABASE_URL is required (Supabase Postgres).")
 
 # ── External APIs ─────────────────────────────────────────────────────────────
 BASE_URL         = "https://v3.football.api-sports.io"
@@ -70,87 +72,59 @@ STATS_CACHE: Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB ADAPTER (SQLite or Postgres with the same API)
+# Postgres adapter (tiny convenience wrapper)
 # ──────────────────────────────────────────────────────────────────────────────
-USE_POSTGRES = bool(DATABASE_URL and DATABASE_URL.startswith(("postgres://","postgresql://")))
+class PgCursor:
+    def __init__(self, cur): self.cur = cur
+    def fetchone(self): return self.cur.fetchone()
+    def fetchall(self): return self.cur.fetchall()
 
-CursorLike = Any
-
-class _PgCursorProxy:
-    def __init__(self, cur): self._cur = cur
-    def fetchone(self): return self._cur.fetchone()
-    def fetchall(self): return self._cur.fetchall()
-
-class _PgConn:
-    def __init__(self, dsn: str):
-        import psycopg2
-        self._psycopg2 = psycopg2
-        self._dsn = dsn
-        self._conn = None
-        self._cursor = None
+class PgConn:
+    def __init__(self, dsn: str): self.dsn = dsn; self.conn=None; self.cur=None
     def __enter__(self):
-        # sslmode=require helps on some hosted Postgres
-        self._conn = self._psycopg2.connect(self._dsn, sslmode=os.getenv("PGSSLMODE","require"))
-        self._conn.autocommit = True
-        self._cursor = self._conn.cursor()
+        # ensure sslmode=require for Supabase if missing
+        if "sslmode=" not in self.dsn:
+            self.dsn = self.dsn + ("&" if "?" in self.dsn else "?") + "sslmode=require"
+        self.conn = psycopg2.connect(self.dsn)
+        self.conn.autocommit = True
+        self.cur = self.conn.cursor()
         return self
     def __exit__(self, exc_type, exc, tb):
         try:
-            if self._cursor: self._cursor.close()
+            if self.cur: self.cur.close()
         finally:
-            if self._conn: self._conn.close()
+            if self.conn: self.conn.close()
     def execute(self, sql: str, params: tuple|list=()):
-        # translate '?' placeholders to '%s'
-        sql = sql.replace("?", "%s")
-        self._cursor.execute(sql, params or ())
-        return _PgCursorProxy(self._cursor)
-    def commit(self):  # autocommit ON
-        pass
+        self.cur.execute(sql, params or ())
+        return PgCursor(self.cur)
 
-class _SqliteConn:
-    def __init__(self, path: str):
-        self._path = path
-        self._conn: Optional[sqlite3.Connection] = None
-    def __enter__(self):
-        self._conn = sqlite3.connect(self._path, timeout=30, isolation_level=None)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        return self._conn
-    def __exit__(self, exc_type, exc, tb):
-        if self._conn:
-            self._conn.close()
-
-def db_conn():
-    if USE_POSTGRES:
-        return _PgConn(DATABASE_URL)
-    return _SqliteConn(DB_PATH)
+def db_conn() -> PgConn:
+    return PgConn(DATABASE_URL)
 
 # ── Init DB ───────────────────────────────────────────────────────────────────
 def init_db():
     with db_conn() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS tips (
-            match_id INTEGER,
-            league_id INTEGER,
+            match_id BIGINT,
+            league_id BIGINT,
             league   TEXT,
             home     TEXT,
             away     TEXT,
             market   TEXT,
             suggestion TEXT,
-            confidence REAL,
+            confidence DOUBLE PRECISION,
             score_at_tip TEXT,
             minute    INTEGER,
-            created_ts INTEGER,
+            created_ts BIGINT,
             sent_ok   INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts)
         )""")
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS tip_snapshots (
-            match_id INTEGER,
-            created_ts INTEGER,
+            match_id BIGINT,
+            created_ts BIGINT,
             payload TEXT,
             PRIMARY KEY (match_id, created_ts)
         )""")
@@ -158,9 +132,9 @@ def init_db():
         conn.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
             id SERIAL PRIMARY KEY,
-            match_id INTEGER UNIQUE,
+            match_id BIGINT UNIQUE,
             verdict  INTEGER,
-            created_ts INTEGER
+            created_ts BIGINT
         )""")
 
         conn.execute("""
@@ -171,16 +145,16 @@ def init_db():
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS match_results (
-            match_id   INTEGER PRIMARY KEY,
+            match_id   BIGINT PRIMARY KEY,
             final_goals_h INTEGER,
             final_goals_a INTEGER,
             btts_yes      INTEGER,
-            updated_ts    INTEGER
+            updated_ts    BIGINT
         )""")
 
-        # Indices / view
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
+
         try:
             conn.execute("DROP VIEW IF EXISTS v_tip_stats")
             conn.execute("""
@@ -199,20 +173,17 @@ def init_db():
         except Exception:
             pass
 
-# ── Settings helpers ──────────────────────────────────────────────────────────
 def set_setting(key: str, value: str):
     with db_conn() as conn:
-        conn.execute(
-            "INSERT INTO settings(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+        conn.execute("""
+            INSERT INTO settings(key,value) VALUES(%s,%s)
+            ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
+        """, (key, value))
 
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
     with db_conn() as conn:
-        cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
-        row = cur.fetchone()
-        return (row[0] if row else default)
+        row = conn.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
+        return row[0] if row else default
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
@@ -277,7 +248,7 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
         out.append(m)
     return out
 
-# ── Fixtures fetch helpers ────────────────────────────────────────────────────
+# ── Fixtures fetch ────────────────────────────────────────────────────────────
 MAX_IDS_PER_REQ = 20
 
 def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -290,7 +261,6 @@ def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
         for fx in resp:
             fid = (fx.get("fixture") or {}).get("id")
             if fid: out[int(fid)] = fx
-        # 1-by-1 fallback for any missing
         missing = [fid for fid in chunk if fid not in out]
         for fid in missing:
             js1 = _api_get(FOOTBALL_API_URL, {"id": fid, "timezone": "UTC"})
@@ -312,7 +282,7 @@ def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
         time.sleep(0.15)
     return out
 
-# ── Feature extraction & snapshot save ────────────────────────────────────────
+# ── Features & snapshots ──────────────────────────────────────────────────────
 def _num(v) -> float:
     try:
         if isinstance(v, str) and v.endswith('%'): return float(v[:-1])
@@ -344,7 +314,6 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     cor_h = _num(sh.get("Corner Kicks", 0));   cor_a = _num(sa.get("Corner Kicks", 0))
     pos_h = _pos_pct(sh.get("Ball Possession", 0)); pos_a = _pos_pct(sa.get("Ball Possession", 0))
 
-    # red cards
     red_h = 0; red_a = 0
     for ev in (match.get("events") or []):
         try:
@@ -397,16 +366,15 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
 
     now = int(time.time())
     with db_conn() as conn:
-        # Portable UPSERT
         conn.execute("""
             INSERT INTO tip_snapshots(match_id, created_ts, payload)
-            VALUES (?,?,?)
-            ON CONFLICT(match_id, created_ts) DO UPDATE SET payload=excluded.payload
+            VALUES (%s,%s,%s)
+            ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload
         """, (fid, now, json.dumps(snapshot)[:200000]))
 
         conn.execute("""
             INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now, 0))
 
 # ── League helpers / backfill ─────────────────────────────────────────────────
@@ -466,12 +434,12 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
     hours = max(1, min(int(hours), 168))
     since = int(time.time()) - int(hours) * 3600
     with db_conn() as conn:
-        cur = conn.execute("""
+        rows = conn.execute("""
             SELECT DISTINCT match_id FROM tip_snapshots
-            WHERE created_ts >= ?
+            WHERE created_ts >= %s
               AND match_id NOT IN (SELECT match_id FROM match_results)
-        """, (since,))
-        ids = [r[0] for r in cur.fetchall()] if cur else []
+        """, (since,)).fetchall()
+        ids = [r[0] for r in rows]
 
     if not ids: return (0, 0)
 
@@ -482,7 +450,7 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
         with db_conn() as conn:
             for fid in group:
                 m = fx.get(fid)
-                if not m: 
+                if not m:
                     logging.warning("[RESULTS] fixture %s not returned by API", fid)
                     continue
                 status = ((m.get("fixture") or {}).get("status") or {}).get("short")
@@ -492,12 +460,12 @@ def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
                 ga = (m.get("goals") or {}).get("away") or 0
                 conn.execute("""
                     INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts)
-                    VALUES (?,?,?,?,?)
-                    ON CONFLICT(match_id) DO UPDATE SET
-                        final_goals_h=excluded.final_goals_h,
-                        final_goals_a=excluded.final_goals_a,
-                        btts_yes=excluded.btts_yes,
-                        updated_ts=excluded.updated_ts
+                    VALUES (%s,%s,%s,%s,%s)
+                    ON CONFLICT (match_id) DO UPDATE SET
+                        final_goals_h=EXCLUDED.final_goals_h,
+                        final_goals_a=EXCLUDED.final_goals_a,
+                        btts_yes=EXCLUDED.btts_yes,
+                        updated_ts=EXCLUDED.updated_ts
                 """, (int(fid), int(gh), int(ga), 1 if (int(gh)>0 and int(ga)>0) else 0, int(time.time())))
                 updated += 1
         time.sleep(0.25)
@@ -512,8 +480,10 @@ def _list_unlabeled_ids(limit: Optional[int] = None) -> List[int]:
             WHERE r.match_id IS NULL
             ORDER BY s.match_id
         """
-        cur = conn.execute(sql + (" LIMIT ?" if limit else ""), ((limit,) if limit else ()))
-        rows = cur.fetchall()
+        if limit:
+            rows = conn.execute(sql + " LIMIT %s", (limit,)).fetchall()
+        else:
+            rows = conn.execute(sql).fetchall()
     return [r[0] for r in rows]
 
 def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
@@ -525,7 +495,7 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
         with db_conn() as conn:
             for fid in group:
                 m = fx.get(fid)
-                if not m: 
+                if not m:
                     logging.warning("[RESULTS] fixture %s not returned by API", fid)
                     continue
                 status = ((m.get("fixture") or {}).get("status") or {}).get("short")
@@ -534,31 +504,20 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
                 ga = (m.get("goals") or {}).get("away") or 0
                 conn.execute("""
                     INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts)
-                    VALUES (?,?,?,?,?)
-                    ON CONFLICT(match_id) DO UPDATE SET
-                        final_goals_h=excluded.final_goals_h,
-                        final_goals_a=excluded.final_goals_a,
-                        btts_yes=excluded.btts_yes,
-                        updated_ts=excluded.updated_ts
+                    VALUES (%s,%s,%s,%s,%s)
+                    ON CONFLICT (match_id) DO UPDATE SET
+                        final_goals_h=EXCLUDED.final_goals_h,
+                        final_goals_a=EXCLUDED.final_goals_a,
+                        btts_yes=EXCLUDED.btts_yes,
+                        updated_ts=EXCLUDED.updated_ts
                 """, (int(fid), int(gh), int(ga), 1 if (int(gh)>0 and int(ga)>0) else 0, int(time.time())))
                 updated += 1
         time.sleep(0.25)
     return updated, len(ids)
 
-# ── Training job (unchanged) ──────────────────────────────────────────────────
+# ── Training job placeholder (trainer still SQLite-based) ─────────────────────
 def retrain_models_job():
-    if not TRAIN_ENABLE:
-        return {"ok": False, "skipped": True, "reason": "TRAIN_ENABLE=0"}
-    cmd = f"python -u train_models.py --db {DB_PATH if not USE_POSTGRES else ''} --min-minute {TRAIN_MIN_MINUTE} --test-size {TRAIN_TEST_SIZE}"
-    try:
-        proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=900)
-        out = (proc.stdout or "").strip()
-        err = (proc.stderr or "").strip()
-        return {"ok": proc.returncode == 0, "code": proc.returncode, "stdout": out[-2000:], "stderr": err[-1000:]}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "timeout": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    return {"ok": False, "skipped": True, "reason": "trainer not ported to Postgres yet"}
 
 # ── Simple stats ──────────────────────────────────────────────────────────────
 def _counts_since(ts_from: int) -> Dict[str, int]:
@@ -572,8 +531,8 @@ def _counts_since(ts_from: int) -> Dict[str, int]:
             LEFT JOIN match_results r ON r.match_id = s.match_id
             WHERE r.match_id IS NULL
         """).fetchone()[0]
-        snap_24h = conn.execute("SELECT COUNT(*) FROM tip_snapshots WHERE created_ts>=?", (ts_from,)).fetchone()[0]
-        res_24h  = conn.execute("SELECT COUNT(*) FROM match_results WHERE updated_ts>=?", (ts_from,)).fetchone()[0]
+        snap_24h = conn.execute("SELECT COUNT(*) FROM tip_snapshots WHERE created_ts>=%s", (ts_from,)).fetchone()[0]
+        res_24h  = conn.execute("SELECT COUNT(*) FROM match_results WHERE updated_ts>=%s", (ts_from,)).fetchone()[0]
     return {
         "snap_total": int(snap_total),
         "tips_total": int(tips_total),
@@ -595,8 +554,7 @@ def add_security_headers(resp):
 @app.route("/")
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
-    db = "Postgres" if USE_POSTGRES else "SQLite"
-    return f"🤖 Robi Superbrain is active ({mode}) · DB={db}"
+    return f"🤖 Robi Superbrain is active ({mode}) · DB=Postgres"
 
 def _require_api_key():
     key = request.headers.get("X-API-Key") or request.args.get("key")
@@ -616,7 +574,7 @@ def harvest_route():
                 if not fid: continue
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
-                    if conn.execute("SELECT 1 FROM tips WHERE match_id=? AND created_ts>=? LIMIT 1", (fid, cutoff)).fetchone():
+                    if conn.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1", (fid, cutoff)).fetchone():
                         continue
                 feat = extract_features(m)
                 if not stats_coverage_ok(feat, int(feat.get("minute",0))):
@@ -690,13 +648,13 @@ def debug_backfill_preview():
             abort(400)
         since = int(time.time()) - h * 3600
         with db_conn() as conn:
-            cur = conn.execute("""
+            rows = conn.execute("""
                 SELECT DISTINCT match_id FROM tip_snapshots
-                WHERE created_ts >= ?
+                WHERE created_ts >= %s
                   AND match_id NOT IN (SELECT match_id FROM match_results)
                 ORDER BY match_id
-            """, (since,))
-            ids = [r[0] for r in cur.fetchall()]
+            """, (since,)).fetchall()
+            ids = [r[0] for r in rows]
     else:
         ids = _list_unlabeled_ids(int(request.args.get("limit", "0")) or None)
     fx = fetch_fixtures_by_ids(ids)
@@ -758,25 +716,19 @@ def debug_env():
         "TRAIN_ENABLE":       TRAIN_ENABLE,
         "TRAIN_MIN_MINUTE":   TRAIN_MIN_MINUTE,
         "TRAIN_TEST_SIZE":    TRAIN_TEST_SIZE,
-        "DB": "Postgres" if USE_POSTGRES else f"SQLite:{DB_PATH}",
+        "DB": "Postgres",
     })
 
 # ── Entrypoint / Scheduler ────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
     if not ADMIN_API_KEY: logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
-    if USE_POSTGRES:
-        try:
-            import psycopg2  # noqa: F401
-            logging.info("Using Postgres via DATABASE_URL")
-        except Exception as e:
-            logging.error("psycopg2 not available: %s", e)
     init_db()
 
     scheduler = BackgroundScheduler()
     if HARVEST_MODE:
         scheduler.add_job(
-            fetch_live_matches,  # just a tick; actual harvest is manual /harvest
+            fetch_live_matches,  # tick
             CronTrigger(day_of_week="sun,mon,tue,wed,thu", hour="9-21", minute="*/2", timezone=ZoneInfo("Europe/Berlin")),
             id="tick", replace_existing=True,
         )
