@@ -1,15 +1,14 @@
 import os
 import json
 import time
-import math
 import logging
 import requests
 import psycopg2
 import subprocess, shlex
 from html import escape
 from zoneinfo import ZoneInfo
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional, Tuple
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
@@ -57,7 +56,7 @@ TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
 
 # Postgres (Supabase) — REQUIRED
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://user:pwd@host:6543/db?sslmode=require
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://... ?sslmode=require
 if not DATABASE_URL:
     raise SystemExit("DATABASE_URL is required (Supabase Postgres).")
 
@@ -89,7 +88,6 @@ class PgCursor:
 class PgConn:
     def __init__(self, dsn: str): self.dsn = dsn; self.conn=None; self.cur=None
     def __enter__(self):
-        # ensure sslmode=require for Supabase if missing
         if "sslmode=" not in self.dsn:
             self.dsn = self.dsn + ("&" if "?" in self.dsn else "?") + "sslmode=require"
         self.conn = psycopg2.connect(self.dsn)
@@ -487,10 +485,7 @@ def _list_unlabeled_ids(limit: Optional[int] = None) -> List[int]:
             WHERE r.match_id IS NULL
             ORDER BY s.match_id
         """
-        if limit:
-            rows = conn.execute(sql + " LIMIT %s", (limit,)).fetchall()
-        else:
-            rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql + (" LIMIT %s" if limit else ""), ((limit,) if limit else ())).fetchall()
     return [r[0] for r in rows]
 
 def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
@@ -522,13 +517,12 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
         time.sleep(0.25)
     return updated, len(ids)
 
-# ── Training job placeholder (trainer still SQLite-based) ─────────────────────
+# ── Training job (calls external script) ──────────────────────────────────────
 def retrain_models_job():
     if not TRAIN_ENABLE:
         logging.info("[TRAIN] skipped (TRAIN_ENABLE=0)")
         return {"ok": False, "skipped": True, "reason": "TRAIN_ENABLE=0"}
 
-    # Call the Postgres trainer with DATABASE_URL
     cmd = (
         f"python -u train_models.py "
         f"--db-url \"{os.getenv('DATABASE_URL','')}\" "
@@ -547,7 +541,6 @@ def retrain_models_job():
         err = (proc.stderr or "").strip()
         logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
 
-        # (optional) telegram summary
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                 summary = "✅ Nightly training OK" if proc.returncode == 0 else "❌ Nightly training failed"
@@ -567,7 +560,7 @@ def retrain_models_job():
         logging.exception(f"[TRAIN] exception: {e}")
         return {"ok": False, "error": str(e)}
 
-# ── Simple stats ──────────────────────────────────────────────────────────────
+# ── Simple stats & digest ─────────────────────────────────────────────────────
 def _counts_since(ts_from: int) -> Dict[str, int]:
     with db_conn() as conn:
         snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
@@ -610,24 +603,8 @@ def nightly_digest_job():
         logging.exception("[DIGEST] failed: %s", e)
         return False
 
-def _resolve_league_id(name: str, country: str) -> Optional[int]:
-    js = _api_get(f"{BASE_URL}/leagues", {"name": name, "country": country})
-    if not isinstance(js, dict):
-        return None
-    for item in js.get("response", []):
-        league = item.get("league") or {}
-        if league.get("name") == name:
-            return league.get("id")
-    try:
-        return (js.get("response", [])[0].get("league") or {}).get("id")
-    except Exception:
-        return None
-
+# ── Harvest scan (final, single version) ──────────────────────────────────────
 def harvest_scan() -> Tuple[int, int]:
-    """
-    Pull in-play fixtures, ensure basic data sufficiency, snapshot them,
-    and throttle duplicates/cadence. Returns (saved, live_seen).
-    """
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
@@ -648,98 +625,7 @@ def harvest_scan() -> Tuple[int, int]:
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
                     dup = conn.execute(
-
-def _run_bulk_leagues(leagues: List[Dict[str, str]], seasons: List[int]) -> Dict[str, Any]:
-    if not leagues:
-        leagues = [
-            {"name":"Premier League","country":"England"},
-            {"name":"La Liga","country":"Spain"},
-            {"name":"Serie A","country":"Italy"},
-            {"name":"Bundesliga","country":"Germany"},
-            {"name":"Ligue 1","country":"France"},
-            {"name":"Championship","country":"England"},
-            {"name":"Segunda División","country":"Spain"},
-            {"name":"Serie B","country":"Italy"},
-            {"name":"2. Bundesliga","country":"Germany"},
-            {"name":"Ligue 2","country":"France"},
-            {"name":"Primeira Liga","country":"Portugal"},
-            {"name":"Eredivisie","country":"Netherlands"},
-            {"name":"Pro League","country":"Belgium"},
-            {"name":"Bundesliga","country":"Austria"},
-            {"name":"Super League","country":"Switzerland"},
-            {"name":"Superliga","country":"Denmark"},
-            {"name":"Premiership","country":"Scotland"},
-            {"name":"Série A","country":"Brazil"},
-            {"name":"Liga Profesional Argentina","country":"Argentina"},
-            {"name":"MLS","country":"USA"},
-            {"name":"Liga MX","country":"Mexico"},
-            {"name":"J1 League","country":"Japan"},
-            {"name":"K League 1","country":"South Korea"},
-            {"name":"Saudi Professional League","country":"Saudi Arabia"},
-            {"name":"Süper Lig","country":"Turkey"},
-            {"name":"Premier League","country":"Russia"},
-            {"name":"Premier League","country":"Ukraine"},
-            {"name":"A-League","country":"Australia"},
-            {"name":"Série B","country":"Brazil"},
-            {"name":"UEFA Champions League","country":"World"},
-            {"name":"UEFA Europa League","country":"World"},
-            {"name":"FA Cup","country":"England"},
-            {"name":"League Cup","country":"England"},
-            {"name":"Women's Super League","country":"England"},
-        ]
-    results = []
-    base_url = PUBLIC_BASE_URL or request.host_url.rstrip("/")
-    for L in leagues:
-        nm = L.get("name"); ct = L.get("country")
-        lid = _resolve_league_id(nm, ct)
-        if not lid:
-            results.append({"name": nm, "country": ct, "ok": False, "reason": "not_found"})
-            continue
-
-        league_summary = {"name": nm, "country": ct, "league_id": lid, "seasons": []}
-        for s in seasons:
-            try:
-                r = session.get(
-                    f"{base_url}/harvest/league_snapshots",
-                    params={
-                        "league": lid, "season": s,
-                        "limit": 200, "include_inplay": 0, "delay_ms": 1000, "key": API_KEY
-                    },
-                    timeout=120
-                )
-                resp = r.json() if r.ok else {"ok": False, "error": f"http {r.status_code}"}
-            except Exception as e:
-                resp = {"ok": False, "error": str(e)}
-            league_summary["seasons"].append({"season": s, "result": resp})
-        results.append(league_summary)
-    return {"ok": True, "count": len(results), "results": results}
-
-def harvest_scan() -> Tuple[int, int]:
-    """
-    Pull in-play fixtures, ensure basic data sufficiency, snapshot them,
-    and throttle duplicates/cadence. Returns (saved, live_seen).
-    """
-    matches = fetch_live_matches()
-    live_seen = len(matches)
-    if live_seen == 0:
-        logging.info("[HARVEST] no live matches")
-        return 0, 0
-
-    saved = 0
-    now_ts = int(time.time())
-
-    with db_conn() as conn:
-        for m in matches:
-            try:
-                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-                if not fid:
-                    continue
-
-                # cooldown – avoid writing multiple rows per match too frequently
-                if DUP_COOLDOWN_MIN > 0:
-                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
-                    dup = conn.execute(
-                        "SELECT 1 FROM tips WHERE match_id=? AND created_ts>=? LIMIT 1",
+                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",
                         (fid, cutoff)
                     ).fetchone()
                     if dup:
@@ -782,7 +668,6 @@ def harvest_bulk_leagues_post():
     seasons = body.get("seasons") or [2024]
     return jsonify(_run_bulk_leagues(leagues, seasons))
 
-# Convenience GET so you can trigger from browser:
 # /harvest/bulk_leagues?key=...&seasons=2023,2024
 @app.route("/harvest/bulk_leagues", methods=["GET"])
 def harvest_bulk_leagues_get():
@@ -805,27 +690,8 @@ def _require_api_key():
 @app.route("/harvest")
 def harvest_route():
     _require_api_key()
-    matches = fetch_live_matches()
-    saved = 0
-    now_ts = int(time.time())
-    with db_conn() as conn:
-        for m in matches:
-            try:
-                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-                if not fid: continue
-                if DUP_COOLDOWN_MIN > 0:
-                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
-                    if conn.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1", (fid, cutoff)).fetchone():
-                        continue
-                feat = extract_features(m)
-                if not stats_coverage_ok(feat, int(feat.get("minute",0))):
-                    continue
-                save_snapshot_from_match(m, feat)
-                saved += 1
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
-            except Exception:
-                continue
-    return jsonify({"ok": True, "live_seen": len(matches), "snapshots_saved": saved})
+    saved, live_seen = harvest_scan()
+    return jsonify({"ok": True, "live_seen": live_seen, "snapshots_saved": saved})
 
 @app.route("/harvest/league_ids")
 def harvest_league_ids_route():
@@ -990,11 +856,11 @@ if __name__ == "__main__":
 
     scheduler = BackgroundScheduler()
     if HARVEST_MODE:
+        # every 2 min during daytime, Europe/Berlin
         scheduler.add_job(
             harvest_scan,
-            fetch_live_matches,  # tick
             CronTrigger(day_of_week="sun,mon,tue,wed,thu", hour="9-21", minute="*/2", timezone=ZoneInfo("Europe/Berlin")),
-            id="tick", replace_existing=True,
+            id="harvest", replace_existing=True,
         )
         scheduler.add_job(backfill_results_from_snapshots, "interval", minutes=15, id="backfill", replace_existing=True)
 
@@ -1003,6 +869,12 @@ if __name__ == "__main__":
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
         id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True,
     )
+    scheduler.add_job(
+        nightly_digest_job,
+        CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
+        id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True,
+    )
+
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
     port = int(os.getenv("PORT", 5000))
