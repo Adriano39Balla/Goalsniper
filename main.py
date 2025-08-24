@@ -1,4 +1,4 @@
-# main.py
+# path: main.py
 import os
 import re
 import json
@@ -191,24 +191,21 @@ def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
         pass
     if not books:
         return {}
-    # API returns list on fixture or bookmakers list per fixture; handle both
     node = books[0]
     if "bookmakers" in node:
         bks = node["bookmakers"] or []
     else:
-        bks = books  # already a bookmaker list
+        bks = books
     if not bks:
         return {}
     bets = (bks[0] or {}).get("bets", []) or []
     out = {"hda": {}, "ou": {}}
-    # 1X2
     mw = next((b for b in bets if "match winner" in (b.get("name","").lower())), None)
     if mw:
         vals = {v.get("value",""): v.get("odd") for v in (mw.get("values") or [])}
         pH, pD, pA = _odds_to_prob(vals.get("Home")), _odds_to_prob(vals.get("Draw")), _odds_to_prob(vals.get("Away"))
         pH, pD, pA = _normalize_three(pH, pD, pA)
         out["hda"] = {"home": pH, "draw": pD, "away": pA}
-    # OU
     ou = next((b for b in bets if "over/under" in (b.get("name","").lower())), None)
     if ou:
         for v in (ou.get("values") or []):
@@ -228,7 +225,6 @@ def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 d = out["ou"].setdefault(th, {"over": 0.0, "under": 0.0})
                 d["under"] = odd
-        # normalize pairs
         for th, d in list(out["ou"].items()):
             s = max(1e-9, d.get("over",0.0) + d.get("under",0.0))
             out["ou"][th] = {"over": d.get("over",0.0)/s, "under": d.get("under",0.0)/s}
@@ -239,7 +235,6 @@ def fetch_fixture_odds(fixture_id: int) -> Dict[str, Any]:
     if fixture_id in ODDS_CACHE:
         ts, data = ODDS_CACHE[fixture_id]
         if now - ts < 90: return data
-    # try prematch endpoint first; fallback to live
     js1 = _api_get(f"{BASE_URL}/odds", {"fixture": fixture_id})
     odds = _parse_odds_payload(js1 if isinstance(js1, dict) else {})
     if not odds:
@@ -382,7 +377,7 @@ def _baseline_from_odds(head: str, suggestion: str, odds: Dict[str,Any]) -> Opti
         d = ou[th]
         if s.startswith("over "): return float(d.get("over", 0.0))
         if s.startswith("under "): return float(d.get("under", 0.0))
-    if head == "BTTS" and hda:  # weak fallback: derive from price symmetry if no direct BTTS
+    if head == "BTTS" and hda:  # weak fallback
         return 0.5
     return None
 
@@ -398,7 +393,6 @@ def _quota(p: float, b: float) -> float:
     b = _clamp_prob(b, 0.05, 0.95)
     return _safe_odds(p) / _safe_odds(b)
 
-# coverage gate
 def _stats_coverage_ok(feat: Dict[str, float], min_fields: int) -> bool:
     fields = [
         feat.get("xg_sum", 0.0),
@@ -429,7 +423,6 @@ def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float
         out.append(("Match Result 1X2", "Draw", _score_prob(feat, mdl), code)); return out
     if code == "WIN_AWAY":
         out.append(("Match Result 1X2", "Away Win", _score_prob(feat, mdl), code)); return out
-    # generic yes/no
     p = _score_prob(feat, mdl)
     out.append((code, f"{code}: Yes", p, code))
     out.append((code, f"{code}: No", 1.0 - p, code))
@@ -452,7 +445,7 @@ def _apply_filter_with_odds(
             continue
         base = _baseline_from_odds(head, sugg, odds)
         if base is None:
-            base = _head_prevalence(head)  # last resort
+            base = _head_prevalence(head)
         lift = p - base
         q = _quota(p, base)
         if p >= min_prob and q >= min_quota:
@@ -522,7 +515,7 @@ def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
     return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Nightly training + digest (unchanged)
+# Nightly training + digest
 def _counts_since(ts_from: int) -> Dict[str, int]:
     with db_conn() as conn:
         snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
@@ -612,7 +605,7 @@ def retrain_models_job():
         return {"ok": False, "error": str(e)}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Production scan: model vs odds baseline
+# Production scan
 def production_scan() -> Tuple[int,int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
@@ -634,8 +627,6 @@ def production_scan() -> Tuple[int,int]:
                 if not fid: continue
                 feat = extract_features(m)
                 minute = int(feat.get("minute", 0))
-
-                # odds baseline
                 odds = fetch_fixture_odds(fid)
 
                 raw: List[Tuple[str,str,float,str]] = []
@@ -686,7 +677,7 @@ def production_scan() -> Tuple[int,int]:
     return saved, live_seen
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Harvest (unchanged)
+# Harvest
 def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
     fx = m.get("fixture", {}) or {}; lg = m.get("league", {}) or {}
     fid = int(fx.get("id")); league_id = int(lg.get("id") or 0)
@@ -778,7 +769,7 @@ def predict_scan_route():
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
     _require_api_key()
-    return jsonify(retrain_models_job)
+    return jsonify(retrain_models_job())  # fixed: call the function
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint / Scheduler
@@ -796,7 +787,6 @@ if __name__ == "__main__":
         scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")), id="production_scan", replace_existing=True)
         logging.info("🎯 Running in PRODUCTION mode (AI-only).")
 
-    # Nightly jobs
     scheduler.add_job(retrain_models_job, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
                       id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True)
     scheduler.add_job(nightly_digest_job, CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
