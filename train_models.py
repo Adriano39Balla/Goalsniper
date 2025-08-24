@@ -1,4 +1,5 @@
-import argparse, json, sqlite3, sys
+import argparse
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -7,11 +8,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, accuracy_score
 from sklearn.model_selection import train_test_split
 from datetime import datetime
+import psycopg2
 
-try:
-    import psycopg2
-except Exception:
-    psycopg2 = None
 
 FEATURES = [
     "minute","goals_h","goals_a","goals_sum","goals_diff",
@@ -22,45 +20,24 @@ FEATURES = [
     "red_h","red_a","red_sum"
 ]
 
-def _connect(db_url: Optional[str], db_path: Optional[str]):
-    """
-    Returns (engine_type, connection, cursor_factory)
-    engine_type in {"pg","sqlite"}
-    """
-    if db_url:
-        if psycopg2 is None:
-            raise SystemExit("psycopg2 not installed but --db-url was provided.")
-        # ensure sslmode=require if missing (mirrors main.py)
-        if "sslmode=" not in db_url:
-            db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
-        conn = psycopg2.connect(db_url)
-        conn.autocommit = True
-        return "pg", conn, None
-    elif db_path:
-        conn = sqlite3.connect(db_path)
-        return "sqlite", conn, None
-    else:
-        raise SystemExit("Provide --db-url (Postgres) or --db (SQLite).")
+def _connect_pg(db_url: str):
+    if not db_url:
+        raise SystemExit("--db-url is required (Postgres DSN).")
+    if "sslmode=" not in db_url:
+        db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
+    conn = psycopg2.connect(db_url)
+    conn.autocommit = True
+    return conn
 
-def _read_sql(engine: str, conn, sql: str, params: Tuple=()):
-    if engine == "pg":
-        return pd.read_sql_query(sql, conn, params=params)
-    else:
-        return pd.read_sql_query(sql, conn, params=params)
+def _read_sql(conn, sql: str, params: Tuple = ()):
+    return pd.read_sql_query(sql, conn, params=params)
 
-def _exec(engine: str, conn, sql: str, params: Tuple):
-    if engine == "pg":
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-    else:
-        cur = conn.cursor()
+def _exec(conn, sql: str, params: Tuple):
+    with conn.cursor() as cur:
         cur.execute(sql, params)
-        conn.commit()
-        cur.close()
 
-def load_data(engine: str, conn, min_minute: int = 15):
-    # Pull the latest snapshot per match and join with final result labels
-    # We parse payload JSON in Python (robust across engines)
+def load_data(conn, min_minute: int = 15) -> pd.DataFrame:
+    # take latest snapshot per match and join with results
     q = """
     WITH latest AS (
       SELECT match_id, MAX(created_ts) AS ts
@@ -72,10 +49,7 @@ def load_data(engine: str, conn, min_minute: int = 15):
     JOIN tip_snapshots s ON s.match_id=l.match_id AND s.created_ts=l.ts
     JOIN match_results r ON r.match_id=l.match_id
     """
-    rows = _read_sql(engine, conn, q)
-
-    if rows.empty:
-        return pd.DataFrame(), pd.DataFrame()
+    rows = _read_sql(conn, q)
 
     feats = []
     for _, row in rows.iterrows():
@@ -83,7 +57,6 @@ def load_data(engine: str, conn, min_minute: int = 15):
             p = json.loads(row["payload"])
         except Exception:
             continue
-
         stat = (p.get("stat") or {}) if isinstance(p, dict) else {}
         try:
             f = {
@@ -109,29 +82,27 @@ def load_data(engine: str, conn, min_minute: int = 15):
         f["pos_diff"] = f["pos_h"] - f["pos_a"]
         f["red_sum"] = f["red_h"] + f["red_a"]
 
-        # Labels
+        # Labels from final
         gh_f = int(row["final_goals_h"] or 0)
         ga_f = int(row["final_goals_a"] or 0)
-        f["label_o25"] = 1 if (gh_f + ga_f) >= 3 else 0
+        f["final_total"] = gh_f + ga_f
         f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
+        f["label_win_home"] = 1 if gh_f > ga_f else 0
+        f["label_draw"] = 1 if gh_f == ga_f else 0
+        f["label_win_away"] = 1 if ga_f > gh_f else 0
+
         feats.append(f)
 
     if not feats:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
     df = pd.DataFrame(feats)
-
-    # Hygiene
     df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     df["minute"] = df["minute"].clip(0, 120)
-
     df = df[df["minute"] >= min_minute].copy()
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
+    return df
 
-    return df[FEATURES + ["label_o25"]], df[FEATURES + ["label_btts"]]
-
-def fit_lr_safe(X, y):
+def fit_lr_safe(X, y) -> Optional[LogisticRegression]:
     if len(np.unique(y)) < 2:
         return None
     return LogisticRegression(
@@ -147,121 +118,139 @@ def to_coeffs(model, feature_names):
         "intercept": float(model.intercept_.ravel()[0]),
     }
 
+def _train_binary(head_name: str, X: np.ndarray, y: np.ndarray, features: List[str]) -> Optional[Dict[str, Any]]:
+    lr = fit_lr_safe(X, y)
+    if lr is None:
+        print(f"[SKIP] {head_name}: single-class; need more balanced data.")
+        return None
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.25, random_state=42,
+        stratify=(y if y.sum() and y.sum() != len(y) else None)
+    )
+    lr2 = fit_lr_safe(X_tr, y_tr)
+    if lr2 is None:
+        return None
+    p_te = lr2.predict_proba(X_te)[:, 1]
+    return {
+        "model": lr2,
+        "metrics": {
+            "brier": float(brier_score_loss(y_te, p_te)),
+            "acc": float(accuracy_score(y_te, (p_te >= 0.5).astype(int))),
+            "n": int(len(y_te)),
+            "prevalence": float(y.mean())
+        },
+        "blob": to_coeffs(lr2, features)
+    }
+
+def _ou_code(th: float) -> str:
+    # 2.5 -> "O25", 0.5 -> "O05"
+    v = int(round(th * 10))
+    return f"O{v:02d}"
+
+def _get_setting_pg(conn, key: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-url", help="Postgres DSN (preferred, used by main.py)")
-    ap.add_argument("--db", help="SQLite path (optional for local dev)")
+    ap.add_argument("--db-url", required=True, help="Postgres DSN (required).")
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=15)
-    ap.add_argument("--test-size", type=float, default=0.25)
+    ap.add_argument("--ou-thresholds", type=str, default="0.5,1.5,2.5,3.5,4.5",
+                    help="Comma-separated: 0.5,1.5,2.5,3.5,4.5")
     ap.add_argument("--min-rows", type=int, default=150)
     args = ap.parse_args()
 
-    engine, conn, _ = _connect(args.db_url, args.db)
+    conn = _connect_pg(args.db_url)
 
     try:
-        df_o25, df_btts = load_data(engine, conn, args.min_minute)
-        if df_o25.empty or df_btts.empty:
+        thresholds = [float(s) for s in args.ou_thresholds.split(",") if s.strip()]
+        df = load_data(conn, args.min_minute)
+        if df.empty:
             print("Not enough labeled data yet.")
             return
 
-        n_o25, n_btts = len(df_o25), len(df_btts)
-        n = min(n_o25, n_btts)
-        print(f"Samples O2.5={n_o25} | BTTS={n_btts}")
-        print(f"O2.5 positive rate={df_o25['label_o25'].mean():.3f} | "
-              f"BTTS positive rate={df_btts['label_btts'].mean():.3f}")
+        n = len(df)
         if n < args.min_rows:
             print(f"Need more data: {n} < min-rows {args.min_rows}.")
             return
 
-        # --- O/U 2.5 ---
-        Xo = df_o25[FEATURES].values
-        yo = df_o25["label_o25"].values.astype(int)
-        strat_o = yo if (yo.sum() and yo.sum() != len(yo)) else None
-        Xo_tr, Xo_te, yo_tr, yo_te = train_test_split(
-            Xo, yo, test_size=args.test_size, random_state=42, stratify=strat_o
-        )
-        mo = fit_lr_safe(Xo_tr, yo_tr)
-        if mo is None:
-            print("O2.5 split became single-class; collect more balanced data.")
+        X = df[FEATURES].values
+
+        # Train heads
+        models: Dict[str, Dict[str, Any]] = {}
+        metrics_summary: Dict[str, Any] = {}
+
+        # Over/Under heads
+        for th in thresholds:
+            y = (df["final_total"].values >= th).astype(int)
+            code = _ou_code(th)  # e.g., O25
+            res = _train_binary(f"OU {th}", X, y, FEATURES)
+            if res:
+                models[code] = res
+                metrics_summary[code] = res["metrics"]
+
+        # BTTS head
+        y_btts = df["label_btts"].values.astype(int)
+        res_btts = _train_binary("BTTS", X, y_btts, FEATURES)
+        if res_btts:
+            models["BTTS"] = res_btts
+            metrics_summary["BTTS"] = res_btts["metrics"]
+
+        # 1X2 heads (as three binaries)
+        for code, col in [("WIN_HOME","label_win_home"), ("DRAW","label_draw"), ("WIN_AWAY","label_win_away")]:
+            y = df[col].values.astype(int)
+            res = _train_binary(code, X, y, FEATURES)
+            if res:
+                models[code] = res
+                metrics_summary[code] = res["metrics"]
+
+        if not models:
+            print("No models trained (all heads skipped).")
             return
-        p_te_o = mo.predict_proba(Xo_te)[:, 1]
-        brier_o = brier_score_loss(yo_te, p_te_o)
-        acc_o = accuracy_score(yo_te, (p_te_o >= 0.5).astype(int))
 
-        # --- BTTS Yes ---
-        Xb = df_btts[FEATURES].values
-        yb = df_btts["label_btts"].values.astype(int)
-        strat_b = yb if (yb.sum() and yb.sum() != len(yb)) else None
-        Xb_tr, Xb_te, yb_tr, yb_te = train_test_split(
-            Xb, yb, test_size=args.test_size, random_state=42, stratify=strat_b
-        )
-        mb = fit_lr_safe(Xb_tr, yb_tr)
-        if mb is None:
-            print("BTTS split became single-class; collect more balanced data.")
-            return
-        p_te_b = mb.predict_proba(Xb_te)[:, 1]
-        brier_b = brier_score_loss(yb_te, p_te_b)
-        acc_b = accuracy_score(yb_te, (p_te_b >= 0.5).astype(int))
+        trained_at = datetime.utcnow().isoformat() + "Z"
 
-        print(f"O2.5 Brier={brier_o:.4f}  Acc={acc_o:.3f}  n={len(yo_te)}  prev={yo.mean():.2f}")
-        print(f"BTTS  Brier={brier_b:.4f}  Acc={acc_b:.3f}  n={len(yb_te)}  prev={yb.mean():.2f}")
-
-        # --- package results for two formats ---
-        blob = {
-            "O25": to_coeffs(mo, FEATURES),
-            "BTTS_YES": to_coeffs(mb, FEATURES),
-            "trained_at_utc": datetime.utcnow().isoformat() + "Z",
-            "metrics": {
-                "o25": {"brier": float(brier_o), "acc": float(acc_o), "n": int(len(yo_te)), "prevalence": float(yo.mean())},
-                "btts": {"brier": float(brier_b), "acc": float(acc_b), "n": int(len(yb_te)), "prevalence": float(yb.mean())},
-            },
-            "features": FEATURES,
-        }
-
-        # Convert to the format main.py expects: intercept + weights dict
-        def as_v2(m):
-            coefs = m["coef"]
-            return {
-                "intercept": float(m["intercept"]),
-                "weights": {feat: float(w) for feat, w in zip(m["features"], coefs)},
+        # Save all as model_v2:<CODE>
+        for code, res in models.items():
+            blob = res["blob"]
+            v2 = {
+                "intercept": float(blob["intercept"]),
+                "weights": {feat: float(w) for feat, w in zip(blob["features"], blob["coef"])},
+                "model_type": "logreg_v2",
+                "feature_order": list(blob["features"]),
                 "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0},
+                "trained_at_utc": trained_at,
             }
-
-        v2_o25 = as_v2(blob["O25"])
-        v2_btts = as_v2(blob["BTTS_YES"])
-
-        # --- save to settings ---
-        if engine == "pg":
-            # 1) keep the combined audit blob
-            _exec(engine, conn,
+            _exec(conn,
                   "INSERT INTO settings(key,value) VALUES(%s,%s) "
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                  ("model_coeffs", json.dumps(blob)))
-            # 2) write per‑market keys that main.py loads
-            _exec(engine, conn,
-                  "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                  ("model_v2:O25", json.dumps(v2_o25)))
-            _exec(engine, conn,
-                  "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                  ("model_v2:BTTS_YES", json.dumps(v2_btts)))
-        else:
-            _exec(engine, conn,
-                  "INSERT INTO settings(key,value) VALUES(?,?) "
-                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                  ("model_coeffs", json.dumps(blob)))
-            _exec(engine, conn,
-                  "INSERT INTO settings(key,value) VALUES(?,?) "
-                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                  ("model_v2:O25", json.dumps(v2_o25)))
-            _exec(engine, conn,
-                  "INSERT INTO settings(key,value) VALUES(?,?) "
-                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                  ("model_v2:BTTS_YES", json.dumps(v2_btts)))
+                  (f"model_v2:{code}", json.dumps(v2)))
 
-        print("Saved model_coeffs, model_v2:O25 and model_v2:BTTS_YES in settings.")
+        # Backward-compat alias for BTTS
+        if "BTTS" in models:
+            val = _get_setting_pg(conn, "model_v2:BTTS") or ""
+            if val:
+                _exec(conn,
+                      "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                      "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                      ("model_v2:BTTS_YES", val))
 
+        # Audit blob
+        audit = {
+            "trained_at_utc": trained_at,
+            "metrics": metrics_summary,
+            "features": FEATURES,
+            "ou_thresholds": thresholds,
+            "heads": list(models.keys())
+        }
+        _exec(conn,
+              "INSERT INTO settings(key,value) VALUES(%s,%s) "
+              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+              ("model_coeffs", json.dumps(audit)))
+
+        print(f"Saved {len(models)} models:", ", ".join(sorted(models.keys())))
     finally:
         try:
             conn.close()
