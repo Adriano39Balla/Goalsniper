@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import math
 import logging
 import requests
 import psycopg2
@@ -29,21 +30,16 @@ HARVEST_MODE       = os.getenv("HARVEST_MODE", "1") not in ("0","false","False",
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 
-# legacy toggles (kept but not used directly in AI mode)
-CONF_THRESHOLD     = int(os.getenv("CONF_THRESHOLD", "60"))
-O25_LATE_MINUTE     = int(os.getenv("O25_LATE_MINUTE", "88"))
-O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))
-BTTS_LATE_MINUTE    = int(os.getenv("BTTS_LATE_MINUTE", "88"))
-UNDER_SUPPRESS_AFTER_MIN = int(os.getenv("UNDER_SUPPRESS_AFTER_MIN", "82"))
-REQUIRE_STATS_MINUTE     = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
-REQUIRE_DATA_FIELDS      = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
-
-# AI‑only mode
+# AI mode
 ONLY_MODEL_MODE    = os.getenv("ONLY_MODEL_MODE", "1") not in ("0","false","False","no","NO")
 MIN_PROB           = max(0.0, min(0.99, float(os.getenv("MIN_PROB", "0.55"))))
+MIN_QUOTA          = float(os.getenv("MIN_QUOTA", "1.05"))  # why: realistic vs odds baseline
 
 TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
+
+REQUIRE_STATS_AFTER_MINUTE = int(os.getenv("REQUIRE_STATS_AFTER_MINUTE", "35"))
+REQUIRE_DATA_FIELDS        = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -60,6 +56,7 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 
 STATS_CACHE: Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
+ODDS_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}  # {fixture_id: (ts, odds_blob)}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DB helpers
@@ -174,6 +171,84 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Odds: parse & implied baselines
+def _odds_to_prob(odd: Any) -> float:
+    try:
+        o = float(odd)
+        return 1.0 / o if o > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def _normalize_three(p1: float, p2: float, p3: float) -> Tuple[float,float,float]:
+    s = max(1e-9, p1 + p2 + p3)
+    return p1/s, p2/s, p3/s
+
+def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
+    books = []
+    try:
+        books = (js or {}).get("response", []) or []
+    except Exception:
+        pass
+    if not books:
+        return {}
+    # API returns list on fixture or bookmakers list per fixture; handle both
+    node = books[0]
+    if "bookmakers" in node:
+        bks = node["bookmakers"] or []
+    else:
+        bks = books  # already a bookmaker list
+    if not bks:
+        return {}
+    bets = (bks[0] or {}).get("bets", []) or []
+    out = {"hda": {}, "ou": {}}
+    # 1X2
+    mw = next((b for b in bets if "match winner" in (b.get("name","").lower())), None)
+    if mw:
+        vals = {v.get("value",""): v.get("odd") for v in (mw.get("values") or [])}
+        pH, pD, pA = _odds_to_prob(vals.get("Home")), _odds_to_prob(vals.get("Draw")), _odds_to_prob(vals.get("Away"))
+        pH, pD, pA = _normalize_three(pH, pD, pA)
+        out["hda"] = {"home": pH, "draw": pD, "away": pA}
+    # OU
+    ou = next((b for b in bets if "over/under" in (b.get("name","").lower())), None)
+    if ou:
+        for v in (ou.get("values") or []):
+            val = (v.get("value") or "")
+            odd = _odds_to_prob(v.get("odd"))
+            if val.lower().startswith("over "):
+                try:
+                    th = float(val.split()[1])
+                except Exception:
+                    continue
+                d = out["ou"].setdefault(th, {"over": 0.0, "under": 0.0})
+                d["over"] = odd
+            elif val.lower().startswith("under "):
+                try:
+                    th = float(val.split()[1])
+                except Exception:
+                    continue
+                d = out["ou"].setdefault(th, {"over": 0.0, "under": 0.0})
+                d["under"] = odd
+        # normalize pairs
+        for th, d in list(out["ou"].items()):
+            s = max(1e-9, d.get("over",0.0) + d.get("under",0.0))
+            out["ou"][th] = {"over": d.get("over",0.0)/s, "under": d.get("under",0.0)/s}
+    return out
+
+def fetch_fixture_odds(fixture_id: int) -> Dict[str, Any]:
+    now = time.time()
+    if fixture_id in ODDS_CACHE:
+        ts, data = ODDS_CACHE[fixture_id]
+        if now - ts < 90: return data
+    # try prematch endpoint first; fallback to live
+    js1 = _api_get(f"{BASE_URL}/odds", {"fixture": fixture_id})
+    odds = _parse_odds_payload(js1 if isinstance(js1, dict) else {})
+    if not odds:
+        js2 = _api_get(f"{BASE_URL}/odds/live", {"fixture": fixture_id})
+        odds = _parse_odds_payload(js2 if isinstance(js2, dict) else {})
+    ODDS_CACHE[fixture_id] = (now, odds or {})
+    return odds or {}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Feature extraction
 def _num(v) -> float:
     try:
@@ -229,13 +304,11 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Models & policy
-MODEL_KEYS_ORDER = ["model_v2:{name}", "model_latest:{name}", "model:{name}"]
 OU_RE = re.compile(r"^O(\d{2})$")
 
 def _sigmoid(x: float) -> float:
     if x < -50: return 1e-22
     if x > 50: return 1.0 - 1e-22
-    import math
     return 1.0 / (1.0 + math.exp(-x))
 
 def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) -> float:
@@ -247,7 +320,6 @@ def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) 
 def _calibrate_prob(p: float, cal: Dict[str,Any]) -> float:
     method = (cal or {}).get("method", "sigmoid").lower()
     a = float((cal or {}).get("a", 1.0)); b = float((cal or {}).get("b", 0.0))
-    import math
     p = max(1e-12, min(1-1e-12, float(p)))
     if method in ("platt","sigmoid"):
         logit = math.log(p / (1 - p))
@@ -271,7 +343,7 @@ def _list_models(prefix: str = "model_v2:") -> Dict[str, Dict[str,Any]]:
     for k, v in rows:
         try:
             code = k.split(":",1)[1]
-            if code.lower() in ("o05","o5"):  # never use O0.5
+            if code.lower() in ("o05","o5"):
                 continue
             out[code] = json.loads(v)
         except Exception:
@@ -279,29 +351,12 @@ def _list_models(prefix: str = "model_v2:") -> Dict[str, Dict[str,Any]]:
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Policy / baselines / quota
-def _load_policy():
-    try:
-        braw = get_setting("policy:baselines_v1") or "{}"
-        praw = get_setting("policy:heads_v1") or "{}"
-        return json.loads(braw), json.loads(praw)
-    except Exception:
-        return {}, {}
+# Baseline from odds (fallback: empirical)
+def _ou_label(code: str) -> Optional[float]:
+    m = OU_RE.match(code)
+    if not m: return None
+    return int(m.group(1)) / 10.0
 
-def _minute_bucket(minute: int) -> int:
-    edges = [15,30,45,60,75,90,120]
-    for i,e in enumerate(edges):
-        if minute <= e: return i
-    return len(edges)
-
-def _score_state_str(feat: Dict[str,float]) -> str:
-    gs = int(feat.get("goals_sum", 0.0))
-    gd = int(feat.get("goals_diff", 0.0))
-    if gs >= 3: gs = 3
-    d = "H" if gd > 0 else ("A" if gd < 0 else "D")
-    return f"gs{gs}_{d}"
-
-# prevalence fallback (avoids 50% default)
 def _head_prevalence(head: str) -> float:
     raw = get_setting("model_coeffs")
     if not raw:
@@ -314,12 +369,22 @@ def _head_prevalence(head: str) -> float:
     except Exception:
         return 0.5
 
-def _baseline_rate(head: str, baselines: Dict[str,Dict[str,float]], minute: int, feat: Dict[str,float]) -> float:
-    tbl = baselines.get(head) or {}
-    key = f"{_minute_bucket(minute)}|{_score_state_str(feat)}"
-    if key in tbl:
-        return float(tbl[key])
-    return _head_prevalence(head)
+def _baseline_from_odds(head: str, suggestion: str, odds: Dict[str,Any]) -> Optional[float]:
+    s = (suggestion or "").lower()
+    hda = (odds or {}).get("hda") or {}
+    ou  = (odds or {}).get("ou") or {}
+    if head in ("WIN_HOME","DRAW","WIN_AWAY") and hda:
+        if "home" in hda and "home win" in s: return float(hda["home"])
+        if "draw" in hda and s == "draw": return float(hda["draw"])
+        if "away" in hda and "away win" in s: return float(hda["away"])
+    th = _ou_label(head)
+    if th is not None and th in ou:
+        d = ou[th]
+        if s.startswith("over "): return float(d.get("over", 0.0))
+        if s.startswith("under "): return float(d.get("under", 0.0))
+    if head == "BTTS" and hda:  # weak fallback: derive from price symmetry if no direct BTTS
+        return 0.5
+    return None
 
 def _clamp_prob(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, float(x)))
@@ -329,12 +394,11 @@ def _safe_odds(p: float) -> float:
     return p / (1.0 - p)
 
 def _quota(p: float, b: float) -> float:
-    # clamp both before converting to odds to avoid explosions
     p = _clamp_prob(p, 0.03, 0.97)
     b = _clamp_prob(b, 0.05, 0.95)
     return _safe_odds(p) / _safe_odds(b)
 
-# stats coverage gate (used after certain minute)
+# coverage gate
 def _stats_coverage_ok(feat: Dict[str, float], min_fields: int) -> bool:
     fields = [
         feat.get("xg_sum", 0.0),
@@ -345,17 +409,7 @@ def _stats_coverage_ok(feat: Dict[str, float], min_fields: int) -> bool:
     nonzero = sum(1 for v in fields if (v or 0) > 0)
     return nonzero >= max(0, int(min_fields))
 
-# map code→market text + compute probs
-OU_RE = re.compile(r"^O(\d{2})$")
-def _ou_label(code: str) -> Optional[float]:
-    m = OU_RE.match(code)
-    if not m: return None
-    return int(m.group(1)) / 10.0
-
 def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float]) -> List[Tuple[str,str,float,str]]:
-    """
-    Returns list of (market, suggestion, prob, head_code).
-    """
     out: List[Tuple[str,str,float,str]] = []
     th = _ou_label(code)
     if th is not None:
@@ -364,7 +418,7 @@ def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float
         out.append((market, f"Over {th_txt} Goals", p_over, code))
         out.append((market, f"Under {th_txt} Goals", 1.0 - p_over, code))
         return out
-    if code in ("BTTS","BTTS_YES"):
+    if code in ("BTTS","BTTS_YES","BTTS_NO"):
         p = _score_prob(feat, mdl)
         out.append(("BTTS", "BTTS: Yes", p, "BTTS"))
         out.append(("BTTS", "BTTS: No", 1.0 - p, "BTTS"))
@@ -375,65 +429,39 @@ def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float
         out.append(("Match Result 1X2", "Draw", _score_prob(feat, mdl), code)); return out
     if code == "WIN_AWAY":
         out.append(("Match Result 1X2", "Away Win", _score_prob(feat, mdl), code)); return out
+    # generic yes/no
     p = _score_prob(feat, mdl)
     out.append((code, f"{code}: Yes", p, code))
     out.append((code, f"{code}: No", 1.0 - p, code))
     return out
 
-def _baseline_for_suggestion(head: str, suggestion: str, minute: int, feat: Dict[str,float],
-                             baselines: Dict[str,Dict[str,float]]) -> float:
-    base = _baseline_rate(head, baselines, minute, feat)
-    s = (suggestion or "").lower()
-    if head.startswith("O") and s.startswith("under"):
-        return 1.0 - base
-    if head == "BTTS" and "no" in s:
-        return 1.0 - base
-    return base
-
-def _apply_policy_filter(
+def _apply_filter_with_odds(
     suggestions: List[Tuple[str,str,float,str]],
     minute: int,
     feat: Dict[str,float],
-    baselines: Dict[str,Dict[str,float]],
-    policy: Dict[str,Any]
-) -> List[Tuple[str,str,float,str,float,float]]:
-    """
-    Returns (market, suggestion, p, head, lift, quota) after filtering.
-    """
+    odds: Dict[str,Any],
+    min_prob: float,
+    min_quota: float,
+    top_k: int = 2,
+    min_fields_after_minute: Tuple[int,int] = (REQUIRE_STATS_AFTER_MINUTE, REQUIRE_DATA_FIELDS)
+) -> List[Tuple[str,str,float,str,float,float,float]]:
     out = []
-    pol_global = policy.get("global") or {}
-    global_quota = float(pol_global.get("min_quota", 1.50))
-    min_fields = int(pol_global.get("min_fields", 2))
-
+    req_minute, req_fields = min_fields_after_minute
     for market, sugg, p, head in suggestions:
-        head_pol = policy.get(head) or {}
-        min_prob = float(head_pol.get("min_prob", MIN_PROB))
-        min_lift = float(head_pol.get("min_lift", 0.0))
-        max_min  = int(head_pol.get("max_minute", 999))
-        min_quota = float(head_pol.get("min_quota", global_quota))
-        min_live_minute = int(head_pol.get("min_live_minute", 0))
-        require_stats_after_minute = int(head_pol.get("require_stats_after_minute", 0))
-
-        if minute < min_live_minute or minute > max_min:
+        if req_minute and minute >= req_minute and not _stats_coverage_ok(feat, req_fields):
             continue
-
-        if require_stats_after_minute and minute >= require_stats_after_minute:
-            if not _stats_coverage_ok(feat, min_fields=min_fields):
-                continue
-
-        base = _baseline_for_suggestion(head, sugg, minute, feat, baselines)
+        base = _baseline_from_odds(head, sugg, odds)
+        if base is None:
+            base = _head_prevalence(head)  # last resort
         lift = p - base
         q = _quota(p, base)
-
-        if p >= min_prob and lift >= min_lift and q >= min_quota:
-            out.append((market, sugg, p, head, lift, q))
-
-    out.sort(key=lambda x: (x[5], x[4], x[2]), reverse=True)  # by quota, then lift, then prob
-    top_k = int(pol_global.get("top_k_per_match", 2))
-    return out[:max(1, top_k)]
+        if p >= min_prob and q >= min_quota:
+            out.append((market, sugg, p, head, base, lift, q))
+    out.sort(key=lambda x: (x[6], x[5], x[2]), reverse=True)
+    return out[:max(1, int(top_k))]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Telegram helpers & message
+# Telegram & formatting
 def tg_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -463,16 +491,17 @@ def _rationale_from_feat(feat: Dict[str, float]) -> str:
 
 def _format_tip_message(
     league: str, home: str, away: str, minute: int, score_txt: str,
-    suggestion: str, prob: float, lift: float, baseline: float, quota: float, rationale: str
+    suggestion: str, prob: float, baseline: float, lift: float, quota: float, rationale: str
 ) -> str:
     prob_pct = min(99.0, max(0.0, prob * 100.0))
-    display_quota = min(quota, 10.0)  # cap display to keep sane output
+    base_pct = min(99.0, max(0.0, baseline * 100.0))
+    display_quota = min(quota, 10.0)
     return (
         "⚽️ New Tip!\n"
         f"Match: {home} vs {away}\n"
         f"⏰ Minute: {minute}' | Score: {score_txt}\n"
         f"Tip: {suggestion}\n"
-        f"📈 Model {prob_pct:.1f}% | Baseline {baseline*100:.1f}% | Edge +{lift*100:.1f} pp | Quota ×{display_quota:.2f}\n"
+        f"📈 Model {prob_pct:.1f}% | Odds-implied {base_pct:.1f}% | Edge +{lift*100:.1f} pp | Quota ×{display_quota:.2f}\n"
         f"🔎 Why: {rationale}\n"
         f"🏆 League: {league}"
     )
@@ -493,7 +522,7 @@ def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
     return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Nightly training + digest
+# Nightly training + digest (unchanged)
 def _counts_since(ts_from: int) -> Dict[str, int]:
     with db_conn() as conn:
         snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
@@ -583,7 +612,7 @@ def retrain_models_job():
         return {"ok": False, "error": str(e)}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Production scan (policy: min_prob + min_lift + quota, top‑K, stats gates)
+# Production scan: model vs odds baseline
 def production_scan() -> Tuple[int,int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
@@ -594,8 +623,6 @@ def production_scan() -> Tuple[int,int]:
     if not models:
         logging.warning("[PROD] no models found in settings (model_v2:*)")
         return 0, live_seen
-
-    baselines, policy = _load_policy()
 
     saved = 0
     now_ts = int(time.time())
@@ -608,18 +635,24 @@ def production_scan() -> Tuple[int,int]:
                 feat = extract_features(m)
                 minute = int(feat.get("minute", 0))
 
+                # odds baseline
+                odds = fetch_fixture_odds(fid)
+
                 raw: List[Tuple[str,str,float,str]] = []
                 for code, mdl in models.items():
                     raw.extend(_mk_suggestions_for_code(code, mdl, feat))
 
-                filtered = _apply_policy_filter(raw, minute, feat, baselines, policy)
+                filtered = _apply_filter_with_odds(
+                    raw, minute, feat, odds,
+                    min_prob=MIN_PROB, min_quota=MIN_QUOTA, top_k=2
+                )
                 if not filtered: continue
 
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
                 score_txt = _pretty_score(m)
 
-                for market, suggestion, prob, head, lift, q in filtered:
+                for market, suggestion, prob, head, base, lift, q in filtered:
                     cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
                     dup = conn.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND market=%s AND suggestion=%s AND created_ts>=%s LIMIT 1",
@@ -633,12 +666,11 @@ def production_scan() -> Tuple[int,int]:
                         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
                     """, (fid, league_id, league, home, away, market, suggestion, float(min(99.0, prob*100.0)), score_txt, minute, now))
 
-                    base = _baseline_for_suggestion(head, suggestion, minute, feat, baselines)
                     rationale = _rationale_from_feat(feat)
                     msg = _format_tip_message(
                         league=league, home=home, away=away,
                         minute=minute, score_txt=score_txt,
-                        suggestion=suggestion, prob=prob, lift=lift, baseline=base, quota=q,
+                        suggestion=suggestion, prob=prob, baseline=base, lift=lift, quota=q,
                         rationale=rationale
                     )
                     send_telegram(msg)
@@ -654,7 +686,7 @@ def production_scan() -> Tuple[int,int]:
     return saved, live_seen
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Harvest (kept for data collection)
+# Harvest (unchanged)
 def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
     fx = m.get("fixture", {}) or {}; lg = m.get("league", {}) or {}
     fid = int(fx.get("id")); league_id = int(lg.get("id") or 0)
@@ -725,7 +757,7 @@ def add_security_headers(resp):
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
     ai_tag = "AI‑only" if ONLY_MODEL_MODE else "legacy"
-    return f"🤖 Robi Superbrain is active ({mode}, {ai_tag}) · DB=Postgres · MIN_PROB={MIN_PROB:.2f}"
+    return f"🤖 Robi Superbrain is active ({mode}, {ai_tag}) · DB=Postgres · MIN_PROB={MIN_PROB:.2f} · MIN_QUOTA={MIN_QUOTA:.2f}"
 
 @app.route("/healthz")
 def healthz():
@@ -741,12 +773,12 @@ def predict_models_route():
 def predict_scan_route():
     _require_api_key()
     saved, live = production_scan()
-    return jsonify({"ok": True, "live_seen": live, "tips_saved": saved, "min_prob": MIN_PROB})
+    return jsonify({"ok": True, "live_seen": live, "tips_saved": saved, "min_prob": MIN_PROB, "min_quota": MIN_QUOTA})
 
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
     _require_api_key()
-    return jsonify(retrain_models_job()))
+    return jsonify(retrain_models_job())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint / Scheduler
