@@ -528,11 +528,11 @@ def _apply_filter_with_odds(
     Returns: (market, suggestion, p, head, base, lift, edge_quota, offered_odds)
     Filters require:
       - stats coverage after the configured minute
-      - offered odds >= MIN_DEC_ODDS when odds exist
+      - offered odds present and >= MIN_DEC_ODDS
       - model probability >= min_prob
       - quota (edge vs odds-implied/prev) >= min_quota
     """
-    out = []
+    out: List[Tuple[str,str,float,str,float,float,float,Optional[float]]] = []
     req_minute, req_fields = min_fields_after_minute
 
     for market, sugg, p, head in suggestions:
@@ -540,21 +540,15 @@ def _apply_filter_with_odds(
         if req_minute and minute >= req_minute and not _stats_coverage_ok(feat, req_fields):
             continue
 
-        # If we do have offered odds, require minimum decimal odds
+        # Require offered odds and minimum price
         offered = _offered_odds(head, sugg, odds)
-        if offered is not None and offered < MIN_DEC_ODDS:
+        if offered is None or offered < MIN_DEC_ODDS:
             continue
 
-        # Baseline from live odds when possible; fallback to head prevalence
-        offered = _offered_odds(head, sugg, odds)
-# require odds present and not too short
-if offered is None or offered < MIN_DEC_ODDS:
-    continue
-
-base = _baseline_from_odds(head, sugg, odds)
-if base is None:
-    # if the book didn’t quote that exact market prob, skip
-    continue
+        # Baseline from live odds; if missing, skip this market
+        base = _baseline_from_odds(head, sugg, odds)
+        if base is None:
+            continue
 
         lift = p - base
         edge_q = _quota(p, base)
