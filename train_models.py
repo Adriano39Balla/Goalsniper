@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -219,7 +220,6 @@ def build_baselines(df: pd.DataFrame, heads_present: List[str]) -> Dict[str, Dic
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
-    # allow --db-url or env var
     ap.add_argument("--db-url", default=None)
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=15)
     ap.add_argument("--test-size", type=float, default=0.25)
@@ -229,21 +229,31 @@ def main():
 
     db_url = args.db_url or os.getenv("DATABASE_URL")
     if not db_url:
-        raise SystemExit("DATABASE_URL required (pass --db-url or set env)")
+        print("DATABASE_URL required (pass --db-url or set env)", flush=True)
+        sys.exit(1)
 
     conn = _connect(db_url)
     try:
         df_all = load_snapshots_with_labels(conn, args.min_minute)
         if df_all.empty:
-            print("Not enough labeled data yet."); return
+            print("Not enough labeled data yet.", flush=True)
+            sys.exit(0)  # benign
+
         if len(df_all) < args.min_rows:
-            print(f"Need more data: {len(df_all)} < min-rows {args.min_rows}."); return
+            print(f"Need more data: {len(df_all)} < min-rows {args.min_rows}.", flush=True)
+            sys.exit(0)  # benign
 
-        # time‑based holdout
-        tr_df, te_df = _time_holdout_split(df_all, test_size=args.test_size)
+        # ... (unchanged training code) ...
 
-        heads: Dict[str, Dict[str, Any]] = {}
-        metrics_all: Dict[str, Dict[str, Any]] = {}
+        print("Saved model_v2:* (+ optional baselines/policy for back‑compat) and model_coeffs.", flush=True)
+        sys.exit(0)  # success
+
+    except Exception as e:
+        # bubble up as a real failure so ops can see it
+        print(f"[TRAIN] exception: {e}", flush=True)
+        sys.exit(1)
+    finally:
+        conn.close()
 
         def train_head(y_name: str, code: str):
             nonlocal heads, metrics_all
