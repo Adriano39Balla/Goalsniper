@@ -206,36 +206,61 @@ def main():
         print(f"O2.5 Brier={brier_o:.4f}  Acc={acc_o:.3f}  n={len(yo_te)}  prev={yo.mean():.2f}")
         print(f"BTTS  Brier={brier_b:.4f}  Acc={acc_b:.3f}  n={len(yb_te)}  prev={yb.mean():.2f}")
 
+        # --- package results for two formats ---
         blob = {
             "O25": to_coeffs(mo, FEATURES),
             "BTTS_YES": to_coeffs(mb, FEATURES),
             "trained_at_utc": datetime.utcnow().isoformat() + "Z",
             "metrics": {
-                "o25": {
-                    "brier": float(brier_o), "acc": float(acc_o),
-                    "n": int(len(yo_te)), "prevalence": float(yo.mean())
-                },
-                "btts": {
-                    "brier": float(brier_b), "acc": float(acc_b),
-                    "n": int(len(yb_te)), "prevalence": float(yb.mean())
-                },
+                "o25": {"brier": float(brier_o), "acc": float(acc_o), "n": int(len(yo_te)), "prevalence": float(yo.mean())},
+                "btts": {"brier": float(brier_b), "acc": float(acc_b), "n": int(len(yb_te)), "prevalence": float(yb.mean())},
             },
             "features": FEATURES,
         }
 
-        # Save into settings(model_coeffs)
+        # Convert to the format main.py expects: intercept + weights dict
+        def as_v2(m):
+            coefs = m["coef"]
+            return {
+                "intercept": float(m["intercept"]),
+                "weights": {feat: float(w) for feat, w in zip(m["features"], coefs)},
+                "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0},
+            }
+
+        v2_o25 = as_v2(blob["O25"])
+        v2_btts = as_v2(blob["BTTS_YES"])
+
+        # --- save to settings ---
         if engine == "pg":
+            # 1) keep the combined audit blob
             _exec(engine, conn,
                   "INSERT INTO settings(key,value) VALUES(%s,%s) "
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
                   ("model_coeffs", json.dumps(blob)))
+            # 2) write per‑market keys that main.py loads
+            _exec(engine, conn,
+                  "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                  ("model_v2:O25", json.dumps(v2_o25)))
+            _exec(engine, conn,
+                  "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                  ("model_v2:BTTS_YES", json.dumps(v2_btts)))
         else:
             _exec(engine, conn,
                   "INSERT INTO settings(key,value) VALUES(?,?) "
                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                   ("model_coeffs", json.dumps(blob)))
+            _exec(engine, conn,
+                  "INSERT INTO settings(key,value) VALUES(?,?) "
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  ("model_v2:O25", json.dumps(v2_o25)))
+            _exec(engine, conn,
+                  "INSERT INTO settings(key,value) VALUES(?,?) "
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  ("model_v2:BTTS_YES", json.dumps(v2_btts)))
 
-        print("Saved model_coeffs in settings.")
+        print("Saved model_coeffs, model_v2:O25 and model_v2:BTTS_YES in settings.")
 
     finally:
         try:
