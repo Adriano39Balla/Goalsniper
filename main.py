@@ -613,15 +613,16 @@ def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
     t = (m.get("teams") or {}) or {}
     return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
 
-# ── Production scan ───────────────────────────────────────────────────────────
+# ── Production scan (save + notify) ───────────────────────────────────────────
 def production_scan() -> Tuple[int,int]:
     """
     Generate tips using models for O25 and BTTS: Yes.
-    Respects:
+    Saves to DB and sends the strongest (highest‑confidence) tip per match
+    to Telegram. Still respects:
       - CONF_THRESHOLD (percent)
       - DUP_COOLDOWN_MIN
       - late-minute suppressors
-      - REQUIRE_STATS_MINUTE / REQUIRE_DATA_FIELDS (if ONLY_MODEL_MODE=1, we still require some stats unless early)
+      - REQUIRE_STATS_MINUTE / REQUIRE_DATA_FIELDS
     """
     matches = fetch_live_matches()
     live_seen = len(matches)
@@ -645,7 +646,7 @@ def production_scan() -> Tuple[int,int]:
                 if not fid:
                     continue
 
-                # cooldown
+                # cooldown: if we wrote a tip for this match recently, skip
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
                     dup = conn.execute(
@@ -658,24 +659,21 @@ def production_scan() -> Tuple[int,int]:
                 feat = extract_features(m)
                 minute = int(feat.get("minute", 0))
 
-                # Require minimal stats after minute threshold
+                # require minimal stats after threshold
                 if not stats_coverage_ok(feat, minute):
                     continue
 
-                # Compute market probabilities
-                preds: List[Tuple[str,str,float]] = []  # (market, suggestion, prob)
+                # compute candidate predictions
+                preds: List[Tuple[str,str,float]] = []  # (market_code, suggestion, prob)
 
                 if mdl_o25:
-                    # Suggest Over 2.5 (we do not push Under by model here)
                     p_over = _score_prob(feat, mdl_o25)
-                    # Late-game heuristic guard
                     if not (minute >= O25_LATE_MINUTE and feat.get("goals_sum",0) < O25_LATE_MIN_GOALS):
                         if p_over * 100.0 >= CONF_THRESHOLD:
                             preds.append(("O25", "Over 2.5 Goals", p_over))
 
                 if mdl_btts:
                     p_btts = _score_prob(feat, mdl_btts)
-                    # Late-game guard for BTTS (very late and a 0 on board often ugly)
                     if not (minute >= BTTS_LATE_MINUTE and (feat.get("goals_h",0)==0 or feat.get("goals_a",0)==0)):
                         if p_btts * 100.0 >= CONF_THRESHOLD:
                             preds.append(("BTTS", "BTTS: Yes", p_btts))
@@ -683,25 +681,33 @@ def production_scan() -> Tuple[int,int]:
                 if not preds:
                     continue
 
-                # Sort strongest first (prob desc)
+                # pick the strongest tip only
                 preds.sort(key=lambda x: x[2], reverse=True)
+                market_code, suggestion, prob = preds[0]
 
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
                 score_txt = _pretty_score(m)
 
-                # Insert at most MAX_TIPS_PER_SCAN per scan
-                for market_code, suggestion, prob in preds:
-                    now = int(time.time())
-                    conn.execute("""
-                        INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
-                    """, (fid, league_id, league, home, away,
-                          ("Over/Under 2.5" if market_code=="O25" else "BTTS"),
-                          suggestion, float(prob*100.0), score_txt, minute, now))
-                    saved += 1
-                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                        break
+                # write to DB
+                now = int(time.time())
+                conn.execute("""
+                    INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+                """, (
+                    fid, league_id, league, home, away,
+                    ("Over/Under 2.5" if market_code=="O25" else "BTTS"),
+                    suggestion, float(prob*100.0), score_txt, minute, now
+                ))
+                saved += 1
+
+                # send to Telegram (best‑effort, no crash if Telegram is down)
+                try:
+                    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                        msg = _fmt_tip_msg(league, home, away, minute, score_txt, suggestion, prob)
+                        send_telegram(msg)
+                except Exception as e:
+                    logging.warning("[PROD] telegram send failed: %s", e)
 
                 if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
                     break
@@ -936,6 +942,17 @@ def _motd_already_announced_for_today() -> Optional[int]:
 def _save_motd_sent(match_id: int):
     rec = {"ts": int(time.time()), "match_id": int(match_id)}
     set_setting("motd:last_sent", json.dumps(rec))
+
+def _fmt_tip_msg(league:str, home:str, away:str, minute:int, score_txt:str,
+                 suggestion:str, prob:float) -> str:
+    return (
+        "🎯 <b>Robi Tip</b>\n"
+        f"{escape(home)} vs {escape(away)}\n"
+        f"🏆 {escape(league)}\n"
+        f"⏱️ {minute}'   🔢 {score_txt}\n"
+        f"💡 Suggestion: <b>{escape(suggestion)}</b>\n"
+        f"🧮 Confidence: <b>{prob*100:.1f}%</b>"
+    )
 
 def _fmt_motd_message(c: Dict[str,Any]) -> str:
     title = "⭐️ <b>Match of the Day</b>"
