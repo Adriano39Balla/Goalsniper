@@ -33,13 +33,22 @@ DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 # AI mode
 ONLY_MODEL_MODE    = os.getenv("ONLY_MODEL_MODE", "1") not in ("0","false","False","no","NO")
 MIN_PROB           = max(0.0, min(0.99, float(os.getenv("MIN_PROB", "0.55"))))
-MIN_QUOTA          = float(os.getenv("MIN_QUOTA", "1.05"))  # why: realistic vs odds baseline
+MIN_QUOTA          = float(os.getenv("MIN_QUOTA", "1.05"))  # kept for compatibility with sorting
 
 TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 
 REQUIRE_STATS_AFTER_MINUTE = int(os.getenv("REQUIRE_STATS_AFTER_MINUTE", "35"))
 REQUIRE_DATA_FIELDS        = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
+
+# NEW: bookmaker odds + quality gates
+MIN_DEC_ODDS       = float(os.getenv("MIN_DEC_ODDS", "1.5"))   # Only send when offered odds >= this
+MINUTE_MIN         = int(os.getenv("MINUTE_MIN", "10"))        # ignore very early
+MINUTE_MAX         = int(os.getenv("MINUTE_MAX", "85"))        # ignore very late
+REQ_AFTER_MIN      = int(os.getenv("REQ_AFTER_MIN", str(REQUIRE_STATS_AFTER_MINUTE)))
+REQ_MIN_FIELDS     = int(os.getenv("REQ_MIN_FIELDS", str(REQUIRE_DATA_FIELDS)))
+REQ_MIN_SOT_SUM    = int(os.getenv("REQ_MIN_SOT_SUM", "3"))
+REQ_MIN_XG_SUM     = float(os.getenv("REQ_MIN_XG_SUM", "1.1"))
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -53,6 +62,7 @@ INPLAY_STATUSES  = {"1H","HT","2H","ET","BT","P"}
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], respect_retry_after_header=True)
 session.mount("https://", HTTPAdapter(max_retries=retries))
+session.mount("http://", HTTPAdapter(max_retries=retries))
 
 STATS_CACHE: Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
@@ -120,6 +130,15 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS match_results (match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
+        # helpful composite indexes for de-dupe checks and recency
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tips_dedupe
+            ON tips(match_id, market, suggestion, created_ts)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tips_recent
+            ON tips(match_id, created_ts)
+        """)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # API + features
@@ -127,9 +146,12 @@ def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY: return None
     try:
         res = session.get(url, headers=HEADERS, params=params, timeout=timeout)
-        if not res.ok: return None
+        if not res.ok:
+            logging.warning("[API] %s %s -> %s", url, params, res.status_code)
+            return None
         return res.json()
-    except Exception:
+    except Exception as e:
+        logging.exception("[API] error: %s", e)
         return None
 
 def fetch_match_stats(fixture_id: int):
@@ -184,6 +206,16 @@ def _normalize_three(p1: float, p2: float, p3: float) -> Tuple[float,float,float
     return p1/s, p2/s, p3/s
 
 def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returns normalized probabilities and raw decimal odds for HDA and OU.
+    Structure:
+      {
+        "hda": {"home":p,"draw":p,"away":p},
+        "hda_odds": {"home":odd,"draw":odd,"away":odd},
+        "ou": {threshold: {"over":p,"under":p}},
+        "ou_odds": {threshold: {"over":odd,"under":odd}}
+      }
+    """
     books = []
     try:
         books = (js or {}).get("response", []) or []
@@ -191,6 +223,7 @@ def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
         pass
     if not books:
         return {}
+
     node = books[0]
     if "bookmakers" in node:
         bks = node["bookmakers"] or []
@@ -198,36 +231,58 @@ def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
         bks = books
     if not bks:
         return {}
+
     bets = (bks[0] or {}).get("bets", []) or []
-    out = {"hda": {}, "ou": {}}
+    out = {"hda": {}, "hda_odds": {}, "ou": {}, "ou_odds": {}}
+
+    def _to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    # Match Winner / 1X2
     mw = next((b for b in bets if "match winner" in (b.get("name","").lower())), None)
     if mw:
-        vals = {v.get("value",""): v.get("odd") for v in (mw.get("values") or [])}
-        pH, pD, pA = _odds_to_prob(vals.get("Home")), _odds_to_prob(vals.get("Draw")), _odds_to_prob(vals.get("Away"))
+        vals = {v.get("value","").strip().lower(): v for v in (mw.get("values") or [])}
+        raw_home = _to_float((vals.get("home") or {}).get("odd"))
+        raw_draw = _to_float((vals.get("draw") or {}).get("odd"))
+        raw_away = _to_float((vals.get("away") or {}).get("odd"))
+        pH = _odds_to_prob(raw_home) if raw_home else 0.0
+        pD = _odds_to_prob(raw_draw) if raw_draw else 0.0
+        pA = _odds_to_prob(raw_away) if raw_away else 0.0
         pH, pD, pA = _normalize_three(pH, pD, pA)
         out["hda"] = {"home": pH, "draw": pD, "away": pA}
+        out["hda_odds"] = {"home": raw_home, "draw": raw_draw, "away": raw_away}
+
+    # Over/Under
     ou = next((b for b in bets if "over/under" in (b.get("name","").lower())), None)
     if ou:
         for v in (ou.get("values") or []):
-            val = (v.get("value") or "")
-            odd = _odds_to_prob(v.get("odd"))
-            if val.lower().startswith("over "):
-                try:
-                    th = float(val.split()[1])
-                except Exception:
-                    continue
-                d = out["ou"].setdefault(th, {"over": 0.0, "under": 0.0})
-                d["over"] = odd
-            elif val.lower().startswith("under "):
-                try:
-                    th = float(val.split()[1])
-                except Exception:
-                    continue
-                d = out["ou"].setdefault(th, {"over": 0.0, "under": 0.0})
-                d["under"] = odd
+            val = (v.get("value") or "").strip().lower()
+            odd = _to_float(v.get("odd"))
+            if not odd:
+                continue
+            is_over = val.startswith("over ")
+            is_under = val.startswith("under ")
+            if not (is_over or is_under):
+                continue
+            try:
+                th = float(val.split()[1])
+            except Exception:
+                continue
+            d = out["ou"].setdefault(th, {"over": 0.0, "under": 0.0})
+            d2 = out["ou_odds"].setdefault(th, {"over": None, "under": None})
+            if is_over:
+                d["over"] = _odds_to_prob(odd)
+                d2["over"] = odd
+            else:
+                d["under"] = _odds_to_prob(odd)
+                d2["under"] = odd
         for th, d in list(out["ou"].items()):
             s = max(1e-9, d.get("over",0.0) + d.get("under",0.0))
             out["ou"][th] = {"over": d.get("over",0.0)/s, "under": d.get("under",0.0)/s}
+
     return out
 
 def fetch_fixture_odds(fixture_id: int) -> Dict[str, Any]:
@@ -279,10 +334,12 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     red_h = 0; red_a = 0
     for ev in (match.get("events") or []):
         try:
-            if (ev.get("type","").lower() == "card") and ("red" in (ev.get("detail","").lower())):
-                tname = (ev.get("team") or {}).get("name") or ""
-                if tname == home: red_h += 1
-                elif tname == away: red_a += 1
+            if (ev.get("type","").lower() == "card"):
+                detail = (ev.get("detail","") or "").lower()
+                if ("red" in detail) or ("second yellow" in detail):
+                    tname = (ev.get("team") or {}).get("name") or ""
+                    if tname == home: red_h += 1
+                    elif tname == away: red_a += 1
         except Exception:
             pass
 
@@ -403,6 +460,27 @@ def _stats_coverage_ok(feat: Dict[str, float], min_fields: int) -> bool:
     nonzero = sum(1 for v in fields if (v or 0) > 0)
     return nonzero >= max(0, int(min_fields))
 
+# NEW: offered odds for a suggestion
+def _offered_odds(head: str, suggestion: str, odds: Dict[str,Any]) -> Optional[float]:
+    s = (suggestion or "").strip().lower()
+    if head in ("WIN_HOME","DRAW","WIN_AWAY"):
+        m = (odds or {}).get("hda_odds") or {}
+        if "home win" in s: return m.get("home")
+        if s == "draw":     return m.get("draw")
+        if "away win" in s: return m.get("away")
+        return None
+    th = _ou_label(head)
+    if th is not None:
+        m = (odds or {}).get("ou_odds") or {}
+        d = m.get(th) or {}
+        if s.startswith("over "):  return d.get("over")
+        if s.startswith("under "): return d.get("under")
+        return None
+    if head == "BTTS":
+        # If you later add BTTS odds parsing, wire it here.
+        return None
+    return None
+
 def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float]) -> List[Tuple[str,str,float,str]]:
     out: List[Tuple[str,str,float,str]] = []
     th = _ou_label(code)
@@ -428,6 +506,18 @@ def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float
     out.append((code, f"{code}: No", 1.0 - p, code))
     return out
 
+# NEW: minute + stats quality gate
+def _quality_gate(feat: Dict[str,float]) -> bool:
+    minute = int(feat.get("minute", 0))
+    if minute < MINUTE_MIN or minute > MINUTE_MAX:
+        return False
+    if minute >= REQ_AFTER_MIN:
+        if not _stats_coverage_ok(feat, REQ_MIN_FIELDS):
+            return False
+        if (feat.get("sot_sum", 0.0) or 0.0) < REQ_MIN_SOT_SUM and (feat.get("xg_sum", 0.0) or 0.0) < REQ_MIN_XG_SUM:
+            return False
+    return True
+
 def _apply_filter_with_odds(
     suggestions: List[Tuple[str,str,float,str]],
     minute: int,
@@ -437,19 +527,33 @@ def _apply_filter_with_odds(
     min_quota: float,
     top_k: int = 2,
     min_fields_after_minute: Tuple[int,int] = (REQUIRE_STATS_AFTER_MINUTE, REQUIRE_DATA_FIELDS)
-) -> List[Tuple[str,str,float,str,float,float,float]]:
+) -> List[Tuple[str,str,float,str,float,float,float,Optional[float]]]:
+    """
+    Returns tuples: (market, suggestion, p, head, base, lift, edge_quota, offered_odds)
+    Filtering requires offered_odds >= MIN_DEC_ODDS (if odds available) and model p >= min_prob.
+    """
     out = []
     req_minute, req_fields = min_fields_after_minute
     for market, sugg, p, head in suggestions:
         if req_minute and minute >= req_minute and not _stats_coverage_ok(feat, req_fields):
             continue
+
+        offered = _offered_odds(head, sugg, odds)
+        # Enforce bookmaker minimum odds if we know them
+        if offered is not None and offered < MIN_DEC_ODDS:
+            continue
+
         base = _baseline_from_odds(head, sugg, odds)
         if base is None:
             base = _head_prevalence(head)
+
         lift = p - base
-        q = _quota(p, base)
-        if p >= min_prob and q >= min_quota:
-            out.append((market, sugg, p, head, base, lift, q))
+        edge_q = _quota(p, base)  # still useful for sorting/telemetry
+
+        if p >= min_prob:
+            out.append((market, sugg, p, head, base, lift, edge_q, offered))
+
+    # Sort by edge ratio, then lift, then model p
     out.sort(key=lambda x: (x[6], x[5], x[2]), reverse=True)
     return out[:max(1, int(top_k))]
 
@@ -484,20 +588,23 @@ def _rationale_from_feat(feat: Dict[str, float]) -> str:
 
 def _format_tip_message(
     league: str, home: str, away: str, minute: int, score_txt: str,
-    suggestion: str, prob: float, baseline: float, lift: float, quota: float, rationale: str
+    suggestion: str, prob: float, baseline: float, lift: float, quota: float, rationale: str,
+    offered_odds: Optional[float] = None
 ) -> str:
     prob_pct = min(99.0, max(0.0, prob * 100.0))
     base_pct = min(99.0, max(0.0, baseline * 100.0))
-    display_quota = min(quota, 10.0)
-    return (
-        "⚽️ New Tip!\n"
-        f"Match: {home} vs {away}\n"
-        f"⏰ Minute: {minute}' | Score: {score_txt}\n"
-        f"Tip: {suggestion}\n"
-        f"📈 Model {prob_pct:.1f}% | Odds-implied {base_pct:.1f}% | Edge +{lift*100:.1f} pp | Quota ×{display_quota:.2f}\n"
-        f"🔎 Why: {rationale}\n"
-        f"🏆 League: {league}"
-    )
+    parts = [
+        "⚽️ New Tip!",
+        f"Match: {home} vs {away}",
+        f"⏰ Minute: {minute}' | Score: {score_txt}",
+        f"Tip: {suggestion}",
+        f"📈 Model {prob_pct:.1f}% | Odds-implied {base_pct:.1f}% | Edge +{lift*100:.1f} pp",
+    ]
+    if offered_odds:
+        parts.append(f"💸 Odds {offered_odds:.2f}")
+    parts.append(f"🔎 Why: {rationale}")
+    parts.append(f"🏆 League: {league}")
+    return "\n".join(parts)
 
 def _pretty_score(m: Dict[str,Any]) -> str:
     gh = (m.get("goals") or {}).get("home") or 0
@@ -626,6 +733,11 @@ def production_scan() -> Tuple[int,int]:
                 fid = int((m.get("fixture", {}) or {}).get("id") or 0)
                 if not fid: continue
                 feat = extract_features(m)
+
+                # NEW: quality gate to reduce trash
+                if not _quality_gate(feat):
+                    continue
+
                 minute = int(feat.get("minute", 0))
                 odds = fetch_fixture_odds(fid)
 
@@ -643,7 +755,7 @@ def production_scan() -> Tuple[int,int]:
                 home, away = _teams(m)
                 score_txt = _pretty_score(m)
 
-                for market, suggestion, prob, head, base, lift, q in filtered:
+                for market, suggestion, prob, head, base, lift, q, offered in filtered:
                     cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
                     dup = conn.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND market=%s AND suggestion=%s AND created_ts>=%s LIMIT 1",
@@ -662,7 +774,7 @@ def production_scan() -> Tuple[int,int]:
                         league=league, home=home, away=away,
                         minute=minute, score_txt=score_txt,
                         suggestion=suggestion, prob=prob, baseline=base, lift=lift, quota=q,
-                        rationale=rationale
+                        rationale=rationale, offered_odds=offered
                     )
                     send_telegram(msg)
                     saved += 1
@@ -748,11 +860,17 @@ def add_security_headers(resp):
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
     ai_tag = "AI‑only" if ONLY_MODEL_MODE else "legacy"
-    return f"🤖 Robi Superbrain is active ({mode}, {ai_tag}) · DB=Postgres · MIN_PROB={MIN_PROB:.2f} · MIN_QUOTA={MIN_QUOTA:.2f}"
+    return f"🤖 Robi Superbrain is active ({mode}, {ai_tag}) · DB=Postgres · MIN_PROB={MIN_PROB:.2f} · MIN_DEC_ODDS={MIN_DEC_ODDS:.2f}"
 
 @app.route("/healthz")
 def healthz():
-    return jsonify({"ok": True, "mode": ("HARVEST" if HARVEST_MODE else "PRODUCTION"), "ai_only": ONLY_MODEL_MODE})
+    db_ok = True
+    try:
+        with db_conn() as conn:
+            conn.execute("SELECT 1")
+    except Exception:
+        db_ok = False
+    return jsonify({"ok": True, "mode": ("HARVEST" if HARVEST_MODE else "PRODUCTION"), "ai_only": ONLY_MODEL_MODE, "db_ok": db_ok})
 
 @app.route("/predict/models")
 def predict_models_route():
@@ -764,7 +882,7 @@ def predict_models_route():
 def predict_scan_route():
     _require_api_key()
     saved, live = production_scan()
-    return jsonify({"ok": True, "live_seen": live, "tips_saved": saved, "min_prob": MIN_PROB, "min_quota": MIN_QUOTA})
+    return jsonify({"ok": True, "live_seen": live, "tips_saved": saved, "min_prob": MIN_PROB, "min_dec_odds": MIN_DEC_ODDS})
 
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
