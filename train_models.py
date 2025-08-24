@@ -237,19 +237,112 @@ def main():
         df_all = load_snapshots_with_labels(conn, args.min_minute)
         if df_all.empty:
             print("Not enough labeled data yet.", flush=True)
-            sys.exit(0)  # benign
+            sys.exit(0)
 
         if len(df_all) < args.min_rows:
             print(f"Need more data: {len(df_all)} < min-rows {args.min_rows}.", flush=True)
-            sys.exit(0)  # benign
+            sys.exit(0)
 
-        # ... (unchanged training code) ...
+        # time-based holdout
+        tr_df, te_df = _time_holdout_split(df_all, test_size=args.test_size)
 
-        print("Saved model_v2:* (+ optional baselines/policy for back‑compat) and model_coeffs.", flush=True)
-        sys.exit(0)  # success
+        heads: Dict[str, Dict[str, Any]] = {}
+        metrics_all: Dict[str, Dict[str, Any]] = {}
+
+        def train_head(y_name: str, code: str):
+            nonlocal heads, metrics_all
+            y_tr = tr_df[y_name].astype(int).values
+            y_te = te_df[y_name].astype(int).values
+            if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
+                return
+            tr_core, tr_cal = _calibration_split(tr_df, frac=args.calib_frac)
+            X_core = _as_matrix(tr_core); y_core = tr_core[y_name].astype(int).values
+            X_cal  = _as_matrix(tr_cal);  y_cal  = tr_cal[y_name].astype(int).values
+            X_te   = _as_matrix(te_df)
+
+            pipe = _fit_lr_balanced(X_core, y_core)
+            z_cal = _decision_function(pipe, X_cal)
+            a, b = _fit_platt(z_cal, y_cal)
+
+            z_te = _decision_function(pipe, X_te)
+            p_te = _platt_proba(z_te, a, b)
+
+            try:
+                auc = roc_auc_score(y_te, p_te)
+            except Exception:
+                auc = float("nan")
+            brier = brier_score_loss(y_te, p_te)
+            acc = accuracy_score(y_te, (p_te >= 0.5).astype(int))
+            prev = float(y_tr.mean())
+
+            metrics_all[code] = {
+                "brier": float(brier), "acc": float(acc), "auc": float(auc),
+                "n": int(len(y_te)), "prevalence": float(prev),
+                "majority_acc": float(max(prev, 1 - prev)),
+                "calibrated": True, "calibration_method": "sigmoid",
+                "time_split": True
+            }
+            heads[code] = _pipe_to_v2(pipe, FEATURES, (a, b))
+
+        # OU heads
+        for th in OU_THRESHOLDS:
+            code = _ou_code(th)
+            tr_df[code] = (tr_df["final_total"] >= th).astype(int)
+            te_df[code] = (te_df["final_total"] >= th).astype(int)
+            train_head(code, code)
+
+        # BTTS + 1X2
+        for (code, col) in [
+            ("BTTS", "label_btts"),
+            ("WIN_HOME", "label_win_home"),
+            ("DRAW", "label_draw"),
+            ("WIN_AWAY", "label_win_away"),
+        ]:
+            train_head(code, col)
+
+        if not heads:
+            print("No heads trained (insufficient variation).", flush=True)
+            sys.exit(0)
+
+        # Persist models
+        for code, v2 in heads.items():
+            _exec(conn,
+                  "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                  (f"model_v2:{_head(code)}", json.dumps(v2)))
+
+        if "BTTS" in heads:
+            _exec(conn,
+                  "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                  ("model_v2:BTTS_YES", json.dumps(heads["BTTS"])))
+
+        baselines = build_baselines(df_all, list(heads.keys()))
+        _exec(conn,
+              "INSERT INTO settings(key,value) VALUES(%s,%s) "
+              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+              ("policy:baselines_v1", json.dumps(baselines)))
+
+        policy = {"global": {"top_k_per_match": 2, "min_quota": 1.50}}
+        _exec(conn,
+              "INSERT INTO settings(key,value) VALUES(%s,%s) "
+              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+              ("policy:heads_v1", json.dumps(policy)))
+
+        audit = {
+            "trained_at_utc": datetime.utcnow().isoformat() + "Z",
+            "features": FEATURES,
+            "metrics": metrics_all
+        }
+        _exec(conn,
+              "INSERT INTO settings(key,value) VALUES(%s,%s) "
+              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+              ("model_coeffs", json.dumps(audit)))
+
+        print("Saved model_v2:* (+ optional baselines/policy for back-compat) and model_coeffs.", flush=True)
+        sys.exit(0)
 
     except Exception as e:
-        # bubble up as a real failure so ops can see it
         print(f"[TRAIN] exception: {e}", flush=True)
         sys.exit(1)
     finally:
