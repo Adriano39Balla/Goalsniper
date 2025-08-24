@@ -1,7 +1,7 @@
-# train_models.py
 # path: ./train_models.py
 import argparse
 import json
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -26,9 +26,17 @@ FEATURES = [
 OU_THRESHOLDS = [1.5, 2.5, 3.5, 4.5]
 
 # ──────────────────────────────────────────────────────────────────────────────
-def _connect(db_url: str):
+def _normalize_db_url(db_url: str) -> str:
+    if not db_url:
+        return db_url
+    if db_url.startswith("postgres://"):
+        db_url = "postgresql://" + db_url[len("postgres://"):]
     if "sslmode=" not in db_url:
         db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
+    return db_url
+
+def _connect(db_url: str):
+    db_url = _normalize_db_url(db_url)
     conn = psycopg2.connect(db_url)
     conn.autocommit = True
     return conn
@@ -86,7 +94,7 @@ def _platt_proba(z: np.ndarray, a: float, b: float) -> np.ndarray:
 def _pipe_to_v2(pipe: Pipeline, feature_names: List[str], cal: Optional[Tuple[float, float]]) -> Dict[str, Any]:
     clf: LogisticRegression = pipe.named_steps["clf"]
     scale: StandardScaler = pipe.named_steps["scale"]
-    # why: export weights in input feature space (pre‑scaled): w' = w / std, b' = b - sum(w*mean/std)
+    # export weights in input feature space (pre‑scaled)
     coef = clf.coef_.ravel()
     std = scale.scale_; mean = scale.mean_
     std = np.where(std == 0.0, 1.0, std)
@@ -211,14 +219,19 @@ def build_baselines(df: pd.DataFrame, heads_present: List[str]) -> Dict[str, Dic
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-url", required=True)
+    # allow --db-url or env var
+    ap.add_argument("--db-url", default=None)
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=15)
     ap.add_argument("--test-size", type=float, default=0.25)
     ap.add_argument("--calib-frac", type=float, default=0.2)
     ap.add_argument("--min-rows", type=int, default=800)
     args = ap.parse_args()
 
-    conn = _connect(args.db_url)
+    db_url = args.db_url or os.getenv("DATABASE_URL")
+    if not db_url:
+        raise SystemExit("DATABASE_URL required (pass --db-url or set env)")
+
+    conn = _connect(db_url)
     try:
         df_all = load_snapshots_with_labels(conn, args.min_minute)
         if df_all.empty:
@@ -293,14 +306,14 @@ def main():
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
                   (f"model_v2:{_head(code)}", json.dumps(v2)))
 
-        # Optional: back‑compat alias for BTTS_YES
+        # Back‑compat alias for BTTS_YES
         if "BTTS" in heads:
             _exec(conn,
                   "INSERT INTO settings(key,value) VALUES(%s,%s) "
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
                   ("model_v2:BTTS_YES", json.dumps(heads["BTTS"])))
 
-        # Optional legacy baselines/policy (kept but no longer used by main)
+        # Optional legacy policy/baselines (main.py doesn't rely on them anymore)
         baselines = build_baselines(df_all, list(heads.keys()))
         _exec(conn,
               "INSERT INTO settings(key,value) VALUES(%s,%s) "
