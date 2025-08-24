@@ -40,7 +40,6 @@ O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))
 BTTS_LATE_MINUTE    = int(os.getenv("BTTS_LATE_MINUTE", "88"))
 UNDER_SUPPRESS_AFTER_MIN = int(os.getenv("UNDER_SUPPRESS_AFTER_MIN", "82"))
 
-# FIXED: removed extra ')'
 ONLY_MODEL_MODE          = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false","False","no","NO")
 REQUIRE_STATS_MINUTE     = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
 REQUIRE_DATA_FIELDS      = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
@@ -52,7 +51,6 @@ MOTD_CONF_MIN       = int(os.getenv("MOTD_CONF_MIN", "65"))
 
 ALLOWED_SUGGESTIONS = {"Over 2.5 Goals", "Under 2.5 Goals", "BTTS: Yes", "BTTS: No"}
 
-# FIXED: removed extra ')'
 TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
@@ -193,10 +191,19 @@ def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
         return row[0] if row else default
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
+def tg_escape(s: str) -> str:
+    """Telegram HTML mode needs only &, <, > escaped."""
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": escape(message), "parse_mode": "HTML"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": tg_escape(message),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     if inline_keyboard:
         payload["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard})
     try:
@@ -204,6 +211,18 @@ def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
         return res.ok
     except Exception:
         return False
+
+def _format_tip_message(league: str, home: str, away: str, minute: int, score_txt: str,
+                        suggestion: str, confidence_pct: float) -> str:
+    # Emoji-first, simple newlines (your preferred style)
+    return (
+        "⚽️ New Tip!\n"
+        f"Match: {home} vs {away}\n"
+        f"⏰ Minute: {minute}' | Score: {score_txt}\n"
+        f"Tip: {suggestion}\n"
+        f"📉 Confidence: {confidence_pct:.0f}%\n"
+        f"🏆 League: {league}"
+    )
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 def _api_get(url: str, params: dict, timeout: int = 15):
@@ -521,16 +540,6 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
     return updated, len(ids)
 
 # ── Model loading & prediction ────────────────────────────────────────────────
-# Expected model format in settings (JSON):
-# {
-#   "intercept": float,
-#   "weights": {"minute": ..., "goals_sum": ..., "goals_h": ..., "goals_a": ..., "goals_diff": ..., "red_sum": ..., "red_h": ..., "red_a": ...},
-#   "calibration": {"method": "sigmoid" | "platt", "a": 1.0, "b": 0.0}
-# }
-# Keys searched (first match wins):
-#   model_v2:BTTS_YES / model_v2:O25  (preferred)
-#   model_latest:BTTS_YES / model_latest:O25
-#   model:BTTS_YES / model:O25
 MODEL_KEYS_ORDER = [
     "model_v2:{name}",
     "model_latest:{name}",
@@ -554,7 +563,6 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
             continue
         try:
             mdl = json.loads(raw)
-            # sanity defaults
             mdl.setdefault("intercept", 0.0)
             mdl.setdefault("weights", {})
             cal = mdl.get("calibration") or {}
@@ -580,7 +588,6 @@ def _calibrate(p: float, cal: Dict[str,Any]) -> float:
         a = float((cal or {}).get("a", 1.0))
         b = float((cal or {}).get("b", 0.0))
         return _sigmoid(a * (p if p == 0 or p == 1 else (float(p) if isinstance(p,(float,int)) else 0.0)) + b)
-    # default: already logistic; allow optional a,b
     a = float((cal or {}).get("a", 1.0))
     b = float((cal or {}).get("b", 0.0))
     import math
@@ -613,16 +620,11 @@ def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
     t = (m.get("teams") or {}) or {}
     return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
 
-# ── Production scan (save + notify) ───────────────────────────────────────────
+# ── Production scan ───────────────────────────────────────────────────────────
 def production_scan() -> Tuple[int,int]:
     """
     Generate tips using models for O25 and BTTS: Yes.
-    Saves to DB and sends the strongest (highest‑confidence) tip per match
-    to Telegram. Still respects:
-      - CONF_THRESHOLD (percent)
-      - DUP_COOLDOWN_MIN
-      - late-minute suppressors
-      - REQUIRE_STATS_MINUTE / REQUIRE_DATA_FIELDS
+    Sends Telegram messages in '⚽️ New Tip!' format.
     """
     matches = fetch_live_matches()
     live_seen = len(matches)
@@ -646,7 +648,7 @@ def production_scan() -> Tuple[int,int]:
                 if not fid:
                     continue
 
-                # cooldown: if we wrote a tip for this match recently, skip
+                # cooldown
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
                     dup = conn.execute(
@@ -659,12 +661,11 @@ def production_scan() -> Tuple[int,int]:
                 feat = extract_features(m)
                 minute = int(feat.get("minute", 0))
 
-                # require minimal stats after threshold
+                # Require minimal stats after minute threshold
                 if not stats_coverage_ok(feat, minute):
                     continue
 
-                # compute candidate predictions
-                preds: List[Tuple[str,str,float]] = []  # (market_code, suggestion, prob)
+                preds: List[Tuple[str,str,float]] = []  # (market, suggestion, prob)
 
                 if mdl_o25:
                     p_over = _score_prob(feat, mdl_o25)
@@ -681,33 +682,31 @@ def production_scan() -> Tuple[int,int]:
                 if not preds:
                     continue
 
-                # pick the strongest tip only
                 preds.sort(key=lambda x: x[2], reverse=True)
-                market_code, suggestion, prob = preds[0]
 
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
                 score_txt = _pretty_score(m)
 
-                # write to DB
-                now = int(time.time())
-                conn.execute("""
-                    INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
-                """, (
-                    fid, league_id, league, home, away,
-                    ("Over/Under 2.5" if market_code=="O25" else "BTTS"),
-                    suggestion, float(prob*100.0), score_txt, minute, now
-                ))
-                saved += 1
-
-                # send to Telegram (best‑effort, no crash if Telegram is down)
-                try:
-                    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                        msg = _fmt_tip_msg(league, home, away, minute, score_txt, suggestion, prob)
-                        send_telegram(msg)
-                except Exception as e:
-                    logging.warning("[PROD] telegram send failed: %s", e)
+                # Insert + send (respect MAX_TIPS_PER_SCAN)
+                for market_code, suggestion, prob in preds:
+                    now = int(time.time())
+                    conn.execute("""
+                        INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+                    """, (fid, league_id, league, home, away,
+                          ("Over/Under 2.5" if market_code=="O25" else "BTTS"),
+                          suggestion, float(prob*100.0), score_txt, minute, now))
+                    # send Telegram in your preferred style
+                    msg = _format_tip_message(
+                        league=league, home=home, away=away,
+                        minute=minute, score_txt=score_txt,
+                        suggestion=suggestion, confidence_pct=prob*100.0
+                    )
+                    send_telegram(msg)
+                    saved += 1
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        break
 
                 if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
                     break
@@ -859,7 +858,6 @@ def _berlin_midnight_utc_ts() -> int:
     return int(today_berlin.timestamp())
 
 def _rank_boost(league_id: Optional[int]) -> int:
-    """Slight preference to curated leagues."""
     if not league_id: return 0
     try:
         if int(league_id) in LEAGUE_PRIORITY_IDS:
@@ -869,10 +867,6 @@ def _rank_boost(league_id: Optional[int]) -> int:
     return 0
 
 def motd_candidates(limit:int=5) -> List[Dict[str,Any]]:
-    """
-    Returns best matches today (Europe/Berlin day) ranked by max confidence among allowed suggestions,
-    requiring at least MOTD_MIN_SAMPLES rows for that match_id today and min confidence.
-    """
     since_ts = _berlin_midnight_utc_ts()
     allowed = sorted(ALLOWED_SUGGESTIONS)
     with db_conn() as conn:
@@ -906,7 +900,6 @@ def motd_candidates(limit:int=5) -> List[Dict[str,Any]]:
             LIMIT %s
         """, (since_ts, allowed, MOTD_MIN_SAMPLES, MOTD_CONF_MIN, limit)).fetchall()
 
-    # Convert to dicts and boost preferred leagues by re-sorting in Python (stable)
     cands = []
     for r in rows:
         (match_id, league_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts, n) = r
@@ -942,17 +935,6 @@ def _motd_already_announced_for_today() -> Optional[int]:
 def _save_motd_sent(match_id: int):
     rec = {"ts": int(time.time()), "match_id": int(match_id)}
     set_setting("motd:last_sent", json.dumps(rec))
-
-def _fmt_tip_msg(league:str, home:str, away:str, minute:int, score_txt:str,
-                 suggestion:str, prob:float) -> str:
-    return (
-        "🎯 <b>Robi Tip</b>\n"
-        f"{escape(home)} vs {escape(away)}\n"
-        f"🏆 {escape(league)}\n"
-        f"⏱️ {minute}'   🔢 {score_txt}\n"
-        f"💡 Suggestion: <b>{escape(suggestion)}</b>\n"
-        f"🧮 Confidence: <b>{prob*100:.1f}%</b>"
-    )
 
 def _fmt_motd_message(c: Dict[str,Any]) -> str:
     title = "⭐️ <b>Match of the Day</b>"
@@ -1022,14 +1004,12 @@ def _require_api_key():
 
 @app.route("/predict/scan")
 def predict_scan_route():
-    """Manual trigger for one production scan (admin only)."""
     _require_api_key()
     saved, live = production_scan()
     return jsonify({"ok": True, "mode": "PRODUCTION", "live_seen": live, "tips_saved": saved})
 
 @app.route("/predict/models")
 def predict_models_route():
-    """Inspect current models loaded from settings."""
     _require_api_key()
     o25 = load_model_from_settings("O25")
     btts = load_model_from_settings("BTTS_YES")
@@ -1204,28 +1184,9 @@ def stats_config():
         "LEAGUE_PRIORITY_IDS": LEAGUE_PRIORITY_IDS,
     })
 
-# MOTD endpoints
-@app.route("/motd/preview")
-def motd_preview_route():
-    _require_api_key()
-    limit = request.args.get("limit")
-    try:
-        limit = int(limit) if limit and str(limit).isdigit() else 5
-    except Exception:
-        limit = 5
-    cands = motd_candidates(limit=limit)
-    return jsonify({"ok": True, "candidates": cands, "already_sent_today": bool(_motd_already_announced_for_today())})
-
-@app.route("/motd/announce", methods=["POST"])
-def motd_announce_route():
-    _require_api_key()
-    res = motd_announce()
-    return jsonify(res)
-
-# Helper used by /harvest/bulk_leagues endpoint (left as-is)
+# Helper used by /harvest/bulk_leagues
 def _run_bulk_leagues(leagues: List[int], seasons: List[int]) -> Dict[str,Any]:
     if not leagues:
-        # Curated default top comps if none supplied
         leagues = LEAGUE_PRIORITY_IDS or [39,140,135,78,61,2]
     results = []
     total = {"requested":0,"processed":0,"saved":0}
@@ -1258,14 +1219,12 @@ if __name__ == "__main__":
 
     # 24/7: harvest or production depending on knob (Europe/Berlin)
     if HARVEST_MODE:
-        # HARVEST alle 10m
         scheduler.add_job(
             harvest_scan,
             CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")),
             id="harvest",
             replace_existing=True,
         )
-        # Backfill finals every 15m
         scheduler.add_job(
             backfill_results_from_snapshots,
             "interval",
@@ -1275,7 +1234,6 @@ if __name__ == "__main__":
         )
         logging.info("⛏️  Running in HARVEST mode.")
     else:
-        # PRODUCTION: score & write tips every 5m (tighter for latency)
         scheduler.add_job(
             production_scan,
             CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
@@ -1304,7 +1262,7 @@ if __name__ == "__main__":
         coalesce=True,
     )
 
-    # Daily MOTD announce (optional; controlled by MOTD_PREDICT)
+    # Daily MOTD announce (optional)
     if MOTD_PREDICT:
         scheduler.add_job(
             motd_announce,
