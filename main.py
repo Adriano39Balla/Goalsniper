@@ -121,6 +121,19 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
 
+# ── Settings helpers (used by nightly jobs)
+def set_setting(key: str, value: str):
+    with db_conn() as conn:
+        conn.execute("""
+            INSERT INTO settings(key,value) VALUES(%s,%s)
+            ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
+        """, (key, value))
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with db_conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
+        return row[0] if row else default
+
 # ──────────────────────────────────────────────────────────────────────────────
 # API + features
 def _api_get(url: str, params: dict, timeout: int = 15):
@@ -362,6 +375,136 @@ def _format_tip_message(league: str, home: str, away: str, minute: int, score_tx
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Nightly reporting & training
+def _counts_since(ts_from: int) -> Dict[str, int]:
+    with db_conn() as conn:
+        snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
+        tips_total = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+        res_total  = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
+        unlabeled  = conn.execute("""
+            SELECT COUNT(DISTINCT s.match_id)
+            FROM tip_snapshots s
+            LEFT JOIN match_results r ON r.match_id = s.match_id
+            WHERE r.match_id IS NULL
+        """).fetchone()[0]
+        snap_24h = conn.execute("SELECT COUNT(*) FROM tip_snapshots WHERE created_ts>=%s", (ts_from,)).fetchone()[0]
+        res_24h  = conn.execute("SELECT COUNT(*) FROM match_results WHERE updated_ts>=%s", (ts_from,)).fetchone()[0]
+    return {
+        "snap_total": int(snap_total),
+        "tips_total": int(tips_total),
+        "res_total": int(res_total),
+        "unlabeled": int(unlabeled),
+        "snap_24h": int(snap_24h),
+        "res_24h": int(res_24h),
+    }
+
+def nightly_digest_job():
+    try:
+        now = int(time.time())
+        day_ago = now - 24*3600
+        c = _counts_since(day_ago)
+        msg = (
+            "📊 <b>Robi Nightly Digest</b>\n"
+            f"Snapshots: {c['snap_total']} (+ {c['snap_24h']} last 24h)\n"
+            f"Finals: {c['res_total']} (+ {c['res_24h']} last 24h)\n"
+            f"Unlabeled match_ids: {c['unlabeled']}\n"
+            "Models retrain at 03:00 CEST daily."
+        )
+        logging.info("[DIGEST]\n%s", msg.replace("<b>","").replace("</b>",""))
+        send_telegram(msg)
+        return True
+    except Exception as e:
+        logging.exception("[DIGEST] failed: %s", e)
+        return False
+
+def _top_feature_strings(model: Dict[str,Any], k: int = 8) -> str:
+    try:
+        ws = model.get("weights", {}) or {}
+        items = sorted(ws.items(), key=lambda kv: abs(float(kv[1] or 0.0)), reverse=True)[:k]
+        parts = []
+        for name, w in items:
+            w = float(w or 0.0)
+            parts.append(f"{name}={'+' if w>=0 else ''}{w:.3f}")
+        icpt = float(model.get("intercept", 0.0))
+        parts.append(f"intercept={'+' if icpt>=0 else ''}{icpt:.3f}")
+        return " | ".join(parts)
+    except Exception:
+        return "(no weights)"
+
+def _metrics_blob_for_telegram() -> str:
+    raw = get_setting("model_coeffs")
+    if not raw:
+        return "{}"
+    try:
+        js = json.loads(raw)
+        keep = {
+            "ok": True,
+            "trained_at_utc": js.get("trained_at_utc"),
+            "counts": {k: int(v.get("n", 0)) if isinstance(v, dict) else v
+                       for k, v in (js.get("metrics") or {}).items()},
+            "metrics": js.get("metrics", {}),
+        }
+        return json.dumps(keep, ensure_ascii=False)
+    except Exception:
+        return raw[:900]
+
+def retrain_models_job():
+    if not TRAIN_ENABLE:
+        logging.info("[TRAIN] skipped (TRAIN_ENABLE=0)")
+        return {"ok": False, "skipped": True, "reason": "TRAIN_ENABLE=0"}
+
+    cmd = (
+        f"python -u train_models.py "
+        f"--db-url \"{os.getenv('DATABASE_URL','')}\" "
+        f"--min-minute {TRAIN_MIN_MINUTE}"
+    )
+    logging.info(f"[TRAIN] starting: {cmd}")
+    try:
+        proc = subprocess.run(
+            shlex.split(cmd),
+            capture_output=True,
+            text=True,
+            timeout=900
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
+
+        models = _list_models("model_v2:")
+        chosen_key = None
+        for key in ("BTTS","BTTS_YES","O25","O15"):
+            if key in models: chosen_key = key; break
+        if not chosen_key and models:
+            chosen_key = sorted(models.keys())[0]
+
+        top_line = ""
+        if chosen_key:
+            top_line = f"[{chosen_key}] top | " + _top_feature_strings(models[chosen_key], 8)
+
+        metrics_json = _metrics_blob_for_telegram()
+        set_setting("model_metrics_latest", metrics_json)
+
+        emoji = "✅" if proc.returncode == 0 else "❌"
+        msg = (
+            f"{emoji} Nightly training {'OK' if proc.returncode == 0 else 'failed'}\n"
+            f"{top_line}\n"
+            f"Saved model_metrics_latest in settings.\n"
+            f"{metrics_json}"
+        )
+        send_telegram(msg)
+
+        return {"ok": proc.returncode == 0, "code": proc.returncode,
+                "stdout": out[-2000:], "stderr": err[-1000:]}
+    except subprocess.TimeoutExpired:
+        logging.error("[TRAIN] timed out (15 min)")
+        send_telegram("❌ Nightly training timed out.")
+        return {"ok": False, "timeout": True}
+    except Exception as e:
+        logging.exception(f"[TRAIN] exception: {e}")
+        send_telegram(f"❌ Nightly training exception: {e}")
+        return {"ok": False, "error": str(e)}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Scanning (AI‑only emits ALL qualifying markets)
 def production_scan() -> Tuple[int,int]:
     matches = fetch_live_matches()
@@ -531,25 +674,7 @@ def predict_models_route():
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
     _require_api_key()
-    if not TRAIN_ENABLE:
-        return jsonify({"ok": False, "skipped": True, "reason": "TRAIN_ENABLE=0"})
-    cmd = (
-        f"python -u train_models.py "
-        f"--db-url \"{os.getenv('DATABASE_URL','')}\" "
-        f"--min-minute {TRAIN_MIN_MINUTE}"
-    )
-    logging.info(f"[TRAIN] starting: {cmd}")
-    try:
-        proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=900)
-        out = (proc.stdout or "").strip(); err = (proc.stderr or "").strip()
-        logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
-        return jsonify({"ok": proc.returncode == 0, "code": proc.returncode, "stdout": out[-2000:], "stderr": err[-1000:]})
-    except subprocess.TimeoutExpired:
-        logging.error("[TRAIN] timed out")
-        return jsonify({"ok": False, "timeout": True})
-    except Exception as e:
-        logging.exception(f"[TRAIN] exception: {e}")
-        return jsonify({"ok": False, "error": str(e)})
+    return jsonify(retrain_models_job())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint / Scheduler
@@ -568,6 +693,26 @@ if __name__ == "__main__":
     else:
         scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")), id="production_scan", replace_existing=True)
         logging.info("🎯 Running in PRODUCTION mode (AI-only=%s, MIN_PROB=%.2f).", ONLY_MODEL_MODE, MIN_PROB)
+
+    # Nightly training at 03:00 Europe/Berlin
+    scheduler.add_job(
+        retrain_models_job,
+        CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+        id="train",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
+    # Nightly digest at 03:02 Europe/Berlin
+    scheduler.add_job(
+        nightly_digest_job,
+        CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
+        id="digest",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
 
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
