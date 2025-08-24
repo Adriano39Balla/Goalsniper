@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 import psycopg2
 
-# why: consistent, explicit feature order for weight export
+# consistent, explicit feature order for weight export
 FEATURES = [
     "minute","goals_h","goals_a","goals_sum","goals_diff",
     "xg_h","xg_a","xg_sum","xg_diff",
@@ -50,22 +50,21 @@ def _exec(conn, sql: str, params: Tuple):
         cur.execute(sql, params)
 
 def _time_holdout_split(df: pd.DataFrame, test_size: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # why: avoid leakage from random shuffle; hold out the most recent chunk by created_ts
+    # avoid leakage from random shuffle; hold out the most recent chunk by created_ts
     df = df.sort_values("created_ts").reset_index(drop=True)
     n = len(df); k = max(1, int(round(n * (1.0 - test_size))))
     return df.iloc[:k].copy(), df.iloc[k:].copy()
 
 def _calibration_split(df: pd.DataFrame, frac: float = 0.20) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # why: dedicate a small slice of train for Platt; keeps test untouched
+    # dedicate a small slice of train for Platt; keeps test untouched
     n = len(df); k = max(1, int(round(n * (1.0 - frac))))
     return df.iloc[:k].copy(), df.iloc[k:].copy()
 
 def _as_matrix(df: pd.DataFrame) -> np.ndarray:
-    X = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float).values
-    return X
+    return df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float).values
 
 def _fit_lr_balanced(X: np.ndarray, y: np.ndarray) -> Pipeline:
-    # why: scale improves convergence; liblinear for binary + balanced classes
+    # scale improves convergence; liblinear for binary + balanced classes
     pipe = Pipeline([
         ("scale", StandardScaler(with_mean=True, with_std=True)),
         ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", solver="liblinear"))
@@ -76,8 +75,7 @@ def _fit_lr_balanced(X: np.ndarray, y: np.ndarray) -> Pipeline:
 def _decision_function(pipe: Pipeline, X: np.ndarray) -> np.ndarray:
     clf: LogisticRegression = pipe.named_steps["clf"]
     scale: StandardScaler = pipe.named_steps["scale"]
-    Z = clf.decision_function(scale.transform(X))
-    return Z
+    return clf.decision_function(scale.transform(X))
 
 def _fit_platt(z_tr: np.ndarray, y_tr: np.ndarray) -> Tuple[float, float]:
     # logistic on logits; single feature
@@ -88,8 +86,7 @@ def _fit_platt(z_tr: np.ndarray, y_tr: np.ndarray) -> Tuple[float, float]:
     return a, b
 
 def _platt_proba(z: np.ndarray, a: float, b: float) -> np.ndarray:
-    x = a * z + b
-    x = np.clip(x, -50, 50)
+    x = np.clip(a * z + b, -50, 50)
     return 1.0 / (1.0 + np.exp(-x))
 
 def _pipe_to_v2(pipe: Pipeline, feature_names: List[str], cal: Optional[Tuple[float, float]]) -> Dict[str, Any]:
@@ -108,9 +105,6 @@ def _pipe_to_v2(pipe: Pipeline, feature_names: List[str], cal: Optional[Tuple[fl
         "weights": weights,
         "calibration": {"method": "sigmoid", "a": float(a), "b": float(b)}
     }
-
-def _head(code: str) -> str:
-    return code
 
 def _ou_code(th: float) -> str:
     return f"O{int(round(th * 10)):02d}"
@@ -174,14 +168,13 @@ def load_snapshots_with_labels(conn, min_minute: int = 15) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(feats)
-    # cleanup
     df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     df["minute"] = df["minute"].clip(0, 120)
     df = df[df["minute"] >= min_minute].copy()
     return df
 
 def build_baselines(df: pd.DataFrame, heads_present: List[str]) -> Dict[str, Dict[str, float]]:
-    # legacy baseline table (kept for back‑compat; not used by updated main)
+    # legacy baseline table (optional)
     def bucket_minute(m):
         edges = [15, 30, 45, 60, 75, 90, 120]
         for i, e in enumerate(edges):
@@ -255,6 +248,7 @@ def main():
             y_te = te_df[y_name].astype(int).values
             if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
                 return
+            # calibration split on train
             tr_core, tr_cal = _calibration_split(tr_df, frac=args.calib_frac)
             X_core = _as_matrix(tr_core); y_core = tr_core[y_name].astype(int).values
             X_cal  = _as_matrix(tr_cal);  y_cal  = tr_cal[y_name].astype(int).values
@@ -298,7 +292,7 @@ def main():
             ("DRAW", "label_draw"),
             ("WIN_AWAY", "label_win_away"),
         ]:
-            train_head(code, col)
+            train_head(col, code)
 
         if not heads:
             print("No heads trained (insufficient variation).", flush=True)
@@ -309,122 +303,22 @@ def main():
             _exec(conn,
                   "INSERT INTO settings(key,value) VALUES(%s,%s) "
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                  (f"model_v2:{_head(code)}", json.dumps(v2)))
+                  (f"model_v2:{code}", json.dumps(v2)))
 
+        # Alias for BTTS_YES (back‑compat)
         if "BTTS" in heads:
             _exec(conn,
                   "INSERT INTO settings(key,value) VALUES(%s,%s) "
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
                   ("model_v2:BTTS_YES", json.dumps(heads["BTTS"])))
 
+        # Optional legacy policy/baselines
         baselines = build_baselines(df_all, list(heads.keys()))
         _exec(conn,
               "INSERT INTO settings(key,value) VALUES(%s,%s) "
               "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
               ("policy:baselines_v1", json.dumps(baselines)))
-
         policy = {"global": {"top_k_per_match": 2, "min_quota": 1.50}}
-        _exec(conn,
-              "INSERT INTO settings(key,value) VALUES(%s,%s) "
-              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-              ("policy:heads_v1", json.dumps(policy)))
-
-        audit = {
-            "trained_at_utc": datetime.utcnow().isoformat() + "Z",
-            "features": FEATURES,
-            "metrics": metrics_all
-        }
-        _exec(conn,
-              "INSERT INTO settings(key,value) VALUES(%s,%s) "
-              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-              ("model_coeffs", json.dumps(audit)))
-
-        print("Saved model_v2:* (+ optional baselines/policy for back-compat) and model_coeffs.", flush=True)
-        sys.exit(0)
-
-    except Exception as e:
-        print(f"[TRAIN] exception: {e}", flush=True)
-        sys.exit(1)
-    finally:
-        conn.close()
-
-        def train_head(y_name: str, code: str):
-            nonlocal heads, metrics_all
-            y_tr = tr_df[y_name].astype(int).values
-            y_te = te_df[y_name].astype(int).values
-            if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
-                return
-            # calibration split on train
-            tr_core, tr_cal = _calibration_split(tr_df, frac=args.calib_frac)
-            X_core = _as_matrix(tr_core); y_core = tr_core[y_name].astype(int).values
-            X_cal  = _as_matrix(tr_cal);  y_cal  = tr_cal[y_name].astype(int).values
-            X_te   = _as_matrix(te_df)
-
-            pipe = _fit_lr_balanced(X_core, y_core)
-            z_cal = _decision_function(pipe, X_cal)
-            a, b = _fit_platt(z_cal, y_cal)
-
-            z_te = _decision_function(pipe, X_te)
-            p_te = _platt_proba(z_te, a, b)
-
-            try:
-                auc = roc_auc_score(y_te, p_te)
-            except Exception:
-                auc = float("nan")
-            brier = brier_score_loss(y_te, p_te)
-            acc = accuracy_score(y_te, (p_te >= 0.5).astype(int))
-            prev = float(y_tr.mean())
-
-            metrics_all[code] = {
-                "brier": float(brier), "acc": float(acc), "auc": float(auc),
-                "n_test": int(len(y_te)), "prevalence": float(prev),
-                "majority_acc": float(max(prev, 1 - prev)),
-                "calibrated": True, "calibration_method": "sigmoid",
-                "time_split": True
-            }
-            heads[code] = _pipe_to_v2(pipe, FEATURES, (a, b))
-
-        # OU heads
-        for th in OU_THRESHOLDS:
-            code = _ou_code(th)
-            tr_df[code] = (tr_df["final_total"] >= th).astype(int)
-            te_df[code] = (te_df["final_total"] >= th).astype(int)
-            train_head(code, code)
-        # BTTS + 1X2
-        for (code, col) in [
-            ("BTTS", "label_btts"),
-            ("WIN_HOME", "label_win_home"),
-            ("DRAW", "label_draw"),
-            ("WIN_AWAY", "label_win_away"),
-        ]:
-            train_head(code, col)
-
-        if not heads:
-            print("No heads trained (insufficient variation)."); return
-
-        # Persist models
-        for code, v2 in heads.items():
-            _exec(conn,
-                  "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                  (f"model_v2:{_head(code)}", json.dumps(v2)))
-
-        # Back‑compat alias for BTTS_YES
-        if "BTTS" in heads:
-            _exec(conn,
-                  "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                  ("model_v2:BTTS_YES", json.dumps(heads["BTTS"])))
-
-        # Optional legacy policy/baselines (main.py doesn't rely on them anymore)
-        baselines = build_baselines(df_all, list(heads.keys()))
-        _exec(conn,
-              "INSERT INTO settings(key,value) VALUES(%s,%s) "
-              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-              ("policy:baselines_v1", json.dumps(baselines)))
-        policy = {
-            "global": {"top_k_per_match": 2, "min_quota": 1.50}
-        }
         _exec(conn,
               "INSERT INTO settings(key,value) VALUES(%s,%s) "
               "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
@@ -441,9 +335,17 @@ def main():
               "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
               ("model_coeffs", json.dumps(audit)))
 
-        print("Saved model_v2:* (+ optional baselines/policy for back‑compat) and model_coeffs.")
+        print("Saved model_v2:* (+ optional baselines/policy for back‑compat) and model_coeffs.", flush=True)
+        sys.exit(0)
+
+    except Exception as e:
+        print(f"[TRAIN] exception: {e}", flush=True)
+        sys.exit(1)
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
