@@ -41,7 +41,7 @@ TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 REQUIRE_STATS_AFTER_MINUTE = int(os.getenv("REQUIRE_STATS_AFTER_MINUTE", "35"))
 REQUIRE_DATA_FIELDS        = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
 
-# NEW: bookmaker odds + quality gates
+# Bookmaker odds + quality gates
 MIN_DEC_ODDS       = float(os.getenv("MIN_DEC_ODDS", "1.5"))   # Only send when offered odds >= this
 MINUTE_MIN         = int(os.getenv("MINUTE_MIN", "10"))        # ignore very early
 MINUTE_MAX         = int(os.getenv("MINUTE_MAX", "85"))        # ignore very late
@@ -130,7 +130,6 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS match_results (match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
-        # helpful composite indexes for de-dupe checks and recency
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tips_dedupe
             ON tips(match_id, market, suggestion, created_ts)
@@ -460,7 +459,6 @@ def _stats_coverage_ok(feat: Dict[str, float], min_fields: int) -> bool:
     nonzero = sum(1 for v in fields if (v or 0) > 0)
     return nonzero >= max(0, int(min_fields))
 
-# NEW: offered odds for a suggestion
 def _offered_odds(head: str, suggestion: str, odds: Dict[str,Any]) -> Optional[float]:
     s = (suggestion or "").strip().lower()
     if head in ("WIN_HOME","DRAW","WIN_AWAY"):
@@ -477,7 +475,6 @@ def _offered_odds(head: str, suggestion: str, odds: Dict[str,Any]) -> Optional[f
         if s.startswith("under "): return d.get("under")
         return None
     if head == "BTTS":
-        # If you later add BTTS odds parsing, wire it here.
         return None
     return None
 
@@ -506,7 +503,6 @@ def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float
     out.append((code, f"{code}: No", 1.0 - p, code))
     return out
 
-# NEW: minute + stats quality gate
 def _quality_gate(feat: Dict[str,float]) -> bool:
     minute = int(feat.get("minute", 0))
     if minute < MINUTE_MIN or minute > MINUTE_MAX:
@@ -539,7 +535,6 @@ def _apply_filter_with_odds(
             continue
 
         offered = _offered_odds(head, sugg, odds)
-        # Enforce bookmaker minimum odds if we know them
         if offered is not None and offered < MIN_DEC_ODDS:
             continue
 
@@ -548,12 +543,11 @@ def _apply_filter_with_odds(
             base = _head_prevalence(head)
 
         lift = p - base
-        edge_q = _quota(p, base)  # still useful for sorting/telemetry
+        edge_q = _quota(p, base)
 
         if p >= min_prob:
             out.append((market, sugg, p, head, base, lift, edge_q, offered))
 
-    # Sort by edge ratio, then lift, then model p
     out.sort(key=lambda x: (x[6], x[5], x[2]), reverse=True)
     return out[:max(1, int(top_k))]
 
@@ -682,10 +676,14 @@ def retrain_models_job():
     if not TRAIN_ENABLE:
         logging.info("[TRAIN] skipped (TRAIN_ENABLE=0)")
         return {"ok": False, "skipped": True, "reason": "TRAIN_ENABLE=0"}
-    cmd = f"python -u train_models.py --db-url \"{os.getenv('DATABASE_URL','')}\" --min-minute {TRAIN_MIN_MINUTE}"
-    logging.info(f"[TRAIN] starting: {cmd}")
+
+    # Pass DB URL via environment (no secrets in logs)
+    env = os.environ.copy()
+    env["DATABASE_URL"] = DATABASE_URL
+    cmd = ["python", "-u", "train_models.py", "--min-minute", str(TRAIN_MIN_MINUTE)]
+    logging.info("[TRAIN] starting train_models.py")
     try:
-        proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=900)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env=env)
         out = (proc.stdout or "").strip(); err = (proc.stderr or "").strip()
         logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
 
@@ -734,7 +732,7 @@ def production_scan() -> Tuple[int,int]:
                 if not fid: continue
                 feat = extract_features(m)
 
-                # NEW: quality gate to reduce trash
+                # Quality gate to reduce trash
                 if not _quality_gate(feat):
                     continue
 
@@ -887,7 +885,7 @@ def predict_scan_route():
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
     _require_api_key()
-    return jsonify(retrain_models_job())  # fixed: call the function
+    return jsonify(retrain_models_job())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint / Scheduler
