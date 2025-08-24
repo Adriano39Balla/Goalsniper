@@ -643,7 +643,7 @@ def predict_scan_route():
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
     _require_api_key()
-    return jsonify(retrain_models_job()))
+    return jsonify(retrain_models_job())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint / Scheduler
