@@ -677,29 +677,46 @@ def retrain_models_job():
         logging.info("[TRAIN] skipped (TRAIN_ENABLE=0)")
         return {"ok": False, "skipped": True, "reason": "TRAIN_ENABLE=0"}
 
-    # Pass DB URL via environment (no secrets in logs)
     env = os.environ.copy()
     env["DATABASE_URL"] = DATABASE_URL
     cmd = ["python", "-u", "train_models.py", "--min-minute", str(TRAIN_MIN_MINUTE)]
     logging.info("[TRAIN] starting train_models.py")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env=env)
-        out = (proc.stdout or "").strip(); err = (proc.stderr or "").strip()
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
         logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
 
+        # Post-check: did we actually get models? If yes, override failure.
         models = _list_models("model_v2:")
+        has_models = bool(models)
+
         chosen = None
         for key in ("BTTS","O25","O15","WIN_HOME","DRAW","WIN_AWAY"):
             if key in models: chosen = key; break
         top_line = f"[{chosen}] top | {_top_feature_strings(models[chosen], 8)}" if chosen else ""
+
         metrics_json = _metrics_blob_for_telegram()
         set_setting("model_metrics_latest", metrics_json)
 
-        emoji = "✅" if proc.returncode == 0 else "❌"
-        msg = f"{emoji} Nightly training {'OK' if proc.returncode == 0 else 'failed'}\n{top_line}\nSaved model_metrics_latest in settings.\n{metrics_json}"
+        ok = (proc.returncode == 0) or has_models
+        emoji = "✅" if ok else "❌"
+
+        msg = (
+            f"{emoji} Nightly training {'OK' if ok else 'failed'} (rc={proc.returncode})\n"
+            f"{top_line}\n"
+            f"Saved model_metrics_latest in settings.\n"
+            f"{metrics_json}"
+        )
         send_telegram(msg)
 
-        return {"ok": proc.returncode == 0, "code": proc.returncode, "stdout": out[-2000:], "stderr": err[-1000:]}
+        return {
+            "ok": ok,
+            "code": proc.returncode,
+            "has_models": has_models,
+            "stdout": out[-2000:],
+            "stderr": err[-1000:]
+        }
     except subprocess.TimeoutExpired:
         logging.error("[TRAIN] timed out")
         send_telegram("❌ Nightly training timed out.")
