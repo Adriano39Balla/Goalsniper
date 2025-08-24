@@ -442,7 +442,7 @@ def main():
               ("model_coeffs", json.dumps(audit)))
 
         print("Saved model_v2:* (+ optional baselines/policy for back‑compat) and model_coeffs.")
-   finally:
+    finally:
         conn.close()
 
 if __name__ == "__main__":
