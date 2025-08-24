@@ -311,7 +311,9 @@ def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float
     out.append((code, f"{code}: No", 1.0 - p, code))
     return out
 
+# ──────────────────────────────────────────────────────────────────────────────
 # Policy / baselines / quota
+
 def _load_policy():
     try:
         braw = get_setting("policy:baselines_v1") or "{}"
@@ -333,10 +335,53 @@ def _score_state_str(feat: Dict[str,float]) -> str:
     d = "H" if gd > 0 else ("A" if gd < 0 else "D")
     return f"gs{gs}_{d}"
 
+def _load_head_prevalence() -> Dict[str, float]:
+    """Global prevalence per head (from training metrics)."""
+    raw = get_setting("model_coeffs")
+    prev: Dict[str,float] = {}
+    if not raw:
+        return prev
+    try:
+        js = json.loads(raw) or {}
+        m = js.get("metrics") or {}
+        for code, stats in (m.items() if isinstance(m, dict) else []):
+            try:
+                prev[str(code)] = float((stats or {}).get("prevalence", 0.5))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return prev
+
+_HEAD_PREVALENCE = _load_head_prevalence()
+
 def _baseline_rate(head: str, baselines: Dict[str,Dict[str,float]], minute: int, feat: Dict[str,float]) -> float:
+    """
+    Return baseline P(outcome) for (head, minute, state).
+    Fallback order: exact cell → nearby minute buckets → global prevalence → 0.5.
+    """
     tbl = baselines.get(head) or {}
-    key = f"{_minute_bucket(minute)}|{_score_state_str(feat)}"
-    return float(tbl.get(key, 0.5))
+    mb = _minute_bucket(minute)
+    st = _score_state_str(feat)
+
+    # exact
+    v = tbl.get(f"{mb}|{st}")
+    if v is not None:
+        return float(v)
+
+    # search neighbours by minute bucket ±d
+    for d in (1,2,3,4):
+        for cand in (mb-d, mb+d):
+            v = tbl.get(f"{cand}|{st}")
+            if v is not None:
+                return float(v)
+
+    # global prevalence from training
+    if head in _HEAD_PREVALENCE:
+        return float(_HEAD_PREVALENCE[head])
+
+    # very last resort
+    return 0.5
 
 def _safe_odds(p: float) -> float:
     p = max(1e-6, min(1-1e-6, float(p)))
@@ -349,9 +394,9 @@ def _baseline_for_suggestion(head: str, suggestion: str, minute: int, feat: Dict
                              baselines: Dict[str,Dict[str,float]]) -> float:
     """
     Map suggestion text to the correct baseline probability.
-    - OU heads store baseline for 'Over'; for 'Under' we use (1 - base_over).
-    - BTTS head baseline is for 'BTTS: Yes'; for 'No' we use (1 - base).
-    - 1X2 heads are already per-outcome.
+    - OU heads baseline is for 'Over'; 'Under' -> 1 - base.
+    - BTTS baseline is for 'Yes'; 'No' -> 1 - base.
+    - 1X2 heads are already per outcome.
     """
     base = _baseline_rate(head, baselines, minute, feat)
     s = (suggestion or "").lower()
@@ -361,6 +406,15 @@ def _baseline_for_suggestion(head: str, suggestion: str, minute: int, feat: Dict
         return 1.0 - base
     return base
 
+def _stats_coverage_ok(feat: Dict[str,float]) -> bool:
+    fields = [
+        float(feat.get("xg_sum", 0.0)),
+        float(feat.get("sot_sum", 0.0)),
+        float(feat.get("cor_sum", 0.0)),
+        max(float(feat.get("pos_h", 0.0)), float(feat.get("pos_a", 0.0))),
+    ]
+    return sum(1 for v in fields if v > 0) >= 2
+
 def _apply_policy_filter(suggestions: List[Tuple[str,str,float,str]],
                          minute: int,
                          feat: Dict[str,float],
@@ -368,17 +422,24 @@ def _apply_policy_filter(suggestions: List[Tuple[str,str,float,str]],
                          policy: Dict[str,Any]) -> List[Tuple[str,str,float,str,float,float]]:
     """
     Returns (market, suggestion, p, head, lift, quota) after filtering.
+    Enforces min_live_minute / max_minute and (optionally) require_stats_after_minute.
     """
     out = []
     global_quota = float((policy.get("global") or {}).get("min_quota", 1.50))
     for market, sugg, p, head in suggestions:
         head_pol = policy.get(head) or {}
-        min_prob = float(head_pol.get("min_prob", MIN_PROB))
-        min_lift = float(head_pol.get("min_lift", 0.0))
-        max_min  = int(head_pol.get("max_minute", 999))
+        min_prob  = float(head_pol.get("min_prob", MIN_PROB))
+        min_lift  = float(head_pol.get("min_lift", 0.0))
+        max_min   = int(head_pol.get("max_minute", 999))
         min_quota = float(head_pol.get("min_quota", global_quota))
+        min_live  = int(head_pol.get("min_live_minute", 0))
+        stats_min = int(head_pol.get("require_stats_after_minute", 999))
 
-        if minute > max_min:
+        # hard time gates
+        if minute < min_live or minute > max_min:
+            continue
+        # after a minute threshold, require some live stats
+        if minute >= stats_min and not _stats_coverage_ok(feat):
             continue
 
         base = _baseline_for_suggestion(head, sugg, minute, feat, baselines)
