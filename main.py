@@ -28,7 +28,7 @@ HARVEST_MODE       = os.getenv("HARVEST_MODE", "1") not in ("0","false","False",
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 
-# legacy (unused in AI filter but kept)
+# legacy toggles (kept but not used by AI mode)
 CONF_THRESHOLD     = int(os.getenv("CONF_THRESHOLD", "60"))
 O25_LATE_MINUTE     = int(os.getenv("O25_LATE_MINUTE", "88"))
 O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))
@@ -37,6 +37,7 @@ UNDER_SUPPRESS_AFTER_MIN = int(os.getenv("UNDER_SUPPRESS_AFTER_MIN", "82"))
 REQUIRE_STATS_MINUTE     = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
 REQUIRE_DATA_FIELDS      = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
 
+# AI‑only mode
 ONLY_MODEL_MODE    = os.getenv("ONLY_MODEL_MODE", "1") not in ("0","false","False","no","NO")
 MIN_PROB           = max(0.0, min(0.99, float(os.getenv("MIN_PROB", "0.55"))))
 
@@ -87,6 +88,16 @@ class PgConn:
 
 def db_conn() -> PgConn: return PgConn(DATABASE_URL)
 
+def set_setting(key: str, value: str):
+    with db_conn() as conn:
+        conn.execute("""INSERT INTO settings(key,value) VALUES(%s,%s)
+                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (key, value))
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with db_conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
+        return row[0] if row else default
+
 def init_db():
     with db_conn() as conn:
         conn.execute("""
@@ -111,16 +122,6 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS match_results (match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
-
-def set_setting(key: str, value: str):
-    with db_conn() as conn:
-        conn.execute("""INSERT INTO settings(key,value) VALUES(%s,%s)
-                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (key, value))
-
-def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    with db_conn() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
-        return row[0] if row else default
 
 # ──────────────────────────────────────────────────────────────────────────────
 # API + features
@@ -160,9 +161,8 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     out = []
     for m in matches:
         status = (m.get("fixture", {}) or {}).get("status", {}) or {}
-        elapsed = status.get("elapsed")
-        short = (status.get("short") or "").upper()
-        if elapsed is None or elapsed > 90:  # ET handled by status
+        elapsed = status.get("elapsed"); short = (status.get("short") or "").upper()
+        if elapsed is None or elapsed > 90:  # ET covered by status filter
             continue
         if short not in INPLAY_STATUSES:
             continue
@@ -257,8 +257,10 @@ def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
     lp = _linpred(feat, mdl.get("weights", {}), float(mdl.get("intercept", 0.0)))
     p = _sigmoid(lp)
     cal = mdl.get("calibration") or {}
-    try: p = _calibrate_prob(p, cal) if cal else p
-    except Exception: pass
+    try:
+        p = _calibrate_prob(p, cal) if cal else p
+    except Exception:
+        pass
     return max(0.0, min(1.0, float(p)))
 
 def _list_models(prefix: str = "model_v2:") -> Dict[str, Dict[str,Any]]:
@@ -268,7 +270,7 @@ def _list_models(prefix: str = "model_v2:") -> Dict[str, Dict[str,Any]]:
     for k, v in rows:
         try:
             code = k.split(":",1)[1]
-            if code in ("O05","O5","o05","o5"):  # never use O0.5
+            if code.lower() in ("o05","o5"):  # never use O0.5
                 continue
             out[code] = json.loads(v)
         except Exception:
@@ -281,12 +283,14 @@ def _ou_label(code: str) -> Optional[float]:
     return int(m.group(1)) / 10.0
 
 def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float]) -> List[Tuple[str,str,float,str]]:
+    """
+    Returns list of (market, suggestion, prob, head_code).
+    """
     out: List[Tuple[str,str,float,str]] = []
     th = _ou_label(code)
     if th is not None:
         p_over = _score_prob(feat, mdl)
-        th_txt = f"{th:.1f}"
-        market = f"Over/Under {th_txt}"
+        th_txt = f"{th:.1f}"; market = f"Over/Under {th_txt}"
         out.append((market, f"Over {th_txt} Goals", p_over, code))
         out.append((market, f"Under {th_txt} Goals", 1.0 - p_over, code))
         return out
@@ -301,12 +305,13 @@ def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float
         out.append(("Match Result 1X2", "Draw", _score_prob(feat, mdl), code)); return out
     if code == "WIN_AWAY":
         out.append(("Match Result 1X2", "Away Win", _score_prob(feat, mdl), code)); return out
+    # Generic fallback
     p = _score_prob(feat, mdl)
     out.append((code, f"{code}: Yes", p, code))
     out.append((code, f"{code}: No", 1.0 - p, code))
     return out
 
-# Policy + baselines
+# Policy / baselines / quota
 def _load_policy():
     try:
         braw = get_setting("policy:baselines_v1") or "{}"
@@ -333,50 +338,101 @@ def _baseline_rate(head: str, baselines: Dict[str,Dict[str,float]], minute: int,
     key = f"{_minute_bucket(minute)}|{_score_state_str(feat)}"
     return float(tbl.get(key, 0.5))
 
+def _safe_odds(p: float) -> float:
+    p = max(1e-6, min(1-1e-6, float(p)))
+    return p / (1.0 - p)
+
+def _quota(p: float, b: float) -> float:
+    return _safe_odds(p) / _safe_odds(b)
+
+def _baseline_for_suggestion(head: str, suggestion: str, minute: int, feat: Dict[str,float],
+                             baselines: Dict[str,Dict[str,float]]) -> float:
+    """
+    Map suggestion text to the correct baseline probability.
+    - OU heads store baseline for 'Over'; for 'Under' we use (1 - base_over).
+    - BTTS head baseline is for 'BTTS: Yes'; for 'No' we use (1 - base).
+    - 1X2 heads are already per-outcome.
+    """
+    base = _baseline_rate(head, baselines, minute, feat)
+    s = (suggestion or "").lower()
+    if head.startswith("O") and s.startswith("under"):
+        return 1.0 - base
+    if head == "BTTS" and "no" in s:
+        return 1.0 - base
+    return base
+
 def _apply_policy_filter(suggestions: List[Tuple[str,str,float,str]],
                          minute: int,
                          feat: Dict[str,float],
                          baselines: Dict[str,Dict[str,float]],
-                         policy: Dict[str,Any]) -> List[Tuple[str,str,float,str,float]]:
+                         policy: Dict[str,Any]) -> List[Tuple[str,str,float,str,float,float]]:
+    """
+    Returns (market, suggestion, p, head, lift, quota) after filtering.
+    """
     out = []
+    global_quota = float((policy.get("global") or {}).get("min_quota", 1.50))
     for market, sugg, p, head in suggestions:
         head_pol = policy.get(head) or {}
         min_prob = float(head_pol.get("min_prob", MIN_PROB))
         min_lift = float(head_pol.get("min_lift", 0.0))
         max_min  = int(head_pol.get("max_minute", 999))
+        min_quota = float(head_pol.get("min_quota", global_quota))
+
         if minute > max_min:
             continue
-        base = _baseline_rate(head, baselines, minute, feat)
+
+        base = _baseline_for_suggestion(head, sugg, minute, feat, baselines)
         lift = p - base
-        if p >= min_prob and lift >= min_lift:
-            out.append((market, sugg, p, head, lift))
-    out.sort(key=lambda x: (x[4], x[2]), reverse=True)
+        q = _quota(p, base)
+
+        if p >= min_prob and lift >= min_lift and q >= min_quota:
+            out.append((market, sugg, p, head, lift, q))
+
+    out.sort(key=lambda x: (x[5], x[4], x[2]), reverse=True)  # quota, lift, prob
     top_k = int((policy.get("global") or {}).get("top_k_per_match", 2))
     return out[:max(1, top_k)]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Telegram helpers
+# Telegram helpers & message
 def tg_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
     try:
-        res = session.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                           data={"chat_id": TELEGRAM_CHAT_ID, "text": tg_escape(message), "parse_mode": "HTML", "disable_web_page_preview": True},
-                           timeout=10)
+        res = session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": tg_escape(message), "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=10
+        )
         return res.ok
     except Exception:
         return False
 
-def _format_tip_message(league: str, home: str, away: str, minute: int, score_txt: str,
-                        suggestion: str, confidence_pct: float, lift: float) -> str:
+def _rationale_from_feat(feat: Dict[str, float]) -> str:
+    parts = []
+    gd = int(feat.get("goals_diff", 0))
+    parts.append("home leading" if gd > 0 else ("away leading" if gd < 0 else "level"))
+    parts.append(f"xG_sum {feat.get('xg_sum',0):.2f}")
+    sot = int(feat.get('sot_sum',0));  cor = int(feat.get('cor_sum',0)); red = int(feat.get('red_sum',0))
+    if sot: parts.append(f"SOT {sot}")
+    if cor: parts.append(f"corners {cor}")
+    if red: parts.append(f"reds {red}")
+    parts.append(f"minute {int(feat.get('minute',0))}")
+    return ", ".join(parts)
+
+def _format_tip_message(
+    league: str, home: str, away: str, minute: int, score_txt: str,
+    suggestion: str, prob: float, lift: float, baseline: float, quota: float, rationale: str
+) -> str:
+    prob_pct = min(99.0, max(0.0, prob * 100.0))  # cap 99
     return (
         "⚽️ New Tip!\n"
         f"Match: {home} vs {away}\n"
         f"⏰ Minute: {minute}' | Score: {score_txt}\n"
         f"Tip: {suggestion}\n"
-        f"📈 Edge: +{lift*100:.1f} pp | Confidence: {confidence_pct:.0f}%\n"
+        f"📈 Model {prob_pct:.1f}% | Baseline {baseline*100:.1f}% | Edge +{lift*100:.1f} pp | Quota ×{quota:.2f}\n"
+        f"🔎 Why: {rationale}\n"
         f"🏆 League: {league}"
     )
 
@@ -396,7 +452,7 @@ def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
     return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Nightly reporting & training
+# Nightly training + digest
 def _counts_since(ts_from: int) -> Dict[str, int]:
     with db_conn() as conn:
         snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
@@ -463,12 +519,12 @@ def retrain_models_job():
         out = (proc.stdout or "").strip(); err = (proc.stderr or "").strip()
         logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
 
+        # Telegram summary using latest saved models/metrics
         models = _list_models("model_v2:")
         chosen = None
         for key in ("BTTS","O25","O15","WIN_HOME","DRAW","WIN_AWAY"):
             if key in models: chosen = key; break
         top_line = f"[{chosen}] top | {_top_feature_strings(models[chosen], 8)}" if chosen else ""
-
         metrics_json = _metrics_blob_for_telegram()
         set_setting("model_metrics_latest", metrics_json)
 
@@ -487,7 +543,7 @@ def retrain_models_job():
         return {"ok": False, "error": str(e)}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Scanning (AI‑only with policy)
+# Production scan (min_prob + min_lift + quota, top‑K)
 def production_scan() -> Tuple[int,int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
@@ -523,7 +579,7 @@ def production_scan() -> Tuple[int,int]:
                 home, away = _teams(m)
                 score_txt = _pretty_score(m)
 
-                for market, suggestion, prob, head, lift in filtered:
+                for market, suggestion, prob, head, lift, q in filtered:
                     cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
                     dup = conn.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND market=%s AND suggestion=%s AND created_ts>=%s LIMIT 1",
@@ -535,9 +591,16 @@ def production_scan() -> Tuple[int,int]:
                     conn.execute("""
                         INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
                         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
-                    """, (fid, league_id, league, home, away, market, suggestion, float(prob*100.0), score_txt, minute, now))
+                    """, (fid, league_id, league, home, away, market, suggestion, float(min(99.0, prob*100.0)), score_txt, minute, now))
 
-                    msg = _format_tip_message(league, home, away, minute, score_txt, suggestion, prob*100.0, lift)
+                    base = _baseline_for_suggestion(head, suggestion, minute, feat, baselines)
+                    rationale = _rationale_from_feat(feat)
+                    msg = _format_tip_message(
+                        league=league, home=home, away=away,
+                        minute=minute, score_txt=score_txt,
+                        suggestion=suggestion, prob=prob, lift=lift, baseline=base, quota=q,
+                        rationale=rationale
+                    )
                     send_telegram(msg)
                     saved += 1
                     if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
@@ -547,11 +610,11 @@ def production_scan() -> Tuple[int,int]:
                 logging.exception(f"[PROD] failure on match: {e}")
                 continue
 
-    logging.info(f"[PROD] saved={saved} live_seen={live_seen} ai_only={ONLY_MODEL_MODE} min_prob={MIN_PROB}")
+    logging.info(f"[PROD] saved={saved} live_seen={live_seen}")
     return saved, live_seen
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Harvest (unchanged, used to collect data)
+# Harvest (kept for data collection)
 def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
     fx = m.get("fixture", {}) or {}; lg = m.get("league", {}) or {}
     fid = int(fx.get("id")); league_id = int(lg.get("id") or 0)
@@ -605,7 +668,7 @@ def harvest_scan() -> Tuple[int, int]:
     return saved, live_seen
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Routes (essentials)
+# Routes
 def _require_api_key():
     key = request.headers.get("X-API-Key") or request.args.get("key")
     if not ADMIN_API_KEY or key != ADMIN_API_KEY: abort(401)
@@ -659,7 +722,7 @@ if __name__ == "__main__":
         logging.info("⛏️  Running in HARVEST mode.")
     else:
         scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")), id="production_scan", replace_existing=True)
-        logging.info("🎯 Running in PRODUCTION mode (AI-only=%s, MIN_PROB=%.2f).", ONLY_MODEL_MODE, MIN_PROB)
+        logging.info("🎯 Running in PRODUCTION mode (AI-only).")
 
     # Nightly jobs
     scheduler.add_job(retrain_models_job, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
