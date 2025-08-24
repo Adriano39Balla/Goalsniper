@@ -525,19 +525,27 @@ def _apply_filter_with_odds(
     min_fields_after_minute: Tuple[int,int] = (REQUIRE_STATS_AFTER_MINUTE, REQUIRE_DATA_FIELDS)
 ) -> List[Tuple[str,str,float,str,float,float,float,Optional[float]]]:
     """
-    Returns tuples: (market, suggestion, p, head, base, lift, edge_quota, offered_odds)
-    Filtering requires offered_odds >= MIN_DEC_ODDS (if odds available) and model p >= min_prob.
+    Returns: (market, suggestion, p, head, base, lift, edge_quota, offered_odds)
+    Filters require:
+      - stats coverage after the configured minute
+      - offered odds >= MIN_DEC_ODDS when odds exist
+      - model probability >= min_prob
+      - quota (edge vs odds-implied/prev) >= min_quota
     """
     out = []
     req_minute, req_fields = min_fields_after_minute
+
     for market, sugg, p, head in suggestions:
+        # After REQ minute, demand some stats coverage
         if req_minute and minute >= req_minute and not _stats_coverage_ok(feat, req_fields):
             continue
 
+        # If we do have offered odds, require minimum decimal odds
         offered = _offered_odds(head, sugg, odds)
         if offered is not None and offered < MIN_DEC_ODDS:
             continue
 
+        # Baseline from live odds when possible; fallback to head prevalence
         base = _baseline_from_odds(head, sugg, odds)
         if base is None:
             base = _head_prevalence(head)
@@ -545,10 +553,11 @@ def _apply_filter_with_odds(
         lift = p - base
         edge_q = _quota(p, base)
 
-        if p >= min_prob:
+        # Actual gates
+        if p >= min_prob and edge_q >= min_quota:
             out.append((market, sugg, p, head, base, lift, edge_q, offered))
 
-    out.sort(key=lambda x: (x[6], x[5], x[2]), reverse=True)
+    out.sort(key=lambda x: (x[6], x[5], x[2]), reverse=True)  # by quota, then lift, then prob
     return out[:max(1, int(top_k))]
 
 # ──────────────────────────────────────────────────────────────────────────────
