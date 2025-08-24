@@ -1,3 +1,4 @@
+# main.py
 import os
 import re
 import json
@@ -28,7 +29,7 @@ HARVEST_MODE       = os.getenv("HARVEST_MODE", "1") not in ("0","false","False",
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 
-# legacy toggles (kept but not used by AI mode)
+# legacy toggles (kept but not used directly in AI mode)
 CONF_THRESHOLD     = int(os.getenv("CONF_THRESHOLD", "60"))
 O25_LATE_MINUTE     = int(os.getenv("O25_LATE_MINUTE", "88"))
 O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))
@@ -162,7 +163,7 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     for m in matches:
         status = (m.get("fixture", {}) or {}).get("status", {}) or {}
         elapsed = status.get("elapsed"); short = (status.get("short") or "").upper()
-        if elapsed is None or elapsed > 90:  # ET covered by status filter
+        if elapsed is None or elapsed > 90:
             continue
         if short not in INPLAY_STATUSES:
             continue
@@ -277,6 +278,75 @@ def _list_models(prefix: str = "model_v2:") -> Dict[str, Dict[str,Any]]:
             continue
     return out
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Policy / baselines / quota
+def _load_policy():
+    try:
+        braw = get_setting("policy:baselines_v1") or "{}"
+        praw = get_setting("policy:heads_v1") or "{}"
+        return json.loads(braw), json.loads(praw)
+    except Exception:
+        return {}, {}
+
+def _minute_bucket(minute: int) -> int:
+    edges = [15,30,45,60,75,90,120]
+    for i,e in enumerate(edges):
+        if minute <= e: return i
+    return len(edges)
+
+def _score_state_str(feat: Dict[str,float]) -> str:
+    gs = int(feat.get("goals_sum", 0.0))
+    gd = int(feat.get("goals_diff", 0.0))
+    if gs >= 3: gs = 3
+    d = "H" if gd > 0 else ("A" if gd < 0 else "D")
+    return f"gs{gs}_{d}"
+
+# prevalence fallback (avoids 50% default)
+def _head_prevalence(head: str) -> float:
+    raw = get_setting("model_coeffs")
+    if not raw:
+        return 0.5
+    try:
+        js = json.loads(raw)
+        m = (js.get("metrics") or {}).get(head) or {}
+        p = float(m.get("prevalence", 0.5))
+        return max(0.05, min(0.95, p))
+    except Exception:
+        return 0.5
+
+def _baseline_rate(head: str, baselines: Dict[str,Dict[str,float]], minute: int, feat: Dict[str,float]) -> float:
+    tbl = baselines.get(head) or {}
+    key = f"{_minute_bucket(minute)}|{_score_state_str(feat)}"
+    if key in tbl:
+        return float(tbl[key])
+    return _head_prevalence(head)
+
+def _clamp_prob(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(x)))
+
+def _safe_odds(p: float) -> float:
+    p = _clamp_prob(p, 1e-6, 1-1e-6)
+    return p / (1.0 - p)
+
+def _quota(p: float, b: float) -> float:
+    # clamp both before converting to odds to avoid explosions
+    p = _clamp_prob(p, 0.03, 0.97)
+    b = _clamp_prob(b, 0.05, 0.95)
+    return _safe_odds(p) / _safe_odds(b)
+
+# stats coverage gate (used after certain minute)
+def _stats_coverage_ok(feat: Dict[str, float], min_fields: int) -> bool:
+    fields = [
+        feat.get("xg_sum", 0.0),
+        feat.get("sot_sum", 0.0),
+        feat.get("cor_sum", 0.0),
+        max(feat.get("pos_h", 0.0), feat.get("pos_a", 0.0)),
+    ]
+    nonzero = sum(1 for v in fields if (v or 0) > 0)
+    return nonzero >= max(0, int(min_fields))
+
+# map code→market text + compute probs
+OU_RE = re.compile(r"^O(\d{2})$")
 def _ou_label(code: str) -> Optional[float]:
     m = OU_RE.match(code)
     if not m: return None
@@ -305,99 +375,13 @@ def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float
         out.append(("Match Result 1X2", "Draw", _score_prob(feat, mdl), code)); return out
     if code == "WIN_AWAY":
         out.append(("Match Result 1X2", "Away Win", _score_prob(feat, mdl), code)); return out
-    # Generic fallback
     p = _score_prob(feat, mdl)
     out.append((code, f"{code}: Yes", p, code))
     out.append((code, f"{code}: No", 1.0 - p, code))
     return out
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Policy / baselines / quota
-
-def _load_policy():
-    try:
-        braw = get_setting("policy:baselines_v1") or "{}"
-        praw = get_setting("policy:heads_v1") or "{}"
-        return json.loads(braw), json.loads(praw)
-    except Exception:
-        return {}, {}
-
-def _minute_bucket(minute: int) -> int:
-    edges = [15,30,45,60,75,90,120]
-    for i,e in enumerate(edges):
-        if minute <= e: return i
-    return len(edges)
-
-def _score_state_str(feat: Dict[str,float]) -> str:
-    gs = int(feat.get("goals_sum", 0.0))
-    gd = int(feat.get("goals_diff", 0.0))
-    if gs >= 3: gs = 3
-    d = "H" if gd > 0 else ("A" if gd < 0 else "D")
-    return f"gs{gs}_{d}"
-
-def _load_head_prevalence() -> Dict[str, float]:
-    """Global prevalence per head (from training metrics)."""
-    raw = get_setting("model_coeffs")
-    prev: Dict[str,float] = {}
-    if not raw:
-        return prev
-    try:
-        js = json.loads(raw) or {}
-        m = js.get("metrics") or {}
-        for code, stats in (m.items() if isinstance(m, dict) else []):
-            try:
-                prev[str(code)] = float((stats or {}).get("prevalence", 0.5))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return prev
-
-_HEAD_PREVALENCE = _load_head_prevalence()
-
-def _baseline_rate(head: str, baselines: Dict[str,Dict[str,float]], minute: int, feat: Dict[str,float]) -> float:
-    """
-    Return baseline P(outcome) for (head, minute, state).
-    Fallback order: exact cell → nearby minute buckets → global prevalence → 0.5.
-    """
-    tbl = baselines.get(head) or {}
-    mb = _minute_bucket(minute)
-    st = _score_state_str(feat)
-
-    # exact
-    v = tbl.get(f"{mb}|{st}")
-    if v is not None:
-        return float(v)
-
-    # search neighbours by minute bucket ±d
-    for d in (1,2,3,4):
-        for cand in (mb-d, mb+d):
-            v = tbl.get(f"{cand}|{st}")
-            if v is not None:
-                return float(v)
-
-    # global prevalence from training
-    if head in _HEAD_PREVALENCE:
-        return float(_HEAD_PREVALENCE[head])
-
-    # very last resort
-    return 0.5
-
-def _safe_odds(p: float) -> float:
-    p = max(1e-6, min(1-1e-6, float(p)))
-    return p / (1.0 - p)
-
-def _quota(p: float, b: float) -> float:
-    return _safe_odds(p) / _safe_odds(b)
-
 def _baseline_for_suggestion(head: str, suggestion: str, minute: int, feat: Dict[str,float],
                              baselines: Dict[str,Dict[str,float]]) -> float:
-    """
-    Map suggestion text to the correct baseline probability.
-    - OU heads baseline is for 'Over'; 'Under' -> 1 - base.
-    - BTTS baseline is for 'Yes'; 'No' -> 1 - base.
-    - 1X2 heads are already per outcome.
-    """
     base = _baseline_rate(head, baselines, minute, feat)
     s = (suggestion or "").lower()
     if head.startswith("O") and s.startswith("under"):
@@ -406,41 +390,36 @@ def _baseline_for_suggestion(head: str, suggestion: str, minute: int, feat: Dict
         return 1.0 - base
     return base
 
-def _stats_coverage_ok(feat: Dict[str,float]) -> bool:
-    fields = [
-        float(feat.get("xg_sum", 0.0)),
-        float(feat.get("sot_sum", 0.0)),
-        float(feat.get("cor_sum", 0.0)),
-        max(float(feat.get("pos_h", 0.0)), float(feat.get("pos_a", 0.0))),
-    ]
-    return sum(1 for v in fields if v > 0) >= 2
-
-def _apply_policy_filter(suggestions: List[Tuple[str,str,float,str]],
-                         minute: int,
-                         feat: Dict[str,float],
-                         baselines: Dict[str,Dict[str,float]],
-                         policy: Dict[str,Any]) -> List[Tuple[str,str,float,str,float,float]]:
+def _apply_policy_filter(
+    suggestions: List[Tuple[str,str,float,str]],
+    minute: int,
+    feat: Dict[str,float],
+    baselines: Dict[str,Dict[str,float]],
+    policy: Dict[str,Any]
+) -> List[Tuple[str,str,float,str,float,float]]:
     """
     Returns (market, suggestion, p, head, lift, quota) after filtering.
-    Enforces min_live_minute / max_minute and (optionally) require_stats_after_minute.
     """
     out = []
-    global_quota = float((policy.get("global") or {}).get("min_quota", 1.50))
+    pol_global = policy.get("global") or {}
+    global_quota = float(pol_global.get("min_quota", 1.50))
+    min_fields = int(pol_global.get("min_fields", 2))
+
     for market, sugg, p, head in suggestions:
         head_pol = policy.get(head) or {}
-        min_prob  = float(head_pol.get("min_prob", MIN_PROB))
-        min_lift  = float(head_pol.get("min_lift", 0.0))
-        max_min   = int(head_pol.get("max_minute", 999))
+        min_prob = float(head_pol.get("min_prob", MIN_PROB))
+        min_lift = float(head_pol.get("min_lift", 0.0))
+        max_min  = int(head_pol.get("max_minute", 999))
         min_quota = float(head_pol.get("min_quota", global_quota))
-        min_live  = int(head_pol.get("min_live_minute", 0))
-        stats_min = int(head_pol.get("require_stats_after_minute", 999))
+        min_live_minute = int(head_pol.get("min_live_minute", 0))
+        require_stats_after_minute = int(head_pol.get("require_stats_after_minute", 0))
 
-        # hard time gates
-        if minute < min_live or minute > max_min:
+        if minute < min_live_minute or minute > max_min:
             continue
-        # after a minute threshold, require some live stats
-        if minute >= stats_min and not _stats_coverage_ok(feat):
-            continue
+
+        if require_stats_after_minute and minute >= require_stats_after_minute:
+            if not _stats_coverage_ok(feat, min_fields=min_fields):
+                continue
 
         base = _baseline_for_suggestion(head, sugg, minute, feat, baselines)
         lift = p - base
@@ -449,8 +428,8 @@ def _apply_policy_filter(suggestions: List[Tuple[str,str,float,str]],
         if p >= min_prob and lift >= min_lift and q >= min_quota:
             out.append((market, sugg, p, head, lift, q))
 
-    out.sort(key=lambda x: (x[5], x[4], x[2]), reverse=True)  # quota, lift, prob
-    top_k = int((policy.get("global") or {}).get("top_k_per_match", 2))
+    out.sort(key=lambda x: (x[5], x[4], x[2]), reverse=True)  # by quota, then lift, then prob
+    top_k = int(pol_global.get("top_k_per_match", 2))
     return out[:max(1, top_k)]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -486,13 +465,14 @@ def _format_tip_message(
     league: str, home: str, away: str, minute: int, score_txt: str,
     suggestion: str, prob: float, lift: float, baseline: float, quota: float, rationale: str
 ) -> str:
-    prob_pct = min(99.0, max(0.0, prob * 100.0))  # cap 99
+    prob_pct = min(99.0, max(0.0, prob * 100.0))
+    display_quota = min(quota, 10.0)  # cap display to keep sane output
     return (
         "⚽️ New Tip!\n"
         f"Match: {home} vs {away}\n"
         f"⏰ Minute: {minute}' | Score: {score_txt}\n"
         f"Tip: {suggestion}\n"
-        f"📈 Model {prob_pct:.1f}% | Baseline {baseline*100:.1f}% | Edge +{lift*100:.1f} pp | Quota ×{quota:.2f}\n"
+        f"📈 Model {prob_pct:.1f}% | Baseline {baseline*100:.1f}% | Edge +{lift*100:.1f} pp | Quota ×{display_quota:.2f}\n"
         f"🔎 Why: {rationale}\n"
         f"🏆 League: {league}"
     )
@@ -580,7 +560,6 @@ def retrain_models_job():
         out = (proc.stdout or "").strip(); err = (proc.stderr or "").strip()
         logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
 
-        # Telegram summary using latest saved models/metrics
         models = _list_models("model_v2:")
         chosen = None
         for key in ("BTTS","O25","O15","WIN_HOME","DRAW","WIN_AWAY"):
@@ -604,7 +583,7 @@ def retrain_models_job():
         return {"ok": False, "error": str(e)}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Production scan (min_prob + min_lift + quota, top‑K)
+# Production scan (policy: min_prob + min_lift + quota, top‑K, stats gates)
 def production_scan() -> Tuple[int,int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
@@ -767,7 +746,7 @@ def predict_scan_route():
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
     _require_api_key()
-    return jsonify(retrain_models_job())
+    return jsonify(retrain_models_job()))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint / Scheduler
