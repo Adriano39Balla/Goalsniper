@@ -546,9 +546,15 @@ def _apply_filter_with_odds(
             continue
 
         # Baseline from live odds when possible; fallback to head prevalence
-        base = _baseline_from_odds(head, sugg, odds)
-        if base is None:
-            base = _head_prevalence(head)
+        offered = _offered_odds(head, sugg, odds)
+# require odds present and not too short
+if offered is None or offered < MIN_DEC_ODDS:
+    continue
+
+base = _baseline_from_odds(head, sugg, odds)
+if base is None:
+    # if the book didn’t quote that exact market prob, skip
+    continue
 
         lift = p - base
         edge_q = _quota(p, base)
@@ -623,6 +629,15 @@ def _league_name(m: Dict[str,Any]) -> Tuple[int,str]:
 def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
     t = (m.get("teams") or {}) or {}
     return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
+
+def _reliability_guard(p: float, feat: Dict[str, float]) -> float:
+    minute = int(feat.get("minute", 0))
+    xg_sum = float(feat.get("xg_sum", 0.0) or 0.0)
+    sot_sum = float(feat.get("sot_sum", 0.0) or 0.0)
+    # before 25’ or with very low chance creation, don’t allow 98–99% spikes
+    if minute < 25 or (xg_sum < 0.8 and sot_sum < 3):
+        return min(p, 0.92)
+    return p
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Nightly training + digest
