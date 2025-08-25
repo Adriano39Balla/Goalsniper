@@ -1,155 +1,455 @@
-import os, sys, json, math
-from typing import Any, Dict, List, Tuple, Optional
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+analyze_precision.py
+
+Evaluate precision metrics for trained models and saved predictions.
+
+Expected project layout (flexible):
+  artifacts/
+    <run-id>/
+      preds_<split>.csv         # y_true, y_prob_[class]..., optional: y_pred
+      model_meta.json           # optional metadata (labels, thresholds, etc.)
+      precision_report_<split>.json
+      precision_report_<split>.csv
+      pr_curve_<split>.png
+
+Typical usage:
+  python analyze_precision.py \
+    --run-id 2025-08-25_12-00-00 \
+    --artifacts-dir artifacts \
+    --split val \
+    --threshold 0.5 \
+    --per-class \
+    --plot
+
+Notes:
+- Works for binary or multi-class (one-vs-rest) probability outputs.
+- If y_pred is absent, it will threshold the max-prob (multiclass) or positive prob (binary).
+- Threshold can be a single float for binary, or "auto" to pick the best threshold by F1 on the split.
+- For multi-class, thresholding is applied one-vs-rest per class for per-class precision; argmax is used for overall precision.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import psycopg2
-from sklearn.metrics import brier_score_loss, accuracy_score, roc_auc_score
 
-FEATURES = [
-    "minute","goals_h","goals_a","goals_sum","goals_diff",
-    "xg_h","xg_a","xg_sum","xg_diff",
-    "sot_h","sot_a","sot_sum",
-    "cor_h","cor_a","cor_sum",
-    "pos_h","pos_a","pos_diff",
-    "red_h","red_a","red_sum"
-]
+from sklearn.metrics import (
+    precision_score,
+    classification_report,
+    precision_recall_curve,
+    average_precision_score,
+)
 
-def _normalize_db_url(db_url: str) -> str:
-    if not db_url: return db_url
-    if db_url.startswith("postgres://"):
-        db_url = "postgresql://" + db_url[len("postgres://"):]
-    if "sslmode=" not in db_url:
-        db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
-    return db_url
+# Optional plotting (guarded so headless envs are fine)
+try:
+    import matplotlib.pyplot as plt
+    _HAS_PLT = True
+except Exception:  # pragma: no cover
+    _HAS_PLT = False
 
-def _connect(db_url: str):
-    conn = psycopg2.connect(_normalize_db_url(db_url)); conn.autocommit=True; return conn
 
-def _read_sql(conn, sql: str, params: Tuple = ()):
-    return pd.read_sql_query(sql, conn, params=params)
+# -----------------------------
+# I/O helpers
+# -----------------------------
 
-def _exec(conn, sql: str, params: Tuple): 
-    with conn.cursor() as cur: cur.execute(sql, params)
+def _default_preds_path(artifacts_dir: Path, run_id: str, split: str) -> Path:
+    return artifacts_dir / run_id / f"preds_{split}.csv"
 
-def load_latest_snapshots(conn, min_minute: int = 15) -> pd.DataFrame:
-    q = """
-    WITH latest AS (
-      SELECT match_id, MAX(created_ts) AS ts
-      FROM tip_snapshots GROUP BY match_id
-    )
-    SELECT l.match_id, s.created_ts, s.payload,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
-    FROM latest l
-    JOIN tip_snapshots s ON s.match_id=l.match_id AND s.created_ts=l.ts
-    JOIN match_results r ON r.match_id=l.match_id
+def _default_meta_path(artifacts_dir: Path, run_id: str) -> Path:
+    return artifacts_dir / run_id / "model_meta.json"
+
+def _ensure_dir(p: Path) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# Core logic
+# -----------------------------
+
+def infer_label_columns(df: pd.DataFrame) -> Tuple[str, List[str], Optional[str]]:
     """
-    rows = _read_sql(conn, q)
-    feats = []
-    for _, row in rows.iterrows():
-        try:
-            p = json.loads(row["payload"]) or {}
-            stat = p.get("stat") or {}
-            f = {"match_id": int(row["match_id"]),
-                 "created_ts": int(row["created_ts"]),
-                 "minute": float(p.get("minute", 0)),
-                 "goals_h": float(p.get("gh", 0)), "goals_a": float(p.get("ga", 0)),
-                 "xg_h": float(stat.get("xg_h", 0)), "xg_a": float(stat.get("xg_a", 0)),
-                 "sot_h": float(stat.get("sot_h", 0)), "sot_a": float(stat.get("sot_a", 0)),
-                 "cor_h": float(stat.get("cor_h", 0)), "cor_a": float(stat.get("cor_a", 0)),
-                 "pos_h": float(stat.get("pos_h", 0)), "pos_a": float(stat.get("pos_a", 0)),
-                 "red_h": float(stat.get("red_h", 0)), "red_a": float(stat.get("red_a", 0))}
-        except Exception: continue
-        f["goals_sum"] = f["goals_h"] + f["goals_a"]; f["goals_diff"] = f["goals_h"] - f["goals_a"]
-        f["xg_sum"] = f["xg_h"] + f["xg_a"]; f["xg_diff"] = f["xg_h"] - f["xg_a"]
-        f["sot_sum"] = f["sot_h"] + f["sot_a"]; f["cor_sum"] = f["cor_h"] + f["cor_a"]
-        f["pos_diff"] = f["pos_h"] - f["pos_a"]; f["red_sum"] = f["red_h"] + f["red_a"]
-        gh_f, ga_f = int(row["final_goals_h"] or 0), int(row["final_goals_a"] or 0)
-        f["final_total"] = gh_f + ga_f
-        f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
-        f["label_win_home"] = 1 if gh_f > ga_f else 0
-        f["label_draw"] = 1 if gh_f == ga_f else 0
-        f["label_win_away"] = 1 if gh_f < ga_f else 0
-        feats.append(f)
-    if not feats: return pd.DataFrame()
-    df = pd.DataFrame(feats)
-    df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    df["minute"] = df["minute"].clip(0, 120)
-    return df[df["minute"] >= min_minute].copy()
+    Infer ground-truth label column, prob columns, and optional predicted label column.
+    Heuristics:
+      - y_true: one of ["y_true", "label", "target"]
+      - y_pred: one of ["y_pred", "pred"]
+      - prob columns: columns starting with "y_prob_" OR named "prob" (binary)
+    """
+    y_true_candidates = [c for c in ["y_true", "label", "target"] if c in df.columns]
+    if not y_true_candidates:
+        raise ValueError("Could not find ground-truth column (expected one of y_true/label/target).")
+    y_true_col = y_true_candidates[0]
 
-def load_models(conn) -> Dict[str, Dict[str, Any]]:
-    rows = _read_sql(conn, "SELECT key, value FROM settings WHERE key LIKE 'model_v2:%'", ())
-    out = {}
-    for _, r in rows.iterrows():
-        try: out[r["key"].split(":", 1)[1]] = json.loads(r["value"])
-        except Exception: continue
-    return out
+    y_pred_col = None
+    for c in ["y_pred", "pred"]:
+        if c in df.columns:
+            y_pred_col = c
+            break
 
-def score_head_row(x: pd.Series, head: Dict[str, Any]) -> float:
-    z = float(head.get("intercept", 0.0))
-    for name in FEATURES: z += float(head.get("weights", {}).get(name, 0.0)) * float(x.get(name, 0.0))
-    a, b = float(head.get("calibration", {}).get("a", 1.0)), float(head.get("calibration", {}).get("b", 0.0))
-    zc = max(-50.0, min(50.0, a * z + b))
-    return 1.0 / (1.0 + math.exp(-zc))
+    # probability columns
+    prob_cols = [c for c in df.columns if c.startswith("y_prob_")]
+    if not prob_cols and "prob" in df.columns:
+        prob_cols = ["prob"]  # treat as positive-class prob for binary
 
-def attach_labels_for_head(df: pd.DataFrame, code: str) -> np.ndarray:
-    if code in ("BTTS","BTTS_YES"): return df["label_btts"].astype(int).values
-    if code == "WIN_HOME": return df["label_win_home"].astype(int).values
-    if code == "DRAW": return df["label_draw"].astype(int).values
-    if code == "WIN_AWAY": return df["label_win_away"].astype(int).values
-    if code.startswith("O") and len(code) == 3: return (df["final_total"].values >= int(code[1:])/10.0).astype(int)
-    raise ValueError(code)
+    if not prob_cols and y_pred_col is None:
+        raise ValueError("No probability columns found (y_prob_* or prob), and y_pred is missing. "
+                         "Provide either probabilities or predicted labels.")
 
-def thresholds_for(code: str) -> List[float]:
-    thrs = [0.5, 0.6, 0.7, 0.75, 0.77, 0.8, 0.85, 0.9]
-    env_thr = os.getenv(code)
-    if env_thr:
-        try: thrs.append(float(env_thr))
-        except: pass
-    return sorted(set([t for t in thrs if 0 < t < 1]))
+    return y_true_col, prob_cols, y_pred_col
 
-def analyze(conn, min_minute: int = 15, heads_whitelist: Optional[List[str]] = None) -> Dict[str, Any]:
-    df = load_latest_snapshots(conn, min_minute)
-    if df.empty: return {"ok": False, "message": "No labeled snapshots"}
-    models = load_models(conn)
-    if not models: return {"ok": False, "message": "No models"}
-    if heads_whitelist: models = {k: v for k, v in models.items() if k in heads_whitelist}
 
-    report: Dict[str, Any] = {"total_rows": int(len(df)), "heads": {}}
-    thresholds: Dict[str,float] = {}
-    for code, head in models.items():
-        try: y = attach_labels_for_head(df, code)
-        except: continue
-        p = df.apply(lambda r: score_head_row(r, head), axis=1).values.astype(float)
-        auc = float(roc_auc_score(y, p)); brier = float(brier_score_loss(y, p))
-        acc = float(accuracy_score(y, (p >= 0.5).astype(int)))
-        # pick threshold that maximizes precision
-        best_thr, best_prec = 0.5, 0.0
-        for t in thresholds_for(code):
-            mask = p >= t
-            if mask.sum() > 20:
-                prec = float(y[mask].mean())
-                if prec > best_prec: best_thr, best_prec = t, prec
-        thresholds[code] = best_thr
-        report["heads"][code] = {"n": int(len(y)), "auc": auc, "brier": brier,
-                                 "acc@0.5": acc, "best_thr": best_thr, "precision@best": best_prec}
-    _exec(conn, "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                ("analysis:precision_v2", json.dumps(report)))
-    _exec(conn, "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                ("policy:thresholds_v1", json.dumps(thresholds)))
-    return {"ok": True, "report": report}
+def is_binary(prob_cols: List[str], df: pd.DataFrame, y_true_col: str) -> bool:
+    if prob_cols == ["prob"]:
+        return True
+    # y_prob_<class> style: binary has either 1 (positive) or 2 classes
+    if len(prob_cols) <= 2:
+        # also check unique labels
+        n_unique = df[y_true_col].nunique(dropna=True)
+        return n_unique <= 2
+    return False
 
-def main():
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url: sys.exit("DATABASE_URL required")
-    conn = _connect(db_url)
+
+def get_classes(prob_cols: List[str], df: pd.DataFrame, y_true_col: str) -> List[str]:
+    if prob_cols and prob_cols != ["prob"]:
+        # names like y_prob_<class>
+        classes = [c.replace("y_prob_", "") for c in prob_cols]
+    else:
+        # fallback to labels found in y_true, sorted
+        classes = sorted(df[y_true_col].dropna().unique().tolist())
+    return [str(c) for c in classes]
+
+
+def compute_binary_metrics(
+    y_true: np.ndarray,
+    pos_prob: np.ndarray,
+    threshold: Optional[float] = 0.5,
+    auto_metric: str = "f1",
+) -> Dict:
+    """
+    Compute precision/recall metrics for binary classification.
+    If threshold is None or "auto", pick best threshold by specified metric over PR curve.
+    """
+    if threshold == "auto":
+        precision, recall, thresh = precision_recall_curve(y_true, pos_prob)
+        # avoid division by zero for F1
+        f1 = (2 * precision * recall) / np.clip(precision + recall, 1e-12, None)
+        best_idx = int(np.nanargmax(f1))
+        best_threshold = 0.5 if best_idx >= len(thresh) else float(thresh[best_idx])
+    else:
+        best_threshold = float(threshold)
+
+    y_pred = (pos_prob >= best_threshold).astype(int)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    ap = average_precision_score(y_true, pos_prob)
+
+    return {
+        "threshold": best_threshold,
+        "precision": float(prec),
+        "average_precision": float(ap),
+        "support": int(y_true.size),
+    }
+
+
+def compute_multiclass_metrics(
+    y_true: np.ndarray,
+    prob_mat: np.ndarray,
+    classes: List[str],
+    threshold: Optional[float] = 0.5,
+    per_class: bool = True,
+) -> Dict:
+    """
+    For overall precision: use argmax(prob) as prediction.
+    For per-class precision: treat each class one-vs-rest and threshold that column.
+    """
+    # overall (macro/micro precision if needed; here primary "overall" is simple precision of argmax)
+    y_pred_idx = np.argmax(prob_mat, axis=1)
+    y_pred = np.array([classes[i] for i in y_pred_idx])
+    overall_precision = precision_score(y_true, y_pred, average="macro", zero_division=0)
+
+    report = {
+        "overall_precision_macro": float(overall_precision),
+        "support": int(y_true.size),
+    }
+
+    if per_class:
+        per_class_metrics = {}
+        for j, cls in enumerate(classes):
+            y_true_bin = (y_true == cls).astype(int)
+            pos_prob = prob_mat[:, j]
+            m = compute_binary_metrics(y_true_bin, pos_prob, threshold=threshold)
+            per_class_metrics[cls] = m
+        report["per_class"] = per_class_metrics
+
+    # also attach a sklearn classification_report string for convenience
     try:
-        result = analyze(conn, min_minute=int(os.getenv("ANALYZE_MIN_MINUTE", "15")))
-        if not result["ok"]: sys.exit(result["message"])
-        print("Analysis done. Thresholds updated.", flush=True)
-    finally: conn.close()
+        report["classification_report"] = classification_report(y_true, y_pred, output_dict=False, zero_division=0)
+    except Exception:
+        report["classification_report"] = None
+
+    return report
+
+
+def plot_pr_curves(
+    out_path: Path,
+    y_true: np.ndarray,
+    prob_source,
+    classes: List[str],
+) -> Optional[Path]:
+    """
+    Plot PR curves (binary or per-class OvR). If binary, prob_source is a 1D array.
+    If multiclass, prob_source is 2D (n_samples, n_classes).
+    """
+    if not _HAS_PLT:
+        return None
+
+    out_path = out_path.with_suffix(".png")
+    _ensure_dir(out_path)
+
+    plt.figure()
+    if prob_source.ndim == 1:
+        precision, recall, _ = precision_recall_curve(y_true, prob_source)
+        ap = average_precision_score(y_true, prob_source)
+        plt.plot(recall, precision, label=f"AP={ap:.4f}")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title("Precision-Recall (Binary)")
+        plt.legend(loc="best")
+    else:
+        for j, cls in enumerate(classes):
+            y_true_bin = (y_true == cls).astype(int)
+            precision, recall, _ = precision_recall_curve(y_true_bin, prob_source[:, j])
+            ap = average_precision_score(y_true_bin, prob_source[:, j])
+            plt.plot(recall, precision, label=f"{cls} (AP={ap:.4f})")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title("Precision-Recall (One-vs-Rest)")
+        plt.legend(loc="best")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    return out_path
+
+
+def run(
+    artifacts_dir: Path,
+    run_id: str,
+    split: str,
+    preds_path: Optional[Path],
+    threshold: Optional[str | float],
+    per_class: bool,
+    plot: bool,
+    verbose: bool,
+) -> Dict:
+    artifacts_dir = Path(artifacts_dir)
+    if preds_path is None:
+        preds_path = _default_preds_path(artifacts_dir, run_id, split)
+    preds_path = Path(preds_path)
+
+    if not preds_path.exists():
+        raise FileNotFoundError(f"Missing predictions file: {preds_path}")
+
+    df = pd.read_csv(preds_path)
+    y_true_col, prob_cols, y_pred_col = infer_label_columns(df)
+    y_true = df[y_true_col].astype(str).values
+
+    # Paths for outputs
+    out_dir = artifacts_dir / run_id
+    json_out = out_dir / f"precision_report_{split}.json"
+    csv_out = out_dir / f"precision_report_{split}.csv"
+    pr_png = out_dir / f"pr_curve_{split}.png"
+
+    # Compute
+    if prob_cols and is_binary(prob_cols, df, y_true_col):
+        # binary
+        if prob_cols == ["prob"]:
+            pos_prob = df["prob"].astype(float).values
+        else:
+            # pick positive class probability
+            # heuristic: prefer y_prob_1 or y_prob_positive; else take the max of provided two
+            pos_candidates = [c for c in prob_cols if c.endswith("_1") or c.endswith("_positive") or c.endswith("_pos")]
+            if len(pos_candidates) == 1:
+                pos_prob = df[pos_candidates[0]].astype(float).values
+            else:
+                # fallback: if two cols exist, assume the larger one is positive prob
+                pos_prob = df[prob_cols].astype(float).values
+                if pos_prob.shape[1] == 2:
+                    pos_prob = pos_prob.max(axis=1)
+                else:
+                    # last resort: take the first as "positive"
+                    pos_prob = pos_prob[:, 0]
+
+        # If y_pred missing and user provided threshold, we’ll compute it anyway.
+        m = compute_binary_metrics(
+            (y_true == "1").astype(int) if set(np.unique(y_true)) <= {"0", "1"} else (y_true == "1").astype(int),
+            pos_prob,
+            threshold=threshold,
+        )
+
+        report = {
+            "task": "binary",
+            "split": split,
+            "metrics": m,
+        }
+
+        if plot:
+            plotted = plot_pr_curves(pr_png, (y_true == "1").astype(int), pos_prob, classes=["0", "1"])
+            if plotted:
+                report["pr_curve_path"] = str(plotted)
+
+        # tabular CSV:
+        csv_tbl = pd.DataFrame([{
+            "split": split,
+            "threshold": m["threshold"],
+            "precision": m["precision"],
+            "average_precision": m["average_precision"],
+            "support": m["support"],
+        }])
+        _ensure_dir(csv_out)
+        csv_tbl.to_csv(csv_out, index=False)
+
+    else:
+        # multiclass
+        # Build probability matrix
+        if not prob_cols:
+            raise ValueError("Multiclass analysis requires probability columns (y_prob_<class>).")
+
+        classes = get_classes(prob_cols, df, y_true_col)
+        prob_mat = df[prob_cols].astype(float).values
+        # normalize probs if not already (defensive)
+        row_sums = prob_mat.sum(axis=1, keepdims=True)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            prob_mat = np.where(row_sums > 0, prob_mat / row_sums, prob_mat)
+
+        m = compute_multiclass_metrics(y_true.astype(str), prob_mat, classes, threshold=threshold, per_class=per_class)
+
+        report = {
+            "task": "multiclass",
+            "split": split,
+            "classes": classes,
+            "metrics": m,
+        }
+
+        if plot:
+            plotted = plot_pr_curves(pr_png, y_true.astype(str), prob_mat, classes)
+            if plotted:
+                report["pr_curve_path"] = str(plotted)
+
+        # tabular CSV:
+        rows = []
+        rows.append({
+            "split": split,
+            "class": "__overall_macro__",
+            "threshold": "",
+            "precision": m["overall_precision_macro"],
+            "average_precision": "",
+            "support": m["support"],
+        })
+        if per_class and "per_class" in m:
+            for cls, cm in m["per_class"].items():
+                rows.append({
+                    "split": split,
+                    "class": cls,
+                    "threshold": cm.get("threshold", ""),
+                    "precision": cm.get("precision", ""),
+                    "average_precision": cm.get("average_precision", ""),
+                    "support": cm.get("support", ""),
+                })
+        _ensure_dir(csv_out)
+        pd.DataFrame(rows).to_csv(csv_out, index=False)
+
+    # Save JSON report
+    _ensure_dir(json_out)
+    with open(json_out, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    # Console summary
+    logging.info("=== Precision Analysis (%s) ===", split)
+    logging.info("Report JSON: %s", json_out)
+    logging.info("Report CSV : %s", csv_out)
+    if report.get("task") == "binary":
+        m = report["metrics"]
+        logging.info("Precision: %.4f  | AP: %.4f  | Thr: %s  | N: %d",
+                     m["precision"], m["average_precision"], str(m["threshold"]), m["support"])
+    else:
+        m = report["metrics"]
+        logging.info("Overall macro precision: %.4f | N: %d", m["overall_precision_macro"], m["support"])
+        if per_class and "per_class" in m:
+            for cls, cm in m["per_class"].items():
+                logging.info("  [%s] Precision: %.4f | AP: %.4f | Thr: %s | N: %d",
+                             cls, cm["precision"], cm["average_precision"], str(cm["threshold"]), cm["support"])
+
+    return report
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Analyze precision for a saved run's predictions.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--run-id", type=str, required=True, help="Run identifier (e.g., timestamped folder).")
+    p.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"), help="Base artifacts directory.")
+    p.add_argument("--split", type=str, default="val", choices=["train", "val", "test"], help="Dataset split.")
+    p.add_argument("--preds-path", type=Path, default=None, help="Optional direct path to predictions CSV.")
+    p.add_argument(
+        "--threshold",
+        type=str,
+        default="0.5",
+        help='Decision threshold: float like "0.5" or "auto" (binary) to choose by max F1.',
+    )
+    p.add_argument("--per-class", action="store_true", help="Emit per-class precision (multiclass).")
+    p.add_argument("--plot", action="store_true", help="Save PR curve plot(s).")
+    p.add_argument("--verbose", action="store_true", help="Verbose logging.")
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    # normalize threshold type
+    thr: Optional[str | float]
+    if args.threshold.lower() == "auto":
+        thr = "auto"
+    else:
+        try:
+            thr = float(args.threshold)
+        except ValueError:
+            logging.error("Invalid --threshold value: %s (use a float or 'auto')", args.threshold)
+            return 2
+
+    try:
+        run(
+            artifacts_dir=args.artifacts_dir,
+            run_id=args.run_id,
+            split=args.split,
+            preds_path=args.preds_path,
+            threshold=thr,
+            per_class=args.per_class,
+            plot=args.plot,
+            verbose=args.verbose,
+        )
+        return 0
+    except Exception as e:
+        logging.exception("Precision analysis failed: %s", e)
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
