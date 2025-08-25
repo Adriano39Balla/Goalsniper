@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-analyze_precision.py
+analyze_predictions.py
 
 Evaluate precision metrics for trained models and saved predictions.
 
@@ -15,7 +15,7 @@ Expected project layout (flexible):
       pr_curve_<split>.png
 
 Typical usage:
-  python analyze_precision.py \
+  python analyze_predictions.py \
     --run-id 2025-08-25_12-00-00 \
     --artifacts-dir artifacts \
     --split val \
@@ -29,7 +29,6 @@ Notes:
 - Threshold can be a single float for binary, or "auto" to pick the best threshold by F1 on the split.
 - For multi-class, thresholding is applied one-vs-rest per class for per-class precision; argmax is used for overall precision.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -109,9 +108,7 @@ def infer_label_columns(df: pd.DataFrame) -> Tuple[str, List[str], Optional[str]
 def is_binary(prob_cols: List[str], df: pd.DataFrame, y_true_col: str) -> bool:
     if prob_cols == ["prob"]:
         return True
-    # y_prob_<class> style: binary has either 1 (positive) or 2 classes
     if len(prob_cols) <= 2:
-        # also check unique labels
         n_unique = df[y_true_col].nunique(dropna=True)
         return n_unique <= 2
     return False
@@ -119,10 +116,8 @@ def is_binary(prob_cols: List[str], df: pd.DataFrame, y_true_col: str) -> bool:
 
 def get_classes(prob_cols: List[str], df: pd.DataFrame, y_true_col: str) -> List[str]:
     if prob_cols and prob_cols != ["prob"]:
-        # names like y_prob_<class>
         classes = [c.replace("y_prob_", "") for c in prob_cols]
     else:
-        # fallback to labels found in y_true, sorted
         classes = sorted(df[y_true_col].dropna().unique().tolist())
     return [str(c) for c in classes]
 
@@ -139,7 +134,6 @@ def compute_binary_metrics(
     """
     if threshold == "auto":
         precision, recall, thresh = precision_recall_curve(y_true, pos_prob)
-        # avoid division by zero for F1
         f1 = (2 * precision * recall) / np.clip(precision + recall, 1e-12, None)
         best_idx = int(np.nanargmax(f1))
         best_threshold = 0.5 if best_idx >= len(thresh) else float(thresh[best_idx])
@@ -165,11 +159,6 @@ def compute_multiclass_metrics(
     threshold: Optional[float] = 0.5,
     per_class: bool = True,
 ) -> Dict:
-    """
-    For overall precision: use argmax(prob) as prediction.
-    For per-class precision: treat each class one-vs-rest and threshold that column.
-    """
-    # overall (macro/micro precision if needed; here primary "overall" is simple precision of argmax)
     y_pred_idx = np.argmax(prob_mat, axis=1)
     y_pred = np.array([classes[i] for i in y_pred_idx])
     overall_precision = precision_score(y_true, y_pred, average="macro", zero_division=0)
@@ -188,7 +177,6 @@ def compute_multiclass_metrics(
             per_class_metrics[cls] = m
         report["per_class"] = per_class_metrics
 
-    # also attach a sklearn classification_report string for convenience
     try:
         report["classification_report"] = classification_report(y_true, y_pred, output_dict=False, zero_division=0)
     except Exception:
@@ -203,10 +191,6 @@ def plot_pr_curves(
     prob_source,
     classes: List[str],
 ) -> Optional[Path]:
-    """
-    Plot PR curves (binary or per-class OvR). If binary, prob_source is a 1D array.
-    If multiclass, prob_source is 2D (n_samples, n_classes).
-    """
     if not _HAS_PLT:
         return None
 
@@ -248,6 +232,7 @@ def run(
     per_class: bool,
     plot: bool,
     verbose: bool,
+    pos_label: str = "1",
 ) -> Dict:
     artifacts_dir = Path(artifacts_dir)
     if preds_path is None:
@@ -269,27 +254,23 @@ def run(
 
     # Compute
     if prob_cols and is_binary(prob_cols, df, y_true_col):
-        # binary
         if prob_cols == ["prob"]:
             pos_prob = df["prob"].astype(float).values
         else:
-            # pick positive class probability
-            # heuristic: prefer y_prob_1 or y_prob_positive; else take the max of provided two
             pos_candidates = [c for c in prob_cols if c.endswith("_1") or c.endswith("_positive") or c.endswith("_pos")]
             if len(pos_candidates) == 1:
                 pos_prob = df[pos_candidates[0]].astype(float).values
             else:
-                # fallback: if two cols exist, assume the larger one is positive prob
-                pos_prob = df[prob_cols].astype(float).values
-                if pos_prob.shape[1] == 2:
-                    pos_prob = pos_prob.max(axis=1)
+                mat = df[prob_cols].astype(float).values
+                if mat.shape[1] == 2:
+                    pos_prob = mat.max(axis=1)
                 else:
-                    # last resort: take the first as "positive"
-                    pos_prob = pos_prob[:, 0]
+                    pos_prob = mat[:, 0]
 
-        # If y_pred missing and user provided threshold, we’ll compute it anyway.
+        y_true_bin = (y_true == str(pos_label)).astype(int)
+
         m = compute_binary_metrics(
-            (y_true == "1").astype(int) if set(np.unique(y_true)) <= {"0", "1"} else (y_true == "1").astype(int),
+            y_true_bin,
             pos_prob,
             threshold=threshold,
         )
@@ -298,14 +279,14 @@ def run(
             "task": "binary",
             "split": split,
             "metrics": m,
+            "pos_label": str(pos_label),
         }
 
         if plot:
-            plotted = plot_pr_curves(pr_png, (y_true == "1").astype(int), pos_prob, classes=["0", "1"])
+            plotted = plot_pr_curves(pr_png, y_true_bin, pos_prob, classes=["neg", "pos"])
             if plotted:
                 report["pr_curve_path"] = str(plotted)
 
-        # tabular CSV:
         csv_tbl = pd.DataFrame([{
             "split": split,
             "threshold": m["threshold"],
@@ -317,14 +298,11 @@ def run(
         csv_tbl.to_csv(csv_out, index=False)
 
     else:
-        # multiclass
-        # Build probability matrix
         if not prob_cols:
             raise ValueError("Multiclass analysis requires probability columns (y_prob_<class>).")
 
         classes = get_classes(prob_cols, df, y_true_col)
         prob_mat = df[prob_cols].astype(float).values
-        # normalize probs if not already (defensive)
         row_sums = prob_mat.sum(axis=1, keepdims=True)
         with np.errstate(divide="ignore", invalid="ignore"):
             prob_mat = np.where(row_sums > 0, prob_mat / row_sums, prob_mat)
@@ -343,7 +321,6 @@ def run(
             if plotted:
                 report["pr_curve_path"] = str(plotted)
 
-        # tabular CSV:
         rows = []
         rows.append({
             "split": split,
@@ -366,12 +343,10 @@ def run(
         _ensure_dir(csv_out)
         pd.DataFrame(rows).to_csv(csv_out, index=False)
 
-    # Save JSON report
     _ensure_dir(json_out)
     with open(json_out, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
-    # Console summary
     logging.info("=== Precision Analysis (%s) ===", split)
     logging.info("Report JSON: %s", json_out)
     logging.info("Report CSV : %s", csv_out)
@@ -409,6 +384,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="0.5",
         help='Decision threshold: float like "0.5" or "auto" (binary) to choose by max F1.',
     )
+    p.add_argument("--pos-label", type=str, default="1", help="Positive label for binary reports (default: '1').")
     p.add_argument("--per-class", action="store_true", help="Emit per-class precision (multiclass).")
     p.add_argument("--plot", action="store_true", help="Save PR curve plot(s).")
     p.add_argument("--verbose", action="store_true", help="Verbose logging.")
@@ -423,10 +399,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
-    # normalize threshold type
-    thr: Optional[str | float]
     if args.threshold.lower() == "auto":
-        thr = "auto"
+        thr: Optional[str | float] = "auto"
     else:
         try:
             thr = float(args.threshold)
@@ -444,6 +418,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             per_class=args.per_class,
             plot=args.plot,
             verbose=args.verbose,
+            pos_label=args.pos_label,
         )
         return 0
     except Exception as e:
