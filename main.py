@@ -40,7 +40,8 @@ O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))
 BTTS_LATE_MINUTE    = int(os.getenv("BTTS_LATE_MINUTE", "88"))
 UNDER_SUPPRESS_AFTER_MIN = int(os.getenv("UNDER_SUPPRESS_AFTER_MIN", "82"))
 
-ONLY_MODEL_MODE          = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false","False","no","NO"))
+# FIXED: removed extra ')'
+ONLY_MODEL_MODE          = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false","False","no","NO")
 REQUIRE_STATS_MINUTE     = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
 REQUIRE_DATA_FIELDS      = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
 
@@ -51,7 +52,8 @@ MOTD_CONF_MIN       = int(os.getenv("MOTD_CONF_MIN", "65"))
 
 ALLOWED_SUGGESTIONS = {"Over 2.5 Goals", "Under 2.5 Goals", "BTTS: Yes", "BTTS: No"}
 
-TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO"))
+# FIXED: removed extra ')'
+TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
 
@@ -845,6 +847,126 @@ def harvest_scan() -> Tuple[int, int]:
     logging.info(f"[HARVEST] saved={saved} live_seen={live_seen}")
     return saved, live_seen
 
+# ── MOTD (Match Of The Day) ──────────────────────────────────────────────────
+def _berlin_midnight_utc_ts() -> int:
+    today_berlin = datetime.now(ZoneInfo("Europe/Berlin")).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(today_berlin.timestamp())
+
+def _rank_boost(league_id: Optional[int]) -> int:
+    """Slight preference to curated leagues."""
+    if not league_id: return 0
+    try:
+        if int(league_id) in LEAGUE_PRIORITY_IDS:
+            return 1
+    except Exception:
+        pass
+    return 0
+
+def motd_candidates(limit:int=5) -> List[Dict[str,Any]]:
+    """
+    Returns best matches today (Europe/Berlin day) ranked by max confidence among allowed suggestions,
+    requiring at least MOTD_MIN_SAMPLES rows for that match_id today and min confidence.
+    """
+    since_ts = _berlin_midnight_utc_ts()
+    allowed = sorted(ALLOWED_SUGGESTIONS)
+    with db_conn() as conn:
+        rows = conn.execute(f"""
+            WITH base AS (
+                SELECT *
+                FROM tips
+                WHERE created_ts >= %s
+                  AND suggestion = ANY(%s)
+            ),
+            counts AS (
+                SELECT match_id, COUNT(*) AS n, MAX(league_id) AS league_id
+                FROM base
+                GROUP BY match_id
+            ),
+            ranks AS (
+                SELECT b.*,
+                       ROW_NUMBER() OVER (PARTITION BY b.match_id ORDER BY b.confidence DESC) AS rn
+                FROM base b
+            ),
+            pick AS (
+                SELECT r.*, c.n, c.league_id
+                FROM ranks r
+                JOIN counts c USING(match_id)
+                WHERE r.rn=1
+            )
+            SELECT match_id, league_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts, n
+            FROM pick
+            WHERE n >= %s AND confidence >= %s
+            ORDER BY confidence DESC, created_ts ASC
+            LIMIT %s
+        """, (since_ts, allowed, MOTD_MIN_SAMPLES, MOTD_CONF_MIN, limit)).fetchall()
+
+    # Convert to dicts and boost preferred leagues by re-sorting in Python (stable)
+    cands = []
+    for r in rows:
+        (match_id, league_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts, n) = r
+        cands.append({
+            "match_id": int(match_id),
+            "league_id": int(league_id) if league_id is not None else None,
+            "league": league or "",
+            "home": home or "",
+            "away": away or "",
+            "market": market or "",
+            "suggestion": suggestion or "",
+            "confidence": float(confidence or 0.0),
+            "score_at_tip": score_at_tip or "",
+            "minute": int(minute or 0),
+            "created_ts": int(created_ts or 0),
+            "samples": int(n or 0),
+            "priority_boost": _rank_boost(league_id),
+        })
+    cands.sort(key=lambda x: (x["confidence"], x["priority_boost"], -x["created_ts"]), reverse=True)
+    return cands
+
+def _motd_already_announced_for_today() -> Optional[int]:
+    since_ts = _berlin_midnight_utc_ts()
+    last_raw = get_setting("motd:last_sent") or ""
+    try:
+        last = json.loads(last_raw) if last_raw else {}
+        if (last.get("ts") or 0) >= since_ts:
+            return int(last.get("match_id") or 0) or None
+    except Exception:
+        pass
+    return None
+
+def _save_motd_sent(match_id: int):
+    rec = {"ts": int(time.time()), "match_id": int(match_id)}
+    set_setting("motd:last_sent", json.dumps(rec))
+
+def _fmt_motd_message(c: Dict[str,Any]) -> str:
+    title = "⭐️ <b>Match of the Day</b>"
+    body = (
+        f"{escape(c['home'])} vs {escape(c['away'])}\n"
+        f"🏆 {escape(c['league'])}\n"
+        f"⏱️ {c['minute']}'   🔢 {escape(c['score_at_tip'])}\n"
+        f"💡 Suggestion: <b>{escape(c['suggestion'])}</b>\n"
+        f"🧮 Confidence: <b>{c['confidence']:.1f}%</b> (n={c['samples']})"
+    )
+    return f"{title}\n\n{body}"
+
+def motd_announce() -> Dict[str,Any]:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return {"ok": False, "reason": "telegram_not_configured"}
+
+    already = _motd_already_announced_for_today()
+    if already:
+        return {"ok": True, "skipped": True, "reason": "already_sent_today", "match_id": already}
+
+    cands = motd_candidates(limit=5)
+    if not cands:
+        return {"ok": False, "reason": "no_candidates"}
+
+    top = cands[0]
+    msg = _fmt_motd_message(top)
+    sent = send_telegram(msg)
+    if sent:
+        _save_motd_sent(top["match_id"])
+    return {"ok": bool(sent), "sent": bool(sent), "candidate": top}
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.after_request
 def add_security_headers(resp):
@@ -1059,7 +1181,29 @@ def stats_config():
         "TRAIN_ENABLE": TRAIN_ENABLE,
         "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
         "TRAIN_TEST_SIZE": TRAIN_TEST_SIZE,
+        "MOTD_PREDICT": MOTD_PREDICT,
+        "MOTD_MIN_SAMPLES": MOTD_MIN_SAMPLES,
+        "MOTD_CONF_MIN": MOTD_CONF_MIN,
+        "LEAGUE_PRIORITY_IDS": LEAGUE_PRIORITY_IDS,
     })
+
+# MOTD endpoints
+@app.route("/motd/preview")
+def motd_preview_route():
+    _require_api_key()
+    limit = request.args.get("limit")
+    try:
+        limit = int(limit) if limit and str(limit).isdigit() else 5
+    except Exception:
+        limit = 5
+    cands = motd_candidates(limit=limit)
+    return jsonify({"ok": True, "candidates": cands, "already_sent_today": bool(_motd_already_announced_for_today())})
+
+@app.route("/motd/announce", methods=["POST"])
+def motd_announce_route():
+    _require_api_key()
+    res = motd_announce()
+    return jsonify(res)
 
 # Helper used by /harvest/bulk_leagues endpoint (left as-is)
 def _run_bulk_leagues(leagues: List[int], seasons: List[int]) -> Dict[str,Any]:
@@ -1142,6 +1286,18 @@ if __name__ == "__main__":
         misfire_grace_time=3600,
         coalesce=True,
     )
+
+    # Daily MOTD announce (optional; controlled by MOTD_PREDICT)
+    if MOTD_PREDICT:
+        scheduler.add_job(
+            motd_announce,
+            CronTrigger(hour=18, minute=30, timezone=ZoneInfo("Europe/Berlin")),
+            id="motd_announce",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+        logging.info("🌟 MOTD daily announcement enabled at 18:30 Europe/Berlin.")
 
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
