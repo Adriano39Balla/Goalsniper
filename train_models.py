@@ -1,4 +1,3 @@
-# path: ./train_models.py
 import argparse
 import json
 import os
@@ -8,13 +7,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from datetime import datetime
+import psycopg2
+
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
 from sklearn.metrics import brier_score_loss, accuracy_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-import psycopg2
 
-# consistent, explicit feature order for weight export
+# consistent, explicit feature order
 FEATURES = [
     "minute","goals_h","goals_a","goals_sum","goals_diff",
     "xg_h","xg_a","xg_sum","xg_diff",
@@ -27,9 +29,9 @@ FEATURES = [
 OU_THRESHOLDS = [1.5, 2.5, 3.5, 4.5]
 
 # ──────────────────────────────────────────────────────────────────────────────
+# DB utils
 def _normalize_db_url(db_url: str) -> str:
-    if not db_url:
-        return db_url
+    if not db_url: return db_url
     if db_url.startswith("postgres://"):
         db_url = "postgresql://" + db_url[len("postgres://"):]
     if "sslmode=" not in db_url:
@@ -49,67 +51,14 @@ def _exec(conn, sql: str, params: Tuple):
     with conn.cursor() as cur:
         cur.execute(sql, params)
 
-def _time_holdout_split(df: pd.DataFrame, test_size: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # avoid leakage from random shuffle; hold out the most recent chunk by created_ts
-    df = df.sort_values("created_ts").reset_index(drop=True)
-    n = len(df); k = max(1, int(round(n * (1.0 - test_size))))
-    return df.iloc[:k].copy(), df.iloc[k:].copy()
-
-def _calibration_split(df: pd.DataFrame, frac: float = 0.20) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # dedicate a small slice of train for Platt; keeps test untouched
-    n = len(df); k = max(1, int(round(n * (1.0 - frac))))
-    return df.iloc[:k].copy(), df.iloc[k:].copy()
-
-def _as_matrix(df: pd.DataFrame) -> np.ndarray:
-    return df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float).values
-
-def _fit_lr_balanced(X: np.ndarray, y: np.ndarray) -> Pipeline:
-    # scale improves convergence; liblinear for binary + balanced classes
-    pipe = Pipeline([
-        ("scale", StandardScaler(with_mean=True, with_std=True)),
-        ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", solver="liblinear"))
-    ])
-    pipe.fit(X, y)
-    return pipe
-
-def _decision_function(pipe: Pipeline, X: np.ndarray) -> np.ndarray:
-    clf: LogisticRegression = pipe.named_steps["clf"]
-    scale: StandardScaler = pipe.named_steps["scale"]
-    return clf.decision_function(scale.transform(X))
-
-def _fit_platt(z_tr: np.ndarray, y_tr: np.ndarray) -> Tuple[float, float]:
-    # logistic on logits; single feature
-    z = z_tr.reshape(-1, 1)
-    cal = LogisticRegression(max_iter=1000, solver="lbfgs")
-    cal.fit(z, y_tr)
-    a = float(cal.coef_.ravel()[0]); b = float(cal.intercept_.ravel()[0])
-    return a, b
-
-def _platt_proba(z: np.ndarray, a: float, b: float) -> np.ndarray:
-    x = np.clip(a * z + b, -50, 50)
-    return 1.0 / (1.0 + np.exp(-x))
-
-def _pipe_to_v2(pipe: Pipeline, feature_names: List[str], cal: Optional[Tuple[float, float]]) -> Dict[str, Any]:
-    clf: LogisticRegression = pipe.named_steps["clf"]
-    scale: StandardScaler = pipe.named_steps["scale"]
-    # export weights in input feature space (pre‑scaled)
-    coef = clf.coef_.ravel()
-    std = scale.scale_; mean = scale.mean_
-    std = np.where(std == 0.0, 1.0, std)
-    w_unscaled = coef / std
-    b_unscaled = float(clf.intercept_.ravel()[0] - np.dot(coef, mean / std))
-    weights = {name: float(w) for name, w in zip(feature_names, w_unscaled.tolist())}
-    a, b = (cal if cal else (1.0, 0.0))
-    return {
-        "intercept": float(b_unscaled),
-        "weights": weights,
-        "calibration": {"method": "sigmoid", "a": float(a), "b": float(b)}
-    }
-
-def _ou_code(th: float) -> str:
-    return f"O{int(round(th * 10)):02d}"
+def _get_old_model(conn, code: str) -> Optional[Dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM settings WHERE key=%s", (f"model_v2:{code}",))
+        row = cur.fetchone()
+        return json.loads(row[0]) if row else None
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Feature + Label Loading
 def load_snapshots_with_labels(conn, min_minute: int = 15) -> pd.DataFrame:
     q = """
     WITH latest AS (
@@ -141,7 +90,6 @@ def load_snapshots_with_labels(conn, min_minute: int = 15) -> pd.DataFrame:
             }
         except Exception:
             continue
-
         # derived
         f["goals_sum"] = f["goals_h"] + f["goals_a"]
         f["goals_diff"] = f["goals_h"] - f["goals_a"]
@@ -161,132 +109,138 @@ def load_snapshots_with_labels(conn, min_minute: int = 15) -> pd.DataFrame:
         f["label_win_home"]  = 1 if gh_f > ga_f else 0
         f["label_draw"]      = 1 if gh_f == ga_f else 0
         f["label_win_away"]  = 1 if gh_f < ga_f else 0
-
         feats.append(f)
 
-    if not feats:
-        return pd.DataFrame()
-
+    if not feats: return pd.DataFrame()
     df = pd.DataFrame(feats)
     df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     df["minute"] = df["minute"].clip(0, 120)
     df = df[df["minute"] >= min_minute].copy()
     return df
 
-def build_baselines(df: pd.DataFrame, heads_present: List[str]) -> Dict[str, Dict[str, float]]:
-    # legacy baseline table (optional)
-    def bucket_minute(m):
-        edges = [15, 30, 45, 60, 75, 90, 120]
-        for i, e in enumerate(edges):
-            if m <= e: return i
-        return len(edges)
-    def score_state(row):
-        gs = int(row["goals_sum"]);  gd = int(row["goals_diff"])
-        if gs >= 3: gs = 3
-        d = "H" if gd > 0 else "A" if gd < 0 else "D"
-        return f"gs{gs}_{d}"
-    base = df.copy()
-    base["min_b"] = base["minute"].apply(bucket_minute)
-    base["state"] = base.apply(score_state, axis=1)
-    def baseline_of(y: np.ndarray, gmin: pd.Series, gstate: pd.Series):
-        out = {}
-        tmp = pd.DataFrame({"y": y, "min_b": gmin, "state": gstate})
-        grp = tmp.groupby(["min_b", "state"])
-        cnt = grp["y"].count(); pos = grp["y"].sum()
-        for (mb, st), n in cnt.items():
-            if n >= 50:
-                out[f"{int(mb)}|{str(st)}"] = float(pos[(mb, st)] / n)
-        return out
-    bl: Dict[str, Dict[str, float]] = {}
-    for th in OU_THRESHOLDS:
-        code = _ou_code(th)
-        if code in heads_present:
-            y = (base["final_total"].values >= th).astype(int)
-            bl[code] = baseline_of(y, base["min_b"], base["state"])
-    if "BTTS" in heads_present:
-        bl["BTTS"] = baseline_of(base["label_btts"].values.astype(int), base["min_b"], base["state"])
-    for (code, col) in [("WIN_HOME", "label_win_home"), ("DRAW", "label_draw"), ("WIN_AWAY", "label_win_away")]:
-        if code in heads_present:
-            bl[code] = baseline_of(base[col].values.astype(int), base["min_b"], base["state"])
-    return bl
+# ──────────────────────────────────────────────────────────────────────────────
+# Model Training Helpers
+def _fit_model(X: np.ndarray, y: np.ndarray, model_type: str = "lr"):
+    if model_type == "lr":
+        pipe = Pipeline([
+            ("scale", StandardScaler(with_mean=True, with_std=True)),
+            ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", solver="liblinear"))
+        ])
+        pipe.fit(X, y)
+        return pipe
+    elif model_type == "rf":
+        model = RandomForestClassifier(n_estimators=200, class_weight="balanced", random_state=42)
+        model.fit(X, y)
+        return model
+    elif model_type == "xgb":
+        model = XGBClassifier(
+            n_estimators=300, learning_rate=0.05, max_depth=5,
+            subsample=0.8, colsample_bytree=0.8, scale_pos_weight=(len(y)-sum(y))/max(1,sum(y)),
+            use_label_encoder=False, eval_metric="logloss"
+        )
+        model.fit(X, y)
+        return model
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
+def _predict_proba(model, X: np.ndarray) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)[:,1]
+    if hasattr(model, "decision_function"):
+        z = model.decision_function(X)
+        return 1.0 / (1.0 + np.exp(-z))
+    raise ValueError("Model has no probability interface")
+
+def _to_json_model(model, feature_names: List[str], model_type: str) -> Dict[str, Any]:
+    """
+    Export weights for LR (like before), or just store type for tree models.
+    """
+    if model_type == "lr":
+        clf: LogisticRegression = model.named_steps["clf"]
+        scale: StandardScaler = model.named_steps["scale"]
+        coef = clf.coef_.ravel()
+        std = scale.scale_; mean = scale.mean_
+        std = np.where(std == 0.0, 1.0, std)
+        w_unscaled = coef / std
+        b_unscaled = float(clf.intercept_.ravel()[0] - np.dot(coef, mean / std))
+        weights = {name: float(w) for name, w in zip(feature_names, w_unscaled.tolist())}
+        return {
+            "type": "lr",
+            "intercept": float(b_unscaled),
+            "weights": weights,
+            "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0}
+        }
+    else:
+        # For RF/XGB → just store model type, keep in DB as "black box"
+        return {
+            "type": model_type,
+            "storage": "not_implemented_yet"  # (future: pickle/onnx)
+        }
 
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db-url", default=None)
-    ap.add_argument("--min-minute", dest="min_minute", type=int, default=15)
+    ap.add_argument("--model-type", default=os.getenv("MODEL_TYPE", "lr"), help="lr | rf | xgb")
+    ap.add_argument("--min-minute", type=int, default=15)
     ap.add_argument("--test-size", type=float, default=0.25)
-    ap.add_argument("--calib-frac", type=float, default=0.2)
     ap.add_argument("--min-rows", type=int, default=800)
     args = ap.parse_args()
 
     db_url = args.db_url or os.getenv("DATABASE_URL")
     if not db_url:
-        print("DATABASE_URL required (pass --db-url or set env)", flush=True)
-        sys.exit(1)
+        print("DATABASE_URL required", flush=True); sys.exit(1)
 
     conn = _connect(db_url)
     try:
         df_all = load_snapshots_with_labels(conn, args.min_minute)
-        if df_all.empty:
-            print("Not enough labeled data yet.", flush=True)
-            sys.exit(0)
+        if df_all.empty or len(df_all) < args.min_rows:
+            print("Not enough data yet.", flush=True); sys.exit(0)
 
-        if len(df_all) < args.min_rows:
-            print(f"Need more data: {len(df_all)} < min-rows {args.min_rows}.", flush=True)
-            sys.exit(0)
+        df_all = df_all.sort_values("created_ts").reset_index(drop=True)
+        n = len(df_all); k = int(n*(1-args.test_size))
+        tr_df, te_df = df_all.iloc[:k], df_all.iloc[k:]
 
-        # time-based holdout
-        tr_df, te_df = _time_holdout_split(df_all, test_size=args.test_size)
-
-        heads: Dict[str, Dict[str, Any]] = {}
-        metrics_all: Dict[str, Dict[str, Any]] = {}
+        heads: Dict[str, Any] = {}
+        metrics: Dict[str, Any] = {}
 
         def train_head(y_name: str, code: str):
-            nonlocal heads, metrics_all
             y_tr = tr_df[y_name].astype(int).values
             y_te = te_df[y_name].astype(int).values
-            if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
-                return
-            # calibration split on train
-            tr_core, tr_cal = _calibration_split(tr_df, frac=args.calib_frac)
-            X_core = _as_matrix(tr_core); y_core = tr_core[y_name].astype(int).values
-            X_cal  = _as_matrix(tr_cal);  y_cal  = tr_cal[y_name].astype(int).values
-            X_te   = _as_matrix(te_df)
+            if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2: return
 
-            pipe = _fit_lr_balanced(X_core, y_core)
-            z_cal = _decision_function(pipe, X_cal)
-            a, b = _fit_platt(z_cal, y_cal)
+            X_tr = tr_df[FEATURES].values; X_te = te_df[FEATURES].values
+            model = _fit_model(X_tr, y_tr, args.model_type)
+            p_te = _predict_proba(model, X_te)
 
-            z_te = _decision_function(pipe, X_te)
-            p_te = _platt_proba(z_te, a, b)
-
-            try:
-                auc = roc_auc_score(y_te, p_te)
-            except Exception:
-                auc = float("nan")
+            auc = roc_auc_score(y_te, p_te)
             brier = brier_score_loss(y_te, p_te)
-            acc = accuracy_score(y_te, (p_te >= 0.5).astype(int))
-            prev = float(y_tr.mean())
+            acc = accuracy_score(y_te, (p_te>=0.5).astype(int))
 
-            metrics_all[code] = {
-                "brier": float(brier), "acc": float(acc), "auc": float(auc),
-                "n": int(len(y_te)), "prevalence": float(prev),
-                "majority_acc": float(max(prev, 1 - prev)),
-                "calibrated": True, "calibration_method": "sigmoid",
-                "time_split": True
-            }
-            heads[code] = _pipe_to_v2(pipe, FEATURES, (a, b))
+            new_json = _to_json_model(model, FEATURES, args.model_type)
+            old = _get_old_model(conn, code)
 
-        # OU heads
+            # rollback check
+            if old:
+                try:
+                    prev_auc = float(old.get("metrics", {}).get("auc", 0))
+                    if auc < prev_auc - 0.02:  # tolerate small fluctuation
+                        print(f"⚠️ Rollback {code}: new AUC={auc:.3f} worse than old {prev_auc:.3f}")
+                        return
+                except: pass
+
+            new_json["metrics"] = {"auc": auc, "brier": brier, "acc": acc}
+            heads[code] = new_json
+            metrics[code] = new_json["metrics"]
+
+        # Train all heads
         for th in OU_THRESHOLDS:
-            code = _ou_code(th)
+            code = f"O{int(th*10):02d}"
             tr_df[code] = (tr_df["final_total"] >= th).astype(int)
             te_df[code] = (te_df["final_total"] >= th).astype(int)
             train_head(code, code)
 
-        # BTTS + 1X2
-        for (code, col) in [
+        for code, col in [
             ("BTTS", "label_btts"),
             ("WIN_HOME", "label_win_home"),
             ("DRAW", "label_draw"),
@@ -295,57 +249,33 @@ def main():
             train_head(col, code)
 
         if not heads:
-            print("No heads trained (insufficient variation).", flush=True)
-            sys.exit(0)
+            print("No valid heads trained.", flush=True); sys.exit(0)
 
-        # Persist models
-        for code, v2 in heads.items():
+        # Save to DB
+        for code, model_json in heads.items():
             _exec(conn,
                   "INSERT INTO settings(key,value) VALUES(%s,%s) "
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                  (f"model_v2:{code}", json.dumps(v2)))
+                  (f"model_v2:{code}", json.dumps(model_json)))
 
-        # Alias for BTTS_YES (back‑compat)
-        if "BTTS" in heads:
-            _exec(conn,
-                  "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                  ("model_v2:BTTS_YES", json.dumps(heads["BTTS"])))
-
-        # Optional legacy policy/baselines
-        baselines = build_baselines(df_all, list(heads.keys()))
-        _exec(conn,
-              "INSERT INTO settings(key,value) VALUES(%s,%s) "
-              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-              ("policy:baselines_v1", json.dumps(baselines)))
-        policy = {"global": {"top_k_per_match": 2, "min_quota": 1.50}}
-        _exec(conn,
-              "INSERT INTO settings(key,value) VALUES(%s,%s) "
-              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-              ("policy:heads_v1", json.dumps(policy)))
-
-        # Audit blob
         audit = {
-            "trained_at_utc": datetime.utcnow().isoformat() + "Z",
-            "features": FEATURES,
-            "metrics": metrics_all
+            "trained_at": datetime.utcnow().isoformat()+"Z",
+            "model_type": args.model_type,
+            "metrics": metrics
         }
         _exec(conn,
               "INSERT INTO settings(key,value) VALUES(%s,%s) "
               "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-              ("model_coeffs", json.dumps(audit)))
+              ("model_audit", json.dumps(audit)))
 
-        print("Saved model_v2:* (+ optional baselines/policy for back‑compat) and model_coeffs.", flush=True)
+        print(f"✅ Saved {len(heads)} heads (model_type={args.model_type})", flush=True)
         sys.exit(0)
 
     except Exception as e:
-        print(f"[TRAIN] exception: {e}", flush=True)
-        sys.exit(1)
+        print(f"[TRAIN] exception: {e}", flush=True); sys.exit(1)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        try: conn.close()
+        except: pass
 
 if __name__ == "__main__":
     main()
