@@ -1,4 +1,3 @@
-# path: main.py
 import os
 import re
 import json
@@ -14,6 +13,7 @@ from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
 
 # ──────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
@@ -29,7 +29,7 @@ HARVEST_MODE       = os.getenv("HARVEST_MODE", "1") not in ("0","false","False",
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 
-# Pure‑model thresholds (no odds/filters): global + per head overrides
+# Pure-model thresholds (no odds/filters): global + per head overrides
 ONLY_MODEL_MODE    = True  # force pure model mode
 MIN_PROB           = max(0.0, min(0.99, float(os.getenv("MIN_PROB", "0.55"))))
 
@@ -49,9 +49,13 @@ MOTD_ENABLE        = os.getenv("MOTD_ENABLE", "1") not in ("0","false","False","
 MOTD_HOUR_LOCAL    = int(os.getenv("MOTD_HOUR", "10"))  # 10:00 local (Europe/Berlin)
 MOTD_LOOKBACK_HRS  = int(os.getenv("MOTD_LOOKBACK_HRS", "24"))
 
-# Training toggles (unchanged)
+# Training toggles
 TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
+
+# Clear cap per match + scheduler toggle
+TOP_K_PER_MATCH    = int(os.getenv("TOP_K_PER_MATCH", "2"))
+SCHEDULER_ENABLE   = os.getenv("SCHEDULER_ENABLE", "1") not in ("0","false","False","no","NO")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -60,7 +64,7 @@ if not DATABASE_URL:
 BASE_URL         = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
 HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}
-INPLAY_STATUSES  = {"1H","HT","2H","ET","BT","P"}
+INPLAY_STATUSES  = {"1H","HT","2H","ET","BT","P","LIVE"}
 
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], respect_retry_after_header=True)
@@ -71,19 +75,27 @@ STATS_CACHE: Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB helpers (same schema as before)
+# DB helpers (+ URL normalization)
+def _normalize_db_url(db_url: str) -> str:
+    if not db_url:
+        return db_url
+    if db_url.startswith("postgres://"):
+        db_url = "postgresql://" + db_url[len("postgres://"):]
+    if "sslmode=" not in db_url:
+        db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
+    return db_url
+
 class PgCursor:
     def __init__(self, cur): self.cur = cur
     def fetchone(self): return self.cur.fetchone()
     def fetchall(self): return self.cur.fetchall()
 
 class PgConn:
-    def __init__(self, dsn: str): self.dsn = dsn; self.conn=None; self.cur=None
+    def __init__(self, dsn: str):
+        self.dsn = _normalize_db_url(dsn)
+        self.conn=None; self.cur=None
     def __enter__(self):
-        dsn = self.dsn
-        if "sslmode=" not in dsn:
-            dsn = dsn + ("&" if "?" in dsn else "?") + "sslmode=require"
-        self.conn = psycopg2.connect(dsn)
+        self.conn = psycopg2.connect(self.dsn)
         self.conn.autocommit = True
         self.cur = self.conn.cursor()
         return self
@@ -143,12 +155,12 @@ def init_db():
 
 # ──────────────────────────────────────────────────────────────────────────────
 # API wrappers
-def _api_get(url: str, params: dict, timeout: int = 15):
+def _api_get(url: str, params: dict, timeout: int = 20):
     if not API_KEY: return None
     try:
         res = session.get(url, headers=HEADERS, params=params, timeout=timeout)
         if not res.ok:
-            logging.warning("[API] %s %s -> %s", url, params, res.status_code)
+            logging.warning("[API] %s %s -> %s %s", url, params, res.status_code, res.text[:200])
             return None
         return res.json()
     except Exception as e:
@@ -163,7 +175,7 @@ def fetch_match_stats(fixture_id: int):
     js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fixture_id})
     stats = js.get("response", []) if isinstance(js, dict) else None
     STATS_CACHE[fixture_id] = (now, stats or [])
-    return stats
+    return stats or []
 
 def fetch_match_events(fixture_id: int):
     now = time.time()
@@ -173,7 +185,7 @@ def fetch_match_events(fixture_id: int):
     js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fixture_id})
     evs = js.get("response", []) if isinstance(js, dict) else None
     EVENTS_CACHE[fixture_id] = (now, evs or [])
-    return evs
+    return evs or []
 
 def fetch_live_matches() -> List[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"live": "all"})
@@ -182,19 +194,41 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     out = []
     for m in matches:
         status = (m.get("fixture", {}) or {}).get("status", {}) or {}
-        elapsed = status.get("elapsed"); short = (status.get("short") or "").upper()
-        if elapsed is None or elapsed > 90:
+        elapsed = status.get("elapsed")
+        short = (status.get("short") or "").upper()
+        if elapsed is None:
             continue
         if short not in INPLAY_STATUSES:
             continue
         fid = (m.get("fixture", {}) or {}).get("id")
-        m["statistics"] = fetch_match_stats(fid) or []
-        m["events"] = fetch_match_events(fid) or []
+        m["statistics"] = fetch_match_stats(fid)
+        m["events"] = fetch_match_events(fid)
         out.append(m)
     return out
 
+# Generic fixtures fetcher (for backfills)
+def fetch_fixtures(params: Dict[str, Any], limit: Optional[int] = None, max_pages: int = 5) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    page = 1
+    while page <= max_pages:
+        js = _api_get(FOOTBALL_API_URL, {**params, "page": page})
+        if not isinstance(js, dict): break
+        data = js.get("response") or []
+        out.extend(data)
+        # API often returns "paging": {"current": x, "total": y}
+        paging = js.get("paging") or {}
+        if limit and len(out) >= limit:
+            out = out[:limit]
+            break
+        if paging and int(paging.get("current", 1)) >= int(paging.get("total", 1)):
+            break
+        if not data:
+            break
+        page += 1
+    return out
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Feature extraction
+# Feature extraction (by team id)
 def _num(v) -> float:
     try:
         if isinstance(v, str) and v.endswith('%'): return float(v[:-1])
@@ -209,18 +243,29 @@ def _pos_pct(v) -> float:
         return 0.0
 
 def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
-    home = (match.get("teams") or {}).get("home", {}).get("name", "")
-    away = (match.get("teams") or {}).get("away", {}).get("name", "")
+    teams = (match.get("teams") or {}) or {}
+    home_info = teams.get("home", {}) or {}
+    away_info = teams.get("away", {}) or {}
+    home = home_info.get("name","")
+    away = away_info.get("name","")
+    home_id = int(home_info.get("id") or 0)
+    away_id = int(away_info.get("id") or 0)
+
     gh = (match.get("goals") or {}).get("home") or 0
     ga = (match.get("goals") or {}).get("away") or 0
-    minute = int((match.get("fixture", {}).get("status", {}) or {}).get("elapsed") or 0)
+    status = (match.get("fixture", {}).get("status", {}) or {})
+    minute = int(status.get("elapsed") or 0)
+
     stats_blocks = match.get("statistics") or []
-    stats: Dict[str, Dict[str, Any]] = {}
+    stats_by_id: Dict[int, Dict[str, Any]] = {}
     for s in stats_blocks:
-        tname = (s.get("team") or {}).get("name")
-        if tname:
-            stats[tname] = {i["type"]: i["value"] for i in (s.get("statistics") or [])}
-    sh = stats.get(home, {}); sa = stats.get(away, {})
+        tid = int(((s.get("team") or {}).get("id")) or 0)
+        if tid:
+            stats_by_id[tid] = {i["type"]: i["value"] for i in (s.get("statistics") or [])}
+
+    sh = stats_by_id.get(home_id, {})
+    sa = stats_by_id.get(away_id, {})
+
     xg_h = _num(sh.get("Expected Goals", 0)); xg_a = _num(sa.get("Expected Goals", 0))
     sot_h = _num(sh.get("Shots on Target", 0)); sot_a = _num(sa.get("Shots on Target", 0))
     cor_h = _num(sh.get("Corner Kicks", 0));   cor_a = _num(sa.get("Corner Kicks", 0))
@@ -232,9 +277,10 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
             if (ev.get("type","").lower() == "card"):
                 detail = (ev.get("detail","") or "").lower()
                 if ("red" in detail) or ("second yellow" in detail):
-                    tname = (ev.get("team") or {}).get("name") or ""
-                    if tname == home: red_h += 1
-                    elif tname == away: red_a += 1
+                    t = ev.get("team") or {}
+                    tid = int(t.get("id") or 0)
+                    if tid == home_id: red_h += 1
+                    elif tid == away_id: red_a += 1
         except Exception:
             pass
 
@@ -343,8 +389,11 @@ def send_telegram(message: str) -> bool:
             data={"chat_id": TELEGRAM_CHAT_ID, "text": tg_escape(message), "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=10
         )
+        if not res.ok:
+            logging.warning("[TG] sendMessage failed %s %s", res.status_code, res.text[:200])
         return res.ok
-    except Exception:
+    except Exception as e:
+        logging.exception("[TG] exception: %s", e)
         return False
 
 def _rationale_from_feat(feat: Dict[str, float]) -> str:
@@ -421,7 +470,7 @@ def production_scan() -> Tuple[int,int]:
                 for code, mdl in models.items():
                     raw.extend(_mk_suggestions_for_code(code, mdl, feat))
 
-                # filter only by per‑head probability
+                # filter only by per-head probability
                 filtered = []
                 for market, suggestion, p, head in raw:
                     if p >= _min_prob_for_head(head):
@@ -430,9 +479,10 @@ def production_scan() -> Tuple[int,int]:
                 if not filtered:
                     continue
 
-                # pick top‑K (by prob)
+                # pick top-K (by prob)
                 filtered.sort(key=lambda x: x[2], reverse=True)
-                filtered = filtered[:max(1, int(2 if MAX_TIPS_PER_SCAN else 2))]
+                k = max(1, TOP_K_PER_MATCH)
+                filtered = filtered[:k]
 
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
@@ -471,7 +521,7 @@ def production_scan() -> Tuple[int,int]:
     return saved, live_seen
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Harvest
+# Harvest save
 def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
     fx = m.get("fixture", {}) or {}; lg = m.get("league", {}) or {}
     fid = int(fx.get("id")); league_id = int(lg.get("id") or 0)
@@ -525,7 +575,7 @@ def harvest_scan() -> Tuple[int, int]:
     return saved, live_seen
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MOTD (Match of the Day)
+# MOTD
 def _motd_row(since_ts: int) -> Optional[Tuple]:
     with db_conn() as conn:
         row = conn.execute("""
@@ -540,15 +590,12 @@ def _motd_row(since_ts: int) -> Optional[Tuple]:
 def send_motd_if_needed() -> Optional[Dict[str,Any]]:
     if not MOTD_ENABLE:
         return None
-    # avoid duplicate within a day (Europe/Berlin date)
-    now = time.time()
-    berlin = ZoneInfo("Europe/Berlin")
-    ymd = time.strftime("%Y-%m-%d", time.localtime(now))
+    ymd = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d")
     last = get_setting("motd_last_ymd", "")
     if last == ymd:
         return None
 
-    since_ts = int(now - MOTD_LOOKBACK_HRS*3600)
+    since_ts = int(time.time() - MOTD_LOOKBACK_HRS*3600)
     row = _motd_row(since_ts)
     if not row:
         return None
@@ -570,10 +617,9 @@ def send_motd_if_needed() -> Optional[Dict[str,Any]]:
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Training + digest (unchanged logic; calls external script)
+# Training + digest
 def nightly_digest_job():
     try:
-        now = int(time.time()); day_ago = now - 24*3600
         with db_conn() as conn:
             snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
             tips_total = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
@@ -615,7 +661,7 @@ def retrain_models_job():
         return {"ok": False, "error": str(e)}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Routes
+# Routes: admin key
 def _require_api_key():
     key = request.headers.get("X-API-Key") or request.args.get("key")
     if not ADMIN_API_KEY or key != ADMIN_API_KEY: abort(401)
@@ -631,7 +677,7 @@ def add_security_headers(resp):
 @app.route("/")
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
-    return f"🤖 Robi Superbrain is active ({mode}, pure-model) · DB=Postgres · MIN_PROB={MIN_PROB:.2f}"
+    return f"🤖 Robi Superbrain is active ({mode}, pure-model) · DB=Postgres · MIN_PROB={MIN_PROB:.2f} · TOP_K={TOP_K_PER_MATCH}"
 
 @app.route("/healthz")
 def healthz():
@@ -662,7 +708,7 @@ def train_route():
 
 @app.route("/motd")
 def motd_route():
-    # no admin key required for convenience; add if you prefer
+    # open endpoint for convenience
     lookback = int(request.args.get("hours", MOTD_LOOKBACK_HRS))
     since_ts = int(time.time()) - lookback*3600
     row = _motd_row(since_ts)
@@ -679,33 +725,180 @@ def motd_route():
     })
 
 # ──────────────────────────────────────────────────────────────────────────────
+# MANUAL CONTROL ROUTES (your list)
+
+# 1) BACKFILL ALL (live matches harvest, up to limit)
+@app.route("/backfill/all")
+def backfill_all_route():
+    _require_api_key()
+    limit = int(request.args.get("limit", "999999"))
+    saved_total = 0
+    # one pass is usually enough; loop is defensive in case matches list changes
+    for _ in range(3):
+        saved, live = harvest_scan()
+        saved_total += saved
+        if saved_total >= limit or live == 0:
+            break
+        time.sleep(1)
+    return jsonify({"ok": True, "mode": "live_backfill", "saved": saved_total, "limit": limit})
+
+# 2) BACKFILL +HRS (pull fixtures from last N hours and snapshot)
+@app.route("/backfill")
+def backfill_hours_route():
+    _require_api_key()
+    hours = int(request.args.get("hours", "168"))  # default 7 days
+    delay_ms = int(request.args.get("delay_ms", "250"))
+    limit = int(request.args.get("limit", "0"))  # 0 = no hard cap
+
+    if not API_KEY:
+        return jsonify({"ok": False, "error": "API_KEY missing"}), 400
+
+    now = datetime.utcnow()
+    start = now - timedelta(hours=hours)
+    # API supports date range via from/to (YYYY-MM-DD)
+    fixtures = fetch_fixtures({"from": start.date().isoformat(), "to": now.date().isoformat()}, limit=None, max_pages=10)
+    if limit > 0:
+        fixtures = fixtures[:limit]
+
+    saved = 0
+    for fx in fixtures:
+        try:
+            fid = int((fx.get("fixture") or {}).get("id") or 0)
+            if not fid: continue
+            # augment with stats/events to build features
+            fx["statistics"] = fetch_match_stats(fid)
+            fx["events"] = fetch_match_events(fid)
+            feat = extract_features(fx)
+            save_snapshot_from_match(fx, feat)
+            saved += 1
+            if delay_ms > 0: time.sleep(delay_ms/1000.0)
+        except Exception as e:
+            logging.exception("[BACKFILL hours] failed for %s: %s", fid, e)
+            continue
+
+    return jsonify({"ok": True, "mode": "hours_backfill", "hours": hours, "saved": saved, "count_fixtures": len(fixtures)})
+
+# 3) TOTAL-COUNT (snapshots count)
+@app.route("/stats/snapshots_count")
+def stats_snapshots_count_route():
+    _require_api_key()
+    with db_conn() as conn:
+        n = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
+    return jsonify({"ok": True, "snapshots_count": int(n)})
+
+# 4) HARVEST league + season (single season)
+@app.route("/harvest/league_snapshots")
+def harvest_league_snapshots_route():
+    _require_api_key()
+    league = request.args.get("league")
+    season = request.args.get("season")
+    status = request.args.get("status", "FT")  # finished matches by default
+    limit = int(request.args.get("limit", "0"))
+    delay_ms = int(request.args.get("delay_ms", "500"))
+
+    if not (league and season):
+        return jsonify({"ok": False, "error": "league & season are required"}), 400
+    if not API_KEY:
+        return jsonify({"ok": False, "error": "API_KEY missing"}), 400
+
+    params = {"league": league, "season": season, "status": status}
+    fixtures = fetch_fixtures(params, limit=None, max_pages=20)
+    if limit > 0: fixtures = fixtures[:limit]
+
+    saved = 0
+    for fx in fixtures:
+        try:
+            fid = int((fx.get("fixture") or {}).get("id") or 0)
+            if not fid: continue
+            fx["statistics"] = fetch_match_stats(fid)
+            fx["events"] = fetch_match_events(fid)
+            feat = extract_features(fx)
+            save_snapshot_from_match(fx, feat)
+            saved += 1
+            if delay_ms > 0: time.sleep(delay_ms/1000.0)
+        except Exception as e:
+            logging.exception("[HARVEST league] failed for %s: %s", fid, e)
+            continue
+
+    return jsonify({"ok": True, "league": int(league), "season": int(season), "status": status, "saved": saved, "count_fixtures": len(fixtures)})
+
+# 5) HARVEST MULTI-SEASON
+@app.route("/harvest/league_multiseason")
+def harvest_league_multiseason_route():
+    _require_api_key()
+    league = request.args.get("league")
+    seasons_csv = request.args.get("seasons")  # e.g. "2021,2022,2023,2024,2025"
+    status = request.args.get("status", "FT")
+    limit = int(request.args.get("limit", "0"))  # per season cap
+    delay_ms = int(request.args.get("delay_ms", "500"))
+    sleep_between_seasons_ms = int(request.args.get("sleep_between_seasons_ms", "1000"))
+
+    if not (league and seasons_csv):
+        return jsonify({"ok": False, "error": "league & seasons are required"}), 400
+    if not API_KEY:
+        return jsonify({"ok": False, "error": "API_KEY missing"}), 400
+
+    seasons = [s.strip() for s in seasons_csv.split(",") if s.strip()]
+    total_saved = 0
+    per_season_stats = []
+
+    for s in seasons:
+        params = {"league": league, "season": s, "status": status}
+        fixtures = fetch_fixtures(params, limit=None, max_pages=20)
+        if limit > 0: fixtures = fixtures[:limit]
+
+        saved = 0
+        for fx in fixtures:
+            try:
+                fid = int((fx.get("fixture") or {}).get("id") or 0)
+                if not fid: continue
+                fx["statistics"] = fetch_match_stats(fid)
+                fx["events"] = fetch_match_events(fid)
+                feat = extract_features(fx)
+                save_snapshot_from_match(fx, feat)
+                saved += 1
+                total_saved += 1
+                if delay_ms > 0: time.sleep(delay_ms/1000.0)
+            except Exception as e:
+                logging.exception("[HARVEST multiseason] season=%s fid=%s error=%s", s, fid, e)
+                continue
+
+        per_season_stats.append({"season": int(s), "fixtures": len(fixtures), "saved": saved})
+        if sleep_between_seasons_ms > 0:
+            time.sleep(sleep_between_seasons_ms/1000.0)
+
+    return jsonify({"ok": True, "league": int(league), "status": status, "total_saved": total_saved, "per_season": per_season_stats})
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint / Scheduler
 if __name__ == "__main__":
-    if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
+    if not API_KEY: logging.error("API_KEY is not set — API calls will fail or return 0 matches.")
     if not ADMIN_API_KEY: logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
     init_db()
 
-    scheduler = BackgroundScheduler()
+    if SCHEDULER_ENABLE:
+        scheduler = BackgroundScheduler()
+        if HARVEST_MODE:
+            scheduler.add_job(harvest_scan, CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")), id="harvest", replace_existing=True)
+            logging.info("⛏️  Running in HARVEST mode.")
+        else:
+            scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")), id="production_scan", replace_existing=True)
+            logging.info("🎯 Running in PRODUCTION mode (pure model).")
 
-    if HARVEST_MODE:
-        scheduler.add_job(harvest_scan, CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")), id="harvest", replace_existing=True)
-        logging.info("⛏️  Running in HARVEST mode.")
+        scheduler.add_job(retrain_models_job, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+                          id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True)
+        scheduler.add_job(nightly_digest_job, CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
+                          id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True)
+
+        if MOTD_ENABLE:
+            scheduler.add_job(send_motd_if_needed, CronTrigger(hour=MOTD_HOUR_LOCAL, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+                              id="motd", replace_existing=True, misfire_grace_time=3600, coalesce=True)
+            logging.info("🏅 MOTD scheduled at %02d:00 Europe/Berlin", MOTD_HOUR_LOCAL)
+
+        scheduler.start()
+        logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
     else:
-        scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")), id="production_scan", replace_existing=True)
-        logging.info("🎯 Running in PRODUCTION mode (pure model).")
-
-    scheduler.add_job(retrain_models_job, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-                      id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True)
-    scheduler.add_job(nightly_digest_job, CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
-                      id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True)
-
-    if MOTD_ENABLE:
-        scheduler.add_job(send_motd_if_needed, CronTrigger(hour=MOTD_HOUR_LOCAL, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-                          id="motd", replace_existing=True, misfire_grace_time=3600, coalesce=True)
-        logging.info("🏅 MOTD scheduled at %02d:00 Europe/Berlin", MOTD_HOUR_LOCAL)
-
-    scheduler.start()
-    logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
+        logging.info("⏱️ Scheduler disabled via SCHEDULER_ENABLE=0")
 
     port = int(os.getenv("PORT", 5000))
     logging.info("✅ Robi Superbrain started.")
