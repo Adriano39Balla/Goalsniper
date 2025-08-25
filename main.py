@@ -130,10 +130,11 @@ def get_dynamic_threshold(code: str, default: float = MIN_PROB) -> float:
         return default
 
 # ──────────────────────────────────────────────────────────────────────────────
-# API wrappers (unchanged fetch functions, same as your old main.py) ...
-# [keep fetch_match_stats, fetch_match_events, fetch_live_matches, extract_features, scoring functions]
+# Feature extraction + model scoring + Telegram helpers
+# (keep your existing extract_features, _mk_suggestions_for_code, etc. from before)
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Selection upgrade
+# Smarter tip selection
 def _select_best_suggestions(raw: List[Tuple[str, str, float, str]], top_k: int) -> List[Tuple[str,str,float,str]]:
     selected = []
     for market, suggestion, p, head in raw:
@@ -147,10 +148,7 @@ def _select_best_suggestions(raw: List[Tuple[str, str, float, str]], top_k: int)
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Telegram helpers (tg_escape, send_telegram, _format_tip_message, etc. unchanged)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Production scan (modified)
+# Production scan
 def production_scan() -> Tuple[int,int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
@@ -171,13 +169,11 @@ def production_scan() -> Tuple[int,int]:
                 fid = int((m.get("fixture", {}) or {}).get("id") or 0)
                 if not fid: continue
                 feat = extract_features(m)
-                minute = int(feat.get("minute", 0))
 
                 raw: List[Tuple[str,str,float,str]] = []
                 for code, mdl in models.items():
                     raw.extend(_mk_suggestions_for_code(code, mdl, feat))
 
-                # NEW: smarter selection
                 filtered = _select_best_suggestions(raw, TOP_K_PER_MATCH)
                 if not filtered: continue
 
@@ -197,11 +193,11 @@ def production_scan() -> Tuple[int,int]:
                     conn.execute("""
                         INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
                         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
-                    """, (fid, league_id, league, home, away, market, suggestion, float(min(99.9, prob*100.0)), score_txt, minute, now))
+                    """, (fid, league_id, league, home, away, market, suggestion, float(min(99.9, prob*100.0)), score_txt, int(feat.get("minute",0)), now))
 
                     msg = _format_tip_message(
                         league=league, home=home, away=away,
-                        minute=minute, score_txt=score_txt,
+                        minute=int(feat.get("minute",0)), score_txt=score_txt,
                         suggestion=suggestion, prob=prob,
                         rationale=_rationale_from_feat(feat)
                     )
@@ -218,12 +214,75 @@ def production_scan() -> Tuple[int,int]:
     return saved, live_seen
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Nightly retrain + analyze job
+# Nightly digest + Match of the Day
+def _counts_since(ts_from: int) -> Dict[str, int]:
+    with db_conn() as conn:
+        snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
+        tips_total = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+        res_total  = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
+        unlabeled  = conn.execute("""
+            SELECT COUNT(DISTINCT s.match_id)
+            FROM tip_snapshots s
+            LEFT JOIN match_results r ON r.match_id = s.match_id
+            WHERE r.match_id IS NULL
+        """).fetchone()[0]
+        snap_24h = conn.execute("SELECT COUNT(*) FROM tip_snapshots WHERE created_ts>=%s", (ts_from,)).fetchone()[0]
+        res_24h  = conn.execute("SELECT COUNT(*) FROM match_results WHERE updated_ts>=%s", (ts_from,)).fetchone()[0]
+    return {"snap_total": int(snap_total), "tips_total": int(tips_total), "res_total": int(res_total),
+            "unlabeled": int(unlabeled), "snap_24h": int(snap_24h), "res_24h": int(res_24h)}
+
+def nightly_digest_job():
+    try:
+        now = int(time.time()); day_ago = now - 24*3600
+        c = _counts_since(day_ago)
+        msg = (
+            "📊 <b>Robi Nightly Digest</b>\n"
+            f"Snapshots: {c['snap_total']} (+ {c['snap_24h']} last 24h)\n"
+            f"Finals: {c['res_total']} (+ {c['res_24h']} last 24h)\n"
+            f"Unlabeled match_ids: {c['unlabeled']}\n"
+            "Models retrain at 03:00 CEST daily."
+        )
+        logging.info("[DIGEST]\n%s", msg.replace("<b>","").replace("</b>",""))
+        send_telegram(msg)
+    except Exception as e:
+        logging.exception("[DIGEST] failed: %s", e)
+
+def match_of_the_day_job():
+    try:
+        now = int(time.time()); day_ago = now - 24*3600
+        with db_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts
+                FROM tips
+                WHERE created_ts >= %s AND sent_ok=1
+                ORDER BY confidence DESC, created_ts DESC
+                LIMIT 1
+                """, (day_ago,)
+            ).fetchone()
+        if not row:
+            send_telegram("🏅 Match of the Day: (no tips in the last 24h)")
+            return
+        league, home, away, market, suggestion, conf, score_at_tip, minute, ts = row
+        when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts)) + " UTC"
+        msg = (
+            "🏅 <b>Match of the Day</b>\n"
+            f"{home} vs {away}\n"
+            f"⏰ Minute {minute}' | Score then: {score_at_tip} | {when}\n"
+            f"Market: {market}\n"
+            f"Tip: {suggestion}\n"
+            f"📈 Model {conf:.1f}%\n"
+            f"🏆 League: {league}"
+        )
+        send_telegram(msg)
+    except Exception as e:
+        logging.exception("[MOTD] failed: %s", e)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Retrain + Analyze
 def retrain_and_analyze_job():
-    """Runs nightly retraining + precision analysis → updates thresholds + calibration in DB."""
     try:
         logging.info("[RETRAIN] Starting nightly retrain & analyze job...")
-
         result_train = subprocess.run(["python", "train_models.py"], capture_output=True, text=True)
         logging.info("[RETRAIN] train_models.py output:\n%s", result_train.stdout)
 
@@ -241,10 +300,7 @@ def retrain_and_analyze_job():
         logging.exception("[RETRAIN] failed: %s", e)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Routes (same as before, keep /predict, /healthz, etc.)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Entrypoint / Scheduler
+# Entrypoint
 if __name__ == "__main__":
     if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
     if not ADMIN_API_KEY: logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
@@ -252,7 +308,7 @@ if __name__ == "__main__":
 
     scheduler = BackgroundScheduler()
 
-    # scan cadence
+    # production scan
     scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
                       id="production_scan", replace_existing=True)
 
@@ -264,7 +320,7 @@ if __name__ == "__main__":
     scheduler.add_job(match_of_the_day_job, CronTrigger(hour=9, minute=5, timezone=ZoneInfo("Europe/Berlin")),
                       id="motd", replace_existing=True, misfire_grace_time=3600, coalesce=True)
 
-    # NEW: retrain & analyze at 03:00
+    # retrain loop
     scheduler.add_job(retrain_and_analyze_job, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
                       id="retrain_loop", replace_existing=True, misfire_grace_time=3600, coalesce=True)
 
