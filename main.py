@@ -255,6 +255,20 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
         out.append(m)
     return out
 
+def _parse_threshold_env(name: str, default_pct: int = 60) -> int:
+    """
+    Reads an env var that may be given as 0–1 (e.g. 0.75) or 0–100 (e.g. 75).
+    Returns an integer percent (0–100).
+    """
+    raw = (os.getenv(name, str(default_pct)) or "").strip()
+    try:
+        v = float(raw)
+        if v <= 1.0:   # treat as probability
+            return int(round(v * 100))
+        return int(round(v))  # already a percent
+    except Exception:
+        return int(default_pct)
+
 # ── Fixtures fetch ────────────────────────────────────────────────────────────
 MAX_IDS_PER_REQ = 20
 
