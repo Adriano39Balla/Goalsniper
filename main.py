@@ -7,6 +7,7 @@ import math
 import logging
 import requests
 import psycopg2
+from psycopg2 import pool
 import subprocess, shlex
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional, Tuple
@@ -20,6 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 app = Flask(__name__)
 
+# ──────────────────────────────────────────────────────────────────────────────
 # Env
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
@@ -30,58 +32,70 @@ HARVEST_MODE       = os.getenv("HARVEST_MODE", "1") not in ("0","false","False",
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 
-# AI mode
+# AI / policy
 ONLY_MODEL_MODE    = os.getenv("ONLY_MODEL_MODE", "1") not in ("0","false","False","no","NO")
-MIN_PROB           = max(0.0, min(0.99, float(os.getenv("MIN_PROB", "0.55"))))
-MIN_QUOTA          = float(os.getenv("MIN_QUOTA", "1.05"))  # kept for compatibility with sorting
+MIN_PROB_DEFAULT   = max(0.0, min(0.99, float(os.getenv("MIN_PROB", "0.55"))))
+MIN_QUOTA          = float(os.getenv("MIN_QUOTA", "1.05"))
 
+# Per‑head overrides (so BTTS can punch through even when global MIN_PROB is high)
+BTTS_MIN_PROB      = float(os.getenv("BTTS_MIN_PROB", str(MIN_PROB_DEFAULT)))
+
+# Training
 TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 
+# Stats requirements
 REQUIRE_STATS_AFTER_MINUTE = int(os.getenv("REQUIRE_STATS_AFTER_MINUTE", "35"))
 REQUIRE_DATA_FIELDS        = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
 
-# Bookmaker odds + quality gates
-MIN_DEC_ODDS       = float(os.getenv("MIN_DEC_ODDS", "1.5"))   # Only send when offered odds >= this
-MINUTE_MIN         = int(os.getenv("MINUTE_MIN", "10"))        # ignore very early
-MINUTE_MAX         = int(os.getenv("MINUTE_MAX", "85"))        # ignore very late
+# Odds gates
+MIN_DEC_ODDS       = float(os.getenv("MIN_DEC_ODDS", "1.5"))
+MINUTE_MIN         = int(os.getenv("MINUTE_MIN", "10"))
+MINUTE_MAX         = int(os.getenv("MINUTE_MAX", "85"))
 REQ_AFTER_MIN      = int(os.getenv("REQ_AFTER_MIN", str(REQUIRE_STATS_AFTER_MINUTE)))
 REQ_MIN_FIELDS     = int(os.getenv("REQ_MIN_FIELDS", str(REQUIRE_DATA_FIELDS)))
 REQ_MIN_SOT_SUM    = int(os.getenv("REQ_MIN_SOT_SUM", "3"))
 REQ_MIN_XG_SUM     = float(os.getenv("REQ_MIN_XG_SUM", "1.1"))
 
+# Odds availability rule:
+# require odds for non‑BTTS markets to reduce noise, but allow BTTS without odds so BTTS tips actually appear.
+REQUIRE_ODDS_FOR_NON_BTTS = os.getenv("REQUIRE_ODDS_FOR_NON_BTTS", "1") not in ("0","false","False","no","NO")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("DATABASE_URL is required (Postgres).")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Requests session
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], respect_retry_after_header=True)
+session.mount("https://", HTTPAdapter(max_retries=retries))
+session.mount("http://", HTTPAdapter(max_retries=retries))
 
 BASE_URL         = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
 HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES  = {"1H","HT","2H","ET","BT","P"}
 
-session = requests.Session()
-retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], respect_retry_after_header=True)
-session.mount("https://", HTTPAdapter(max_retries=retries))
-session.mount("http://", HTTPAdapter(max_retries=retries))
-
 STATS_CACHE: Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
-ODDS_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}  # {fixture_id: (ts, odds_blob)}
+ODDS_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB helpers
-class PgCursor:
-    def __init__(self, cur): self.cur = cur
-    def fetchone(self): return self.cur.fetchone()
-    def fetchall(self): return self.cur.fetchall()
+# DB pooling + helpers
+def _normalize_db_url(db_url: str) -> str:
+    if db_url.startswith("postgres://"):
+        db_url = "postgresql://" + db_url[len("postgres://"):]
+    if "sslmode=" not in db_url:
+        db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
+    return db_url
+
+pg_pool: Optional[pool.SimpleConnectionPool] = None
 
 class PgConn:
-    def __init__(self, dsn: str): self.dsn = dsn; self.conn=None; self.cur=None
     def __enter__(self):
-        dsn = self.dsn
-        if "sslmode=" not in dsn:
-            dsn = dsn + ("&" if "?" in dsn else "?") + "sslmode=require"
-        self.conn = psycopg2.connect(dsn)
+        assert pg_pool is not None, "pg_pool not initialized"
+        self.conn = pg_pool.getconn()
         self.conn.autocommit = True
         self.cur = self.conn.cursor()
         return self
@@ -89,24 +103,22 @@ class PgConn:
         try:
             if self.cur: self.cur.close()
         finally:
-            if self.conn: self.conn.close()
+            if self.conn and pg_pool: pg_pool.putconn(self.conn)
     def execute(self, sql: str, params: tuple|list=()):
         self.cur.execute(sql, params or ())
-        return PgCursor(self.cur)
+        return self.cur
 
-def db_conn() -> PgConn: return PgConn(DATABASE_URL)
+def db_conn() -> PgConn: return PgConn()
 
-def set_setting(key: str, value: str):
-    with db_conn() as conn:
-        conn.execute("""INSERT INTO settings(key,value) VALUES(%s,%s)
-                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (key, value))
-
-def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    with db_conn() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
-        return row[0] if row else default
+def init_pool_and_db():
+    global pg_pool
+    if pg_pool is None:
+        dsn = _normalize_db_url(DATABASE_URL)
+        pg_pool = pool.SimpleConnectionPool(minconn=1, maxconn=10, dsn=dsn)
+    init_db()
 
 def init_db():
+    # tables + indexes + non‑breaking migrations
     with db_conn() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS tips (
@@ -122,6 +134,12 @@ def init_db():
             minute    INTEGER,
             created_ts BIGINT,
             sent_ok   INTEGER DEFAULT 1,
+            -- new analytics cols (nullable for backward compat)
+            head      TEXT,
+            baseline  DOUBLE PRECISION,
+            lift      DOUBLE PRECISION,
+            quota     DOUBLE PRECISION,
+            offered_odds DOUBLE PRECISION,
             PRIMARY KEY (match_id, created_ts)
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS tip_snapshots (match_id BIGINT, created_ts BIGINT, payload TEXT, PRIMARY KEY (match_id, created_ts))""")
@@ -130,17 +148,29 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS match_results (match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_tips_dedupe
-            ON tips(match_id, market, suggestion, created_ts)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_tips_recent
-            ON tips(match_id, created_ts)
-        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_recent ON tips(created_ts)")
+        # Defensive migrations if old tips table exists without new cols
+        for col, ddl in [
+            ("head",         "ALTER TABLE tips ADD COLUMN IF NOT EXISTS head TEXT"),
+            ("baseline",     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS baseline DOUBLE PRECISION"),
+            ("lift",         "ALTER TABLE tips ADD COLUMN IF NOT EXISTS lift DOUBLE PRECISION"),
+            ("quota",        "ALTER TABLE tips ADD COLUMN IF NOT EXISTS quota DOUBLE PRECISION"),
+            ("offered_odds", "ALTER TABLE tips ADD COLUMN IF NOT EXISTS offered_odds DOUBLE PRECISION"),
+        ]:
+            conn.execute(ddl)
+
+def set_setting(key: str, value: str):
+    with db_conn() as conn:
+        conn.execute("""INSERT INTO settings(key,value) VALUES(%s,%s)
+                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (key, value))
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with db_conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
+        return row[0] if row else default
 
 # ──────────────────────────────────────────────────────────────────────────────
-# API + features
+# API calls
 def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY: return None
     try:
@@ -155,22 +185,20 @@ def _api_get(url: str, params: dict, timeout: int = 15):
 
 def fetch_match_stats(fixture_id: int):
     now = time.time()
-    if fixture_id in STATS_CACHE:
-        ts, data = STATS_CACHE[fixture_id]
-        if now - ts < 90: return data
+    if fixture_id in STATS_CACHE and now - STATS_CACHE[fixture_id][0] < 90:
+        return STATS_CACHE[fixture_id][1]
     js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fixture_id})
-    stats = js.get("response", []) if isinstance(js, dict) else None
-    STATS_CACHE[fixture_id] = (now, stats or [])
+    stats = js.get("response", []) if isinstance(js, dict) else []
+    STATS_CACHE[fixture_id] = (now, stats)
     return stats
 
 def fetch_match_events(fixture_id: int):
     now = time.time()
-    if fixture_id in EVENTS_CACHE:
-        ts, data = EVENTS_CACHE[fixture_id]
-        if now - ts < 90: return data
+    if fixture_id in EVENTS_CACHE and now - EVENTS_CACHE[fixture_id][0] < 90:
+        return EVENTS_CACHE[fixture_id][1]
     js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fixture_id})
-    evs = js.get("response", []) if isinstance(js, dict) else None
-    EVENTS_CACHE[fixture_id] = (now, evs or [])
+    evs = js.get("response", []) if isinstance(js, dict) else []
+    EVENTS_CACHE[fixture_id] = (now, evs)
     return evs
 
 def fetch_live_matches() -> List[Dict[str, Any]]:
@@ -180,19 +208,20 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     out = []
     for m in matches:
         status = (m.get("fixture", {}) or {}).get("status", {}) or {}
-        elapsed = status.get("elapsed"); short = (status.get("short") or "").upper()
-        if elapsed is None or elapsed > 90:
+        elapsed = status.get("elapsed")
+        short = (status.get("short") or "").upper()
+        if elapsed is None or elapsed > 90:  # cap at 90; ET will show via short
             continue
         if short not in INPLAY_STATUSES:
             continue
         fid = (m.get("fixture", {}) or {}).get("id")
-        m["statistics"] = fetch_match_stats(fid) or []
-        m["events"] = fetch_match_events(fid) or []
+        m["statistics"] = fetch_match_stats(fid)
+        m["events"] = fetch_match_events(fid)
         out.append(m)
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Odds: parse & implied baselines
+# Odds parsing
 def _odds_to_prob(odd: Any) -> float:
     try:
         o = float(odd)
@@ -205,45 +234,22 @@ def _normalize_three(p1: float, p2: float, p3: float) -> Tuple[float,float,float
     return p1/s, p2/s, p3/s
 
 def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns normalized probabilities and raw decimal odds for HDA and OU.
-    Structure:
-      {
-        "hda": {"home":p,"draw":p,"away":p},
-        "hda_odds": {"home":odd,"draw":odd,"away":odd},
-        "ou": {threshold: {"over":p,"under":p}},
-        "ou_odds": {threshold: {"over":odd,"under":odd}}
-      }
-    """
-    books = []
-    try:
-        books = (js or {}).get("response", []) or []
-    except Exception:
-        pass
-    if not books:
-        return {}
-
+    books = (js or {}).get("response", []) or []
+    if not books: return {}
     node = books[0]
-    if "bookmakers" in node:
-        bks = node["bookmakers"] or []
-    else:
-        bks = books
-    if not bks:
-        return {}
-
+    bks = node.get("bookmakers", books) or []
+    if not bks: return {}
     bets = (bks[0] or {}).get("bets", []) or []
     out = {"hda": {}, "hda_odds": {}, "ou": {}, "ou_odds": {}}
 
     def _to_float(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
+        try: return float(x)
+        except Exception: return None
 
-    # Match Winner / 1X2
+    # 1X2
     mw = next((b for b in bets if "match winner" in (b.get("name","").lower())), None)
     if mw:
-        vals = {v.get("value","").strip().lower(): v for v in (mw.get("values") or [])}
+        vals = { (v.get("value","") or "").strip().lower(): v for v in (mw.get("values") or []) }
         raw_home = _to_float((vals.get("home") or {}).get("odd"))
         raw_draw = _to_float((vals.get("draw") or {}).get("odd"))
         raw_away = _to_float((vals.get("away") or {}).get("odd"))
@@ -260,12 +266,10 @@ def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
         for v in (ou.get("values") or []):
             val = (v.get("value") or "").strip().lower()
             odd = _to_float(v.get("odd"))
-            if not odd:
-                continue
+            if not odd: continue
             is_over = val.startswith("over ")
             is_under = val.startswith("under ")
-            if not (is_over or is_under):
-                continue
+            if not (is_over or is_under): continue
             try:
                 th = float(val.split()[1])
             except Exception:
@@ -273,11 +277,10 @@ def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
             d = out["ou"].setdefault(th, {"over": 0.0, "under": 0.0})
             d2 = out["ou_odds"].setdefault(th, {"over": None, "under": None})
             if is_over:
-                d["over"] = _odds_to_prob(odd)
-                d2["over"] = odd
+                d["over"] = _odds_to_prob(odd); d2["over"] = odd
             else:
-                d["under"] = _odds_to_prob(odd)
-                d2["under"] = odd
+                d["under"] = _odds_to_prob(odd); d2["under"] = odd
+        # normalize each threshold
         for th, d in list(out["ou"].items()):
             s = max(1e-9, d.get("over",0.0) + d.get("under",0.0))
             out["ou"][th] = {"over": d.get("over",0.0)/s, "under": d.get("under",0.0)/s}
@@ -286,9 +289,8 @@ def _parse_odds_payload(js: Dict[str, Any]) -> Dict[str, Any]:
 
 def fetch_fixture_odds(fixture_id: int) -> Dict[str, Any]:
     now = time.time()
-    if fixture_id in ODDS_CACHE:
-        ts, data = ODDS_CACHE[fixture_id]
-        if now - ts < 90: return data
+    if fixture_id in ODDS_CACHE and now - ODDS_CACHE[fixture_id][0] < 90:
+        return ODDS_CACHE[fixture_id][1]
     js1 = _api_get(f"{BASE_URL}/odds", {"fixture": fixture_id})
     odds = _parse_odds_payload(js1 if isinstance(js1, dict) else {})
     if not odds:
@@ -394,15 +396,14 @@ def _list_models(prefix: str = "model_v2:") -> Dict[str, Dict[str,Any]]:
     for k, v in rows:
         try:
             code = k.split(":",1)[1]
-            if code.lower() in ("o05","o5"):
+            if code.lower() in ("o05","o5"):  # never use O0.5
                 continue
             out[code] = json.loads(v)
         except Exception:
             continue
     return out
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Baseline from odds (fallback: empirical)
+# Baselines from odds (fallback to empirical prevalence)
 def _ou_label(code: str) -> Optional[float]:
     m = OU_RE.match(code)
     if not m: return None
@@ -433,8 +434,8 @@ def _baseline_from_odds(head: str, suggestion: str, odds: Dict[str,Any]) -> Opti
         d = ou[th]
         if s.startswith("over "): return float(d.get("over", 0.0))
         if s.startswith("under "): return float(d.get("under", 0.0))
-    if head == "BTTS" and hda:  # weak fallback
-        return 0.5
+    if head == "BTTS" and hda:
+        return 0.5  # weak fallback; better than none
     return None
 
 def _clamp_prob(x: float, lo: float, hi: float) -> float:
@@ -514,50 +515,54 @@ def _quality_gate(feat: Dict[str,float]) -> bool:
             return False
     return True
 
+def _min_prob_for_head(head: str) -> float:
+    if head == "BTTS":
+        return BTTS_MIN_PROB
+    return MIN_PROB_DEFAULT
+
 def _apply_filter_with_odds(
     suggestions: List[Tuple[str,str,float,str]],
     minute: int,
     feat: Dict[str,float],
     odds: Dict[str,Any],
-    min_prob: float,
     min_quota: float,
     top_k: int = 2,
     min_fields_after_minute: Tuple[int,int] = (REQUIRE_STATS_AFTER_MINUTE, REQUIRE_DATA_FIELDS)
 ) -> List[Tuple[str,str,float,str,float,float,float,Optional[float]]]:
     """
     Returns: (market, suggestion, p, head, base, lift, edge_quota, offered_odds)
-    Filters require:
-      - stats coverage after the configured minute
-      - offered odds present and >= MIN_DEC_ODDS
-      - model probability >= min_prob
-      - quota (edge vs odds-implied/prev) >= min_quota
     """
-    out: List[Tuple[str,str,float,str,float,float,float,Optional[float]]] = []
+    out = []
     req_minute, req_fields = min_fields_after_minute
 
     for market, sugg, p, head in suggestions:
-        # After REQ minute, demand some stats coverage
+        # Stats coverage gate after a given minute
         if req_minute and minute >= req_minute and not _stats_coverage_ok(feat, req_fields):
             continue
 
-        # Require offered odds and minimum price
         offered = _offered_odds(head, sugg, odds)
-        if offered is None or offered < MIN_DEC_ODDS:
+        # If we have odds quoted, enforce a minimum price
+        if offered is not None and offered < MIN_DEC_ODDS:
             continue
 
-        # Baseline from live odds; if missing, skip this market
+        # If odds are required for non‑BTTS, enforce presence
+        if REQUIRE_ODDS_FOR_NON_BTTS and head != "BTTS" and offered is None:
+            continue
+
         base = _baseline_from_odds(head, sugg, odds)
         if base is None:
-            continue
+            base = _head_prevalence(head)
 
-        lift = p - base
+        lift   = p - base
         edge_q = _quota(p, base)
 
-        # Actual gates
+        # Per‑head probability floors (BTTS override lives here)
+        min_prob = _min_prob_for_head(head)
+
         if p >= min_prob and edge_q >= min_quota:
             out.append((market, sugg, p, head, base, lift, edge_q, offered))
 
-    out.sort(key=lambda x: (x[6], x[5], x[2]), reverse=True)  # by quota, then lift, then prob
+    out.sort(key=lambda x: (x[6], x[5], x[2]), reverse=True)  # quota, lift, prob
     return out[:max(1, int(top_k))]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -601,7 +606,7 @@ def _format_tip_message(
         f"Match: {home} vs {away}",
         f"⏰ Minute: {minute}' | Score: {score_txt}",
         f"Tip: {suggestion}",
-        f"📈 Model {prob_pct:.1f}% | Odds-implied {base_pct:.1f}% | Edge +{lift*100:.1f} pp",
+        f"📈 Model {prob_pct:.1f}% | Odds‑implied {base_pct:.1f}% | Edge +{lift*100:.1f} pp | Quota ×{quota:.2f}",
     ]
     if offered_odds:
         parts.append(f"💸 Odds {offered_odds:.2f}")
@@ -624,17 +629,8 @@ def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
     t = (m.get("teams") or {}) or {}
     return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
 
-def _reliability_guard(p: float, feat: Dict[str, float]) -> float:
-    minute = int(feat.get("minute", 0))
-    xg_sum = float(feat.get("xg_sum", 0.0) or 0.0)
-    sot_sum = float(feat.get("sot_sum", 0.0) or 0.0)
-    # before 25’ or with very low chance creation, don’t allow 98–99% spikes
-    if minute < 25 or (xg_sum < 0.8 and sot_sum < 3):
-        return min(p, 0.92)
-    return p
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Nightly training + digest
+# Nightly training + digest + MOTD
 def _counts_since(ts_from: int) -> Dict[str, int]:
     with db_conn() as conn:
         snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
@@ -705,36 +701,20 @@ def retrain_models_job():
         err = (proc.stderr or "").strip()
         logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
 
-        # Post-check: did we actually get models? If yes, override failure.
         models = _list_models("model_v2:")
-        has_models = bool(models)
-
         chosen = None
         for key in ("BTTS","O25","O15","WIN_HOME","DRAW","WIN_AWAY"):
             if key in models: chosen = key; break
         top_line = f"[{chosen}] top | {_top_feature_strings(models[chosen], 8)}" if chosen else ""
-
         metrics_json = _metrics_blob_for_telegram()
         set_setting("model_metrics_latest", metrics_json)
 
-        ok = (proc.returncode == 0) or has_models
+        ok = (proc.returncode == 0)
         emoji = "✅" if ok else "❌"
-
-        msg = (
-            f"{emoji} Nightly training {'OK' if ok else 'failed'} (rc={proc.returncode})\n"
-            f"{top_line}\n"
-            f"Saved model_metrics_latest in settings.\n"
-            f"{metrics_json}"
-        )
+        msg = f"{emoji} Nightly training {'OK' if ok else 'failed'} (rc={proc.returncode})\n{top_line}\nSaved model_metrics_latest in settings.\n{metrics_json}"
         send_telegram(msg)
 
-        return {
-            "ok": ok,
-            "code": proc.returncode,
-            "has_models": has_models,
-            "stdout": out[-2000:],
-            "stderr": err[-1000:]
-        }
+        return {"ok": ok, "code": proc.returncode, "stdout": out[-2000:], "stderr": err[-1000:]}
     except subprocess.TimeoutExpired:
         logging.error("[TRAIN] timed out")
         send_telegram("❌ Nightly training timed out.")
@@ -744,13 +724,49 @@ def retrain_models_job():
         send_telegram(f"❌ Nightly training exception: {e}")
         return {"ok": False, "error": str(e)}
 
+def motd_job():
+    """Pick the single best tip from the last 24h by quota, then by confidence, and send it."""
+    try:
+        now = int(time.time()); from_ts = now - 24*3600
+        with db_conn() as conn:
+            rows = conn.execute("""
+                SELECT league, home, away, market, suggestion, confidence, minute, score_at_tip,
+                       COALESCE(quota, 0) AS quota, COALESCE(lift, 0) AS lift, COALESCE(baseline, 0) AS baseline,
+                       COALESCE(offered_odds, NULL) AS offered_odds, created_ts
+                FROM tips
+                WHERE created_ts >= %s AND suggestion <> 'HARVEST'
+                ORDER BY quota DESC NULLS LAST, confidence DESC NULLS LAST, created_ts DESC
+                LIMIT 1
+            """, (from_ts,)).fetchone()
+        if not rows:
+            send_telegram("🏆 Match of the Day: no qualifying tips in the last 24h.")
+            return False
+
+        league, home, away, market, suggestion, conf, minute, score, quota, lift, baseline, offered, _ = rows
+        msg = (
+            "🏆 <b>Match of the Day</b>\n"
+            f"Match: {home} vs {away}\n"
+            f"Tip: {suggestion} ({market})\n"
+            f"⏰ At {minute}' | Score then: {score}\n"
+            f"📈 Model {float(conf or 0):.1f}% | Odds‑implied {baseline*100:.1f}% | Edge +{lift*100:.1f} pp | Quota ×{float(quota or 0):.2f}"
+        )
+        if offered:
+            msg += f"\n💸 Odds {float(offered):.2f}"
+        msg += f"\n🏁 League: {league}"
+        send_telegram(msg)
+        return True
+    except Exception as e:
+        logging.exception("[MOTD] failed: %s", e)
+        return False
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Production scan
 def production_scan() -> Tuple[int,int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
-        logging.info("[PROD] no live matches"); return 0, 0
+        logging.info("[PROD] no live matches")
+        return 0, 0
 
     models = _list_models("model_v2:")
     if not models:
@@ -767,7 +783,6 @@ def production_scan() -> Tuple[int,int]:
                 if not fid: continue
                 feat = extract_features(m)
 
-                # Quality gate to reduce trash
                 if not _quality_gate(feat):
                     continue
 
@@ -780,7 +795,7 @@ def production_scan() -> Tuple[int,int]:
 
                 filtered = _apply_filter_with_odds(
                     raw, minute, feat, odds,
-                    min_prob=MIN_PROB, min_quota=MIN_QUOTA, top_k=2
+                    min_quota=MIN_QUOTA, top_k=2
                 )
                 if not filtered: continue
 
@@ -798,9 +813,11 @@ def production_scan() -> Tuple[int,int]:
 
                     now = int(time.time())
                     conn.execute("""
-                        INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
-                    """, (fid, league_id, league, home, away, market, suggestion, float(min(99.0, prob*100.0)), score_txt, minute, now))
+                        INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok,head,baseline,lift,quota,offered_odds)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s,%s,%s)
+                    """, (fid, league_id, league, home, away, market, suggestion,
+                          float(min(99.0, prob*100.0)), score_txt, minute, now,
+                          head, float(base), float(lift), float(q), float(offered) if (offered is not None) else None))
 
                     rationale = _rationale_from_feat(feat)
                     msg = _format_tip_message(
@@ -822,7 +839,7 @@ def production_scan() -> Tuple[int,int]:
     return saved, live_seen
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Harvest
+# Harvest (data collection)
 def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
     fx = m.get("fixture", {}) or {}; lg = m.get("league", {}) or {}
     fid = int(fx.get("id")); league_id = int(lg.get("id") or 0)
@@ -893,7 +910,7 @@ def add_security_headers(resp):
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
     ai_tag = "AI‑only" if ONLY_MODEL_MODE else "legacy"
-    return f"🤖 Robi Superbrain is active ({mode}, {ai_tag}) · DB=Postgres · MIN_PROB={MIN_PROB:.2f} · MIN_DEC_ODDS={MIN_DEC_ODDS:.2f}"
+    return f"🤖 Robi Superbrain is active ({mode}, {ai_tag}) · DB=Postgres · MIN_PROB={MIN_PROB_DEFAULT:.2f} · MIN_DEC_ODDS={MIN_DEC_ODDS:.2f} · BTTS_MIN={BTTS_MIN_PROB:.2f}"
 
 @app.route("/healthz")
 def healthz():
@@ -915,7 +932,7 @@ def predict_models_route():
 def predict_scan_route():
     _require_api_key()
     saved, live = production_scan()
-    return jsonify({"ok": True, "live_seen": live, "tips_saved": saved, "min_prob": MIN_PROB, "min_dec_odds": MIN_DEC_ODDS})
+    return jsonify({"ok": True, "live_seen": live, "tips_saved": saved, "min_prob": MIN_PROB_DEFAULT, "btts_min_prob": BTTS_MIN_PROB, "min_dec_odds": MIN_DEC_ODDS})
 
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
@@ -924,13 +941,8 @@ def train_route():
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint / Scheduler
-if __name__ == "__main__":
-    if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
-    if not ADMIN_API_KEY: logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
-    init_db()
-
+def start_scheduler():
     scheduler = BackgroundScheduler()
-
     if HARVEST_MODE:
         scheduler.add_job(harvest_scan, CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")), id="harvest", replace_existing=True)
         logging.info("⛏️  Running in HARVEST mode.")
@@ -942,10 +954,18 @@ if __name__ == "__main__":
                       id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True)
     scheduler.add_job(nightly_digest_job, CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
                       id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True)
+    # MOTD every morning 09:00 CEST
+    scheduler.add_job(motd_job, CronTrigger(hour=9, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+                      id="motd", replace_existing=True, misfire_grace_time=3600, coalesce=True)
 
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
 
+# Initialize pool + DB at import so routes work under Gunicorn
+init_pool_and_db()
+
+if __name__ == "__main__":
+    start_scheduler()
     port = int(os.getenv("PORT", 5000))
     logging.info("✅ Robi Superbrain started.")
     app.run(host="0.0.0.0", port=port)
