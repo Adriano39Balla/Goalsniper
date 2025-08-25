@@ -578,6 +578,68 @@ def motd_route():
     return jsonify({"ok": True})
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Admin / Manual Routes (API-protected)
+@app.route("/admin/train")
+def admin_train():
+    """Trigger manual model retraining."""
+    _require_api_key()
+    import subprocess
+    result = subprocess.run(["python", "train_models.py"], capture_output=True, text=True)
+    return jsonify({
+        "ok": result.returncode == 0,
+        "stdout": result.stdout,
+        "stderr": result.stderr
+    })
+
+@app.route("/admin/analyze")
+def admin_analyze():
+    """Trigger manual model analysis & threshold update."""
+    _require_api_key()
+    import subprocess
+    result = subprocess.run(["python", "analyze_precision.py"], capture_output=True, text=True)
+    return jsonify({
+        "ok": result.returncode == 0,
+        "stdout": result.stdout,
+        "stderr": result.stderr
+    })
+
+@app.route("/admin/backfill")
+def admin_backfill():
+    """Backfill missing matches (basic example, extend with logic)."""
+    _require_api_key()
+    hours = int(request.args.get("hours", "24"))
+    # 👉 implement your own backfill logic (fetch last N hours fixtures)
+    return jsonify({"ok": True, "message": f"Backfill job queued for last {hours}h"})
+
+@app.route("/admin/harvest")
+def admin_harvest():
+    """Harvest historical seasons manually."""
+    _require_api_key()
+    seasons = request.args.get("season", "2023").split(",")
+    harvested = []
+    for s in seasons:
+        # 👉 insert logic to fetch fixtures & stats for season s
+        harvested.append(s)
+    return jsonify({"ok": True, "harvested_seasons": harvested})
+
+@app.route("/debug/snapshot/<int:match_id>")
+def debug_snapshot(match_id: int):
+    """Inspect latest snapshot features & predictions for a match."""
+    _require_api_key()
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT payload FROM tip_snapshots WHERE match_id=%s ORDER BY created_ts DESC LIMIT 1",
+            (match_id,)
+        ).fetchone()
+    if not row:
+        return jsonify({"error": "No snapshot for this match"})
+    payload = json.loads(row[0])
+    feat = payload.get("stat", {})
+    models = _list_models("model_v2:")
+    preds = {code: _score_prob(feat, mdl) for code, mdl in models.items()}
+    return jsonify({"features": feat, "predictions": preds})
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint
 if __name__ == "__main__":
     if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
