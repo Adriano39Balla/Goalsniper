@@ -50,7 +50,7 @@ MOTD_HOUR_LOCAL    = int(os.getenv("MOTD_HOUR", "10"))  # 10:00 local (Europe/Be
 MOTD_LOOKBACK_HRS  = int(os.getenv("MOTD_LOOKBACK_HRS", "24"))
 
 # Training toggles (unchanged)
-TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO"))
+TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 
 DATABASE_URL = os.getenv("DATABASE_URL")
