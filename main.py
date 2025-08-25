@@ -1,15 +1,13 @@
+# path: main.py
 import os
 import re
 import json
 import time
 import math
-import heapq
 import logging
-import subprocess
-from typing import List, Dict, Any, Optional, Tuple
-
 import requests
 import psycopg2
+from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
@@ -21,21 +19,39 @@ from zoneinfo import ZoneInfo
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 app = Flask(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Env
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY            = os.getenv("API_KEY")
 ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY")
 
-HARVEST_MODE       = os.getenv("HARVEST_MODE", "0") not in ("0","false","False","no","NO")
+HARVEST_MODE       = os.getenv("HARVEST_MODE", "1") not in ("0","false","False","no","NO")
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 
-# Model-only mode knobs
-ONLY_MODEL_MODE    = True
-MIN_PROB           = max(0.0, min(0.999, float(os.getenv("MIN_PROB", "0.90"))))
-TOP_K_PER_MATCH    = int(os.getenv("TOP_K_PER_MATCH", "2"))
+# Pure‑model thresholds (no odds/filters): global + per head overrides
+ONLY_MODEL_MODE    = True  # force pure model mode
+MIN_PROB           = max(0.0, min(0.99, float(os.getenv("MIN_PROB", "0.55"))))
+
+HEAD_MINP = {
+    "BTTS":      float(os.getenv("MINP_BTTS",      str(MIN_PROB))),
+    "WIN_HOME":  float(os.getenv("MINP_WIN_HOME",  str(MIN_PROB))),
+    "DRAW":      float(os.getenv("MINP_DRAW",      str(MIN_PROB))),
+    "WIN_AWAY":  float(os.getenv("MINP_WIN_AWAY",  str(MIN_PROB))),
+    "O15":       float(os.getenv("MINP_O15",       str(MIN_PROB))),
+    "O25":       float(os.getenv("MINP_O25",       str(MIN_PROB))),
+    "O35":       float(os.getenv("MINP_O35",       str(MIN_PROB))),
+    "O45":       float(os.getenv("MINP_O45",       str(MIN_PROB))),
+}
+
+# MOTD (Match of the Day)
+MOTD_ENABLE        = os.getenv("MOTD_ENABLE", "1") not in ("0","false","False","no","NO")
+MOTD_HOUR_LOCAL    = int(os.getenv("MOTD_HOUR", "10"))  # 10:00 local (Europe/Berlin)
+MOTD_LOOKBACK_HRS  = int(os.getenv("MOTD_LOOKBACK_HRS", "24"))
+
+# Training toggles (unchanged)
+TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO"))
+TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -51,8 +67,11 @@ retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503,
 session.mount("https://", HTTPAdapter(max_retries=retries))
 session.mount("http://", HTTPAdapter(max_retries=retries))
 
+STATS_CACHE: Dict[int, Tuple[float, list]] = {}
+EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
+
 # ──────────────────────────────────────────────────────────────────────────────
-# DB helpers
+# DB helpers (same schema as before)
 class PgCursor:
     def __init__(self, cur): self.cur = cur
     def fetchone(self): return self.cur.fetchone()
@@ -93,18 +112,18 @@ def init_db():
     with db_conn() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS tips (
-            match_id   BIGINT,
-            league_id  BIGINT,
-            league     TEXT,
-            home       TEXT,
-            away       TEXT,
-            market     TEXT,
+            match_id BIGINT,
+            league_id BIGINT,
+            league   TEXT,
+            home     TEXT,
+            away     TEXT,
+            market   TEXT,
             suggestion TEXT,
             confidence DOUBLE PRECISION,
             score_at_tip TEXT,
-            minute     INTEGER,
+            minute    INTEGER,
             created_ts BIGINT,
-            sent_ok    INTEGER DEFAULT 1,
+            sent_ok   INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts)
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS tip_snapshots (match_id BIGINT, created_ts BIGINT, payload TEXT, PRIMARY KEY (match_id, created_ts))""")
@@ -113,10 +132,13 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS match_results (match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tip_snaps_created ON tip_snapshots(created_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips(match_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_recent ON tips(created_ts)")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tips_dedupe
             ON tips(match_id, market, suggestion, created_ts)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tips_recent
+            ON tips(match_id, created_ts)
         """)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -134,12 +156,24 @@ def _api_get(url: str, params: dict, timeout: int = 15):
         return None
 
 def fetch_match_stats(fixture_id: int):
+    now = time.time()
+    if fixture_id in STATS_CACHE:
+        ts, data = STATS_CACHE[fixture_id]
+        if now - ts < 90: return data
     js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fixture_id})
-    return (js or {}).get("response", []) if isinstance(js, dict) else []
+    stats = js.get("response", []) if isinstance(js, dict) else None
+    STATS_CACHE[fixture_id] = (now, stats or [])
+    return stats
 
 def fetch_match_events(fixture_id: int):
+    now = time.time()
+    if fixture_id in EVENTS_CACHE:
+        ts, data = EVENTS_CACHE[fixture_id]
+        if now - ts < 90: return data
     js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fixture_id})
-    return (js or {}).get("response", []) if isinstance(js, dict) else []
+    evs = js.get("response", []) if isinstance(js, dict) else None
+    EVENTS_CACHE[fixture_id] = (now, evs or [])
+    return evs
 
 def fetch_live_matches() -> List[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"live": "all"})
@@ -149,7 +183,7 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     for m in matches:
         status = (m.get("fixture", {}) or {}).get("status", {}) or {}
         elapsed = status.get("elapsed"); short = (status.get("short") or "").upper()
-        if elapsed is None or elapsed > 120:
+        if elapsed is None or elapsed > 90:
             continue
         if short not in INPLAY_STATUSES:
             continue
@@ -180,7 +214,6 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     gh = (match.get("goals") or {}).get("home") or 0
     ga = (match.get("goals") or {}).get("away") or 0
     minute = int((match.get("fixture", {}).get("status", {}) or {}).get("elapsed") or 0)
-
     stats_blocks = match.get("statistics") or []
     stats: Dict[str, Dict[str, Any]] = {}
     for s in stats_blocks:
@@ -217,7 +250,7 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Model scoring
+# Models & scoring (pure)
 OU_RE = re.compile(r"^O(\d{2})$")
 
 def _sigmoid(x: float) -> float:
@@ -294,6 +327,9 @@ def _mk_suggestions_for_code(code: str, mdl: Dict[str,Any], feat: Dict[str,float
     out.append((code, f"{code}: No", 1.0 - p, code))
     return out
 
+def _min_prob_for_head(head: str) -> float:
+    return float(HEAD_MINP.get(head, MIN_PROB))
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram & formatting
 def tg_escape(s: str) -> str:
@@ -323,11 +359,11 @@ def _rationale_from_feat(feat: Dict[str, float]) -> str:
     parts.append(f"minute {int(feat.get('minute',0))}")
     return ", ".join(parts)
 
-def _format_tip_message(
+def _format_tip_message_pure(
     league: str, home: str, away: str, minute: int, score_txt: str,
     suggestion: str, prob: float, rationale: str
 ) -> str:
-    prob_pct = min(99.9, max(0.0, prob * 100.0))
+    prob_pct = min(99.0, max(0.0, prob * 100.0))
     parts = [
         "⚽️ New Tip!",
         f"Match: {home} vs {away}",
@@ -355,36 +391,13 @@ def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
     return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Dynamic thresholds
-def get_dynamic_threshold(code: str, default: float = MIN_PROB) -> float:
-    raw = get_setting("policy:thresholds_v1", "{}")
-    try:
-        thresholds = json.loads(raw)
-        return float(thresholds.get(code, default))
-    except Exception:
-        return default
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Smarter tip selection
-def _select_best_suggestions(raw: List[Tuple[str, str, float, str]], top_k: int) -> List[Tuple[str,str,float,str]]:
-    selected = []
-    for market, suggestion, p, head in raw:
-        thr = get_dynamic_threshold(head, MIN_PROB)
-        if p >= thr:
-            heapq.heappush(selected, (-p, (market, suggestion, p, head)))
-    out = []
-    while selected and len(out) < top_k:
-        _, s = heapq.heappop(selected)
-        out.append(s)
-    return out
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Production scan
+# Production scan (PURE MODEL, no odds filters)
 def production_scan() -> Tuple[int,int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
-        logging.info("[PROD] no live matches"); return 0, 0
+        logging.info("[PROD] no live matches")
+        return 0, 0
 
     models = _list_models("model_v2:")
     if not models:
@@ -399,14 +412,27 @@ def production_scan() -> Tuple[int,int]:
             try:
                 fid = int((m.get("fixture", {}) or {}).get("id") or 0)
                 if not fid: continue
-                feat = extract_features(m)
 
+                feat = extract_features(m)
+                minute = int(feat.get("minute", 0))
+
+                # score all heads
                 raw: List[Tuple[str,str,float,str]] = []
                 for code, mdl in models.items():
                     raw.extend(_mk_suggestions_for_code(code, mdl, feat))
 
-                filtered = _select_best_suggestions(raw, TOP_K_PER_MATCH)
-                if not filtered: continue
+                # filter only by per‑head probability
+                filtered = []
+                for market, suggestion, p, head in raw:
+                    if p >= _min_prob_for_head(head):
+                        filtered.append((market, suggestion, p, head))
+
+                if not filtered:
+                    continue
+
+                # pick top‑K (by prob)
+                filtered.sort(key=lambda x: x[2], reverse=True)
+                filtered = filtered[:max(1, int(2 if MAX_TIPS_PER_SCAN else 2))]
 
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
@@ -424,13 +450,13 @@ def production_scan() -> Tuple[int,int]:
                     conn.execute("""
                         INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
                         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
-                    """, (fid, league_id, league, home, away, market, suggestion, float(min(99.9, prob*100.0)), score_txt, int(feat.get("minute",0)), now))
+                    """, (fid, league_id, league, home, away, market, suggestion, float(min(99.0, prob*100.0)), score_txt, minute, now))
 
-                    msg = _format_tip_message(
+                    rationale = _rationale_from_feat(feat)
+                    msg = _format_tip_message_pure(
                         league=league, home=home, away=away,
-                        minute=int(feat.get("minute",0)), score_txt=score_txt,
-                        suggestion=suggestion, prob=prob,
-                        rationale=_rationale_from_feat(feat)
+                        minute=minute, score_txt=score_txt,
+                        suggestion=suggestion, prob=prob, rationale=rationale
                     )
                     send_telegram(msg)
                     saved += 1
@@ -445,90 +471,148 @@ def production_scan() -> Tuple[int,int]:
     return saved, live_seen
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Nightly digest + Match of the Day
-def _counts_since(ts_from: int) -> Dict[str, int]:
+# Harvest
+def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
+    fx = m.get("fixture", {}) or {}; lg = m.get("league", {}) or {}
+    fid = int(fx.get("id")); league_id = int(lg.get("id") or 0)
+    league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+    home = (m.get("teams") or {}).get("home", {}).get("name", "")
+    away = (m.get("teams") or {}).get("away", {}).get("name", "")
+    gh = (m.get("goals") or {}).get("home") or 0
+    ga = (m.get("goals") or {}).get("away") or 0
+    minute = int(feat.get("minute", 0))
+    snapshot = {
+        "minute": minute, "gh": gh, "ga": ga,
+        "league_id": league_id, "market": "HARVEST", "suggestion": "HARVEST",
+        "confidence": 0,
+        "stat": {"xg_h": feat.get("xg_h",0), "xg_a": feat.get("xg_a",0),
+                 "sot_h": feat.get("sot_h",0), "sot_a": feat.get("sot_a",0),
+                 "cor_h": feat.get("cor_h",0), "cor_a": feat.get("cor_a",0),
+                 "pos_h": feat.get("pos_h",0), "pos_a": feat.get("pos_a",0),
+                 "red_h": feat.get("red_h",0), "red_a": feat.get("red_a",0)}
+    }
+    now = int(time.time())
     with db_conn() as conn:
-        snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
-        tips_total = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
-        res_total  = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
-        unlabeled  = conn.execute("""
-            SELECT COUNT(DISTINCT s.match_id)
-            FROM tip_snapshots s
-            LEFT JOIN match_results r ON r.match_id = s.match_id
-            WHERE r.match_id IS NULL
-        """).fetchone()[0]
-        snap_24h = conn.execute("SELECT COUNT(*) FROM tip_snapshots WHERE created_ts>=%s", (ts_from,)).fetchone()[0]
-        res_24h  = conn.execute("SELECT COUNT(*) FROM match_results WHERE updated_ts>=%s", (ts_from,)).fetchone()[0]
-    return {"snap_total": int(snap_total), "tips_total": int(tips_total), "res_total": int(res_total),
-            "unlabeled": int(unlabeled), "snap_24h": int(snap_24h), "res_24h": int(res_24h)}
+        conn.execute("INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
+                     (fid, now, json.dumps(snapshot)[:200000]))
+        conn.execute("""
+            INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now, 0))
 
+def harvest_scan() -> Tuple[int, int]:
+    matches = fetch_live_matches()
+    live_seen = len(matches)
+    if live_seen == 0:
+        logging.info("[HARVEST] no live matches"); return 0, 0
+    saved = 0; now_ts = int(time.time())
+    with db_conn() as conn:
+        for m in matches:
+            try:
+                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                if not fid: continue
+                cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
+                dup = conn.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1", (fid, cutoff)).fetchone()
+                if dup: continue
+                feat = extract_features(m)
+                save_snapshot_from_match(m, feat)
+                saved += 1
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
+            except Exception as e:
+                logging.exception(f"[HARVEST] failure on match: {e}")
+                continue
+    logging.info(f"[HARVEST] saved={saved} live_seen={live_seen}")
+    return saved, live_seen
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MOTD (Match of the Day)
+def _motd_row(since_ts: int) -> Optional[Tuple]:
+    with db_conn() as conn:
+        row = conn.execute("""
+            SELECT match_id, league_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts
+            FROM tips
+            WHERE created_ts >= %s AND sent_ok=1 AND suggestion <> 'HARVEST'
+            ORDER BY confidence DESC, created_ts DESC
+            LIMIT 1
+        """, (since_ts,)).fetchone()
+        return row
+
+def send_motd_if_needed() -> Optional[Dict[str,Any]]:
+    if not MOTD_ENABLE:
+        return None
+    # avoid duplicate within a day (Europe/Berlin date)
+    now = time.time()
+    berlin = ZoneInfo("Europe/Berlin")
+    ymd = time.strftime("%Y-%m-%d", time.localtime(now))
+    last = get_setting("motd_last_ymd", "")
+    if last == ymd:
+        return None
+
+    since_ts = int(now - MOTD_LOOKBACK_HRS*3600)
+    row = _motd_row(since_ts)
+    if not row:
+        return None
+
+    (match_id, league_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts) = row
+    msg = (
+        "🏅 Match of the Day\n"
+        f"Match: {home} vs {away}\n"
+        f"⏰ Minute at tip: {minute}' | Score: {score_at_tip}\n"
+        f"Tip: {suggestion}\n"
+        f"📈 Model {float(confidence):.1f}%\n"
+        f"🏆 League: {league}"
+    )
+    send_telegram(msg)
+    set_setting("motd_last_ymd", ymd)
+    return {
+        "match_id": int(match_id), "league": league, "home": home, "away": away,
+        "suggestion": suggestion, "confidence": float(confidence), "created_ts": int(created_ts)
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Training + digest (unchanged logic; calls external script)
 def nightly_digest_job():
     try:
         now = int(time.time()); day_ago = now - 24*3600
-        c = _counts_since(day_ago)
+        with db_conn() as conn:
+            snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
+            tips_total = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+            res_total  = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
         msg = (
             "📊 <b>Robi Nightly Digest</b>\n"
-            f"Snapshots: {c['snap_total']} (+ {c['snap_24h']} last 24h)\n"
-            f"Finals: {c['res_total']} (+ {c['res_24h']} last 24h)\n"
-            f"Unlabeled match_ids: {c['unlabeled']}\n"
+            f"Snapshots: {snap_total}\nTips: {tips_total}\nFinals: {res_total}\n"
             "Models retrain at 03:00 CEST daily."
         )
         logging.info("[DIGEST]\n%s", msg.replace("<b>","").replace("</b>",""))
         send_telegram(msg)
+        return True
     except Exception as e:
         logging.exception("[DIGEST] failed: %s", e)
+        return False
 
-def match_of_the_day_job():
+def retrain_models_job():
+    if not TRAIN_ENABLE:
+        logging.info("[TRAIN] skipped (TRAIN_ENABLE=0)")
+        return {"ok": False, "skipped": True}
+    import subprocess, os
+    env = os.environ.copy()
+    env["DATABASE_URL"] = DATABASE_URL
+    cmd = ["python", "-u", "train_models.py", "--min-minute", str(TRAIN_MIN_MINUTE)]
     try:
-        now = int(time.time()); day_ago = now - 24*3600
-        with db_conn() as conn:
-            row = conn.execute(
-                """
-                SELECT league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts
-                FROM tips
-                WHERE created_ts >= %s AND sent_ok=1
-                ORDER BY confidence DESC, created_ts DESC
-                LIMIT 1
-                """, (day_ago,)
-            ).fetchone()
-        if not row:
-            send_telegram("🏅 Match of the Day: (no tips in the last 24h)")
-            return
-        league, home, away, market, suggestion, conf, score_at_tip, minute, ts = row
-        when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts)) + " UTC"
-        msg = (
-            "🏅 <b>Match of the Day</b>\n"
-            f"{home} vs {away}\n"
-            f"⏰ Minute {minute}' | Score then: {score_at_tip} | {when}\n"
-            f"Market: {market}\n"
-            f"Tip: {suggestion}\n"
-            f"📈 Model {conf:.1f}%\n"
-            f"🏆 League: {league}"
-        )
-        send_telegram(msg)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env=env)
+        out = (proc.stdout or "").strip(); err = (proc.stderr or "").strip()
+        logging.info(f"[TRAIN] returncode={proc.returncode}\nstdout:\n{out}\nstderr:\n{err}")
+        ok = (proc.returncode == 0)
+        send_telegram(("✅" if ok else "❌") + " Nightly training " + ("OK" if ok else "failed"))
+        return {"ok": ok, "code": proc.returncode, "stdout": out[-2000:], "stderr": err[-1000:]}
+    except subprocess.TimeoutExpired:
+        logging.error("[TRAIN] timed out")
+        send_telegram("❌ Nightly training timed out.")
+        return {"ok": False, "timeout": True}
     except Exception as e:
-        logging.exception("[MOTD] failed: %s", e)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Retrain + Analyze
-def retrain_and_analyze_job():
-    try:
-        logging.info("[RETRAIN] Starting nightly retrain & analyze job...")
-        result_train = subprocess.run(["python", "train_models.py"], capture_output=True, text=True)
-        logging.info("[RETRAIN] train_models.py output:\n%s", result_train.stdout)
-
-        result_analyze = subprocess.run(["python", "analyze_precision.py"], capture_output=True, text=True)
-        logging.info("[RETRAIN] analyze_precision.py output:\n%s", result_analyze.stdout)
-
-        thresholds = get_setting("policy:thresholds_v1", "{}")
-        msg = (
-            "🤖 <b>Nightly Retrain Completed</b>\n"
-            f"Models & thresholds updated at {time.strftime('%Y-%m-%d %H:%M', time.gmtime())} UTC\n"
-            f"Dynamic thresholds: <code>{thresholds}</code>"
-        )
-        send_telegram(msg)
-    except Exception as e:
-        logging.exception("[RETRAIN] failed: %s", e)
+        logging.exception(f"[TRAIN] exception: {e}")
+        send_telegram(f"❌ Nightly training exception: {e}")
+        return {"ok": False, "error": str(e)}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Routes
@@ -547,7 +631,7 @@ def add_security_headers(resp):
 @app.route("/")
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
-    return f"🤖 Robi Superbrain is active ({mode}, model-only) · DB=Postgres · MIN_PROB={MIN_PROB:.2f}"
+    return f"🤖 Robi Superbrain is active ({mode}, pure-model) · DB=Postgres · MIN_PROB={MIN_PROB:.2f}"
 
 @app.route("/healthz")
 def healthz():
@@ -557,7 +641,7 @@ def healthz():
             conn.execute("SELECT 1")
     except Exception:
         db_ok = False
-    return jsonify({"ok": True, "mode": ("HARVEST" if HARVEST_MODE else "PRODUCTION"), "ai_only": ONLY_MODEL_MODE, "db_ok": db_ok})
+    return jsonify({"ok": True, "mode": ("HARVEST" if HARVEST_MODE else "PRODUCTION"), "ai_only": True, "db_ok": db_ok})
 
 @app.route("/predict/models")
 def predict_models_route():
@@ -571,76 +655,31 @@ def predict_scan_route():
     saved, live = production_scan()
     return jsonify({"ok": True, "live_seen": live, "tips_saved": saved, "min_prob": MIN_PROB})
 
+@app.route("/train", methods=["POST", "GET"])
+def train_route():
+    _require_api_key()
+    return jsonify(retrain_models_job())
+
 @app.route("/motd")
 def motd_route():
-    _require_api_key()
-    match_of_the_day_job()
-    return jsonify({"ok": True})
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Admin / Manual Routes (API-protected)
-@app.route("/admin/train")
-def admin_train():
-    """Trigger manual model retraining."""
-    _require_api_key()
-    import subprocess
-    result = subprocess.run(["python", "train_models.py"], capture_output=True, text=True)
-    return jsonify({
-        "ok": result.returncode == 0,
-        "stdout": result.stdout,
-        "stderr": result.stderr
-    })
-
-@app.route("/admin/analyze")
-def admin_analyze():
-    """Trigger manual model analysis & threshold update."""
-    _require_api_key()
-    import subprocess
-    result = subprocess.run(["python", "analyze_precision.py"], capture_output=True, text=True)
-    return jsonify({
-        "ok": result.returncode == 0,
-        "stdout": result.stdout,
-        "stderr": result.stderr
-    })
-
-@app.route("/admin/backfill")
-def admin_backfill():
-    """Backfill missing matches (basic example, extend with logic)."""
-    _require_api_key()
-    hours = int(request.args.get("hours", "24"))
-    # 👉 implement your own backfill logic (fetch last N hours fixtures)
-    return jsonify({"ok": True, "message": f"Backfill job queued for last {hours}h"})
-
-@app.route("/admin/harvest")
-def admin_harvest():
-    """Harvest historical seasons manually."""
-    _require_api_key()
-    seasons = request.args.get("season", "2023").split(",")
-    harvested = []
-    for s in seasons:
-        # 👉 insert logic to fetch fixtures & stats for season s
-        harvested.append(s)
-    return jsonify({"ok": True, "harvested_seasons": harvested})
-
-@app.route("/debug/snapshot/<int:match_id>")
-def debug_snapshot(match_id: int):
-    """Inspect latest snapshot features & predictions for a match."""
-    _require_api_key()
-    with db_conn() as conn:
-        row = conn.execute(
-            "SELECT payload FROM tip_snapshots WHERE match_id=%s ORDER BY created_ts DESC LIMIT 1",
-            (match_id,)
-        ).fetchone()
+    # no admin key required for convenience; add if you prefer
+    lookback = int(request.args.get("hours", MOTD_LOOKBACK_HRS))
+    since_ts = int(time.time()) - lookback*3600
+    row = _motd_row(since_ts)
     if not row:
-        return jsonify({"error": "No snapshot for this match"})
-    payload = json.loads(row[0])
-    feat = payload.get("stat", {})
-    models = _list_models("model_v2:")
-    preds = {code: _score_prob(feat, mdl) for code, mdl in models.items()}
-    return jsonify({"features": feat, "predictions": preds})
+        return jsonify({"ok": True, "motd": None})
+    (match_id, league_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts) = row
+    return jsonify({
+        "ok": True,
+        "motd": {
+            "match_id": int(match_id), "league": league, "home": home, "away": away,
+            "market": market, "suggestion": suggestion, "confidence": float(confidence),
+            "score_at_tip": score_at_tip, "minute": int(minute), "created_ts": int(created_ts)
+        }
+    })
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Entrypoint
+# Entrypoint / Scheduler
 if __name__ == "__main__":
     if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
     if not ADMIN_API_KEY: logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
@@ -648,20 +687,25 @@ if __name__ == "__main__":
 
     scheduler = BackgroundScheduler()
 
-    scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
-                      id="production_scan", replace_existing=True)
+    if HARVEST_MODE:
+        scheduler.add_job(harvest_scan, CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")), id="harvest", replace_existing=True)
+        logging.info("⛏️  Running in HARVEST mode.")
+    else:
+        scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")), id="production_scan", replace_existing=True)
+        logging.info("🎯 Running in PRODUCTION mode (pure model).")
 
+    scheduler.add_job(retrain_models_job, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+                      id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True)
     scheduler.add_job(nightly_digest_job, CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
                       id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True)
 
-    scheduler.add_job(match_of_the_day_job, CronTrigger(hour=9, minute=5, timezone=ZoneInfo("Europe/Berlin")),
-                      id="motd", replace_existing=True, misfire_grace_time=3600, coalesce=True)
-
-    scheduler.add_job(retrain_and_analyze_job, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-                      id="retrain_loop", replace_existing=True, misfire_grace_time=3600, coalesce=True)
+    if MOTD_ENABLE:
+        scheduler.add_job(send_motd_if_needed, CronTrigger(hour=MOTD_HOUR_LOCAL, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+                          id="motd", replace_existing=True, misfire_grace_time=3600, coalesce=True)
+        logging.info("🏅 MOTD scheduled at %02d:00 Europe/Berlin", MOTD_HOUR_LOCAL)
 
     scheduler.start()
-    logging.info("⏱️ Scheduler started (model-only, MIN_PROB=%.2f, TOP_K=%d)", MIN_PROB, TOP_K_PER_MATCH)
+    logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
 
     port = int(os.getenv("PORT", 5000))
     logging.info("✅ Robi Superbrain started.")
