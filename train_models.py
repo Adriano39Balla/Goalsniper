@@ -1,4 +1,4 @@
-# path: ./train_models.py
+/train_models.py
 import argparse
 import json
 import os
