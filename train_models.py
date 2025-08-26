@@ -1,106 +1,136 @@
-# train_models.py
-import argparse, json, sqlite3, sys
+# file: train_models.py
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import logging
 from typing import Any, Dict, List, Optional, Tuple
+
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, accuracy_score
 from sklearn.model_selection import train_test_split
-from datetime import datetime
 
 try:
-    import psycopg2
-except Exception:
+    import psycopg2  # Postgres (preferred)
+except Exception:  # pragma: no cover
     psycopg2 = None
 
-FEATURES = [
-    "minute","goals_h","goals_a","goals_sum","goals_diff",
-    "xg_h","xg_a","xg_sum","xg_diff",
-    "sot_h","sot_a","sot_sum",
-    "cor_h","cor_a","cor_sum",
-    "pos_h","pos_a","pos_diff",
-    "red_h","red_a","red_sum"
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Features
+# ──────────────────────────────────────────────────────────────────────────────
+FEATURES: List[str] = [
+    "minute",
+    "goals_h", "goals_a", "goals_sum", "goals_diff",
+    "xg_h", "xg_a", "xg_sum", "xg_diff",
+    "sot_h", "sot_a", "sot_sum",
+    "cor_h", "cor_a", "cor_sum",
+    "pos_h", "pos_a", "pos_diff",
+    "red_h", "red_a", "red_sum",
 ]
 
+# ──────────────────────────────────────────────────────────────────────────────
+# DB helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def _connect(db_url: Optional[str], db_path: Optional[str]):
     """
-    Returns (engine_type, connection, cursor_factory)
+    Returns (engine_type, connection)
     engine_type in {"pg","sqlite"}
     """
     if db_url:
         if psycopg2 is None:
-            raise SystemExit("psycopg2 not installed but --db-url was provided.")
-        # ensure sslmode=require if missing (mirrors main.py)
+            raise SystemExit("psycopg2 not installed but --db-url / DATABASE_URL was provided.")
         if "sslmode=" not in db_url:
             db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
         conn = psycopg2.connect(db_url)
         conn.autocommit = True
-        return "pg", conn, None
-    elif db_path:
+        return "pg", conn
+    if db_path:
         conn = sqlite3.connect(db_path)
-        return "sqlite", conn, None
-    else:
-        raise SystemExit("Provide --db-url (Postgres) or --db (SQLite).")
+        return "sqlite", conn
+    raise SystemExit("Provide --db-url (Postgres) or --db (SQLite), or set env DATABASE_URL.")
 
-def _read_sql(engine: str, conn, sql: str, params: Tuple=()):
-    if engine == "pg":
-        return pd.read_sql_query(sql, conn, params=params)
-    else:
-        return pd.read_sql_query(sql, conn, params=params)
 
-def _exec(engine: str, conn, sql: str, params: Tuple):
+def _read_sql(engine: str, conn, sql: str, params: Tuple = ()) -> pd.DataFrame:
+    return pd.read_sql_query(sql, conn, params=params)
+
+
+def _exec(engine: str, conn, sql: str, params: Tuple) -> None:
     if engine == "pg":
         with conn.cursor() as cur:
             cur.execute(sql, params)
-    else:
+    else:  # sqlite
         cur = conn.cursor()
         cur.execute(sql, params)
         conn.commit()
         cur.close()
 
-def load_data(engine: str, conn, min_minute: int = 15):
-    # Pull the latest snapshot per match and join with final result labels
-    # We parse payload JSON in Python (robust across engines)
+# ──────────────────────────────────────────────────────────────────────────────
+# Data loading
+# ──────────────────────────────────────────────────────────────────────────────
+def load_data(engine: str, conn, min_minute: int = 15) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns two dataframes with FEATURES + labels:
+      df_o25[FEATURES + ["label_o25"]]
+      df_btts[FEATURES + ["label_btts"]]
+    """
     q = """
     WITH latest AS (
       SELECT match_id, MAX(created_ts) AS ts
-      FROM tip_snapshots GROUP BY match_id
+      FROM tip_snapshots
+      GROUP BY match_id
     )
     SELECT l.match_id, s.created_ts, s.payload,
            r.final_goals_h, r.final_goals_a, r.btts_yes
     FROM latest l
-    JOIN tip_snapshots s ON s.match_id=l.match_id AND s.created_ts=l.ts
-    JOIN match_results r ON r.match_id=l.match_id
+    JOIN tip_snapshots s ON s.match_id = l.match_id AND s.created_ts = l.ts
+    JOIN match_results r ON r.match_id = l.match_id
     """
     rows = _read_sql(engine, conn, q)
 
     if rows.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    feats = []
+    feats: List[Dict[str, Any]] = []
     for _, row in rows.iterrows():
         try:
-            p = json.loads(row["payload"])
+            payload = json.loads(row["payload"])
         except Exception:
             continue
+        stat = (payload.get("stat") or {}) if isinstance(payload, dict) else {}
 
-        stat = (p.get("stat") or {}) if isinstance(p, dict) else {}
         try:
-            f = {
-                "match_id": int(row["match_id"]),
-                "minute": float(p.get("minute", 0)),
-                "goals_h": float(p.get("gh", 0)), "goals_a": float(p.get("ga", 0)),
-                "xg_h": float((stat or {}).get("xg_h", 0)), "xg_a": float((stat or {}).get("xg_a", 0)),
-                "sot_h": float((stat or {}).get("sot_h", 0)), "sot_a": float((stat or {}).get("sot_a", 0)),
-                "cor_h": float((stat or {}).get("cor_h", 0)), "cor_a": float((stat or {}).get("cor_a", 0)),
-                "pos_h": float((stat or {}).get("pos_h", 0)), "pos_a": float((stat or {}).get("pos_a", 0)),
-                "red_h": float((stat or {}).get("red_h", 0)), "red_a": float((stat or {}).get("red_a", 0)),
+            # Base signals
+            f: Dict[str, float] = {
+                "minute": float(payload.get("minute", 0)),
+                "goals_h": float(payload.get("gh", 0)),
+                "goals_a": float(payload.get("ga", 0)),
+                "xg_h": float(stat.get("xg_h", 0)),
+                "xg_a": float(stat.get("xg_a", 0)),
+                "sot_h": float(stat.get("sot_h", 0)),
+                "sot_a": float(stat.get("sot_a", 0)),
+                "cor_h": float(stat.get("cor_h", 0)),
+                "cor_a": float(stat.get("cor_a", 0)),
+                "pos_h": float(stat.get("pos_h", 0)),
+                "pos_a": float(stat.get("pos_a", 0)),
+                "red_h": float(stat.get("red_h", 0)),
+                "red_a": float(stat.get("red_a", 0)),
             }
         except Exception:
             continue
 
-        # Deriveds
+        # Derived features
         f["goals_sum"] = f["goals_h"] + f["goals_a"]
         f["goals_diff"] = f["goals_h"] - f["goals_a"]
         f["xg_sum"] = f["xg_h"] + f["xg_a"]
@@ -115,143 +145,187 @@ def load_data(engine: str, conn, min_minute: int = 15):
         ga_f = int(row["final_goals_a"] or 0)
         f["label_o25"] = 1 if (gh_f + ga_f) >= 3 else 0
         f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
+
         feats.append(f)
 
     if not feats:
         return pd.DataFrame(), pd.DataFrame()
 
     df = pd.DataFrame(feats)
-
-    # Hygiene
     df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     df["minute"] = df["minute"].clip(0, 120)
 
-    df = df[df["minute"] >= min_minute].copy()
+    df = df[df["minute"] >= float(min_minute)].copy()
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     return df[FEATURES + ["label_o25"]], df[FEATURES + ["label_btts"]]
 
-def fit_lr_safe(X, y):
+# ──────────────────────────────────────────────────────────────────────────────
+# Modeling
+# ──────────────────────────────────────────────────────────────────────────────
+def fit_lr_safe(X: np.ndarray, y: np.ndarray) -> Optional[LogisticRegression]:
     if len(np.unique(y)) < 2:
         return None
-    return LogisticRegression(
-        max_iter=1000,
-        class_weight="balanced",
-        solver="liblinear"
-    ).fit(X, y)
+    return LogisticRegression(max_iter=1000, class_weight="balanced", solver="liblinear").fit(X, y)
 
-def to_coeffs(model, feature_names):
+
+def weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[str, float]:
+    # Why: main.py expects a dict of feature->weight
+    coefs = model.coef_.ravel().tolist()
+    return {name: float(w) for name, w in zip(feature_names, coefs)}
+
+
+def build_model_blob(model: LogisticRegression, features: List[str]) -> Dict[str, Any]:
     return {
-        "features": list(feature_names),
-        "coef": model.coef_.ravel().tolist(),
         "intercept": float(model.intercept_.ravel()[0]),
+        "weights": weights_dict(model, features),
+        "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0},  # identity; main.py can refine later
     }
 
-def retrain_models_job():
-    logger.info("Starting retrain job...")
+# ──────────────────────────────────────────────────────────────────────────────
+# Public entry (used by main.py) + CLI
+# ──────────────────────────────────────────────────────────────────────────────
+def train_models(
+    db_url: Optional[str] = None,
+    db_path: Optional[str] = None,
+    min_minute: Optional[int] = None,
+    test_size: Optional[float] = None,
+    min_rows: int = 150,
+) -> Dict[str, Any]:
+    """
+    Trains O25 and BTTS_YES models and stores them in settings under:
+      - model_latest:O25, model_latest:BTTS_YES  (and mirrors to model:{name})
+    Returns a summary dict with metrics.
+    """
+    # Resolve config from env if not provided
+    db_url = db_url or os.getenv("DATABASE_URL")
+    min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
+    test_size = float(test_size if test_size is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
+
+    engine, conn = _connect(db_url, db_path)
+
     try:
-       from train_models import train_models  
-        train_models()
-        logger.info("Retrain completed successfully")
-    except Exception as e:
-        logger.error(f"Retrain job failed: {e}")
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--db-url", help="Postgres DSN (preferred, used by main.py)")
-    ap.add_argument("--db", help="SQLite path (optional for local dev)")
-    ap.add_argument("--min-minute", dest="min_minute", type=int, default=15)
-    ap.add_argument("--test-size", type=float, default=0.25)
-    ap.add_argument("--min-rows", type=int, default=150)
-    args = ap.parse_args()
-
-    engine, conn, _ = _connect(args.db_url, args.db)
-
-    try:
-        df_o25, df_btts = load_data(engine, conn, args.min_minute)
+        df_o25, df_btts = load_data(engine, conn, min_minute)
         if df_o25.empty or df_btts.empty:
-            print("Not enough labeled data yet.")
-            return
+            msg = "Not enough labeled data yet."
+            logger.info(msg)
+            return {"ok": False, "reason": msg}
 
         n_o25, n_btts = len(df_o25), len(df_btts)
         n = min(n_o25, n_btts)
-        print(f"Samples O2.5={n_o25} | BTTS={n_btts}")
-        print(f"O2.5 positive rate={df_o25['label_o25'].mean():.3f} | "
-              f"BTTS positive rate={df_btts['label_btts'].mean():.3f}")
-        if n < args.min_rows:
-            print(f"Need more data: {n} < min-rows {args.min_rows}.")
-            return
+        if n < int(min_rows):
+            msg = f"Need more data: {n} < min-rows {min_rows}."
+            logger.info(msg)
+            return {"ok": False, "reason": msg, "n": n, "n_o25": n_o25, "n_btts": n_btts}
 
-        # --- O/U 2.5 ---
+        # O/U 2.5
         Xo = df_o25[FEATURES].values
         yo = df_o25["label_o25"].values.astype(int)
         strat_o = yo if (yo.sum() and yo.sum() != len(yo)) else None
-        Xo_tr, Xo_te, yo_tr, yo_te = train_test_split(
-            Xo, yo, test_size=args.test_size, random_state=42, stratify=strat_o
-        )
+        Xo_tr, Xo_te, yo_tr, yo_te = train_test_split(Xo, yo, test_size=test_size, random_state=42, stratify=strat_o)
         mo = fit_lr_safe(Xo_tr, yo_tr)
         if mo is None:
-            print("O2.5 split became single-class; collect more balanced data.")
-            return
+            return {"ok": False, "reason": "O2.5 split became single-class; collect more balanced data."}
         p_te_o = mo.predict_proba(Xo_te)[:, 1]
-        brier_o = brier_score_loss(yo_te, p_te_o)
-        acc_o = accuracy_score(yo_te, (p_te_o >= 0.5).astype(int))
+        brier_o = float(brier_score_loss(yo_te, p_te_o))
+        acc_o = float(accuracy_score(yo_te, (p_te_o >= 0.5).astype(int)))
 
-        # --- BTTS Yes ---
+        # BTTS: Yes
         Xb = df_btts[FEATURES].values
         yb = df_btts["label_btts"].values.astype(int)
         strat_b = yb if (yb.sum() and yb.sum() != len(yb)) else None
-        Xb_tr, Xb_te, yb_tr, yb_te = train_test_split(
-            Xb, yb, test_size=args.test_size, random_state=42, stratify=strat_b
-        )
+        Xb_tr, Xb_te, yb_tr, yb_te = train_test_split(Xb, yb, test_size=test_size, random_state=42, stratify=strat_b)
         mb = fit_lr_safe(Xb_tr, yb_tr)
         if mb is None:
-            print("BTTS split became single-class; collect more balanced data.")
-            return
+            return {"ok": False, "reason": "BTTS split became single-class; collect more balanced data."}
         p_te_b = mb.predict_proba(Xb_te)[:, 1]
-        brier_b = brier_score_loss(yb_te, p_te_b)
-        acc_b = accuracy_score(yb_te, (p_te_b >= 0.5).astype(int))
+        brier_b = float(brier_score_loss(yb_te, p_te_b))
+        acc_b = float(accuracy_score(yb_te, (p_te_b >= 0.5).astype(int)))
 
-        print(f"O2.5 Brier={brier_o:.4f}  Acc={acc_o:.3f}  n={len(yo_te)}  prev={yo.mean():.2f}")
-        print(f"BTTS  Brier={brier_b:.4f}  Acc={acc_b:.3f}  n={len(yb_te)}  prev={yb.mean():.2f}")
+        # Serialize for main.py
+        blob_o25 = build_model_blob(mo, FEATURES)
+        blob_btts = build_model_blob(mb, FEATURES)
 
-        blob = {
-            "O25": to_coeffs(mo, FEATURES),
-            "BTTS_YES": to_coeffs(mb, FEATURES),
-            "trained_at_utc": datetime.utcnow().isoformat() + "Z",
-            "metrics": {
-                "o25": {
-                    "brier": float(brier_o), "acc": float(acc_o),
-                    "n": int(len(yo_te)), "prevalence": float(yo.mean())
-                },
-                "btts": {
-                    "brier": float(brier_b), "acc": float(acc_b),
-                    "n": int(len(yb_te)), "prevalence": float(yb.mean())
-                },
-            },
+        # Persist into settings (keys main.py reads)
+        # Prefer model_latest:{name}, also mirror to model:{name} for backward-compat.
+        def _save_model(name: str, model_obj: Dict[str, Any]) -> None:
+            val = json.dumps(model_obj)
+            if engine == "pg":
+                _exec(engine, conn,
+                      "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                      "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                      (f"model_latest:{name}", val))
+                _exec(engine, conn,
+                      "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                      "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                      (f"model:{name}", val))
+            else:
+                _exec(engine, conn,
+                      "INSERT INTO settings(key,value) VALUES(?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                      (f"model_latest:{name}", val))
+                _exec(engine, conn,
+                      "INSERT INTO settings(key,value) VALUES(?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                      (f"model:{name}", val))
+
+        _save_model("O25", blob_o25)
+        _save_model("BTTS_YES", blob_btts)
+
+        metrics = {
+            "trained_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "o25": {"brier": brier_o, "acc": acc_o, "n_test": int(len(yo_te)), "prevalence": float(yo.mean())},
+            "btts": {"brier": brier_b, "acc": acc_b, "n_test": int(len(yb_te)), "prevalence": float(yb.mean())},
             "features": FEATURES,
         }
 
-        # Save into settings(model_coeffs)
+        # Optional: store metrics bundle
+        metrics_key = "model_metrics_latest"
         if engine == "pg":
             _exec(engine, conn,
                   "INSERT INTO settings(key,value) VALUES(%s,%s) "
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                  ("model_coeffs", json.dumps(blob)))
+                  (metrics_key, json.dumps(metrics)))
         else:
             _exec(engine, conn,
                   "INSERT INTO settings(key,value) VALUES(?,?) "
                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                  ("model_coeffs", json.dumps(blob)))
+                  (metrics_key, json.dumps(metrics)))
 
-        print("Saved model_coeffs in settings.")
+        logger.info("Saved models to settings: model_latest:O25, model_latest:BTTS_YES (and model:* mirrors).")
+        return {"ok": True, "metrics": metrics}
 
+    except Exception as e:
+        logger.exception("Training failed: %s", e)
+        return {"ok": False, "error": str(e)}
     finally:
         try:
             conn.close()
         except Exception:
             pass
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+def _cli_main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db-url", help="Postgres DSN (preferred, used by main.py)")
+    ap.add_argument("--db", help="SQLite path (optional for local dev)")
+    ap.add_argument("--min-minute", dest="min_minute", type=int, default=int(os.getenv("TRAIN_MIN_MINUTE", 15)))
+    ap.add_argument("--test-size", type=float, default=float(os.getenv("TRAIN_TEST_SIZE", 0.25)))
+    ap.add_argument("--min-rows", type=int, default=150)
+    args = ap.parse_args()
+
+    res = train_models(
+        db_url=args.db_url or os.getenv("DATABASE_URL"),
+        db_path=args.db,
+        min_minute=args.min_minute,
+        test_size=args.test_size,
+        min_rows=args.min_rows,
+    )
+    print(json.dumps(res, indent=2))
+
+
 if __name__ == "__main__":
-    main()
+    _cli_main()
