@@ -1,7 +1,7 @@
 # file: analytics.py
 """
 Math engine for in-play probabilities (Poisson-based) with soft calibration.
-We deliberately avoid extreme 0%/100% outputs to keep tips realistic.
+No extremes: we shrink toward neutral and clip away 0%/100% outputs.
 """
 
 import math
@@ -9,7 +9,7 @@ import os
 from typing import Dict, Tuple, List
 
 # Softening / clipping knobs (env overrides)
-ANALYTICS_MIN_PROB = float(os.getenv("ANALYTICS_MIN_PROB", "0.05"))  # 5% floor/ceiling for binary
+ANALYTICS_MIN_PROB = float(os.getenv("ANALYTICS_MIN_PROB", "0.05"))   # 5% floor/ceiling for binary
 ANALYTICS_SOFT_ALPHA = float(os.getenv("ANALYTICS_SOFT_ALPHA", "0.85"))  # 0..1; 1=no softening
 WLD_SOFT_ALPHA = float(os.getenv("WLD_SOFT_ALPHA", "0.90"))  # tri-outcome shrink toward uniform
 
@@ -26,14 +26,14 @@ def _clip(x: float, lo: float, hi: float) -> float:
 
 
 def _soften_binary(p: float) -> float:
-    """Shrink p toward 0.5 then clip to [m,1-m]."""
+    # Why: early-game math can be overconfident; shrink toward 0.5 and bound.
     m = ANALYTICS_MIN_PROB
     p = 0.5 + ANALYTICS_SOFT_ALPHA * (p - 0.5)
     return _clip(p, m, 1.0 - m)
 
 
 def _soften_tri(p_home: float, p_draw: float, p_away: float) -> Tuple[float, float, float]:
-    """Shrink 3-way probabilities toward uniform; keeps sum=1."""
+    # Why: keep 1X2 in realistic ranges; shrink toward uniform, renormalize.
     a = _clip(WLD_SOFT_ALPHA, 0.0, 1.0)
     u = (1.0 - a) / 3.0
     ph = u + a * p_home
@@ -77,7 +77,6 @@ def _poisson_pmf_vec(lmbda: float, kmax: int) -> Tuple[float, ...]:
 
 
 def estimate_rates(feat: Dict[str, float], minute: int, total_minutes: int = 95) -> Dict[str, float]:
-    """Estimate per-minute scoring intensity from in-play signals."""
     minute_eff = max(1, min(int(minute or 0), total_minutes))
     rem = max(0, total_minutes - minute_eff)
 
@@ -87,6 +86,7 @@ def estimate_rates(feat: Dict[str, float], minute: int, total_minutes: int = 95)
     sot_sum = float(feat.get("sot_sum", float(feat.get("sot_h", 0.0)) + float(feat.get("sot_a", 0.0))))
     cor_sum = float(feat.get("cor_sum", float(feat.get("cor_h", 0.0)) + float(feat.get("cor_a", 0.0))))
 
+    # Conservative mapping of auxiliary stats to xG-ish rate
     SOT_TO_XG = 0.12
     CK_TO_XG = 0.03
 
@@ -108,7 +108,6 @@ def estimate_rates(feat: Dict[str, float], minute: int, total_minutes: int = 95)
 
 
 def ou_over_probability(feat: Dict[str, float], line: float, total_minutes: int = 95) -> float:
-    """P(final total goals > line), softened and clipped."""
     minute = int(feat.get("minute", 0))
     goals_sum = int(feat.get("goals_sum", 0))
     rates = estimate_rates(feat, minute, total_minutes)
@@ -121,7 +120,6 @@ def ou_over_probability(feat: Dict[str, float], line: float, total_minutes: int 
 
 
 def btts_yes_probability(feat: Dict[str, float], total_minutes: int = 95) -> float:
-    """P(both teams score by FT), softened and clipped."""
     minute = int(feat.get("minute", 0))
     gh = int(feat.get("goals_h", 0))
     ga = int(feat.get("goals_a", 0))
@@ -143,7 +141,6 @@ def btts_yes_probability(feat: Dict[str, float], total_minutes: int = 95) -> flo
 
 
 def wld_probabilities(feat: Dict[str, float], total_minutes: int = 95) -> Tuple[float, float, float]:
-    """(Home, Draw, Away) using Poisson enumeration, then soften toward uniform."""
     minute = int(feat.get("minute", 0))
     gh = int(feat.get("goals_h", 0))
     ga = int(feat.get("goals_a", 0))
@@ -164,12 +161,9 @@ def wld_probabilities(feat: Dict[str, float], total_minutes: int = 95) -> Tuple[
         for j, p_j in enumerate(pmf_a):
             pij = p_i * p_j
             d = base_diff + (i - j)
-            if d > 0:
-                p_home += pij
-            elif d == 0:
-                p_draw += pij
-            else:
-                p_away += pij
+            if d > 0:   p_home += pij
+            elif d == 0: p_draw += pij
+            else:       p_away += pij
 
     s = p_home + p_draw + p_away
     if s > 0:
