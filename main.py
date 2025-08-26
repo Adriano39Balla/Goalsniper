@@ -427,6 +427,64 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now, 0))
 
+                      chosen: Optional[Tuple[str,str,float,Dict[str,float]]] = None) -> Tuple[str, list, Dict[str, Any]]:
+    fixture = match["fixture"]; league_block = match.get("league") or {}
+    league_id = league_block.get("id") or 0
+    league = escape(f"{league_block.get('country','')} - {league_block.get('name','')}".strip(" -"))
+    minute = fixture["status"].get("elapsed") or 0
+    match_id = fixture["id"]
+    home = escape(match["teams"]["home"]["name"]); away = escape(match["teams"]["away"]["name"])
+    g_home = match["goals"]["home"] or 0; g_away = match["goals"]["away"] or 0
+
+    market, suggestion, confidence, stat = chosen if chosen else decide_market(match)
+
+    if suggestion not in ALLOWED_SUGGESTIONS or confidence < CONF_THRESHOLD:
+        return "", [], {"skip": True}
+    if is_settled_or_impossible(suggestion, g_home, g_away) or is_too_late(suggestion, int(minute), g_home, g_away, stat):
+        return "", [], {"skip": True}
+
+    stat_line = ""
+    if any([stat.get("xg_h",0), stat.get("xg_a",0), stat.get("sot_h",0), stat.get("sot_a",0), stat.get("cor_h",0), stat.get("cor_a",0), stat.get("pos_h",0), stat.get("pos_a",0), stat.get("red_h",0), stat.get("red_a",0)]):
+        stat_line = (
+            f"\n📊 xG H {stat.get('xg_h',0):.2f} / A {stat.get('xg_a',0):.2f}"
+            f" • SOT {int(stat.get('sot_h',0))}–{int(stat.get('sot_a',0))}"
+            f" • CK {int(stat.get('cor_h',0))}–{int(stat.get('cor_a',0))}"
+        )
+        if stat.get("pos_h",0) or stat.get("pos_a",0):
+            stat_line += f" • POS {int(stat.get('pos_h',0))}%–{int(stat.get('pos_a',0))}%"
+        if stat.get("red_h",0) or stat.get("red_a",0):
+            stat_line += f" • RED {int(stat.get('red_h',0))}–{int(stat.get('red_a',0))}"
+
+    lines = [
+        "⚽️ <b>New Tip!</b>",
+        f"<b>Match:</b> {home} vs {away}",
+        f"⏱ <b>Minute:</b> {minute}'  |  <b>Score:</b> {g_home}–{g_away}",
+        f"<b>Tip:</b> {escape(suggestion)}",
+        f"📈 <b>Confidence:</b> {int(confidence)}%",
+        f"🏆 <b>League:</b> {league}{stat_line}",
+    ]
+    msg = "\n".join(lines)
+
+    kb = [[
+        {"text": "👍 Correct", "callback_data": json.dumps({"t": "correct", "id": match_id})},
+        {"text": "👎 Wrong",   "callback_data": json.dumps({"t": "wrong",   "id": match_id})},
+    ]]
+    row = []
+    if BET_URL_TMPL:
+        try: row.append({"text": "💰 Bet Now", "url": BET_URL_TMPL.format(home=home, away=away, fixture_id=match_id)})
+        except Exception: pass
+    if WATCH_URL_TMPL:
+        try: row.append({"text": "📺 Watch Match", "url": WATCH_URL_TMPL.format(home=home, away=away, fixture_id=match_id)})
+        except Exception: pass
+    if row: kb.append(row)
+
+    meta = {
+        "match_id": match_id, "league_id": int(league_id), "league": league,
+        "home": home, "away": away, "confidence": int(confidence),
+        "score_at_tip": f"{g_home}-{g_away}", "minute": int(minute)
+    }
+    return msg, kb, meta
+
 # ── League helpers / backfill ─────────────────────────────────────────────────
 def _chunk(seq: List[int], size: int) -> List[List[int]]:
     size = max(1, int(size)); return [seq[i:i+size] for i in range(0, len(seq), size)]
