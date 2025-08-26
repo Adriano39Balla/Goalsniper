@@ -529,6 +529,7 @@ def _format_tip_message(home: str, away: str, league: str,
                         minute: int, score_txt: str,
                         suggestion: str, prob_pct: float,
                         feat: Dict[str, float]) -> str:
+    # Build optional stats line
     stat_line = ""
     if any([feat.get("xg_h",0), feat.get("xg_a",0), feat.get("sot_h",0), feat.get("sot_a",0),
             feat.get("cor_h",0), feat.get("cor_a",0), feat.get("pos_h",0), feat.get("pos_a",0),
@@ -543,15 +544,22 @@ def _format_tip_message(home: str, away: str, league: str,
         if feat.get("red_h",0) or feat.get("red_a",0):
             stat_line += f" • RED {int(feat.get('red_h',0))}-{int(feat.get('red_a',0))}"
 
-msg = (
-    "⚽️ <b>New Tip!</b>\n"
-    f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
-    f"⏱ <b>Minute:</b> {minute}'  |  <b>Score:</b> {g_home}–{g_away}\n"
-    f"<b>Tip:</b> {escape(suggestion)}\n"
-    f"📈 <b>Confidence:</b> {int(confidence)}%\n"
-    f"🏆 <b>League:</b> {escape(league)}"
-)
-send_telegram(msg)
+    msg = (
+        "⚽️ <b>New Tip!</b>\n"
+        f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
+        f"⏱ <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score_txt)}\n"
+        f"<b>Tip:</b> {escape(suggestion)}\n"
+        f"📈 <b>Confidence:</b> {prob_pct:.1f}%\n"
+        f"🏆 <b>League:</b> {escape(league)}"
+        f"{stat_line}"
+    )
+    return msg
+
+def _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    msg = _format_tip_message(home, away, league, minute, score_txt, suggestion, prob_pct, feat)
+    return send_telegram(msg)
 
 def _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
