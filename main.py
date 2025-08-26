@@ -520,6 +520,40 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
         time.sleep(0.25)
     return updated, len(ids)
 
+def _format_tip_message(home: str, away: str, league: str,
+                        minute: int, score_txt: str,
+                        suggestion: str, prob_pct: float,
+                        feat: Dict[str, float]) -> str:
+    stat_line = ""
+    if any([feat.get("xg_h",0), feat.get("xg_a",0), feat.get("sot_h",0), feat.get("sot_a",0),
+            feat.get("cor_h",0), feat.get("cor_a",0), feat.get("pos_h",0), feat.get("pos_a",0),
+            feat.get("red_h",0), feat.get("red_a",0)]):
+        stat_line = (
+            f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
+            f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
+            f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}"
+        )
+        if feat.get("pos_h",0) or feat.get("pos_a",0):
+            stat_line += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
+        if feat.get("red_h",0) or feat.get("red_a",0):
+            stat_line += f" • RED {int(feat.get('red_h',0))}-{int(feat.get('red_a',0))}"
+
+    lines = [
+        "⚽️ <b>New Tip!</b>",
+        f"<b>Match:</b> {escape(home)} vs {escape(away)}",
+        f"⏱ <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score_txt)}",
+        f"<b>Tip:</b> {escape(suggestion)}",
+        f"📈 <b>Model {prob_pct:.1f}%</b>",
+        f"🏆 <b>League:</b> {escape(league)}{stat_line}",
+    ]
+    return "\n".join(lines)
+
+def _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    msg = _format_tip_message(home, away, league, minute, score_txt, suggestion, prob_pct, feat)
+    return send_telegram(msg)
+
 # ── Model loading & prediction ────────────────────────────────────────────────
 # Expected model format in settings (JSON):
 # {
@@ -691,20 +725,33 @@ def production_scan() -> Tuple[int,int]:
                 score_txt = _pretty_score(m)
 
                 # Insert at most MAX_TIPS_PER_SCAN per scan
-                for market_code, suggestion, prob in preds:
-                    now = int(time.time())
+                                # Insert at most MAX_TIPS_PER_SCAN per scan
+                base_now = int(time.time())
+                for idx, (market_code, suggestion, prob) in enumerate(preds):
+                    created_ts = base_now + idx  # avoid PK clash (same match, same second)
+                    market_txt = "Over/Under 2.5" if market_code == "O25" else "BTTS"
+                    prob_pct = float(prob * 100.0)
+
+                    # 1) insert as unsent
                     conn.execute("""
                         INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)
                     """, (fid, league_id, league, home, away,
-                          ("Over/Under 2.5" if market_code=="O25" else "BTTS"),
-                          suggestion, float(prob*100.0), score_txt, minute, now))
+                          market_txt, suggestion, prob_pct, score_txt, minute, created_ts))
+
+                    # 2) try to send now
+                    sent_ok = _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat)
+
+                    # 3) mark sent_ok=1 if delivered
+                    if sent_ok:
+                        conn.execute(
+                            "UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
+                            (fid, created_ts)
+                        )
+
                     saved += 1
                     if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
                         break
-
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
 
             except Exception as e:
                 logging.exception(f"[PROD] failure on match: {e}")
