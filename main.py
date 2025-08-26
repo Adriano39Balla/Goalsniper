@@ -308,6 +308,23 @@ def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
         time.sleep(0.15)
     return out
 
+def _format_tip_message(m: Dict[str,Any], suggestion: str, prob: float) -> str:
+    lg = (m.get("league") or {})
+    league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+    t  = (m.get("teams") or {})
+    home = (t.get("home") or {}).get("name",""); away = (t.get("away") or {}).get("name","")
+    gh = (m.get("goals") or {}).get("home") or 0
+    ga = (m.get("goals") or {}).get("away") or 0
+    minute = ((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0
+    return (
+        "⚽️ <b>New Tip!</b>\n"
+        f"Match: {escape(home)} vs {escape(away)}\n"
+        f"⏱ Minute: {int(minute)}' | Score: {gh}-{ga}\n"
+        f"Tip: {escape(suggestion)}\n"
+        f"📈 Model {prob*100:.1f}%\n"
+        f"🏆 League: {escape(league)}"
+    )
+
 # ── Features & snapshots ──────────────────────────────────────────────────────
 def _num(v) -> float:
     try:
@@ -787,20 +804,23 @@ def production_scan() -> Tuple[int,int]:
                 score_txt = _pretty_score(m)
 
                 # Insert at most MAX_TIPS_PER_SCAN per scan
-                for market_code, suggestion, prob in preds:
-                    now = int(time.time())
-                    conn.execute("""
-                        INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
-                    """, (fid, league_id, league, home, away,
-                          ("Over/Under 2.5" if market_code=="O25" else "BTTS"),
-                          suggestion, float(prob*100.0), score_txt, minute, now))
-                    saved += 1
-                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                        break
+                ts_base = int(time.time())
+for idx, (market_code, suggestion, prob) in enumerate(preds):
+    created_ts = ts_base + idx  # avoid PK clashes when sending multiple tips for same match
+    conn.execute("""
+        INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+    """, (fid, league_id, league, home, away,
+          ("Over/Under 2.5" if market_code=="O25" else "BTTS"),
+          suggestion, float(prob*100.0), score_txt, minute, created_ts))
 
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
+    # send to Telegram
+    msg = _format_tip_message(m, suggestion, prob)
+    _ = send_telegram(msg)
+
+    saved += 1
+    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+        break
 
             except Exception as e:
                 logging.exception(f"[PROD] failure on match: {e}")
