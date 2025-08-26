@@ -997,7 +997,7 @@ def main():
         )
         logging.info("🎯 Running in PRODUCTION mode.")
 
-    # Nightly training at 03:00 Berlin time
+        # Nightly training at 03:00 Europe/Berlin
     scheduler.add_job(
         retrain_models_job,
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
@@ -1007,7 +1007,7 @@ def main():
         coalesce=True,
     )
 
-    # Nightly digest at 03:02 Berlin time
+    # Nightly digest at 03:02 Europe/Berlin
     scheduler.add_job(
         nightly_digest_job,
         CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
@@ -1017,22 +1017,19 @@ def main():
         coalesce=True,
     )
 
-    # Match Of The Day announce (optional, controlled by MOTD_PREDICT)
+    # Daily MOTD announce (time configurable via env; defaults to 09:00)
     if MOTD_PREDICT:
-    motd_hour = int(os.getenv("MOTD_HOUR", "9"))       # default 09:00
-    motd_minute = int(os.getenv("MOTD_MINUTE", "0"))   # default :00
-    scheduler.add_job(
-        motd_announce,
-        CronTrigger(hour=motd_hour, minute=motd_minute, timezone=ZoneInfo("Europe/Berlin")),
-        id="motd_announce",
-        replace_existing=True,
-        misfire_grace_time=3600,
-        coalesce=True,
-    )
-    logging.info(f"🌟 MOTD daily announcement enabled at {motd_hour:02d}:{motd_minute:02d} Europe/Berlin.")
-
-    scheduler.start()
-    logging.info("⏱️ Scheduler started.")
+        motd_hour = int(os.getenv("MOTD_HOUR", "9"))      # default 09:00
+        motd_minute = int(os.getenv("MOTD_MINUTE", "0"))  # default :00
+        scheduler.add_job(
+            motd_announce,
+            CronTrigger(hour=motd_hour, minute=motd_minute, timezone=ZoneInfo("Europe/Berlin")),
+            id="motd_announce",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+        logging.info(f"🌟 MOTD daily announcement enabled at {motd_hour:02d}:{motd_minute:02d} Europe/Berlin.")
 
     # Start Flask app
     port = int(os.getenv("PORT", 5000))
