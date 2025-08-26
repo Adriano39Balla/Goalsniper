@@ -196,7 +196,12 @@ def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": escape(message), "parse_mode": "HTML"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,                      # ← no global escape()
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     if inline_keyboard:
         payload["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard})
     try:
@@ -538,15 +543,15 @@ def _format_tip_message(home: str, away: str, league: str,
         if feat.get("red_h",0) or feat.get("red_a",0):
             stat_line += f" • RED {int(feat.get('red_h',0))}-{int(feat.get('red_a',0))}"
 
-    lines = [
-        "⚽️ <b>New Tip!</b>",
-        f"<b>Match:</b> {escape(home)} vs {escape(away)}",
-        f"⏱ <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score_txt)}",
-        f"<b>Tip:</b> {escape(suggestion)}",
-        f"📈 <b>Model {prob_pct:.1f}%</b>",
-        f"🏆 <b>League:</b> {escape(league)}{stat_line}",
-    ]
-    return "\n".join(lines)
+msg = (
+    "⚽️ <b>New Tip!</b>\n"
+    f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
+    f"⏱ <b>Minute:</b> {minute}'  |  <b>Score:</b> {g_home}–{g_away}\n"
+    f"<b>Tip:</b> {escape(suggestion)}\n"
+    f"📈 <b>Confidence:</b> {int(confidence)}%\n"
+    f"🏆 <b>League:</b> {escape(league)}"
+)
+send_telegram(msg)
 
 def _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
