@@ -1351,7 +1351,7 @@ if __name__ == "__main__":
     if MOTD_PREDICT:
         scheduler.add_job(
             motd_announce,
-            CronTrigger(hour=18, minute=30, timezone=ZoneInfo("Europe/Berlin")),
+            CronTrigger(hour=08, minute=30, timezone=ZoneInfo("Europe/Berlin")),
             id="motd_announce",
             replace_existing=True,
             misfire_grace_time=3600,
