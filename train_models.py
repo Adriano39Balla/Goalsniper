@@ -1,8 +1,7 @@
 # file: train_models.py
 """
-Train logistic models for BTTS and multiple O/U lines with Platt calibration.
-Saves models to settings as: model_latest:BTTS_YES, model_latest:OU_{line}, and mirrors to model:*.
-Only Postgres is supported (SQLite removed).
+Postgres-only training with Platt calibration.
+Saves models as: model_latest:BTTS_YES, model_latest:OU_{line} (+ model:* mirrors).
 """
 
 import argparse
@@ -21,7 +20,7 @@ from sklearn.model_selection import train_test_split
 import psycopg2
 
 try:
-    from dotenv import load_dotenv  # local dev convenience
+    from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
@@ -43,7 +42,6 @@ EPS = 1e-6
 
 
 def _connect(db_url: str):
-    """Connects to Postgres only (no SQLite fallback)."""
     if not db_url:
         raise SystemExit("DATABASE_URL must be set.")
     if "sslmode=" not in db_url:
@@ -53,16 +51,16 @@ def _connect(db_url: str):
     return "pg", conn
 
 
-def _read_sql(engine: str, conn, sql: str, params: Tuple = ()) -> pd.DataFrame:
+def _read_sql(conn, sql: str, params: Tuple = ()) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn, params=params)
 
 
-def _exec(engine: str, conn, sql: str, params: Tuple) -> None:
+def _exec(conn, sql: str, params: Tuple) -> None:
     with conn.cursor() as cur:
         cur.execute(sql, params)
 
 
-def load_data(engine: str, conn, min_minute: int = 15) -> pd.DataFrame:
+def load_data(conn, min_minute: int = 15) -> pd.DataFrame:
     q = """
     WITH latest AS (
       SELECT match_id, MAX(created_ts) AS ts
@@ -74,7 +72,7 @@ def load_data(engine: str, conn, min_minute: int = 15) -> pd.DataFrame:
     JOIN tip_snapshots s ON s.match_id = l.match_id AND s.created_ts = l.ts
     JOIN match_results r ON r.match_id = l.match_id
     """
-    rows = _read_sql(engine, conn, q)
+    rows = _read_sql(conn, q)
     if rows.empty:
         return pd.DataFrame()
 
@@ -141,13 +139,13 @@ def weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[st
     return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
 
 
-def _logit(p: np.ndarray) -> np.ndarray:
+def _logit_vec(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, EPS, 1 - EPS)
     return np.log(p / (1 - p))
 
 
 def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
-    z = _logit(p_raw).reshape(-1, 1)
+    z = _logit_vec(p_raw).reshape(-1, 1)
     y = y_true.astype(int)
     lr = LogisticRegression(max_iter=1000, solver="lbfgs")
     lr.fit(z, y)
@@ -186,23 +184,100 @@ def train_models(
     test_size = float(test_size if test_size is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
 
     ou_lines_env = os.getenv("OU_TRAIN_LINES", "1.5,2.5,3.5")
-    ou_lines: List[float] = [float(x) for x in ou_lines_env.split(",") if x.strip()]
+    ou_lines: List[float] = []
+    for t in ou_lines_env.split(","):
+        t = t.strip()
+        if not t:
+            continue
+        try:
+            ou_lines.append(float(t))
+        except Exception:
+            continue
+    if not ou_lines:
+        ou_lines = [1.5, 2.5, 3.5]
 
     summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "features": FEATURES}
 
     try:
-        df = load_data(engine, conn, min_minute)
+        df = load_data(conn, min_minute)
         if df.empty:
             msg = "Not enough labeled data yet."
             logger.info(msg)
             return {"ok": False, "reason": msg}
 
-        # Train BTTS and O/U lines exactly as before (code unchanged)...
+        # --- BTTS ---
+        Xb = df[FEATURES].values
+        yb = df["label_btts"].values.astype(int)
+        strat_b = yb if (yb.sum() and yb.sum() != len(yb)) else None
+        Xb_tr, Xb_te, yb_tr, yb_te = train_test_split(Xb, yb, test_size=test_size, random_state=42, stratify=strat_b)
+        mb = fit_lr_safe(Xb_tr, yb_tr)
+        if mb is not None:
+            p_te_b = mb.predict_proba(Xb_te)[:, 1]
+            a_b, b_b = fit_platt(yb_te, p_te_b)
+            p_te_b_cal = 1.0 / (1.0 + np.exp(-(a_b * _logit_vec(p_te_b) + b_b)))
+            brier_b = float(brier_score_loss(yb_te, p_te_b_cal))
+            acc_b = float(accuracy_score(yb_te, (p_te_b_cal >= 0.5).astype(int)))
+            ll_b = float(log_loss(yb_te, p_te_b_cal, labels=[0, 1]))
+            blob_btts = build_model_blob(mb, FEATURES, (a_b, b_b))
+            for k in ("model_latest:BTTS_YES", "model:BTTS_YES"):
+                _exec(conn,
+                      "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                      "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                      (k, json.dumps(blob_btts)))
+            summary["trained"]["BTTS_YES"] = True
+            summary["metrics"]["BTTS_YES"] = {"brier": brier_b, "acc": acc_b, "logloss": ll_b,
+                                              "n_test": int(len(yb_te)), "prevalence": float(yb.mean())}
+        else:
+            summary["trained"]["BTTS_YES"] = False
 
-        # (For brevity, reuse the BTTS + OU loop code from my last version.)
-        # The only change is: only Postgres is supported now.
+        # --- O/U lines ---
+        total_goals = df["final_goals_sum"].values.astype(int)
+        for line in ou_lines:
+            name = f"OU_{_fmt_line(line)}"
+            yo = (total_goals > line).astype(int)
+            if yo.sum() == 0 or yo.sum() == len(yo):
+                summary["trained"][name] = False
+                continue
+            Xo = df[FEATURES].values
+            strat_o = yo if (yo.sum() and yo.sum() != len(yo)) else None
+            Xo_tr, Xo_te, yo_tr, yo_te = train_test_split(Xo, yo, test_size=test_size, random_state=42, stratify=strat_o)
+            mo = fit_lr_safe(Xo_tr, yo_tr)
+            if mo is None:
+                summary["trained"][name] = False
+                continue
+            p_te_o = mo.predict_proba(Xo_te)[:, 1]
+            a_o, b_o = fit_platt(yo_te, p_te_o)
+            p_te_o_cal = 1.0 / (1.0 + np.exp(-(a_o * _logit_vec(p_te_o) + b_o)))
+            brier_o = float(brier_score_loss(yo_te, p_te_o_cal))
+            acc_o = float(accuracy_score(yo_te, (p_te_o_cal >= 0.5).astype(int)))
+            ll_o = float(log_loss(yo_te, p_te_o_cal, labels=[0, 1]))
+            blob_o = build_model_blob(mo, FEATURES, (a_o, b_o))
+            for k in (f"model_latest:{name}", f"model:{name}"):
+                _exec(conn,
+                      "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                      "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                      (k, json.dumps(blob_o)))
+            if abs(line - 2.5) < 1e-6:
+                for k in ("model_latest:O25", "model:O25"):
+                    _exec(conn,
+                          "INSERT INTO settings(key,value) VALUES(%s,%s) "
+                          "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                          (k, json.dumps(blob_o)))
+            summary["trained"][name] = True
+            summary["metrics"][name] = {"brier": brier_o, "acc": acc_o, "logloss": ll_o,
+                                        "n_test": int(len(yo_te)), "prevalence": float(yo.mean())}
 
+        metrics_bundle = {
+            "trained_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            **summary["metrics"],
+            "features": FEATURES,
+        }
+        _exec(conn,
+              "INSERT INTO settings(key,value) VALUES(%s,%s) "
+              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+              ("model_metrics_latest", json.dumps(metrics_bundle)))
         return summary
+
     except Exception as e:
         logger.exception("Training failed: %s", e)
         return {"ok": False, "error": str(e)}
@@ -215,7 +290,7 @@ def train_models(
 
 def _cli_main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-url", help="Postgres DSN (preferred, used by main.py)")
+    ap.add_argument("--db-url", help="Postgres DSN (or use env DATABASE_URL)")
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=int(os.getenv("TRAIN_MIN_MINUTE", 15)))
     ap.add_argument("--test-size", type=float, default=float(os.getenv("TRAIN_TEST_SIZE", 0.25)))
     ap.add_argument("--min-rows", type=int, default=150)
