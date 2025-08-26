@@ -40,7 +40,7 @@ O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))
 BTTS_LATE_MINUTE    = int(os.getenv("BTTS_LATE_MINUTE", "88"))
 UNDER_SUPPRESS_AFTER_MIN = int(os.getenv("UNDER_SUPPRESS_AFTER_MIN", "82"))
 
-ONLY_MODEL_MODE          = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false","False","no","NO")
+ONLY_MODEL_MODE          = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false","False","no","NO"))
 REQUIRE_STATS_MINUTE     = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
 REQUIRE_DATA_FIELDS      = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
 
@@ -51,7 +51,7 @@ MOTD_CONF_MIN       = int(os.getenv("MOTD_CONF_MIN", "65"))
 
 ALLOWED_SUGGESTIONS = {"Over 2.5 Goals", "Under 2.5 Goals", "BTTS: Yes", "BTTS: No"}
 
-TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
+TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO"))
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
 
@@ -287,6 +287,34 @@ def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
         time.sleep(0.15)
     return out
 
+# Match of the Day job at 08:00 Europe/Berlin
+def match_of_the_day_job():
+    try:
+        with db_conn() as conn:
+            row = conn.execute("""
+                SELECT league, home, away, market, suggestion, confidence
+                FROM tips
+                WHERE confidence >= %s
+                  AND league_id = ANY(%s)
+                ORDER BY confidence DESC
+                LIMIT 1
+            """, (MOTD_CONF_MIN, LEAGUE_PRIORITY_IDS)).fetchone()
+
+        if row:
+            league, home, away, market, suggestion, conf = row
+            msg = (
+                f"🌅 <b>Match of the Day</b>\n"
+                f"{league}: {home} vs {away}\n"
+                f"⚡️ {market} → {suggestion}\n"
+                f"Confidence: {conf:.1f}%"
+            )
+            send_telegram(msg)
+            logging.info("[MOTD] sent: %s vs %s", home, away)
+        else:
+            logging.info("[MOTD] No eligible match found")
+    except Exception as e:
+        logging.exception("[MOTD] failed: %s", e)
+
 # ── Features & snapshots ──────────────────────────────────────────────────────
 def _num(v) -> float:
     try:
@@ -338,6 +366,7 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
         "cor_h": float(cor_h), "cor_a": float(cor_a), "cor_sum": float(cor_h + cor_a),
         "pos_h": float(pos_h), "pos_a": float(pos_a),
         "red_h": float(red_h), "red_a": float(red_a),
+        "red_sum": float(red_h + red_a),
     }
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
@@ -517,6 +546,199 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
         time.sleep(0.25)
     return updated, len(ids)
 
+# ── Model loading & prediction ────────────────────────────────────────────────
+# Expected model format in settings (JSON):
+# {
+#   "intercept": float,
+#   "weights": {"minute": ..., "goals_sum": ..., "goals_h": ..., "goals_a": ..., "goals_diff": ..., "red_sum": ..., "red_h": ..., "red_a": ...},
+#   "calibration": {"method": "sigmoid" | "platt", "a": 1.0, "b": 0.0}
+# }
+# Keys searched (first match wins):
+#   model_v2:BTTS_YES / model_v2:O25  (preferred)
+#   model_latest:BTTS_YES / model_latest:O25
+#   model:BTTS_YES / model:O25
+MODEL_KEYS_ORDER = [
+    "model_v2:{name}",
+    "model_latest:{name}",
+    "model:{name}",
+]
+
+def _sigmoid(x: float) -> float:
+    try:
+        if x < -50: return 1e-22
+        if x > 50: return 1.0 - 1e-22
+        import math
+        return 1.0 / (1.0 + math.exp(-x))
+    except Exception:
+        return 0.5
+
+def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
+    for pat in MODEL_KEYS_ORDER:
+        key = pat.format(name=name)
+        raw = get_setting(key)
+        if not raw:
+            continue
+        try:
+            mdl = json.loads(raw)
+            # sanity defaults
+            mdl.setdefault("intercept", 0.0)
+            mdl.setdefault("weights", {})
+            cal = mdl.get("calibration") or {}
+            if isinstance(cal, dict):
+                cal.setdefault("method", "sigmoid")
+                cal.setdefault("a", 1.0)
+                cal.setdefault("b", 0.0)
+                mdl["calibration"] = cal
+            return mdl
+        except Exception as e:
+            logging.warning("[MODEL] failed to parse %s: %s", key, e)
+    return None
+
+def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) -> float:
+    s = float(intercept or 0.0)
+    for k, w in (weights or {}).items():
+        s += float(w or 0.0) * float(feat.get(k, 0.0))
+    return s
+
+def _calibrate(p: float, cal: Dict[str,Any]) -> float:
+    method = (cal or {}).get("method", "sigmoid")
+    if method == "platt":
+        a = float((cal or {}).get("a", 1.0))
+        b = float((cal or {}).get("b", 0.0))
+        return _sigmoid(a * (p if p == 0 or p == 1 else (float(p) if isinstance(p,(float,int)) else 0.0)) + b)
+    # default: already logistic; allow optional a,b
+    a = float((cal or {}).get("a", 1.0))
+    b = float((cal or {}).get("b", 0.0))
+    import math
+    logit = math.log(max(min(p, 1-1e-12), 1e-12) / max(1 - max(min(p,1-1e-12),1e-12), 1e-12))
+    return _sigmoid(a * logit + b)
+
+def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
+    lp = _linpred(feat, mdl.get("weights", {}), float(mdl.get("intercept", 0.0)))
+    p = _sigmoid(lp)
+    cal = mdl.get("calibration") or {}
+    try:
+        if cal:
+            p = _calibrate(p, cal)
+    except Exception:
+        pass
+    return max(0.0, min(1.0, float(p)))
+
+def _pretty_score(m: Dict[str,Any]) -> str:
+    gh = (m.get("goals") or {}).get("home") or 0
+    ga = (m.get("goals") or {}).get("away") or 0
+    return f"{gh}-{ga}"
+
+def _league_name(m: Dict[str,Any]) -> Tuple[int,str]:
+    lg = (m.get("league") or {}) or {}
+    league_id = int(lg.get("id") or 0)
+    league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+    return league_id, league
+
+def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
+    t = (m.get("teams") or {}) or {}
+    return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
+
+# ── Production scan ───────────────────────────────────────────────────────────
+def production_scan() -> Tuple[int,int]:
+    """
+    Generate tips using models for O25 and BTTS: Yes.
+    Respects:
+      - CONF_THRESHOLD (percent)
+      - DUP_COOLDOWN_MIN
+      - late-minute suppressors
+      - REQUIRE_STATS_MINUTE / REQUIRE_DATA_FIELDS (if ONLY_MODEL_MODE=1, we still require some stats unless early)
+    """
+    matches = fetch_live_matches()
+    live_seen = len(matches)
+    if live_seen == 0:
+        logging.info("[PROD] no live matches")
+        return 0, 0
+
+    mdl_o25  = load_model_from_settings("O25")
+    mdl_btts = load_model_from_settings("BTTS_YES")
+    if not mdl_o25 and not mdl_btts:
+        logging.warning("[PROD] no models available in settings — skipping.")
+        return 0, live_seen
+
+    saved = 0
+    now_ts = int(time.time())
+
+    with db_conn() as conn:
+        for m in matches:
+            try:
+                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                if not fid:
+                    continue
+
+                # cooldown
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
+                    dup = conn.execute(
+                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",
+                        (fid, cutoff)
+                    ).fetchone()
+                    if dup:
+                        continue
+
+                feat = extract_features(m)
+                minute = int(feat.get("minute", 0))
+
+                # Require minimal stats after minute threshold
+                if not stats_coverage_ok(feat, minute):
+                    continue
+
+                # Compute market probabilities
+                preds: List[Tuple[str,str,float]] = []  # (market, suggestion, prob)
+
+                if mdl_o25:
+                    # Suggest Over 2.5 (we do not push Under by model here)
+                    p_over = _score_prob(feat, mdl_o25)
+                    # Late-game heuristic guard
+                    if not (minute >= O25_LATE_MINUTE and feat.get("goals_sum",0) < O25_LATE_MIN_GOALS):
+                        if p_over * 100.0 >= CONF_THRESHOLD:
+                            preds.append(("O25", "Over 2.5 Goals", p_over))
+
+                if mdl_btts:
+                    p_btts = _score_prob(feat, mdl_btts)
+                    # Late-game guard for BTTS (very late and a 0 on board often ugly)
+                    if not (minute >= BTTS_LATE_MINUTE and (feat.get("goals_h",0)==0 or feat.get("goals_a",0)==0)):
+                        if p_btts * 100.0 >= CONF_THRESHOLD:
+                            preds.append(("BTTS", "BTTS: Yes", p_btts))
+
+                if not preds:
+                    continue
+
+                # Sort strongest first (prob desc)
+                preds.sort(key=lambda x: x[2], reverse=True)
+
+                league_id, league = _league_name(m)
+                home, away = _teams(m)
+                score_txt = _pretty_score(m)
+
+                # Insert at most MAX_TIPS_PER_SCAN per scan
+                for market_code, suggestion, prob in preds:
+                    now = int(time.time())
+                    conn.execute("""
+                        INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+                    """, (fid, league_id, league, home, away,
+                          ("Over/Under 2.5" if market_code=="O25" else "BTTS"),
+                          suggestion, float(prob*100.0), score_txt, minute, now))
+                    saved += 1
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        break
+
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break
+
+            except Exception as e:
+                logging.exception(f"[PROD] failure on match: {e}")
+                continue
+
+    logging.info(f"[PROD] saved={saved} live_seen={live_seen}")
+    return saved, live_seen
+
 # ── Training job (calls external script) ──────────────────────────────────────
 def retrain_models_job():
     if not TRAIN_ENABLE:
@@ -687,6 +909,25 @@ def _require_api_key():
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
+@app.route("/predict/scan")
+def predict_scan_route():
+    """Manual trigger for one production scan (admin only)."""
+    _require_api_key()
+    saved, live = production_scan()
+    return jsonify({"ok": True, "mode": "PRODUCTION", "live_seen": live, "tips_saved": saved})
+
+@app.route("/predict/models")
+def predict_models_route():
+    """Inspect current models loaded from settings."""
+    _require_api_key()
+    o25 = load_model_from_settings("O25")
+    btts = load_model_from_settings("BTTS_YES")
+    return jsonify({
+        "O25_found": bool(o25),
+        "BTTS_YES_found": bool(btts),
+        "keys_tried": MODEL_KEYS_ORDER,
+    })
+
 @app.route("/harvest")
 def harvest_route():
     _require_api_key()
@@ -848,35 +1089,100 @@ def stats_config():
         "TRAIN_TEST_SIZE": TRAIN_TEST_SIZE,
     })
 
+# Helper used by /harvest/bulk_leagues endpoint (left as-is)
+def _run_bulk_leagues(leagues: List[int], seasons: List[int]) -> Dict[str,Any]:
+    if not leagues:
+        # Curated default top comps if none supplied
+        leagues = LEAGUE_PRIORITY_IDS or [39,140,135,78,61,2]
+    results = []
+    total = {"requested":0,"processed":0,"saved":0}
+    for league in leagues:
+        for season in seasons:
+            summary = create_synthetic_snapshots_for_league(
+                league_id=league,
+                season=season,
+                include_inplay=False,
+                extra_statuses=None,
+                max_per_run=None,
+                sleep_ms_between_chunks=1000
+            )
+            results.append({"league":league,"season":season,"result":summary})
+            total["requested"] += int(summary.get("requested",0))
+            total["processed"] += int(summary.get("processed",0))
+            total["saved"] += int(summary.get("saved",0))
+            time.sleep(1.0)
+    return {"ok": True, "totals": total, "results": results}
+
 # ── Entrypoint / Scheduler ────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
-    if not ADMIN_API_KEY: logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
+    if not API_KEY:
+        logging.error("API_KEY is not set — live fetch will return 0 matches.")
+    if not ADMIN_API_KEY:
+        logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
     init_db()
 
     scheduler = BackgroundScheduler()
+
+    # 24/7: harvest or production depending on knob (Europe/Berlin)
     if HARVEST_MODE:
-        # every 2 min during daytime, Europe/Berlin
+        # HARVEST alle 10m
         scheduler.add_job(
             harvest_scan,
-            CronTrigger(day_of_week="sun,mon,tue,wed,thu", hour="9-21", minute="*/2", timezone=ZoneInfo("Europe/Berlin")),
-            id="harvest", replace_existing=True,
+            CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")),
+            id="harvest",
+            replace_existing=True,
         )
-        scheduler.add_job(backfill_results_from_snapshots, "interval", minutes=15, id="backfill", replace_existing=True)
+        # Backfill finals every 15m
+        scheduler.add_job(
+            backfill_results_from_snapshots,
+            "interval",
+            minutes=15,
+            id="backfill",
+            replace_existing=True,
+        )
+        logging.info("⛏️  Running in HARVEST mode.")
+    else:
+        # PRODUCTION: score & write tips every 5m (tighter for latency)
+        scheduler.add_job(
+            production_scan,
+            CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
+            id="production_scan",
+            replace_existing=True,
+        )
+        logging.info("🎯 Running in PRODUCTION mode.")
 
+    # Nightly training at 03:00 Europe/Berlin
     scheduler.add_job(
         retrain_models_job,
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-        id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True,
+        id="train",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
     )
+
+    # Nightly digest at 03:02 Europe/Berlin
     scheduler.add_job(
         nightly_digest_job,
         CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
-        id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True,
+        id="digest",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
     )
+
+    # add to scheduler
+scheduler.add_job(
+    match_of_the_day_job,
+    CronTrigger(hour=8, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+    id="motd",
+    replace_existing=True,
+    misfire_grace_time=3600,
+    coalesce=True,
 
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
+
     port = int(os.getenv("PORT", 5000))
     logging.info("✅ Robi Superbrain started.")
     app.run(host="0.0.0.0", port=port)
