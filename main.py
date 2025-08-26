@@ -12,7 +12,7 @@ import requests
 import psycopg2
 from html import escape
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
 from urllib3.util.retry import Retry
@@ -59,6 +59,10 @@ LEAGUE_PRIORITY_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS", "39,140,135
 MOTD_PREDICT = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
 MOTD_MIN_SAMPLES = int(os.getenv("MOTD_MIN_SAMPLES", "30"))
 MOTD_CONF_MIN = int(os.getenv("MOTD_CONF_MIN", "65"))
+
+DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
+DAILY_ACCURACY_HOUR = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
+DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     out: List[float] = []
@@ -790,6 +794,145 @@ def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
         time.sleep(0.15)
     return out
 
+def _parse_ou_suggestion(s: str) -> Optional[Tuple[str, float]]:
+    # returns ("over"/"under", line) for strings like "Over 2.5 Goals"
+    if not s:
+        return None
+    s = s.strip().lower()
+    if s.startswith("over "):
+        try:
+            rest = s[len("over "):].strip()
+            num = rest.split()[0].replace(",", ".")
+            return ("over", float(num))
+        except Exception:
+            return None
+    if s.startswith("under "):
+        try:
+            rest = s[len("under "):].strip()
+            num = rest.split()[0].replace(",", ".")
+            return ("under", float(num))
+        except Exception:
+            return None
+    return None
+
+def _winner_from_score(gh: int, ga: int) -> str:
+    if gh > ga: return "Home Win"
+    if gh < ga: return "Away Win"
+    return "Draw"
+
+def _eval_tip(suggestion: str, gh: int, ga: int, btts_yes: Optional[int]) -> Tuple[str, Optional[bool]]:
+    """
+    Returns (market, win?): market in {"OU","BTTS","1X2","OTHER"}; win None if can't evaluate.
+    """
+    s = suggestion or ""
+    # O/U
+    ou = _parse_ou_suggestion(s)
+    if ou:
+        side, line = ou
+        total = (gh or 0) + (ga or 0)
+        return ("OU", (total > line) if side == "over" else (total < line))
+    # BTTS
+    if s in ("BTTS: Yes", "BTTS: No"):
+        if btts_yes is None:
+            return ("BTTS", None)
+        want_yes = (s == "BTTS: Yes")
+        return ("BTTS", (btts_yes == 1) if want_yes else (btts_yes == 0))
+    # 1X2
+    if s in ("Home Win", "Draw", "Away Win"):
+        actual = _winner_from_score(int(gh or 0), int(ga or 0))
+        return ("1X2", actual == s)
+    return ("OTHER", None)
+
+def _date_range_local_utc_ts(target_date_str: Optional[str]) -> Tuple[int, int, str]:
+    """
+    Returns [start_ts_utc, end_ts_utc) for Europe/Berlin midnight..midnight of date.
+    If target_date_str missing, use "yesterday" local date.
+    """
+    tz = ZoneInfo("Europe/Berlin")
+    if target_date_str:
+        try:
+            d = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+        except Exception:
+            d = datetime.now(tz).date()
+    else:
+        d = (datetime.now(tz) - timedelta(days=1)).date()
+    start_local = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    return int(start_local.timestamp()), int(end_local.timestamp()), d.isoformat()
+
+def _daily_accuracy_summary(start_ts: int, end_ts: int) -> Dict[str, Any]:
+    """
+    Evaluate all tips created in [start_ts, end_ts) where a final result exists.
+    """
+    sql = """
+    SELECT t.match_id, t.suggestion, r.final_goals_h, r.final_goals_a, r.btts_yes
+    FROM tips t
+    JOIN match_results r ON r.match_id = t.match_id
+    WHERE t.created_ts >= %s AND t.created_ts < %s
+    """
+    with db_conn() as conn:
+        rows = conn.execute(sql, (start_ts, end_ts)).fetchall()
+
+    agg = {
+        "OU": {"win": 0, "lose": 0},
+        "BTTS": {"win": 0, "lose": 0},
+        "1X2": {"win": 0, "lose": 0},
+        "OTHER": {"win": 0, "lose": 0},
+        "total": {"win": 0, "lose": 0},
+        "count_tips": 0,
+        "count_scored": 0
+    }
+
+    for match_id, suggestion, gh, ga, btts_yes in rows:
+        market, win = _eval_tip(suggestion, int(gh or 0), int(ga or 0), None if btts_yes is None else int(btts_yes))
+        agg["count_tips"] += 1
+        if win is None:
+            continue
+        agg["count_scored"] += 1
+        if win:
+            agg[market]["win"] += 1
+            agg["total"]["win"] += 1
+        else:
+            agg[market]["lose"] += 1
+            agg["total"]["lose"] += 1
+
+    def pct(win, lose):
+        n = win + lose
+        return (100.0 * win / n) if n > 0 else 0.0
+
+    out = {"markets": {}, "overall": {}, "scored": agg["count_scored"], "tips": agg["count_tips"]}
+    for m in ("OU","BTTS","1X2","OTHER"):
+        w, l = agg[m]["win"], agg[m]["lose"]
+        out["markets"][m] = {"win": w, "lose": l, "acc_pct": round(pct(w,l), 1), "n": w+l}
+    W, L = agg["total"]["win"], agg["total"]["lose"]
+    out["overall"] = {"win": W, "lose": L, "acc_pct": round(pct(W,L), 1), "n": W+L}
+    return out
+
+def _format_accuracy_msg(day_label: str, summary: Dict[str, Any]) -> str:
+    m = summary["markets"]
+    o = summary["overall"]
+    def line(mk):
+        d = m[mk]
+        return f"{mk}: {d['win']}✅ / {d['lose']}❌  ({d['acc_pct']:.1f}% of {d['n']})"
+    return (
+        "📊 <b>Daily Tip Accuracy</b>\n"
+        f"📅 <b>Date:</b> {day_label}\n"
+        f"{line('OU')}\n"
+        f"{line('BTTS')}\n"
+        f"{line('1X2')}\n"
+        # omit OTHER in message unless you want it
+        f"—\n"
+        f"Total: {o['win']}✅ / {o['lose']}❌  (<b>{o['acc_pct']:.1f}%</b> of {o['n']})\n"
+        f"(Scored {summary['scored']} of {summary['tips']} tips)"
+    )
+
+def daily_accuracy_digest_job(target_date: Optional[str] = None) -> Dict[str, Any]:
+    start_ts, end_ts, day = _date_range_local_utc_ts(target_date)
+    summary = _daily_accuracy_summary(start_ts, end_ts)
+    msg = _format_accuracy_msg(day, summary)
+    ok = send_telegram(msg)
+    return {"ok": bool(ok), "date": day, "summary": summary}
+
 # ── Stats/MOTD helpers
 def _counts_since(since_ts: int) -> Dict[str, int]:
     with db_conn() as conn:
@@ -1056,6 +1199,18 @@ def stats_progress():
         "window_7d": {"snapshots_added_est": c7["snap_24h"], "results_added_est": c7["res_24h"]},
     })
 
+@app.route("/stats/daily_accuracy")
+def stats_daily_accuracy_route():
+    _require_api_key()
+    date_q = request.args.get("date")  # YYYY-MM-DD (local)
+    send = request.args.get("send", "0") not in ("0","false","False","no","NO")
+    start_ts, end_ts, day = _date_range_local_utc_ts(date_q)
+    summary = _daily_accuracy_summary(start_ts, end_ts)
+    if send:
+        msg = _format_accuracy_msg(day, summary)
+        send_telegram(msg)
+    return jsonify({"ok": True, "date": day, "summary": summary, "sent": bool(send)})
+
 @app.route("/stats/config")
 def stats_config():
     _require_api_key()
@@ -1135,6 +1290,11 @@ def main():
     scheduler.start()
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+    if DAILY_ACCURACY_DIGEST_ENABLE:
+        scheduler.add_job(daily_accuracy_digest_job,
+            CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=ZoneInfo("Europe/Berlin")),
+            id="daily_accuracy_digest", replace_existing=True, misfire_grace_time=3600, coalesce=True)
 
 if __name__ == "__main__":
     main()
