@@ -1,4 +1,8 @@
 # file: main.py
+"""
+Flask backend for live football tips.
+Now supports blended math+ML for multi-line O/U, BTTS (Yes/No), and 1X2.
+"""
 
 import os
 import json
@@ -6,8 +10,6 @@ import time
 import logging
 import requests
 import psycopg2
-import subprocess  # noqa: F401  (kept if used elsewhere)
-import shlex       # noqa: F401
 from html import escape
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -18,14 +20,26 @@ from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ──────────────────────────────────────────────────────────────────────────────
+# Load .env (optional, safe if missing)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+# Math engine
+from analytics import (
+    ou_over_probability,
+    btts_yes_probability,
+    wld_probabilities,
+)
+
 # App / Logging
-# ──────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# ── Env ───────────────────────────────────────────────────────────────────────
+# ── Env
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("API_KEY")
@@ -48,49 +62,62 @@ ONLY_MODEL_MODE = os.getenv("ONLY_MODEL_MODE", "0") not in ("0", "false", "False
 REQUIRE_STATS_MINUTE = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
 REQUIRE_DATA_FIELDS = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
 
-LEAGUE_PRIORITY_IDS = [
-    int(x) for x in (os.getenv("MOTD_LEAGUE_IDS", "39,140,135,78,61,2").split(",")) if x.strip().isdigit()
-]
+LEAGUE_PRIORITY_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS", "39,140,135,78,61,2").split(",")) if x.strip().isdigit()]
 MOTD_PREDICT = os.getenv("MOTD_PREDICT", "1") not in ("0", "false", "False", "no", "NO")
 MOTD_MIN_SAMPLES = int(os.getenv("MOTD_MIN_SAMPLES", "30"))
 MOTD_CONF_MIN = int(os.getenv("MOTD_CONF_MIN", "65"))
 
-ALLOWED_SUGGESTIONS = {"Over 2.5 Goals", "Under 2.5 Goals", "BTTS: Yes", "BTTS: No"}
+def _parse_lines(env_val: str, default: List[float]) -> List[float]:
+    out: List[float] = []
+    for tok in (env_val or "").split(","):
+        tok = tok.strip()
+        try:
+            if tok:
+                out.append(float(tok))
+        except Exception:
+            continue
+    return out or default
+
+OU_LINES: List[float] = _parse_lines(os.getenv("OU_LINES", "0.5,1.5,2.5,3.5"), [0.5, 1.5, 2.5, 3.5])
+TOTAL_MATCH_MINUTES = int(os.getenv("TOTAL_MATCH_MINUTES", "95"))
+PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "2"))
+
+BLEND_ML_WEIGHT = float(os.getenv("BLEND_ML_WEIGHT", "0.6"))
+BLEND_ML_WEIGHT = 0.0 if BLEND_ML_WEIGHT < 0 else (1.0 if BLEND_ML_WEIGHT > 1.0 else BLEND_ML_WEIGHT)
+BLEND_MATH_WEIGHT = 1.0 - BLEND_ML_WEIGHT
+
+ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Draw", "Away Win"}
+for ln in OU_LINES:
+    s = f"{ln}".rstrip("0").rstrip(".")
+    ALLOWED_SUGGESTIONS.add(f"Over {s} Goals")
+    ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
 
 TRAIN_ENABLE = os.getenv("TRAIN_ENABLE", "1") not in ("0", "false", "False", "no", "NO")
 TRAIN_MIN_MINUTE = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 TRAIN_TEST_SIZE = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
 
-# Postgres (Supabase) — REQUIRED
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("DATABASE_URL is required (Supabase Postgres).")
 
-# ── External APIs ─────────────────────────────────────────────────────────────
+# External APIs
 BASE_URL = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES = ["1H", "HT", "2H", "ET", "BT", "P"]
 
-# ── HTTP session ──────────────────────────────────────────────────────────────
+# HTTP session
 session = requests.Session()
-retries = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504],
-    respect_retry_after_header=True,
-)
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], respect_retry_after_header=True)
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
-# ── Caches ────────────────────────────────────────────────────────────────────
+# Caches
 STATS_CACHE: Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 CAL_CACHE: Dict[str, Any] = {"ts": 0, "bins": []}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional training import (kept robust)
-# ──────────────────────────────────────────────────────────────────────────────
+# Optional training import
 try:
     from train_models import train_models
 except Exception as _imp_err:
@@ -98,26 +125,14 @@ except Exception as _imp_err:
         logger.warning("train_models not available: %s", _imp_err)
         return {"ok": False, "reason": "train_models not available"}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Postgres adapter
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Postgres adapter
 class PgCursor:
-    def __init__(self, cur):
-        self.cur = cur
-
-    def fetchone(self):
-        return self.cur.fetchone()
-
-    def fetchall(self):
-        return self.cur.fetchall()
-
+    def __init__(self, cur): self.cur = cur
+    def fetchone(self): return self.cur.fetchone()
+    def fetchall(self): return self.cur.fetchall()
 
 class PgConn:
-    def __init__(self, dsn: str):
-        self.dsn = dsn
-        self.conn = None
-        self.cur = None
-
+    def __init__(self, dsn: str): self.dsn = dsn; self.conn=None; self.cur=None
     def __enter__(self):
         if "sslmode=" not in self.dsn:
             self.dsn = self.dsn + ("&" if "?" in self.dsn else "?") + "sslmode=require"
@@ -125,45 +140,35 @@ class PgConn:
         self.conn.autocommit = True
         self.cur = self.conn.cursor()
         return self
-
     def __exit__(self, exc_type, exc, tb):
         try:
-            if self.cur:
-                self.cur.close()
+            if self.cur: self.cur.close()
         finally:
-            if self.conn:
-                self.conn.close()
-
-    def execute(self, sql: str, params: tuple | list = ()):
+            if self.conn: self.conn.close()
+    def execute(self, sql: str, params: tuple|list=()):
         self.cur.execute(sql, params or ())
         return PgCursor(self.cur)
-
 
 def db_conn() -> PgConn:
     return PgConn(DATABASE_URL)
 
-# ── Settings helpers ──────────────────────────────────────────────────────────
+# ── Settings helpers
 def get_setting(key: str) -> Optional[str]:
     with db_conn() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
         return row[0] if row else None
 
-
 def set_setting(key: str, value: str) -> None:
     with db_conn() as conn:
         conn.execute(
-            """
-            INSERT INTO settings(key,value) VALUES(%s,%s)
-            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
-            """,
+            "INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
             (key, value),
         )
 
-# ── Init DB ───────────────────────────────────────────────────────────────────
+# ── Init DB
 def init_db():
     with db_conn() as conn:
-        conn.execute(
-            """
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS tips (
             match_id BIGINT,
             league_id BIGINT,
@@ -178,73 +183,49 @@ def init_db():
             created_ts BIGINT,
             sent_ok   INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts)
-        )"""
-        )
-
-        conn.execute(
-            """
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS tip_snapshots (
             match_id BIGINT,
             created_ts BIGINT,
             payload TEXT,
             PRIMARY KEY (match_id, created_ts)
-        )"""
-        )
-
-        conn.execute(
-            """
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
             id SERIAL PRIMARY KEY,
             match_id BIGINT UNIQUE,
             verdict  INTEGER,
             created_ts BIGINT
-        )"""
-        )
-
-        conn.execute(
-            """
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        )"""
-        )
-
-        conn.execute(
-            """
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS match_results (
             match_id   BIGINT PRIMARY KEY,
             final_goals_h INTEGER,
             final_goals_a INTEGER,
             btts_yes      INTEGER,
             updated_ts    BIGINT
-        )"""
-        )
+        )""")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Telegram
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Telegram
 def send_telegram(message: str, inline_keyboard: Optional[list] = None) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
     if inline_keyboard:
         payload["reply_markup"] = json.dumps({"inline_keyboard": inline_keyboard})
-
     try:
         res = session.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=10)
         return res.ok
     except Exception:
         return False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# External API helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ── External API helpers
 def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY:
         return None
@@ -255,7 +236,6 @@ def _api_get(url: str, params: dict, timeout: int = 15):
         return res.json()
     except Exception:
         return None
-
 
 def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     now = time.time()
@@ -268,7 +248,6 @@ def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     STATS_CACHE[fixture_id] = (now, stats or [])
     return stats
 
-
 def fetch_match_events(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     now = time.time()
     if fixture_id in EVENTS_CACHE:
@@ -280,36 +259,29 @@ def fetch_match_events(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     EVENTS_CACHE[fixture_id] = (now, evs or [])
     return evs
 
-
 def fetch_live_matches() -> List[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"live": "all"})
     if not isinstance(js, dict):
         return []
     matches = js.get("response", []) or []
     out = []
-
     allowed = {"1H", "HT", "2H", "ET", "BT", "P"}
     for m in matches:
         status = (m.get("fixture", {}) or {}).get("status", {}) or {}
         elapsed = status.get("elapsed")
         short = (status.get("short") or "").upper()
-
         if elapsed is None or elapsed > 120:
             continue
         if short not in allowed:
             continue
-
         fid = (m.get("fixture", {}) or {}).get("id")
         m["statistics"] = fetch_match_stats(fid) or []
         m["events"] = fetch_match_events(fid) or []
         out.append(m)
     return out
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fixture helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Fixture helpers
 MAX_IDS_PER_REQ = 20
-
 
 def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
     out: Dict[int, Dict[str, Any]] = {}
@@ -323,7 +295,6 @@ def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
             fid = (fx.get("fixture") or {}).get("id")
             if fid:
                 out[int(fid)] = fx
-
         missing = [fid for fid in chunk if fid not in out]
         for fid in missing:
             js1 = _api_get(FOOTBALL_API_URL, {"id": fid, "timezone": "UTC"})
@@ -333,25 +304,7 @@ def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
         time.sleep(0.15)
     return out
 
-
-def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    if not ids:
-        return {}
-    out: Dict[int, Dict[str, Any]] = {}
-    for i in range(0, len(ids), MAX_IDS_PER_REQ):
-        chunk = ids[i : i + MAX_IDS_PER_REQ]
-        js = _api_get(FOOTBALL_API_URL, {"ids": "-".join(map(str, chunk)), "timezone": "UTC"})
-        resp = js.get("response", []) if isinstance(js, dict) else []
-        for fx in resp:
-            fid = (fx.get("fixture") or {}).get("id")
-            if fid:
-                out[int(fid)] = fx
-        time.sleep(0.15)
-    return out
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Feature extraction & snapshots
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Features & snapshots
 def _num(v) -> float:
     try:
         if isinstance(v, str) and v.endswith("%"):
@@ -360,18 +313,15 @@ def _num(v) -> float:
     except Exception:
         return 0.0
 
-
 def _pos_pct(v) -> float:
     try:
         return float(str(v).replace("%", "").strip() or 0)
     except Exception:
         return 0.0
 
-
 def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     home_name = match["teams"]["home"]["name"]
     away_name = match["teams"]["away"]["name"]
-
     gh = match["goals"]["home"] or 0
     ga = match["goals"]["away"] or 0
     minute = int(((match.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
@@ -382,7 +332,6 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
         tname = (s.get("team") or {}).get("name")
         if tname:
             stats[tname] = { (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
-
     sh = stats.get(home_name, {}) or {}
     sa = stats.get(away_name, {}) or {}
 
@@ -395,8 +344,7 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     pos_h = _pos_pct(sh.get("Ball Possession", 0))
     pos_a = _pos_pct(sa.get("Ball Possession", 0))
 
-    red_h = 0
-    red_a = 0
+    red_h = red_a = 0
     for ev in (match.get("events") or []):
         try:
             if (ev.get("type", "").lower() == "card"):
@@ -419,6 +367,7 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
         "xg_h": float(xg_h),
         "xg_a": float(xg_a),
         "xg_sum": float(xg_h + xg_a),
+        "xg_diff": float(xg_h - xg_a),
         "sot_h": float(sot_h),
         "sot_a": float(sot_a),
         "sot_sum": float(sot_h + sot_a),
@@ -427,13 +376,14 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
         "cor_sum": float(cor_h + cor_a),
         "pos_h": float(pos_h),
         "pos_a": float(pos_a),
+        "pos_diff": float(pos_h - pos_a),
         "red_h": float(red_h),
         "red_a": float(red_a),
         "red_sum": float(red_h + red_a),
     }
 
-
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
+    # Why: avoid firing with zero-signal after minute threshold
     if minute < REQUIRE_STATS_MINUTE:
         return True
     fields = [
@@ -445,15 +395,12 @@ def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
     nonzero = sum(1 for v in fields if (v or 0) > 0)
     return nonzero >= max(0, REQUIRE_DATA_FIELDS)
 
-
 def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
     fx = m.get("fixture", {}) or {}
     lg = m.get("league", {}) or {}
-
     fid = int(fx.get("id"))
     league_id = int(lg.get("id") or 0)
     league = f"{lg.get('country', '')} - {lg.get('name', '')}".strip(" -")
-
     home = (m.get("teams") or {}).get("home", {}).get("name", "")
     away = (m.get("teams") or {}).get("away", {}).get("name", "")
     gh = (m.get("goals") or {}).get("home") or 0
@@ -461,68 +408,41 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
     minute = int(feat.get("minute", 0))
 
     snapshot = {
-        "minute": minute,
-        "gh": gh,
-        "ga": ga,
-        "league_id": league_id,
-        "market": "HARVEST",
-        "suggestion": "HARVEST",
-        "confidence": 0,
+        "minute": minute, "gh": gh, "ga": ga, "league_id": league_id,
+        "market": "HARVEST", "suggestion": "HARVEST", "confidence": 0,
         "stat": {
-            "xg_h": feat.get("xg_h", 0),
-            "xg_a": feat.get("xg_a", 0),
-            "sot_h": feat.get("sot_h", 0),
-            "sot_a": feat.get("sot_a", 0),
-            "cor_h": feat.get("cor_h", 0),
-            "cor_a": feat.get("cor_a", 0),
-            "pos_h": feat.get("pos_h", 0),
-            "pos_a": feat.get("pos_a", 0),
-            "red_h": feat.get("red_h", 0),
-            "red_a": feat.get("red_a", 0),
+            "xg_h": feat.get("xg_h", 0), "xg_a": feat.get("xg_a", 0),
+            "sot_h": feat.get("sot_h", 0), "sot_a": feat.get("sot_a", 0),
+            "cor_h": feat.get("cor_h", 0), "cor_a": feat.get("cor_a", 0),
+            "pos_h": feat.get("pos_h", 0), "pos_a": feat.get("pos_a", 0),
+            "red_h": feat.get("red_h", 0), "red_a": feat.get("red_a", 0),
         },
     }
 
     now = int(time.time())
     with db_conn() as conn:
         conn.execute(
-            """
-            INSERT INTO tip_snapshots(match_id, created_ts, payload)
-            VALUES (%s,%s,%s)
-            ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload
-            """,
+            "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
+            "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
             (fid, now, json.dumps(snapshot)[:200000]),
         )
-
         conn.execute(
-            """
-            INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)
-            """,
+            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
             (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now),
         )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Model loading & scoring
-# ──────────────────────────────────────────────────────────────────────────────
-MODEL_KEYS_ORDER = [
-    "model_v2:{name}",
-    "model_latest:{name}",
-    "model:{name}",
-]
-
+# ── Models
+MODEL_KEYS_ORDER = ["model_v2:{name}", "model_latest:{name}", "model:{name}"]
 
 def _sigmoid(x: float) -> float:
     try:
-        if x < -50:
-            return 1e-22
-        if x > 50:
-            return 1.0 - 1e-22
+        if x < -50: return 1e-22
+        if x >  50: return 1.0 - 1e-22
         import math
-
         return 1.0 / (1.0 + math.exp(-x))
     except Exception:
         return 0.5
-
 
 def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     for pat in MODEL_KEYS_ORDER:
@@ -545,39 +465,21 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
             logger.warning("[MODEL] failed to parse %s: %s", key, e)
     return None
 
-
 def _linpred(feat: Dict[str, float], weights: Dict[str, float], intercept: float) -> float:
     s = float(intercept or 0.0)
     for k, w in (weights or {}).items():
         s += float(w or 0.0) * float(feat.get(k, 0.0))
     return s
 
-
-def retrain_models_job() -> Dict[str, Any]:
-    logger.info("Starting retrain job...")
-    try:
-        res = train_models()
-        logger.info("Retrain completed")
-        return res if isinstance(res, dict) else {"ok": True, "result": res}
-    except Exception as e:
-        logger.exception("Retrain job failed: %s", e)
-        return {"ok": False, "error": str(e)}
-
-
 def _calibrate(p: float, cal: Dict[str, Any]) -> float:
     method = (cal or {}).get("method", "sigmoid")
-    a = float((cal or {}).get("a", 1.0))
-    b = float((cal or {}).get("b", 0.0))
-
+    a = float((cal or {}).get("a", 1.0)); b = float((cal or {}).get("b", 0.0))
     if method == "platt":
         return _sigmoid(a * float(p) + b)
-
     import math
-
     p = max(1e-12, min(1 - 1e-12, float(p)))
     logit = math.log(p / (1.0 - p))
     return _sigmoid(a * logit + b)
-
 
 def _score_prob(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
     lp = _linpred(feat, mdl.get("weights", {}), float(mdl.get("intercept", 0.0)))
@@ -590,12 +492,10 @@ def _score_prob(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
         pass
     return max(0.0, min(1.0, float(p)))
 
-
 def _pretty_score(m: Dict[str, Any]) -> str:
     gh = (m.get("goals") or {}).get("home") or 0
     ga = (m.get("goals") or {}).get("away") or 0
     return f"{gh}-{ga}"
-
 
 def _league_name(m: Dict[str, Any]) -> Tuple[int, str]:
     lg = (m.get("league") or {}) or {}
@@ -603,49 +503,23 @@ def _league_name(m: Dict[str, Any]) -> Tuple[int, str]:
     league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
     return league_id, league
 
-
 def _teams(m: Dict[str, Any]) -> Tuple[str, str]:
     t = (m.get("teams") or {}) or {}
     return (t.get("home", {}).get("name", ""), t.get("away", {}).get("name", ""))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tip formatting/sending
-# ──────────────────────────────────────────────────────────────────────────────
-def _format_tip_message(
-    home: str,
-    away: str,
-    league: str,
-    minute: int,
-    score_txt: str,
-    suggestion: str,
-    prob_pct: float,
-    feat: Dict[str, float],
-) -> str:
+# ── Tip formatting
+def _format_tip_message(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> str:
     stat_line = ""
-    if any(
-        [
-            feat.get("xg_h", 0),
-            feat.get("xg_a", 0),
-            feat.get("sot_h", 0),
-            feat.get("sot_a", 0),
-            feat.get("cor_h", 0),
-            feat.get("cor_a", 0),
-            feat.get("pos_h", 0),
-            feat.get("pos_a", 0),
-            feat.get("red_h", 0),
-            feat.get("red_a", 0),
-        ]
-    ):
-        stat_line = (
-            f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
-            f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
-            f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}"
-        )
+    if any([feat.get("xg_h", 0), feat.get("xg_a", 0), feat.get("sot_h", 0), feat.get("sot_a", 0),
+            feat.get("cor_h", 0), feat.get("cor_a", 0), feat.get("pos_h", 0), feat.get("pos_a", 0),
+            feat.get("red_h", 0), feat.get("red_a", 0)]):
+        stat_line = (f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
+                     f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
+                     f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
         if feat.get("pos_h", 0) or feat.get("pos_a", 0):
             stat_line += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
         if feat.get("red_h", 0) or feat.get("red_a", 0):
             stat_line += f" • RED {int(feat.get('red_h',0))}-{int(feat.get('red_a',0))}"
-
     msg = (
         "⚽️ <b>New Tip!</b>\n"
         f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
@@ -657,27 +531,29 @@ def _format_tip_message(
     )
     return msg
 
-
 def _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     return send_telegram(_format_tip_message(home, away, league, minute, score_txt, suggestion, prob_pct, feat))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Production scan (models → tips)
-# ──────────────────────────────────────────────────────────────────────────────
+def _fmt_line(line: float) -> str:
+    return f"{line}".rstrip("0").rstrip(".")
+
+def _load_ou_model_for_line(line: float) -> Optional[Dict[str, Any]]:
+    """Try OU_{line} first, fallback to O25 for 2.5."""
+    name = f"OU_{_fmt_line(line)}"
+    mdl = load_model_from_settings(name)
+    if not mdl and abs(line - 2.5) < 1e-6:
+        mdl = load_model_from_settings("O25")
+    return mdl
+
+# ── Production scan (math+ML; O/U multi-lines, BTTS, 1X2)
 def production_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
         logger.info("[PROD] no live matches")
         return 0, 0
-
-    mdl_o25 = load_model_from_settings("O25")
-    mdl_btts = load_model_from_settings("BTTS_YES")
-    if not mdl_o25 and not mdl_btts:
-        logger.warning("[PROD] no models available in settings — skipping.")
-        return 0, live_seen
 
     saved = 0
     now_ts = int(time.time())
@@ -703,61 +579,81 @@ def production_scan() -> Tuple[int, int]:
                 if not stats_coverage_ok(feat, minute):
                     continue
 
-                preds: List[Tuple[str, str, float]] = []
-
-                if mdl_o25:
-                    p_over = _score_prob(feat, mdl_o25)
-                    if not (minute >= O25_LATE_MINUTE and feat.get("goals_sum", 0) < O25_LATE_MIN_GOALS):
-                        if p_over * 100.0 >= CONF_THRESHOLD:
-                            preds.append(("O25", "Over 2.5 Goals", p_over))
-
-                if mdl_btts:
-                    p_btts = _score_prob(feat, mdl_btts)
-                    if not (minute >= BTTS_LATE_MINUTE and (feat.get("goals_h", 0) == 0 or feat.get("goals_a", 0) == 0)):
-                        if p_btts * 100.0 >= CONF_THRESHOLD:
-                            preds.append(("BTTS", "BTTS: Yes", p_btts))
-
-                if not preds:
-                    continue
-
-                preds.sort(key=lambda x: x[2], reverse=True)
-
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
                 score_txt = _pretty_score(m)
 
+                candidates: List[Tuple[str, str, float]] = []
+
+                # O/U lines
+                for line in OU_LINES:
+                    p_over_math = ou_over_probability(feat, line, TOTAL_MATCH_MINUTES)
+                    mdl_line = _load_ou_model_for_line(line)
+                    if mdl_line:
+                        p_over_ml = _score_prob(feat, mdl_line)
+                        p_over = BLEND_ML_WEIGHT * p_over_ml + BLEND_MATH_WEIGHT * p_over_math
+                    else:
+                        p_over = p_over_math
+
+                    if p_over * 100.0 >= CONF_THRESHOLD:
+                        candidates.append((f"OU_{_fmt_line(line)}", f"Over {_fmt_line(line)} Goals", p_over))
+
+                    if minute <= UNDER_SUPPRESS_AFTER_MIN:
+                        p_under = 1.0 - p_over
+                        if p_under * 100.0 >= CONF_THRESHOLD:
+                            candidates.append((f"OU_{_fmt_line(line)}", f"Under {_fmt_line(line)} Goals", p_under))
+
+                # BTTS (Yes/No)
+                p_btts_math = btts_yes_probability(feat, TOTAL_MATCH_MINUTES)
+                mdl_btts = load_model_from_settings("BTTS_YES")
+                if mdl_btts:
+                    p_btts_ml = _score_prob(feat, mdl_btts)
+                    p_btts = BLEND_ML_WEIGHT * p_btts_ml + BLEND_MATH_WEIGHT * p_btts_math
+                else:
+                    p_btts = p_btts_math
+                if not (minute >= BTTS_LATE_MINUTE and (feat.get("goals_h", 0) == 0 or feat.get("goals_a", 0) == 0)):
+                    if p_btts * 100.0 >= CONF_THRESHOLD:
+                        candidates.append(("BTTS", "BTTS: Yes", p_btts))
+                p_btts_no = 1.0 - p_btts
+                if minute <= UNDER_SUPPRESS_AFTER_MIN and p_btts_no * 100.0 >= CONF_THRESHOLD:
+                    candidates.append(("BTTS", "BTTS: No", p_btts_no))
+
+                # 1X2 (pick strongest)
+                p_home, p_draw, p_away = wld_probabilities(feat, TOTAL_MATCH_MINUTES)
+                wld_map = [("1X2", "Home Win", p_home), ("1X2", "Draw", p_draw), ("1X2", "Away Win", p_away)]
+                best_market = max(wld_map, key=lambda x: x[2])
+                if best_market[2] * 100.0 >= CONF_THRESHOLD:
+                    candidates.append(best_market)
+
+                if not candidates:
+                    continue
+
+                candidates.sort(key=lambda x: x[2], reverse=True)
+                per_match = 0
                 base_now = int(time.time())
-                for idx, (market_code, suggestion, prob) in enumerate(preds):
+
+                for idx, (market_code, suggestion, prob) in enumerate(candidates):
+                    if suggestion not in ALLOWED_SUGGESTIONS:
+                        continue
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        break
+
                     created_ts = base_now + idx
-                    market_txt = "Over/Under 2.5" if market_code == "O25" else "BTTS"
                     prob_pct = float(prob * 100.0)
+                    market_txt = f"Over/Under {market_code.split('_',1)[1]}" if market_code.startswith("OU_") else market_code
 
                     conn.execute(
-                        """
-                        INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)
-                        """,
-                        (
-                            fid,
-                            league_id,
-                            league,
-                            home,
-                            away,
-                            market_txt,
-                            suggestion,
-                            prob_pct,
-                            score_txt,
-                            minute,
-                            created_ts,
-                        ),
+                        "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
+                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                        (fid, league_id, league, home, away, market_txt, suggestion, prob_pct, score_txt, minute, created_ts),
                     )
 
                     sent_ok = _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat)
-
                     if sent_ok:
                         conn.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
 
                     saved += 1
+                    per_match += 1
                     if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
                         break
 
@@ -771,9 +667,7 @@ def production_scan() -> Tuple[int, int]:
     logger.info(f"[PROD] saved={saved} live_seen={live_seen}")
     return saved, live_seen
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Harvest & Backfill helpers (added)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Harvest & Backfill
 def harvest_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
     saved = 0
@@ -788,19 +682,15 @@ def harvest_scan() -> Tuple[int, int]:
             if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
                 break
         except Exception as e:
-            logger.exception("[HARVEST] failure on match: %s", e)
+            logger.exception("[HARVEST] failure: %s", e)
     logger.info("[HARVEST] snapshots_saved=%d live_seen=%d", saved, len(matches))
     return saved, len(matches)
 
-
 def get_fixture_ids_for_league(league: int, season: int, statuses: List[str]) -> List[int]:
-    js = _api_get(
-        FOOTBALL_API_URL,
-        {"league": league, "season": season, "status": "-".join(statuses), "timezone": "UTC"},
-    )
+    js = _api_get(FOOTBALL_API_URL, {"league": league, "season": season, "status": "-".join(statuses), "timezone": "UTC"})
     if not isinstance(js, dict):
         return []
-    out = []
+    out: List[int] = []
     for it in js.get("response", []) or []:
         try:
             fid = int((it.get("fixture") or {}).get("id") or 0)
@@ -810,17 +700,10 @@ def get_fixture_ids_for_league(league: int, season: int, statuses: List[str]) ->
             continue
     return out
 
-
-def create_synthetic_snapshots_for_league(
-    league: int,
-    season: int,
-    include_inplay: bool,
-    extra_statuses: Optional[List[str]],
-    limit: Optional[int],
-    delay_ms: int,
-) -> Dict[str, Any]:
-    base_statuses = ["FT", "AET", "PEN"]
-    statuses = list(base_statuses)
+def create_synthetic_snapshots_for_league(league: int, season: int, include_inplay: bool,
+                                          extra_statuses: Optional[List[str]],
+                                          limit: Optional[int], delay_ms: int) -> Dict[str, Any]:
+    statuses = ["FT", "AET", "PEN"]
     if include_inplay:
         for s in INPLAY_STATUSES:
             if s not in statuses:
@@ -833,8 +716,7 @@ def create_synthetic_snapshots_for_league(
     ids = get_fixture_ids_for_league(league, season, statuses)
     if limit:
         ids = ids[: max(0, int(limit))]
-    saved = 0
-    checked = 0
+    saved = checked = 0
     for fid in ids:
         js = _api_get(FOOTBALL_API_URL, {"id": fid, "timezone": "UTC"}) or {}
         resp = (js.get("response") if isinstance(js, dict) else []) or []
@@ -845,11 +727,9 @@ def create_synthetic_snapshots_for_league(
         m["events"] = fetch_match_events(fid) or []
         feat = extract_features(m)
         save_snapshot_from_match(m, feat)
-        saved += 1
-        checked += 1
+        saved += 1; checked += 1
         time.sleep(max(0, delay_ms) / 1000.0)
     return {"ok": True, "league": league, "season": season, "requested": len(ids), "saved": saved, "checked": checked}
-
 
 def _list_unlabeled_ids(limit: Optional[int] = None) -> List[int]:
     with db_conn() as conn:
@@ -860,21 +740,15 @@ def _list_unlabeled_ids(limit: Optional[int] = None) -> List[int]:
         WHERE r.match_id IS NULL
         ORDER BY s.match_id
         """
-        if limit:
-            sql += " LIMIT %s"
-            rows = conn.execute(sql, (int(limit),)).fetchall()
-        else:
-            rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql + (" LIMIT %s" if limit else ""), ((int(limit),) if limit else ())).fetchall()
     return [int(r[0]) for r in rows]
-
 
 def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
     if not ids:
         return 0, 0
     finished_status = {"FT", "AET", "PEN"}
     fx = fetch_fixtures_by_ids(ids)
-    updated = 0
-    checked = 0
+    updated = checked = 0
     now = int(time.time())
     with db_conn() as conn:
         for fid in ids:
@@ -887,157 +761,100 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
             if st in finished_status and gh is not None and ga is not None:
                 btts_yes = 1 if (int(gh) > 0 and int(ga) > 0) else 0
                 conn.execute(
-                    """
-                    INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts)
-                    VALUES(%s,%s,%s,%s,%s)
-                    ON CONFLICT (match_id) DO UPDATE SET
-                      final_goals_h=EXCLUDED.final_goals_h,
-                      final_goals_a=EXCLUDED.final_goals_a,
-                      btts_yes=EXCLUDED.btts_yes,
-                      updated_ts=EXCLUDED.updated_ts
-                    """,
+                    "INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
+                    "VALUES(%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (match_id) DO UPDATE SET "
+                    "final_goals_h=EXCLUDED.final_goals_h, final_goals_a=EXCLUDED.final_goals_a, "
+                    "btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
                     (fid, int(gh), int(ga), int(btts_yes), now),
                 )
                 updated += 1
             checked += 1
     return updated, checked
 
-
 def backfill_results_from_snapshots(hours: int = 48) -> Tuple[int, int]:
     hours = max(1, min(int(hours), 168))
     since = int(time.time()) - hours * 3600
     with db_conn() as conn:
         rows = conn.execute(
-            """
-            SELECT DISTINCT match_id FROM tip_snapshots
-            WHERE created_ts >= %s
-              AND match_id NOT IN (SELECT match_id FROM match_results)
-            ORDER BY match_id
-            """,
+            "SELECT DISTINCT match_id FROM tip_snapshots WHERE created_ts >= %s "
+            "AND match_id NOT IN (SELECT match_id FROM match_results) ORDER BY match_id",
             (since,),
         ).fetchall()
     ids = [int(r[0]) for r in rows]
     return _backfill_for_ids(ids)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Stats helpers (added)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Stats/MOTD
 def _counts_since(since_ts: int) -> Dict[str, int]:
     with db_conn() as conn:
-        snap_24h = conn.execute(
-            "SELECT COUNT(*) FROM tip_snapshots WHERE created_ts >= %s", (since_ts,)
-        ).fetchone()[0]
-        tips_24h = conn.execute(
-            "SELECT COUNT(*) FROM tips WHERE created_ts >= %s", (since_ts,)
-        ).fetchone()[0]
-        res_24h = conn.execute(
-            "SELECT COUNT(*) FROM match_results WHERE updated_ts >= %s", (since_ts,)
-        ).fetchone()[0]
-
+        snap_24h = conn.execute("SELECT COUNT(*) FROM tip_snapshots WHERE created_ts >= %s", (since_ts,)).fetchone()[0]
+        tips_24h = conn.execute("SELECT COUNT(*) FROM tips WHERE created_ts >= %s", (since_ts,)).fetchone()[0]
+        res_24h = conn.execute("SELECT COUNT(*) FROM match_results WHERE updated_ts >= %s", (since_ts,)).fetchone()[0]
         snap_total = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
         tips_total = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
         res_total = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
-        unlabeled = conn.execute(
-            """
+        unlabeled = conn.execute("""
             SELECT COUNT(DISTINCT s.match_id)
             FROM tip_snapshots s
             LEFT JOIN match_results r ON r.match_id = s.match_id
             WHERE r.match_id IS NULL
-            """
-        ).fetchone()[0]
+        """).fetchone()[0]
+    return {"snap_24h": int(snap_24h), "tips_24h": int(tips_24h), "res_24h": int(res_24h),
+            "snap_total": int(snap_total), "tips_total": int(tips_total),
+            "res_total": int(res_total), "unlabeled": int(unlabeled)}
 
-    return {
-        "snap_24h": int(snap_24h),
-        "tips_24h": int(tips_24h),
-        "res_24h": int(res_24h),
-        "snap_total": int(snap_total),
-        "tips_total": int(tips_total),
-        "res_total": int(res_total),
-        "unlabeled": int(unlabeled),
-    }
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MOTD & Digest (added minimal implementations)
-# ──────────────────────────────────────────────────────────────────────────────
 def motd_candidates(limit: int = 5) -> List[Dict[str, Any]]:
     today = datetime.now(ZoneInfo("Europe/Berlin")).date()
     start_ts = int(datetime(today.year, today.month, today.day, tzinfo=ZoneInfo("Europe/Berlin")).timestamp())
     with db_conn() as conn:
         rows = conn.execute(
-            """
-            SELECT match_id, league, home, away, suggestion, confidence, minute, created_ts
-            FROM tips
-            WHERE created_ts >= %s
-              AND suggestion IN ('Over 2.5 Goals','BTTS: Yes')
-            ORDER BY confidence DESC, created_ts DESC
-            LIMIT %s
-            """,
+            "SELECT match_id, league, home, away, suggestion, confidence, minute, created_ts "
+            "FROM tips WHERE created_ts >= %s AND suggestion IN ('Over 2.5 Goals','BTTS: Yes','Home Win','Away Win') "
+            "ORDER BY confidence DESC, created_ts DESC LIMIT %s",
             (start_ts, int(limit)),
         ).fetchall()
     out = []
     for r in rows:
-        out.append(
-            {
-                "match_id": int(r[0]),
-                "league": r[1],
-                "home": r[2],
-                "away": r[3],
-                "suggestion": r[4],
-                "confidence": float(r[5]),
-                "minute": int(r[6]),
-                "created_ts": int(r[7]),
-            }
-        )
+        out.append({"match_id": int(r[0]), "league": r[1], "home": r[2], "away": r[3],
+                    "suggestion": r[4], "confidence": float(r[5]), "minute": int(r[6]), "created_ts": int(r[7])})
     return out
-
 
 def _motd_key_for_today() -> str:
     today = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d")
     return f"motd_sent:{today}"
 
-
 def _motd_already_announced_for_today() -> bool:
     return bool(get_setting(_motd_key_for_today()))
-
 
 def motd_announce() -> Dict[str, Any]:
     if _motd_already_announced_for_today():
         return {"ok": True, "already_sent": True}
-
     cands = motd_candidates(limit=1)
     if not cands:
         return {"ok": False, "reason": "no candidates"}
     c = cands[0]
-    msg = (
-        "🌟 <b>Match of the Day</b>\n"
-        f"{escape(c['home'])} vs {escape(c['away'])}\n"
-        f"Tip: {escape(c['suggestion'])} • Confidence: {c['confidence']:.1f}%"
-    )
+    msg = ("🌟 <b>Match of the Day</b>\n"
+           f"{escape(c['home'])} vs {escape(c['away'])}\n"
+           f"Tip: {escape(c['suggestion'])} • Confidence: {c['confidence']:.1f}%")
     delivered = send_telegram(msg)
     if delivered:
         set_setting(_motd_key_for_today(), "1")
     return {"ok": delivered, "candidate": c, "sent": delivered}
 
-
 def nightly_digest_job():
     try:
-        now = int(time.time())
-        day_ago = now - 24 * 3600
+        now = int(time.time()); day_ago = now - 24 * 3600
         c = _counts_since(day_ago)
-        msg = (
-            "🗞️ <b>Nightly Digest</b>\n"
-            f"Snapshots: +{c['snap_24h']} (total {c['snap_total']})\n"
-            f"Tips: +{c['tips_24h']} (total {c['tips_total']})\n"
-            f"Results: +{c['res_24h']} (total {c['res_total']})\n"
-            f"Unlabeled IDs: {c['unlabeled']}"
-        )
+        msg = ("🗞️ <b>Nightly Digest</b>\n"
+               f"Snapshots: +{c['snap_24h']} (total {c['snap_total']})\n"
+               f"Tips: +{c['tips_24h']} (total {c['tips_total']})\n"
+               f"Results: +{c['res_24h']} (total {c['res_total']})\n"
+               f"Unlabeled IDs: {c['unlabeled']}")
         send_telegram(msg)
     except Exception as e:
         logger.exception("Nightly digest failed: %s", e)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Routes & Security Headers
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Security headers & routes
 @app.after_request
 def add_security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
@@ -1046,19 +863,17 @@ def add_security_headers(resp):
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
-
 def _require_api_key():
     key = request.headers.get("X-API-Key") or request.args.get("key")
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
-
 
 @app.route("/")
 def home():
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
     return f"🤖 Robi Superbrain is active ({mode}) · DB=Postgres"
 
-# ── Harvest (bulk) ────────────────────────────────────────────────────────────
+# Harvest routes
 def _run_bulk_leagues(leagues: List[int], seasons: List[int]) -> Dict[str, Any]:
     if not leagues:
         leagues = LEAGUE_PRIORITY_IDS
@@ -1067,21 +882,13 @@ def _run_bulk_leagues(leagues: List[int], seasons: List[int]) -> Dict[str, Any]:
     for lg in leagues:
         for season in seasons:
             try:
-                summary = create_synthetic_snapshots_for_league(
-                    league=lg,
-                    season=season,
-                    include_inplay=False,
-                    extra_statuses=None,
-                    limit=None,
-                    delay_ms=250,
-                )
+                summary = create_synthetic_snapshots_for_league(lg, season, False, None, None, 250)
                 total_saved += int(summary.get("saved", 0))
                 per_league.append({"league": lg, "season": season, **summary})
             except Exception as e:
                 logger.exception("bulk league failed: %s", e)
                 per_league.append({"league": lg, "season": season, "ok": False, "error": str(e)})
     return {"ok": True, "total_saved": total_saved, "details": per_league}
-
 
 @app.route("/harvest/bulk_leagues", methods=["POST"])
 def harvest_bulk_leagues_post():
@@ -1091,7 +898,6 @@ def harvest_bulk_leagues_post():
     seasons = body.get("seasons") or [2024]
     return jsonify(_run_bulk_leagues(leagues, seasons))
 
-
 @app.route("/harvest/bulk_leagues", methods=["GET"])
 def harvest_bulk_leagues_get():
     _require_api_key()
@@ -1100,13 +906,11 @@ def harvest_bulk_leagues_get():
     leagues = []
     return jsonify(_run_bulk_leagues(leagues, seasons))
 
-
 @app.route("/harvest")
 def harvest_route():
     _require_api_key()
     saved, live_seen = harvest_scan()
     return jsonify({"ok": True, "live_seen": live_seen, "snapshots_saved": saved})
-
 
 @app.route("/harvest/league_ids")
 def harvest_league_ids_route():
@@ -1117,17 +921,14 @@ def harvest_league_ids_route():
     except Exception:
         abort(400)
     statuses_param = request.args.get("statuses", "")
-    include_inplay = request.args.get("include_inplay", "0") not in ("0", "false", "False", "no", "NO")
-    statuses = [s for s in statuses_param.split("-") if s] if statuses_param else ["FT", "AET", "PEN"]
+    include_inplay = request.args.get("include_inplay", "0") not in ("0","false","False","no","NO")
+    statuses = [s for s in statuses_param.split("-") if s] if statuses_param else ["FT","AET","PEN"]
     if include_inplay:
         for s in INPLAY_STATUSES:
             if s not in statuses:
                 statuses.append(s)
     ids = get_fixture_ids_for_league(league, season, statuses)
-    return jsonify(
-        {"ok": True, "league": league, "season": season, "statuses": "-".join(statuses), "count": len(ids), "ids": ids}
-    )
-
+    return jsonify({"ok": True, "league": league, "season": season, "statuses": "-".join(statuses), "count": len(ids), "ids": ids})
 
 @app.route("/harvest/league_snapshots")
 def harvest_league_snapshots_route():
@@ -1137,7 +938,7 @@ def harvest_league_snapshots_route():
         season = int(request.args.get("season"))
     except Exception:
         abort(400)
-    include_inplay = request.args.get("include_inplay", "0") not in ("0", "false", "False", "no", "NO")
+    include_inplay = request.args.get("include_inplay", "0") not in ("0","false","False","no","NO")
     statuses_param = request.args.get("statuses", "")
     extra_statuses = [s for s in statuses_param.split("-") if s] if statuses_param else None
     limit_param = request.args.get("limit")
@@ -1146,7 +947,7 @@ def harvest_league_snapshots_route():
     summary = create_synthetic_snapshots_for_league(league, season, include_inplay, extra_statuses, limit, delay_ms)
     return jsonify(summary)
 
-# ── Backfill finals ───────────────────────────────────────────────────────────
+# Backfill
 @app.route("/backfill")
 def backfill_route():
     _require_api_key()
@@ -1158,7 +959,6 @@ def backfill_route():
     updated, checked = backfill_results_from_snapshots(hours=hours)
     return jsonify({"ok": True, "hours": hours, "checked": checked, "updated": updated})
 
-
 @app.route("/backfill/all")
 def backfill_all_unlabeled_route():
     _require_api_key()
@@ -1166,7 +966,6 @@ def backfill_all_unlabeled_route():
     ids = _list_unlabeled_ids(int(limit) if (limit and str(limit).isdigit()) else None)
     updated, checked = _backfill_for_ids(ids)
     return jsonify({"ok": True, "mode": "all_unlabeled", "checked": checked, "updated": updated})
-
 
 @app.route("/debug/backfill_preview")
 def debug_backfill_preview():
@@ -1179,243 +978,156 @@ def debug_backfill_preview():
             abort(400)
         since = int(time.time()) - h * 3600
         with db_conn() as conn:
-            rows = conn.execute(
-                """
+            rows = conn.execute("""
                 SELECT DISTINCT match_id FROM tip_snapshots
                 WHERE created_ts >= %s
                   AND match_id NOT IN (SELECT match_id FROM match_results)
                 ORDER BY match_id
-            """,
-                (since,),
-            ).fetchall()
+            """, (since,)).fetchall()
             ids = [r[0] for r in rows]
     else:
         ids = _list_unlabeled_ids(int(request.args.get("limit", "0")) or None)
     fx = fetch_fixtures_by_ids(ids)
-    finished_status = {"FT", "AET", "PEN"}
+    finished_status = {"FT","AET","PEN"}
     out = []
     for fid in ids:
         m = fx.get(fid)
         if not m:
-            out.append({"match_id": fid, "fetched": False})
-            continue
+            out.append({"match_id": fid, "fetched": False}); continue
         st = ((m.get("fixture") or {}).get("status") or {}).get("short")
-        gh = (m.get("goals") or {}).get("home")
-        ga = (m.get("goals") or {}).get("away")
-        out.append(
-            {"match_id": fid, "fetched": True, "status": st, "goals_h": gh, "goals_a": ga, "will_update": (st or "") in finished_status}
-        )
+        gh = (m.get("goals") or {}).get("home"); ga = (m.get("goals") or {}).get("away")
+        out.append({"match_id": fid, "fetched": True, "status": st, "goals_h": gh, "goals_a": ga,
+                    "will_update": (st or "") in finished_status})
     return jsonify({"count": len(ids), "candidates": out})
 
-# ── Prediction / Models ───────────────────────────────────────────────────────
+# Predict/Train/Stats
 @app.route("/predict/scan")
 def predict_scan_route():
     _require_api_key()
     saved, live = production_scan()
     return jsonify({"ok": True, "mode": "PRODUCTION", "live_seen": live, "tips_saved": saved})
 
-
 @app.route("/predict/models")
 def predict_models_route():
     _require_api_key()
-    o25 = load_model_from_settings("O25")
-    btts = load_model_from_settings("BTTS_YES")
-    return jsonify(
-        {
-            "O25_found": bool(o25),
-            "BTTS_YES_found": bool(btts),
-            "keys_tried": MODEL_KEYS_ORDER,
-        }
-    )
+    keys_tried = MODEL_KEYS_ORDER
+    found = {}
+    for ln in OU_LINES:
+        name = f"OU_{_fmt_line(ln)}"
+        found[name] = bool(load_model_from_settings(name))
+    found["O25"] = bool(load_model_from_settings("O25"))
+    found["BTTS_YES"] = bool(load_model_from_settings("BTTS_YES"))
+    return jsonify({"found": found, "keys_tried": keys_tried})
 
 @app.route("/train", methods=["POST", "GET"])
 def train_route():
     _require_api_key()
-    return jsonify(retrain_models_job())
+    return jsonify(train_models())
 
-# ── Stats / Admin ────────────────────────────────────────────────────────────
 @app.route("/stats/snapshots_count")
 def snapshots_count():
     _require_api_key()
     with db_conn() as conn:
         snap = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
         tips = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
-        res = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
-        unlabeled = conn.execute(
-            """
+        res  = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
+        unlabeled = conn.execute("""
             SELECT COUNT(DISTINCT s.match_id)
             FROM tip_snapshots s
             LEFT JOIN match_results r ON r.match_id = s.match_id
             WHERE r.match_id IS NULL
-        """
-        ).fetchone()[0]
-    return jsonify(
-        {"tip_snapshots": int(snap), "tips_rows": int(tips), "match_results": int(res), "unlabeled_match_ids": int(unlabeled)}
-    )
-
+        """).fetchone()[0]
+    return jsonify({"tip_snapshots": int(snap), "tips_rows": int(tips), "match_results": int(res), "unlabeled_match_ids": int(unlabeled)})
 
 @app.route("/stats/progress")
 def stats_progress():
     _require_api_key()
     now = int(time.time())
-    day_ago = now - 24 * 3600
-    week_ago = now - 7 * 24 * 3600
+    day_ago = now - 24*3600
+    week_ago = now - 7*24*3600
     c24 = _counts_since(day_ago)
-    c7 = _counts_since(week_ago)
-    return jsonify(
-        {
-            "window_24h": {"snapshots_added": c24["snap_24h"], "results_added": c24["res_24h"]},
-            "totals": {
-                "tip_snapshots": c24["snap_total"],
-                "tips_rows": c24["tips_total"],
-                "match_results": c24["res_total"],
-                "unlabeled_match_ids": c24["unlabeled"],
-            },
-            "window_7d": {"snapshots_added_est": c7["snap_24h"], "results_added_est": c7["res_24h"]},
-        }
-    )
-
+    c7  = _counts_since(week_ago)
+    return jsonify({
+        "window_24h": {"snapshots_added": c24["snap_24h"], "results_added": c24["res_24h"]},
+        "totals": {"tip_snapshots": c24["snap_total"], "tips_rows": c24["tips_total"], "match_results": c24["res_total"], "unlabeled_match_ids": c24["unlabeled"]},
+        "window_7d": {"snapshots_added_est": c7["snap_24h"], "results_added_est": c7["res_24h"]},
+    })
 
 @app.route("/stats/config")
 def stats_config():
     _require_api_key()
-    return jsonify(
-        {
-            "HARVEST_MODE": HARVEST_MODE,
-            "CONF_THRESHOLD": CONF_THRESHOLD,
-            "MAX_TIPS_PER_SCAN": MAX_TIPS_PER_SCAN,
-            "DUP_COOLDOWN_MIN": DUP_COOLDOWN_MIN,
-            "REQUIRE_STATS_MINUTE": REQUIRE_STATS_MINUTE,
-            "REQUIRE_DATA_FIELDS": REQUIRE_DATA_FIELDS,
-            "UNDER_SUPPRESS_AFTER_MIN": UNDER_SUPPRESS_AFTER_MIN,
-            "O25_LATE_MINUTE": O25_LATE_MINUTE,
-            "O25_LATE_MIN_GOALS": O25_LATE_MIN_GOALS,
-            "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
-            "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
-            "API_KEY_set": bool(API_KEY),
-            "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
-            "TRAIN_ENABLE": TRAIN_ENABLE,
-            "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
-            "TRAIN_TEST_SIZE": TRAIN_TEST_SIZE,
-            "MOTD_PREDICT": MOTD_PREDICT,
-            "MOTD_MIN_SAMPLES": MOTD_MIN_SAMPLES,
-            "MOTD_CONF_MIN": MOTD_CONF_MIN,
-            "LEAGUE_PRIORITY_IDS": LEAGUE_PRIORITY_IDS,
-        }
-    )
-
+    return jsonify({
+        "HARVEST_MODE": HARVEST_MODE,
+        "CONF_THRESHOLD": CONF_THRESHOLD,
+        "MAX_TIPS_PER_SCAN": MAX_TIPS_PER_SCAN,
+        "DUP_COOLDOWN_MIN": DUP_COOLDOWN_MIN,
+        "REQUIRE_STATS_MINUTE": REQUIRE_STATS_MINUTE,
+        "REQUIRE_DATA_FIELDS": REQUIRE_DATA_FIELDS,
+        "UNDER_SUPPRESS_AFTER_MIN": UNDER_SUPPRESS_AFTER_MIN,
+        "O25_LATE_MINUTE": O25_LATE_MINUTE,
+        "O25_LATE_MIN_GOALS": O25_LATE_MIN_GOALS,
+        "BTTS_LATE_MINUTE": BTTS_LATE_MINUTE,
+        "ONLY_MODEL_MODE": ONLY_MODEL_MODE,
+        "API_KEY_set": bool(API_KEY),
+        "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
+        "TRAIN_ENABLE": TRAIN_ENABLE,
+        "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
+        "TRAIN_TEST_SIZE": TRAIN_TEST_SIZE,
+        "MOTD_PREDICT": MOTD_PREDICT,
+        "MOTD_MIN_SAMPLES": MOTD_MIN_SAMPLES,
+        "MOTD_CONF_MIN": MOTD_CONF_MIN,
+        "LEAGUE_PRIORITY_IDS": LEAGUE_PRIORITY_IDS,
+        "OU_LINES": OU_LINES,
+        "BLEND_ML_WEIGHT": BLEND_ML_WEIGHT,
+        "TOTAL_MATCH_MINUTES": TOTAL_MATCH_MINUTES,
+        "PREDICTIONS_PER_MATCH": PREDICTIONS_PER_MATCH,
+    })
 
 @app.route("/debug/env")
 def debug_env():
     _require_api_key()
+    def mark(val): return {"set": bool(val), "len": (len(val) if val else 0)}
+    return jsonify({
+        "API_KEY":            mark(API_KEY),
+        "ADMIN_API_KEY":      {"set": bool(ADMIN_API_KEY)},
+        "TELEGRAM_BOT_TOKEN": mark(TELEGRAM_BOT_TOKEN),
+        "TELEGRAM_CHAT_ID":   mark(TELEGRAM_CHAT_ID),
+        "HARVEST_MODE":       HARVEST_MODE,
+        "TRAIN_ENABLE":       TRAIN_ENABLE,
+        "TRAIN_MIN_MINUTE":   TRAIN_MIN_MINUTE,
+        "TRAIN_TEST_SIZE":    TRAIN_TEST_SIZE,
+        "DB": "Postgres",
+    })
 
-    def mark(val):
-        return {"set": bool(val), "len": (len(val) if val else 0)}
-
-    return jsonify(
-        {
-            "API_KEY": mark(API_KEY),
-            "ADMIN_API_KEY": {"set": bool(ADMIN_API_KEY)},
-            "TELEGRAM_BOT_TOKEN": mark(TELEGRAM_BOT_TOKEN),
-            "TELEGRAM_CHAT_ID": mark(TELEGRAM_CHAT_ID),
-            "HARVEST_MODE": HARVEST_MODE,
-            "TRAIN_ENABLE": TRAIN_ENABLE,
-            "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
-            "TRAIN_TEST_SIZE": TRAIN_TEST_SIZE,
-            "DB": "Postgres",
-        }
-    )
-
-# ── MOTD ─────────────────────────────────────────────────────────────────────
-@app.route("/motd/preview")
-def motd_preview_route():
-    _require_api_key()
-    limit = request.args.get("limit")
-    try:
-        limit = int(limit) if limit and str(limit).isdigit() else 5
-    except Exception:
-        limit = 5
-    cands = motd_candidates(limit=limit)
-    return jsonify({"ok": True, "candidates": cands, "already_sent_today": bool(_motd_already_announced_for_today())})
-
-
-@app.route("/motd/announce", methods=["POST"])
-def motd_announce_route():
-    _require_api_key()
-    res = motd_announce()
-    return jsonify(res)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Entrypoint / Scheduler
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Entrypoint / Scheduler
 def main():
     init_db()
-
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
     logger.info(f"🤖 Robi Superbrain starting in {mode} mode.")
-
     scheduler = BackgroundScheduler()
-
     if HARVEST_MODE:
-        scheduler.add_job(
-            harvest_scan,
-            CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")),
-            id="harvest",
-            replace_existing=True,
-        )
-        scheduler.add_job(
-            backfill_results_from_snapshots,
-            "interval",
-            minutes=15,
-            id="backfill",
-            replace_existing=True,
-        )
+        scheduler.add_job(harvest_scan, CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")),
+                          id="harvest", replace_existing=True)
+        scheduler.add_job(backfill_results_from_snapshots, "interval", minutes=15,
+                          id="backfill", replace_existing=True)
         logger.info("⛏️ Running in HARVEST mode.")
     else:
-        scheduler.add_job(
-            production_scan,
-            CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
-            id="production_scan",
-            replace_existing=True,
-        )
+        scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
+                          id="production_scan", replace_existing=True)
         logger.info("🎯 Running in PRODUCTION mode.")
-
-    scheduler.add_job(
-        retrain_models_job,
-        CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-        id="train",
-        replace_existing=True,
-        misfire_grace_time=3600,
-        coalesce=True,
-    )
-
-    scheduler.add_job(
-        nightly_digest_job,
-        CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
-        id="digest",
-        replace_existing=True,
-        misfire_grace_time=3600,
-        coalesce=True,
-    )
-
+    scheduler.add_job(train_models, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+                      id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True)
+    scheduler.add_job(nightly_digest_job, CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
+                      id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True)
     if MOTD_PREDICT:
         motd_hour = int(os.getenv("MOTD_HOUR", "9"))
         motd_minute = int(os.getenv("MOTD_MINUTE", "0"))
-        scheduler.add_job(
-            motd_announce,
-            CronTrigger(hour=motd_hour, minute=motd_minute, timezone=ZoneInfo("Europe/Berlin")),
-            id="motd_announce",
-            replace_existing=True,
-            misfire_grace_time=3600,
-            coalesce=True,
-        )
+        scheduler.add_job(motd_announce, CronTrigger(hour=motd_hour, minute=motd_minute, timezone=ZoneInfo("Europe/Berlin")),
+                          id="motd_announce", replace_existing=True, misfire_grace_time=3600, coalesce=True)
         logger.info(f"🌟 MOTD daily announcement enabled at {motd_hour:02d}:{motd_minute:02d} Europe/Berlin.")
-
     scheduler.start()
-
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
 
 if __name__ == "__main__":
     main()
