@@ -241,13 +241,18 @@ def fetch_match_events(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
 
 def fetch_live_matches() -> List[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"live": "all"})
-    if not isinstance(js, dict): return []
+    if not isinstance(js, dict):
+        return []
     matches = js.get("response", []) or []
     out = []
+    allowed = {"1H","HT","2H","ET","BT","P"}
     for m in matches:
         status = (m.get("fixture", {}) or {}).get("status", {}) or {}
         elapsed = status.get("elapsed")
-        if elapsed is None or elapsed > 90:
+        short = (status.get("short") or "").upper()
+        if elapsed is None or elapsed > 120:
+            continue
+        if short not in allowed:
             continue
         fid = (m.get("fixture", {}) or {}).get("id")
         m["statistics"] = fetch_match_stats(fid) or []
@@ -318,18 +323,40 @@ def _pos_pct(v) -> float:
         return 0.0
 
 def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
-    home_name = match["teams"]["home"]["name"]
-    away_name = match["teams"]["away"]["name"]
-    gh = match["goals"]["home"] or 0
-    ga = match["goals"]["away"] or 0
-    minute = int((match.get("fixture", {}).get("status", {}) or {}).get("elapsed") or 0)
+    teams = match.get("teams") or {}
+    home = (teams.get("home") or {}).get("name", "")
+    away = (teams.get("away") or {}).get("name", "")
+
+    goals = match.get("goals") or {}
+    gh = goals.get("home") or 0
+    ga = goals.get("away") or 0
+
+    status = (match.get("fixture") or {}).get("status") or {}
+    minute = int(status.get("elapsed") or 0)
+
     stats_blocks = match.get("statistics") or []
     stats: Dict[str, Dict[str, Any]] = {}
     for s in stats_blocks:
         tname = (s.get("team") or {}).get("name")
         if tname:
-            stats[tname] = {i["type"]: i["value"] for i in (s.get("statistics") or [])}
-    sh = stats.get(home_name, {}); sa = stats.get(away_name, {})
+            stats[tname] = { (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
+
+    sh = stats.get(home, {}) if home else {}
+    sa = stats.get(away, {}) if away else {}
+
+    def _num(v) -> float:
+        try:
+            if isinstance(v, str) and v.endswith('%'): return float(v[:-1])
+            return float(v or 0)
+        except Exception:
+            return 0.0
+
+    def _pos_pct(v) -> float:
+        try:
+            return float(str(v).replace('%','').strip() or 0)
+        except Exception:
+            return 0.0
+
     xg_h = _num(sh.get("Expected Goals", 0)); xg_a = _num(sa.get("Expected Goals", 0))
     sot_h = _num(sh.get("Shots on Target", 0)); sot_a = _num(sa.get("Shots on Target", 0))
     cor_h = _num(sh.get("Corner Kicks", 0));   cor_a = _num(sa.get("Corner Kicks", 0))
@@ -338,10 +365,12 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     red_h = 0; red_a = 0
     for ev in (match.get("events") or []):
         try:
-            if (ev.get("type","").lower() == "card") and ("red" in (ev.get("detail","").lower())):
-                tname = (ev.get("team") or {}).get("name") or ""
-                if tname == home_name: red_h += 1
-                elif tname == away_name: red_a += 1
+            if (ev.get("type","").lower() == "card"):
+                detail = (ev.get("detail","") or "").lower()
+                if ("red" in detail) or ("second yellow" in detail):
+                    tname = (ev.get("team") or {}).get("name") or ""
+                    if tname == home: red_h += 1
+                    elif tname == away: red_a += 1
         except Exception:
             pass
 
@@ -353,8 +382,7 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
         "sot_h": float(sot_h), "sot_a": float(sot_a), "sot_sum": float(sot_h + sot_a),
         "cor_h": float(cor_h), "cor_a": float(cor_a), "cor_sum": float(cor_h + cor_a),
         "pos_h": float(pos_h), "pos_a": float(pos_a),
-        "red_h": float(red_h), "red_a": float(red_a),
-        "red_sum": float(red_h + red_a),
+        "red_h": float(red_h), "red_a": float(red_a), "red_sum": float(red_h + red_a),
     }
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
@@ -589,16 +617,12 @@ def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) 
     return s
 
 def _calibrate(p: float, cal: Dict[str,Any]) -> float:
-    method = (cal or {}).get("method", "sigmoid")
-    if method == "platt":
-        a = float((cal or {}).get("a", 1.0))
-        b = float((cal or {}).get("b", 0.0))
-        return _sigmoid(a * (p if p == 0 or p == 1 else (float(p) if isinstance(p,(float,int)) else 0.0)) + b)
-    # default: already logistic; allow optional a,b
+    # Apply sigmoid(a*logit(p) + b) for both "sigmoid" and "platt"
     a = float((cal or {}).get("a", 1.0))
     b = float((cal or {}).get("b", 0.0))
     import math
-    logit = math.log(max(min(p, 1-1e-12), 1e-12) / max(1 - max(min(p,1-1e-12),1e-12), 1e-12))
+    p = max(1e-12, min(1-1e-12, float(p)))
+    logit = math.log(p / (1.0 - p))
     return _sigmoid(a * logit + b)
 
 def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
