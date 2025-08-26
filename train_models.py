@@ -148,6 +148,15 @@ def to_coeffs(model, feature_names):
         "intercept": float(model.intercept_.ravel()[0]),
     }
 
+def retrain_models_job():
+    logger.info("Starting retrain job...")
+    try:
+       from train_models import train_models  
+        train_models()
+        logger.info("Retrain completed successfully")
+    except Exception as e:
+        logger.error(f"Retrain job failed: {e}")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db-url", help="Postgres DSN (preferred, used by main.py)")
