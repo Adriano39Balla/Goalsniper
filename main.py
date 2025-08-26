@@ -5,6 +5,7 @@ import logging
 import requests
 import psycopg2
 import subprocess, shlex
+from train_models import train_models
 from html import escape
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -488,6 +489,14 @@ def _linpred(feat: Dict[str, float], weights: Dict[str, float], intercept: float
     for k, w in (weights or {}).items():
         s += float(w or 0.0) * float(feat.get(k, 0.0))
     return s
+
+def retrain_models_job():
+    logger.info("Starting retrain job...")
+    try:
+        train_models()
+        logger.info("Retrain completed successfully")
+    except Exception as e:
+        logger.error(f"Retrain job failed: {e}")
 
 def _calibrate(p: float, cal: Dict[str, Any]) -> float:
     """
