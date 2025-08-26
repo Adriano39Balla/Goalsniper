@@ -40,7 +40,6 @@ O25_LATE_MIN_GOALS  = int(os.getenv("O25_LATE_MIN_GOALS", "2"))
 BTTS_LATE_MINUTE    = int(os.getenv("BTTS_LATE_MINUTE", "88"))
 UNDER_SUPPRESS_AFTER_MIN = int(os.getenv("UNDER_SUPPRESS_AFTER_MIN", "82"))
 
-# FIXED: removed extra ')'
 ONLY_MODEL_MODE          = os.getenv("ONLY_MODEL_MODE", "0") not in ("0","false","False","no","NO")
 REQUIRE_STATS_MINUTE     = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
 REQUIRE_DATA_FIELDS      = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
@@ -52,7 +51,6 @@ MOTD_CONF_MIN       = int(os.getenv("MOTD_CONF_MIN", "65"))
 
 ALLOWED_SUGGESTIONS = {"Over 2.5 Goals", "Under 2.5 Goals", "BTTS: Yes", "BTTS: No"}
 
-# FIXED: removed extra ')'
 TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 TRAIN_TEST_SIZE    = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
@@ -241,38 +239,19 @@ def fetch_match_events(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
 
 def fetch_live_matches() -> List[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"live": "all"})
-    if not isinstance(js, dict):
-        return []
+    if not isinstance(js, dict): return []
     matches = js.get("response", []) or []
     out = []
-    allowed = {"1H","HT","2H","ET","BT","P"}
     for m in matches:
         status = (m.get("fixture", {}) or {}).get("status", {}) or {}
         elapsed = status.get("elapsed")
-        short = (status.get("short") or "").upper()
-        if elapsed is None or elapsed > 120:
-            continue
-        if short not in allowed:
+        if elapsed is None or elapsed > 90:
             continue
         fid = (m.get("fixture", {}) or {}).get("id")
         m["statistics"] = fetch_match_stats(fid) or []
         m["events"] = fetch_match_events(fid) or []
         out.append(m)
     return out
-
-def _parse_threshold_env(name: str, default_pct: int = 60) -> int:
-    """
-    Reads an env var that may be given as 0–1 (e.g. 0.75) or 0–100 (e.g. 75).
-    Returns an integer percent (0–100).
-    """
-    raw = (os.getenv(name, str(default_pct)) or "").strip()
-    try:
-        v = float(raw)
-        if v <= 1.0:   # treat as probability
-            return int(round(v * 100))
-        return int(round(v))  # already a percent
-    except Exception:
-        return int(default_pct)
 
 # ── Fixtures fetch ────────────────────────────────────────────────────────────
 MAX_IDS_PER_REQ = 20
@@ -308,23 +287,6 @@ def fetch_fixtures_by_ids_hyphen(ids: List[int]) -> Dict[int, Dict[str, Any]]:
         time.sleep(0.15)
     return out
 
-def _format_tip_message(m: Dict[str,Any], suggestion: str, prob: float) -> str:
-    lg = (m.get("league") or {})
-    league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-    t  = (m.get("teams") or {})
-    home = (t.get("home") or {}).get("name",""); away = (t.get("away") or {}).get("name","")
-    gh = (m.get("goals") or {}).get("home") or 0
-    ga = (m.get("goals") or {}).get("away") or 0
-    minute = ((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0
-    return (
-        "⚽️ <b>New Tip!</b>\n"
-        f"Match: {escape(home)} vs {escape(away)}\n"
-        f"⏱ Minute: {int(minute)}' | Score: {gh}-{ga}\n"
-        f"Tip: {escape(suggestion)}\n"
-        f"📈 Model {prob*100:.1f}%\n"
-        f"🏆 League: {escape(league)}"
-    )
-
 # ── Features & snapshots ──────────────────────────────────────────────────────
 def _num(v) -> float:
     try:
@@ -340,40 +302,18 @@ def _pos_pct(v) -> float:
         return 0.0
 
 def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
-    teams = match.get("teams") or {}
-    home = (teams.get("home") or {}).get("name", "")
-    away = (teams.get("away") or {}).get("name", "")
-
-    goals = match.get("goals") or {}
-    gh = goals.get("home") or 0
-    ga = goals.get("away") or 0
-
-    status = (match.get("fixture") or {}).get("status") or {}
-    minute = int(status.get("elapsed") or 0)
-
+    home_name = match["teams"]["home"]["name"]
+    away_name = match["teams"]["away"]["name"]
+    gh = match["goals"]["home"] or 0
+    ga = match["goals"]["away"] or 0
+    minute = int((match.get("fixture", {}).get("status", {}) or {}).get("elapsed") or 0)
     stats_blocks = match.get("statistics") or []
     stats: Dict[str, Dict[str, Any]] = {}
     for s in stats_blocks:
         tname = (s.get("team") or {}).get("name")
         if tname:
-            stats[tname] = { (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
-
-    sh = stats.get(home, {}) if home else {}
-    sa = stats.get(away, {}) if away else {}
-
-    def _num(v) -> float:
-        try:
-            if isinstance(v, str) and v.endswith('%'): return float(v[:-1])
-            return float(v or 0)
-        except Exception:
-            return 0.0
-
-    def _pos_pct(v) -> float:
-        try:
-            return float(str(v).replace('%','').strip() or 0)
-        except Exception:
-            return 0.0
-
+            stats[tname] = {i["type"]: i["value"] for i in (s.get("statistics") or [])}
+    sh = stats.get(home_name, {}); sa = stats.get(away_name, {})
     xg_h = _num(sh.get("Expected Goals", 0)); xg_a = _num(sa.get("Expected Goals", 0))
     sot_h = _num(sh.get("Shots on Target", 0)); sot_a = _num(sa.get("Shots on Target", 0))
     cor_h = _num(sh.get("Corner Kicks", 0));   cor_a = _num(sa.get("Corner Kicks", 0))
@@ -382,12 +322,10 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     red_h = 0; red_a = 0
     for ev in (match.get("events") or []):
         try:
-            if (ev.get("type","").lower() == "card"):
-                detail = (ev.get("detail","") or "").lower()
-                if ("red" in detail) or ("second yellow" in detail):
-                    tname = (ev.get("team") or {}).get("name") or ""
-                    if tname == home: red_h += 1
-                    elif tname == away: red_a += 1
+            if (ev.get("type","").lower() == "card") and ("red" in (ev.get("detail","").lower())):
+                tname = (ev.get("team") or {}).get("name") or ""
+                if tname == home_name: red_h += 1
+                elif tname == away_name: red_a += 1
         except Exception:
             pass
 
@@ -399,7 +337,7 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
         "sot_h": float(sot_h), "sot_a": float(sot_a), "sot_sum": float(sot_h + sot_a),
         "cor_h": float(cor_h), "cor_a": float(cor_a), "cor_sum": float(cor_h + cor_a),
         "pos_h": float(pos_h), "pos_a": float(pos_a),
-        "red_h": float(red_h), "red_a": float(red_a), "red_sum": float(red_h + red_a),
+        "red_h": float(red_h), "red_a": float(red_a),
     }
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
@@ -443,64 +381,6 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
             INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now, 0))
-
-                      chosen: Optional[Tuple[str,str,float,Dict[str,float]]] = None) -> Tuple[str, list, Dict[str, Any]]:
-    fixture = match["fixture"]; league_block = match.get("league") or {}
-    league_id = league_block.get("id") or 0
-    league = escape(f"{league_block.get('country','')} - {league_block.get('name','')}".strip(" -"))
-    minute = fixture["status"].get("elapsed") or 0
-    match_id = fixture["id"]
-    home = escape(match["teams"]["home"]["name"]); away = escape(match["teams"]["away"]["name"])
-    g_home = match["goals"]["home"] or 0; g_away = match["goals"]["away"] or 0
-
-    market, suggestion, confidence, stat = chosen if chosen else decide_market(match)
-
-    if suggestion not in ALLOWED_SUGGESTIONS or confidence < CONF_THRESHOLD:
-        return "", [], {"skip": True}
-    if is_settled_or_impossible(suggestion, g_home, g_away) or is_too_late(suggestion, int(minute), g_home, g_away, stat):
-        return "", [], {"skip": True}
-
-    stat_line = ""
-    if any([stat.get("xg_h",0), stat.get("xg_a",0), stat.get("sot_h",0), stat.get("sot_a",0), stat.get("cor_h",0), stat.get("cor_a",0), stat.get("pos_h",0), stat.get("pos_a",0), stat.get("red_h",0), stat.get("red_a",0)]):
-        stat_line = (
-            f"\n📊 xG H {stat.get('xg_h',0):.2f} / A {stat.get('xg_a',0):.2f}"
-            f" • SOT {int(stat.get('sot_h',0))}–{int(stat.get('sot_a',0))}"
-            f" • CK {int(stat.get('cor_h',0))}–{int(stat.get('cor_a',0))}"
-        )
-        if stat.get("pos_h",0) or stat.get("pos_a",0):
-            stat_line += f" • POS {int(stat.get('pos_h',0))}%–{int(stat.get('pos_a',0))}%"
-        if stat.get("red_h",0) or stat.get("red_a",0):
-            stat_line += f" • RED {int(stat.get('red_h',0))}–{int(stat.get('red_a',0))}"
-
-    lines = [
-        "⚽️ <b>New Tip!</b>",
-        f"<b>Match:</b> {home} vs {away}",
-        f"⏱ <b>Minute:</b> {minute}'  |  <b>Score:</b> {g_home}–{g_away}",
-        f"<b>Tip:</b> {escape(suggestion)}",
-        f"📈 <b>Confidence:</b> {int(confidence)}%",
-        f"🏆 <b>League:</b> {league}{stat_line}",
-    ]
-    msg = "\n".join(lines)
-
-    kb = [[
-        {"text": "👍 Correct", "callback_data": json.dumps({"t": "correct", "id": match_id})},
-        {"text": "👎 Wrong",   "callback_data": json.dumps({"t": "wrong",   "id": match_id})},
-    ]]
-    row = []
-    if BET_URL_TMPL:
-        try: row.append({"text": "💰 Bet Now", "url": BET_URL_TMPL.format(home=home, away=away, fixture_id=match_id)})
-        except Exception: pass
-    if WATCH_URL_TMPL:
-        try: row.append({"text": "📺 Watch Match", "url": WATCH_URL_TMPL.format(home=home, away=away, fixture_id=match_id)})
-        except Exception: pass
-    if row: kb.append(row)
-
-    meta = {
-        "match_id": match_id, "league_id": int(league_id), "league": league,
-        "home": home, "away": away, "confidence": int(confidence),
-        "score_at_tip": f"{g_home}-{g_away}", "minute": int(minute)
-    }
-    return msg, kb, meta
 
 # ── League helpers / backfill ─────────────────────────────────────────────────
 def _chunk(seq: List[int], size: int) -> List[List[int]]:
@@ -637,198 +517,6 @@ def _backfill_for_ids(ids: List[int]) -> Tuple[int, int]:
         time.sleep(0.25)
     return updated, len(ids)
 
-# ── Model loading & prediction ────────────────────────────────────────────────
-# Expected model format in settings (JSON):
-# {
-#   "intercept": float,
-#   "weights": {"minute": ..., "goals_sum": ..., "goals_h": ..., "goals_a": ..., "goals_diff": ..., "red_sum": ..., "red_h": ..., "red_a": ...},
-#   "calibration": {"method": "sigmoid" | "platt", "a": 1.0, "b": 0.0}
-# }
-# Keys searched (first match wins):
-#   model_v2:BTTS_YES / model_v2:O25  (preferred)
-#   model_latest:BTTS_YES / model_latest:O25
-#   model:BTTS_YES / model:O25
-MODEL_KEYS_ORDER = [
-    "model_v2:{name}",
-    "model_latest:{name}",
-    "model:{name}",
-]
-
-def _sigmoid(x: float) -> float:
-    try:
-        if x < -50: return 1e-22
-        if x > 50: return 1.0 - 1e-22
-        import math
-        return 1.0 / (1.0 + math.exp(-x))
-    except Exception:
-        return 0.5
-
-def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
-    for pat in MODEL_KEYS_ORDER:
-        key = pat.format(name=name)
-        raw = get_setting(key)
-        if not raw:
-            continue
-        try:
-            mdl = json.loads(raw)
-            # sanity defaults
-            mdl.setdefault("intercept", 0.0)
-            mdl.setdefault("weights", {})
-            cal = mdl.get("calibration") or {}
-            if isinstance(cal, dict):
-                cal.setdefault("method", "sigmoid")
-                cal.setdefault("a", 1.0)
-                cal.setdefault("b", 0.0)
-                mdl["calibration"] = cal
-            return mdl
-        except Exception as e:
-            logging.warning("[MODEL] failed to parse %s: %s", key, e)
-    return None
-
-def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) -> float:
-    s = float(intercept or 0.0)
-    for k, w in (weights or {}).items():
-        s += float(w or 0.0) * float(feat.get(k, 0.0))
-    return s
-
-def _calibrate(p: float, cal: Dict[str,Any]) -> float:
-    # Apply sigmoid(a*logit(p) + b) for both "sigmoid" and "platt"
-    a = float((cal or {}).get("a", 1.0))
-    b = float((cal or {}).get("b", 0.0))
-    import math
-    p = max(1e-12, min(1-1e-12, float(p)))
-    logit = math.log(p / (1.0 - p))
-    return _sigmoid(a * logit + b)
-
-def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
-    lp = _linpred(feat, mdl.get("weights", {}), float(mdl.get("intercept", 0.0)))
-    p = _sigmoid(lp)
-    cal = mdl.get("calibration") or {}
-    try:
-        if cal:
-            p = _calibrate(p, cal)
-    except Exception:
-        pass
-    return max(0.0, min(1.0, float(p)))
-
-def _pretty_score(m: Dict[str,Any]) -> str:
-    gh = (m.get("goals") or {}).get("home") or 0
-    ga = (m.get("goals") or {}).get("away") or 0
-    return f"{gh}-{ga}"
-
-def _league_name(m: Dict[str,Any]) -> Tuple[int,str]:
-    lg = (m.get("league") or {}) or {}
-    league_id = int(lg.get("id") or 0)
-    league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-    return league_id, league
-
-def _teams(m: Dict[str,Any]) -> Tuple[str,str]:
-    t = (m.get("teams") or {}) or {}
-    return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
-
-# ── Production scan ───────────────────────────────────────────────────────────
-def production_scan() -> Tuple[int,int]:
-    """
-    Generate tips using models for O25 and BTTS: Yes.
-    Respects:
-      - CONF_THRESHOLD (percent)
-      - DUP_COOLDOWN_MIN
-      - late-minute suppressors
-      - REQUIRE_STATS_MINUTE / REQUIRE_DATA_FIELDS (if ONLY_MODEL_MODE=1, we still require some stats unless early)
-    """
-    matches = fetch_live_matches()
-    live_seen = len(matches)
-    if live_seen == 0:
-        logging.info("[PROD] no live matches")
-        return 0, 0
-
-    mdl_o25  = load_model_from_settings("O25")
-    mdl_btts = load_model_from_settings("BTTS_YES")
-    if not mdl_o25 and not mdl_btts:
-        logging.warning("[PROD] no models available in settings — skipping.")
-        return 0, live_seen
-
-    saved = 0
-    now_ts = int(time.time())
-
-    with db_conn() as conn:
-        for m in matches:
-            try:
-                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-                if not fid:
-                    continue
-
-                # cooldown
-                if DUP_COOLDOWN_MIN > 0:
-                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
-                    dup = conn.execute(
-                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",
-                        (fid, cutoff)
-                    ).fetchone()
-                    if dup:
-                        continue
-
-                feat = extract_features(m)
-                minute = int(feat.get("minute", 0))
-
-                # Require minimal stats after minute threshold
-                if not stats_coverage_ok(feat, minute):
-                    continue
-
-                # Compute market probabilities
-                preds: List[Tuple[str,str,float]] = []  # (market, suggestion, prob)
-
-                if mdl_o25:
-                    # Suggest Over 2.5 (we do not push Under by model here)
-                    p_over = _score_prob(feat, mdl_o25)
-                    # Late-game heuristic guard
-                    if not (minute >= O25_LATE_MINUTE and feat.get("goals_sum",0) < O25_LATE_MIN_GOALS):
-                        if p_over * 100.0 >= CONF_THRESHOLD:
-                            preds.append(("O25", "Over 2.5 Goals", p_over))
-
-                if mdl_btts:
-                    p_btts = _score_prob(feat, mdl_btts)
-                    # Late-game guard for BTTS (very late and a 0 on board often ugly)
-                    if not (minute >= BTTS_LATE_MINUTE and (feat.get("goals_h",0)==0 or feat.get("goals_a",0)==0)):
-                        if p_btts * 100.0 >= CONF_THRESHOLD:
-                            preds.append(("BTTS", "BTTS: Yes", p_btts))
-
-                if not preds:
-                    continue
-
-                # Sort strongest first (prob desc)
-                preds.sort(key=lambda x: x[2], reverse=True)
-
-                league_id, league = _league_name(m)
-                home, away = _teams(m)
-                score_txt = _pretty_score(m)
-
-                # Insert at most MAX_TIPS_PER_SCAN per scan
-                ts_base = int(time.time())
-for idx, (market_code, suggestion, prob) in enumerate(preds):
-    created_ts = ts_base + idx  # avoid PK clashes when sending multiple tips for same match
-    conn.execute("""
-        INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok)
-        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
-    """, (fid, league_id, league, home, away,
-          ("Over/Under 2.5" if market_code=="O25" else "BTTS"),
-          suggestion, float(prob*100.0), score_txt, minute, created_ts))
-
-    # send to Telegram
-    msg = _format_tip_message(m, suggestion, prob)
-    _ = send_telegram(msg)
-
-    saved += 1
-    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-        break
-
-            except Exception as e:
-                logging.exception(f"[PROD] failure on match: {e}")
-                continue
-
-    logging.info(f"[PROD] saved={saved} live_seen={live_seen}")
-    return saved, live_seen
-
 # ── Training job (calls external script) ──────────────────────────────────────
 def retrain_models_job():
     if not TRAIN_ENABLE:
@@ -963,126 +651,6 @@ def harvest_scan() -> Tuple[int, int]:
     logging.info(f"[HARVEST] saved={saved} live_seen={live_seen}")
     return saved, live_seen
 
-# ── MOTD (Match Of The Day) ──────────────────────────────────────────────────
-def _berlin_midnight_utc_ts() -> int:
-    today_berlin = datetime.now(ZoneInfo("Europe/Berlin")).replace(hour=0, minute=0, second=0, microsecond=0)
-    return int(today_berlin.timestamp())
-
-def _rank_boost(league_id: Optional[int]) -> int:
-    """Slight preference to curated leagues."""
-    if not league_id: return 0
-    try:
-        if int(league_id) in LEAGUE_PRIORITY_IDS:
-            return 1
-    except Exception:
-        pass
-    return 0
-
-def motd_candidates(limit:int=5) -> List[Dict[str,Any]]:
-    """
-    Returns best matches today (Europe/Berlin day) ranked by max confidence among allowed suggestions,
-    requiring at least MOTD_MIN_SAMPLES rows for that match_id today and min confidence.
-    """
-    since_ts = _berlin_midnight_utc_ts()
-    allowed = sorted(ALLOWED_SUGGESTIONS)
-    with db_conn() as conn:
-        rows = conn.execute(f"""
-            WITH base AS (
-                SELECT *
-                FROM tips
-                WHERE created_ts >= %s
-                  AND suggestion = ANY(%s)
-            ),
-            counts AS (
-                SELECT match_id, COUNT(*) AS n, MAX(league_id) AS league_id
-                FROM base
-                GROUP BY match_id
-            ),
-            ranks AS (
-                SELECT b.*,
-                       ROW_NUMBER() OVER (PARTITION BY b.match_id ORDER BY b.confidence DESC) AS rn
-                FROM base b
-            ),
-            pick AS (
-                SELECT r.*, c.n, c.league_id
-                FROM ranks r
-                JOIN counts c USING(match_id)
-                WHERE r.rn=1
-            )
-            SELECT match_id, league_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts, n
-            FROM pick
-            WHERE n >= %s AND confidence >= %s
-            ORDER BY confidence DESC, created_ts ASC
-            LIMIT %s
-        """, (since_ts, allowed, MOTD_MIN_SAMPLES, MOTD_CONF_MIN, limit)).fetchall()
-
-    # Convert to dicts and boost preferred leagues by re-sorting in Python (stable)
-    cands = []
-    for r in rows:
-        (match_id, league_id, league, home, away, market, suggestion, confidence, score_at_tip, minute, created_ts, n) = r
-        cands.append({
-            "match_id": int(match_id),
-            "league_id": int(league_id) if league_id is not None else None,
-            "league": league or "",
-            "home": home or "",
-            "away": away or "",
-            "market": market or "",
-            "suggestion": suggestion or "",
-            "confidence": float(confidence or 0.0),
-            "score_at_tip": score_at_tip or "",
-            "minute": int(minute or 0),
-            "created_ts": int(created_ts or 0),
-            "samples": int(n or 0),
-            "priority_boost": _rank_boost(league_id),
-        })
-    cands.sort(key=lambda x: (x["confidence"], x["priority_boost"], -x["created_ts"]), reverse=True)
-    return cands
-
-def _motd_already_announced_for_today() -> Optional[int]:
-    since_ts = _berlin_midnight_utc_ts()
-    last_raw = get_setting("motd:last_sent") or ""
-    try:
-        last = json.loads(last_raw) if last_raw else {}
-        if (last.get("ts") or 0) >= since_ts:
-            return int(last.get("match_id") or 0) or None
-    except Exception:
-        pass
-    return None
-
-def _save_motd_sent(match_id: int):
-    rec = {"ts": int(time.time()), "match_id": int(match_id)}
-    set_setting("motd:last_sent", json.dumps(rec))
-
-def _fmt_motd_message(c: Dict[str,Any]) -> str:
-    title = "⭐️ <b>Match of the Day</b>"
-    body = (
-        f"{escape(c['home'])} vs {escape(c['away'])}\n"
-        f"🏆 {escape(c['league'])}\n"
-        f"⏱️ {c['minute']}'   🔢 {escape(c['score_at_tip'])}\n"
-        f"💡 Suggestion: <b>{escape(c['suggestion'])}</b>\n"
-        f"🧮 Confidence: <b>{c['confidence']:.1f}%</b> (n={c['samples']})"
-    )
-    return f"{title}\n\n{body}"
-
-def motd_announce() -> Dict[str,Any]:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return {"ok": False, "reason": "telegram_not_configured"}
-
-    already = _motd_already_announced_for_today()
-    if already:
-        return {"ok": True, "skipped": True, "reason": "already_sent_today", "match_id": already}
-
-    cands = motd_candidates(limit=5)
-    if not cands:
-        return {"ok": False, "reason": "no_candidates"}
-
-    top = cands[0]
-    msg = _fmt_motd_message(top)
-    sent = send_telegram(msg)
-    if sent:
-        _save_motd_sent(top["match_id"])
-    return {"ok": bool(sent), "sent": bool(sent), "candidate": top}
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.after_request
 def add_security_headers(resp):
@@ -1118,25 +686,6 @@ def _require_api_key():
     key = request.headers.get("X-API-Key") or request.args.get("key")
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
-
-@app.route("/predict/scan")
-def predict_scan_route():
-    """Manual trigger for one production scan (admin only)."""
-    _require_api_key()
-    saved, live = production_scan()
-    return jsonify({"ok": True, "mode": "PRODUCTION", "live_seen": live, "tips_saved": saved})
-
-@app.route("/predict/models")
-def predict_models_route():
-    """Inspect current models loaded from settings."""
-    _require_api_key()
-    o25 = load_model_from_settings("O25")
-    btts = load_model_from_settings("BTTS_YES")
-    return jsonify({
-        "O25_found": bool(o25),
-        "BTTS_YES_found": bool(btts),
-        "keys_tried": MODEL_KEYS_ORDER,
-    })
 
 @app.route("/harvest")
 def harvest_route():
@@ -1297,127 +846,37 @@ def stats_config():
         "TRAIN_ENABLE": TRAIN_ENABLE,
         "TRAIN_MIN_MINUTE": TRAIN_MIN_MINUTE,
         "TRAIN_TEST_SIZE": TRAIN_TEST_SIZE,
-        "MOTD_PREDICT": MOTD_PREDICT,
-        "MOTD_MIN_SAMPLES": MOTD_MIN_SAMPLES,
-        "MOTD_CONF_MIN": MOTD_CONF_MIN,
-        "LEAGUE_PRIORITY_IDS": LEAGUE_PRIORITY_IDS,
     })
-
-# MOTD endpoints
-@app.route("/motd/preview")
-def motd_preview_route():
-    _require_api_key()
-    limit = request.args.get("limit")
-    try:
-        limit = int(limit) if limit and str(limit).isdigit() else 5
-    except Exception:
-        limit = 5
-    cands = motd_candidates(limit=limit)
-    return jsonify({"ok": True, "candidates": cands, "already_sent_today": bool(_motd_already_announced_for_today())})
-
-@app.route("/motd/announce", methods=["POST"])
-def motd_announce_route():
-    _require_api_key()
-    res = motd_announce()
-    return jsonify(res)
-
-# Helper used by /harvest/bulk_leagues endpoint (left as-is)
-def _run_bulk_leagues(leagues: List[int], seasons: List[int]) -> Dict[str,Any]:
-    if not leagues:
-        # Curated default top comps if none supplied
-        leagues = LEAGUE_PRIORITY_IDS or [39,140,135,78,61,2]
-    results = []
-    total = {"requested":0,"processed":0,"saved":0}
-    for league in leagues:
-        for season in seasons:
-            summary = create_synthetic_snapshots_for_league(
-                league_id=league,
-                season=season,
-                include_inplay=False,
-                extra_statuses=None,
-                max_per_run=None,
-                sleep_ms_between_chunks=1000
-            )
-            results.append({"league":league,"season":season,"result":summary})
-            total["requested"] += int(summary.get("requested",0))
-            total["processed"] += int(summary.get("processed",0))
-            total["saved"] += int(summary.get("saved",0))
-            time.sleep(1.0)
-    return {"ok": True, "totals": total, "results": results}
 
 # ── Entrypoint / Scheduler ────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if not API_KEY:
-        logging.error("API_KEY is not set — live fetch will return 0 matches.")
-    if not ADMIN_API_KEY:
-        logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
+    if not API_KEY: logging.error("API_KEY is not set — live fetch will return 0 matches.")
+    if not ADMIN_API_KEY: logging.error("ADMIN_API_KEY is not set — admin endpoints will 401.")
     init_db()
 
     scheduler = BackgroundScheduler()
-
-    # 24/7: harvest or production depending on knob (Europe/Berlin)
     if HARVEST_MODE:
-        # HARVEST alle 10m
+        # every 2 min during daytime, Europe/Berlin
         scheduler.add_job(
             harvest_scan,
-            CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")),
-            id="harvest",
-            replace_existing=True,
+            CronTrigger(day_of_week="sun,mon,tue,wed,thu", hour="9-21", minute="*/2", timezone=ZoneInfo("Europe/Berlin")),
+            id="harvest", replace_existing=True,
         )
-        # Backfill finals every 15m
-        scheduler.add_job(
-            backfill_results_from_snapshots,
-            "interval",
-            minutes=15,
-            id="backfill",
-            replace_existing=True,
-        )
-        logging.info("⛏️  Running in HARVEST mode.")
-    else:
-        # PRODUCTION: score & write tips every 5m (tighter for latency)
-        scheduler.add_job(
-            production_scan,
-            CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
-            id="production_scan",
-            replace_existing=True,
-        )
-        logging.info("🎯 Running in PRODUCTION mode.")
+        scheduler.add_job(backfill_results_from_snapshots, "interval", minutes=15, id="backfill", replace_existing=True)
 
-    # Nightly training at 03:00 Europe/Berlin
     scheduler.add_job(
         retrain_models_job,
         CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-        id="train",
-        replace_existing=True,
-        misfire_grace_time=3600,
-        coalesce=True,
+        id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True,
     )
-
-    # Nightly digest at 03:02 Europe/Berlin
     scheduler.add_job(
         nightly_digest_job,
         CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
-        id="digest",
-        replace_existing=True,
-        misfire_grace_time=3600,
-        coalesce=True,
+        id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True,
     )
-
-    # Daily MOTD announce (optional; controlled by MOTD_PREDICT)
-    if MOTD_PREDICT:
-        scheduler.add_job(
-            motd_announce,
-            CronTrigger(hour=18, minute=30, timezone=ZoneInfo("Europe/Berlin")),
-            id="motd_announce",
-            replace_existing=True,
-            misfire_grace_time=3600,
-            coalesce=True,
-        )
-        logging.info("🌟 MOTD daily announcement enabled at 18:30 Europe/Berlin.")
 
     scheduler.start()
     logging.info("⏱️ Scheduler started (HARVEST_MODE=%s)", HARVEST_MODE)
-
     port = int(os.getenv("PORT", 5000))
     logging.info("✅ Robi Superbrain started.")
     app.run(host="0.0.0.0", port=port)
