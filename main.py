@@ -63,6 +63,15 @@ DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") no
 DAILY_ACCURACY_HOUR = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
 DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
+# ── Autonomous mode / policy tuning
+AUTO_TUNE_ENABLE = os.getenv("AUTO_TUNE_ENABLE", "1") not in ("0","false","False","no","NO")
+TARGET_PRECISION = float(os.getenv("TARGET_PRECISION", "0.60"))   # aim precision per market
+TUNE_STEP = float(os.getenv("TUNE_STEP", "2.5"))                  # pct points to nudge thresholds
+MIN_THRESH = float(os.getenv("MIN_THRESH", "55"))
+MAX_THRESH = float(os.getenv("MAX_THRESH", "85"))
+MARKET_SCORE_ENABLE = os.getenv("MARKET_SCORE_ENABLE", "0") not in ("0","false","False","no","NO")
+MARKET_SCORE_DAYS = int(os.getenv("MARKET_SCORE_DAYS", "7"))
+
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     out: List[float] = []
     for tok in (env_val or "").split(","):
@@ -81,6 +90,10 @@ PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "2"))
 BLEND_ML_WEIGHT = float(os.getenv("BLEND_ML_WEIGHT", "0.7"))
 BLEND_ML_WEIGHT = 0.0 if BLEND_ML_WEIGHT < 0 else (1.0 if BLEND_ML_WEIGHT > 1.0 else BLEND_ML_WEIGHT)
 BLEND_MATH_WEIGHT = 1.0 - BLEND_ML_WEIGHT
+# If ONLY_MODEL_MODE is enabled, let ML fully drive probabilities (math is disabled)
+if ONLY_MODEL_MODE:
+    BLEND_ML_WEIGHT = 1.0
+    BLEND_MATH_WEIGHT = 0.0
 
 # Final-prob softening & display caps
 GLOBAL_MIN_PROB = float(os.getenv("GLOBAL_MIN_PROB", "0.02"))
@@ -529,138 +542,119 @@ def _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat)
         return False
     return send_telegram(_format_tip_message(home, away, league, minute, score_txt, suggestion, prob_pct, feat))
 
-# ── Production scan
-def production_scan() -> Tuple[int, int]:
-    matches = fetch_live_matches()
-    live_seen = len(matches)
-    if live_seen == 0:
-        logger.info("[PROD] no live matches")
-        return 0, 0
+# ── Autonomous policy: per-market thresholds + auto-train/promote + optional market scoring
+def _get_market_threshold_key(market: str) -> str:
+    return f"conf_threshold:{market}"
 
-    saved = 0
-    now_ts = int(time.time())
+def _get_market_threshold_default(market: str) -> float:
+    return float(CONF_THRESHOLD)
 
+def _get_market_threshold(market: str) -> float:
+    try:
+        val = get_setting(_get_market_threshold_key(market))
+        return float(val) if val is not None else _get_market_threshold_default(market)
+    except Exception:
+        return _get_market_threshold_default(market)
+
+def _set_market_threshold(market: str, val: float) -> None:
+    try:
+        set_setting(_get_market_threshold_key(market), f"{float(val):.2f}")
+    except Exception:
+        pass
+
+def _recent_precision_for_market(market: str, days: int = 3) -> Tuple[int,int,float]:
+    end = int(time.time())
+    start = end - days*24*3600
     with db_conn() as conn:
-        for m in matches:
-            try:
-                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-                if not fid:
-                    continue
+        rows = conn.execute("""
+          SELECT t.suggestion, r.final_goals_h, r.final_goals_a, r.btts_yes
+          FROM tips t
+          LEFT JOIN match_results r ON r.match_id = t.match_id
+          WHERE t.created_ts BETWEEN %s AND %s
+            AND t.market = %s
+            AND t.suggestion <> 'HARVEST' AND t.sent_ok=1
+        """, (start, end, market)).fetchall()
+    graded = wins = 0
+    for (sugg, gh, ga, btts) in rows:
+        out = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
+        if out is None:
+            continue
+        graded += 1
+        wins += 1 if out == 1 else 0
+    prec = (wins/graded) if graded else 0.0
+    return graded, wins, prec
 
-                # cooldown
-                if DUP_COOLDOWN_MIN > 0:
-                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
-                    dup = conn.execute(
-                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",
-                        (fid, cutoff),
-                    ).fetchone()
-                    if dup:
-                        continue
+def auto_tune_thresholds():
+    if not AUTO_TUNE_ENABLE:
+        return
+    markets = ["BTTS", "1X2"] + [f"Over/Under { _fmt_line(ln) }" for ln in OU_LINES]
+    for mk in markets:
+        graded, wins, prec = _recent_precision_for_market(mk, days=3)
+        if graded < 30:  # need signal
+            continue
+        cur = _get_market_threshold(mk)
+        if prec < TARGET_PRECISION - 0.02:
+            cur = min(MAX_THRESH, cur + TUNE_STEP)
+        elif prec > TARGET_PRECISION + 0.02:
+            cur = max(MIN_THRESH, cur - TUNE_STEP)
+        _set_market_threshold(mk, cur)
+        logger.info("[AUTO-TUNE] %s graded=%d wins=%d prec=%.3f -> new_threshold=%.1f",
+                    mk, graded, wins, prec, cur)
 
-                feat = extract_features(m)
-                minute = int(feat.get("minute", 0))
-                if not stats_coverage_ok(feat, minute):
-                    continue
+def _compare_and_promote(current_metrics: dict, new_metrics: dict) -> bool:
+    """Return True if new metrics are better (lower logloss & brier; tie-break by accuracy)."""
+    try:
+        c_ll = float((current_metrics or {}).get("logloss", 1e9))
+        n_ll = float((new_metrics or {}).get("logloss", 1e9))
+        c_br = float((current_metrics or {}).get("brier", 1e9))
+        n_br = float((new_metrics or {}).get("brier", 1e9))
+        c_acc = float((current_metrics or {}).get("acc", 0.0))
+        n_acc = float((new_metrics or {}).get("acc", 0.0))
+        better = (n_ll < c_ll and n_br < c_br) or (abs(n_ll - c_ll) < 1e-6 and n_br < c_br) \
+                 or (n_ll <= c_ll and n_br <= c_br and n_acc > c_acc)
+        return better
+    except Exception:
+        return False
 
-                # HARVEST snapshots for training (rate-limit to every ~3 min by minute%3)
-                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
-                    try:
-                        save_snapshot_from_match(m, feat)
-                    except Exception as e:
-                        logger.warning("[HARVEST] snapshot failed for %s: %s", fid, e)
-
-                league_id, league = _league_name(m)
-                home, away = _teams(m)
-                score_txt = _pretty_score(m)
-
-                candidates: List[Tuple[str, str, float]] = []
-
-                # O/U lines (math+ML blend)
-                for line in OU_LINES:
-                    p_over_math = ou_over_probability(feat, line, TOTAL_MATCH_MINUTES)
-                    mdl_line = _load_ou_model_for_line(line)
-                    if mdl_line:
-                        p_over_ml = _score_prob(feat, mdl_line)
-                        p_over = BLEND_ML_WEIGHT * p_over_ml + BLEND_MATH_WEIGHT * p_over_math
-                    else:
-                        p_over = p_over_math
-                    p_over = _soften_final_prob(p_over)
-
-                    if p_over * 100.0 >= CONF_THRESHOLD:
-                        candidates.append((f"Over/Under {_fmt_line(line)}", f"Over {_fmt_line(line)} Goals", p_over))
-
-                    if minute <= UNDER_SUPPRESS_AFTER_MIN:
-                        p_under = _soften_final_prob(1.0 - p_over)
-                        if p_under * 100.0 >= CONF_THRESHOLD:
-                            candidates.append((f"Over/Under {_fmt_line(line)}", f"Under {_fmt_line(line)} Goals", p_under))
-
-                # BTTS
-                p_btts_math = btts_yes_probability(feat, TOTAL_MATCH_MINUTES)
-                mdl_btts = load_model_from_settings("BTTS_YES")
-                if mdl_btts:
-                    p_btts_ml = _score_prob(feat, mdl_btts)
-                    p_btts = BLEND_ML_WEIGHT * p_btts_ml + BLEND_MATH_WEIGHT * p_btts_math
-                else:
-                    p_btts = p_btts_math
-                p_btts = _soften_final_prob(p_btts)
-
-                if not (minute >= BTTS_LATE_MINUTE and (feat.get("goals_h", 0) == 0 or feat.get("goals_a", 0) == 0)):
-                    if p_btts * 100.0 >= CONF_THRESHOLD:
-                        candidates.append(("BTTS", "BTTS: Yes", p_btts))
-                p_btts_no = _soften_final_prob(1.0 - p_btts)
-                if minute <= UNDER_SUPPRESS_AFTER_MIN and p_btts_no * 100.0 >= CONF_THRESHOLD:
-                    candidates.append(("BTTS", "BTTS: No", p_btts_no))
-
-                # 1X2 (pick only best side above threshold)
-                p_home, p_draw, p_away = wld_probabilities(feat, TOTAL_MATCH_MINUTES)
-                wld_map = [("1X2", "Home Win", p_home), ("1X2", "Draw", p_draw), ("1X2", "Away Win", p_away)]
-                best_market = max(wld_map, key=lambda x: x[2])
-                best_market = (best_market[0], best_market[1], _soften_final_prob(best_market[2]))
-                if best_market[2] * 100.0 >= CONF_THRESHOLD:
-                    candidates.append(best_market)
-
-                if not candidates:
-                    continue
-
-                candidates.sort(key=lambda x: x[2], reverse=True)
-                per_match = 0
-                base_now = int(time.time())
-
-                for idx, (market_txt, suggestion, prob) in enumerate(candidates):
-                    if suggestion not in ALLOWED_SUGGESTIONS:
-                        continue
-                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                        break
-
-                    created_ts = base_now + idx
-                    prob_pct = round(prob * 100.0, 1)
-                    if prob_pct >= 100.0: prob_pct = DISPLAY_MAX_PCT
-                    if prob_pct <= 0.0: prob_pct = DISPLAY_MIN_PCT
-
-                    with db_conn() as conn2:
-                        conn2.execute(
-                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
-                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
-                            (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), score_txt, minute, created_ts),
-                        )
-                        sent_ok = _send_tip(home, away, league, minute, score_txt, suggestion, float(prob_pct), feat)
-                        if sent_ok:
-                            conn2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
-
-                    saved += 1
-                    per_match += 1
-                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                        break
-
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
-
-            except Exception as e:
-                logger.exception("[PROD] failure on match: %s", e)
+def _auto_train_and_promote():
+    if not TRAIN_ENABLE:
+        return
+    try:
+        res = train_models()
+        if not (isinstance(res, dict) and res.get("ok")):
+            logger.info("[AUTO-TRAIN] skipped/failed: %s", res)
+            return
+        latest = get_setting("model_metrics_latest")
+        if not latest:
+            return
+        metrics = json.loads(latest)
+        active = get_setting("model_metrics_active")
+        active_m = json.loads(active) if active else {}
+        improved = False
+        for name, met in metrics.items():
+            if name in ("trained_at_utc", "features"):
                 continue
+            old = (active_m or {}).get(name, {})
+            if _compare_and_promote(old, met):
+                improved = True
+        if improved:
+            set_setting("model_metrics_active", latest)
+            logger.info("[AUTO-TRAIN] promoted models based on metrics")
+        else:
+            logger.info("[AUTO-TRAIN] new models not better; kept current")
+    except Exception as e:
+        logger.warning("[AUTO-TRAIN] error: %s", e)
 
-    logger.info(f"[PROD] saved={saved} live_seen={live_seen}")
-    return saved, live_seen
+# Optional: market scoring (small multiplier by recent precision). Off by default.
+def _market_score(market: str, days: int = None) -> float:
+    if not MARKET_SCORE_ENABLE:
+        return 1.0
+    days = days or MARKET_SCORE_DAYS
+    graded, wins, prec = _recent_precision_for_market(market, days)
+    if graded < 50:
+        return 1.0
+    # map precision 0.45..0.75 → 0.9..1.1
+    return 0.9 + 0.2 * max(0.0, min(1.0, (prec - 0.45) / 0.30))
 
 # ── Results backfill & accuracy
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
@@ -1009,6 +1003,148 @@ def telegram_webhook(secret: str):
         logger.warning("telegram webhook parse error: %s", e)
     return jsonify({"ok": True})
 
+# ── Production scan
+def production_scan() -> Tuple[int, int]:
+    matches = fetch_live_matches()
+    live_seen = len(matches)
+    if live_seen == 0:
+        logger.info("[PROD] no live matches")
+        return 0, 0
+
+    saved = 0
+    now_ts = int(time.time())
+
+    with db_conn() as conn:
+        for m in matches:
+            try:
+                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                if not fid:
+                    continue
+
+                # cooldown
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
+                    dup = conn.execute(
+                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",
+                        (fid, cutoff),
+                    ).fetchone()
+                    if dup:
+                        continue
+
+                feat = extract_features(m)
+                minute = int(feat.get("minute", 0))
+                if not stats_coverage_ok(feat, minute):
+                    continue
+
+                # HARVEST snapshots for training (rate-limit to every ~3 min by minute%3)
+                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
+                    try:
+                        save_snapshot_from_match(m, feat)
+                    except Exception as e:
+                        logger.warning("[HARVEST] snapshot failed for %s: %s", fid, e)
+
+                league_id, league = _league_name(m)
+                home, away = _teams(m)
+                score_txt = _pretty_score(m)
+
+                candidates: List[Tuple[str, str, float]] = []
+
+                # O/U lines (math+ML blend or ML-only per ONLY_MODEL_MODE)
+                for line in OU_LINES:
+                    p_over_math = ou_over_probability(feat, line, TOTAL_MATCH_MINUTES)
+                    mdl_line = _load_ou_model_for_line(line)
+                    if mdl_line:
+                        p_over_ml = _score_prob(feat, mdl_line)
+                        p_over = BLEND_ML_WEIGHT * p_over_ml + BLEND_MATH_WEIGHT * p_over_math
+                    else:
+                        p_over = p_over_math
+                    p_over = _soften_final_prob(p_over)
+
+                    market_name = f"Over/Under {_fmt_line(line)}"
+                    thr_ou = _get_market_threshold(market_name)
+                    if p_over * 100.0 >= thr_ou:
+                        prob_adj = p_over * _market_score(market_name)
+                        candidates.append((market_name, f"Over {_fmt_line(line)} Goals", prob_adj))
+
+                    if minute <= UNDER_SUPPRESS_AFTER_MIN:
+                        p_under = _soften_final_prob(1.0 - p_over)
+                        if p_under * 100.0 >= thr_ou:
+                            prob_adj = p_under * _market_score(market_name)
+                            candidates.append((market_name, f"Under {_fmt_line(line)} Goals", prob_adj))
+
+                # BTTS
+                p_btts_math = btts_yes_probability(feat, TOTAL_MATCH_MINUTES)
+                mdl_btts = load_model_from_settings("BTTS_YES")
+                if mdl_btts:
+                    p_btts_ml = _score_prob(feat, mdl_btts)
+                    p_btts = BLEND_ML_WEIGHT * p_btts_ml + BLEND_MATH_WEIGHT * p_btts_math
+                else:
+                    p_btts = p_btts_math
+                p_btts = _soften_final_prob(p_btts)
+
+                thr_btts = _get_market_threshold("BTTS")
+                if not (minute >= BTTS_LATE_MINUTE and (feat.get("goals_h", 0) == 0 or feat.get("goals_a", 0) == 0)):
+                    if p_btts * 100.0 >= thr_btts:
+                        prob_adj = p_btts * _market_score("BTTS")
+                        candidates.append(("BTTS", "BTTS: Yes", prob_adj))
+                p_btts_no = _soften_final_prob(1.0 - p_btts)
+                if minute <= UNDER_SUPPRESS_AFTER_MIN and p_btts_no * 100.0 >= thr_btts:
+                    prob_adj = p_btts_no * _market_score("BTTS")
+                    candidates.append(("BTTS", "BTTS: No", prob_adj))
+
+                # 1X2 (pick only best side above threshold)
+                p_home, p_draw, p_away = wld_probabilities(feat, TOTAL_MATCH_MINUTES)
+                wld_map = [("1X2", "Home Win", p_home), ("1X2", "Draw", p_draw), ("1X2", "Away Win", p_away)]
+                best_market = max(wld_map, key=lambda x: x[2])
+                best_market = (best_market[0], best_market[1], _soften_final_prob(best_market[2]))
+                thr_1x2 = _get_market_threshold("1X2")
+                if best_market[2] * 100.0 >= thr_1x2:
+                    prob_adj = best_market[2] * _market_score("1X2")
+                    candidates.append((best_market[0], best_market[1], prob_adj))
+
+                if not candidates:
+                    continue
+
+                candidates.sort(key=lambda x: x[2], reverse=True)
+                per_match = 0
+                base_now = int(time.time())
+
+                for idx, (market_txt, suggestion, prob) in enumerate(candidates):
+                    if suggestion not in ALLOWED_SUGGESTIONS:
+                        continue
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        break
+
+                    created_ts = base_now + idx
+                    prob_pct = round(prob * 100.0, 1)
+                    if prob_pct >= 100.0: prob_pct = DISPLAY_MAX_PCT
+                    if prob_pct <= 0.0: prob_pct = DISPLAY_MIN_PCT
+
+                    with db_conn() as conn2:
+                        conn2.execute(
+                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
+                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                            (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), score_txt, minute, created_ts),
+                        )
+                        sent_ok = _send_tip(home, away, league, minute, score_txt, suggestion, float(prob_pct), feat)
+                        if sent_ok:
+                            conn2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
+
+                    saved += 1
+                    per_match += 1
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        break
+
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break
+
+            except Exception as e:
+                logger.exception("[PROD] failure on match: %s", e)
+                continue
+
+    logger.info(f"[PROD] saved={saved} live_seen={live_seen}")
+    return saved, live_seen
+
 # ── Scheduler setup
 scheduler: Optional[BackgroundScheduler] = None
 
@@ -1036,6 +1172,16 @@ def _start_scheduler():
     if DAILY_ACCURACY_DIGEST_ENABLE:
         trig = CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=BERLIN_TZ)
         scheduler.add_job(daily_accuracy_digest, trig, id="daily_digest", max_instances=1, coalesce=True)
+
+    # Auto-train & promote (daily, Berlin morning) + kick once after boot
+    scheduler.add_job(_auto_train_and_promote, CronTrigger(hour=4, minute=12, timezone=BERLIN_TZ),
+                      id="auto_train_promote", max_instances=1, coalesce=True)
+    scheduler.add_job(_auto_train_and_promote, "date",
+                      run_date=datetime.now(BERLIN_TZ)+timedelta(seconds=5),
+                      id="auto_train_boot", replace_existing=True)
+
+    # Auto-tune per-market thresholds hourly
+    scheduler.add_job(auto_tune_thresholds, "interval", minutes=60, id="auto_tune", max_instances=1, coalesce=True)
 
     scheduler.start()
     logger.info("[SCHED] started")
