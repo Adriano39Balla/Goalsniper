@@ -875,7 +875,7 @@ def _load_wld_models() -> Tuple[Optional[Dict], Optional[Dict], Optional[Dict]]:
         load_model_from_settings("WLD_AWAY"),
     )
 
-def _score_wld_probs(feat: Dict[str,float])
+def _score_wld_probs(feat: Dict[str,float]):
     mh, md, ma = _load_wld_models()
     if not (mh and md and ma):
         return None
