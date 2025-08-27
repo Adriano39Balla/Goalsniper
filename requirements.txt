@@ -4,7 +4,8 @@ urllib3==2.2.2
 APScheduler==3.10.4
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
-scikit-learn==1.5.1
-pandas==2.2.2
 numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.2
+scikit-learn==1.5.1
 pytest==8.3.2
