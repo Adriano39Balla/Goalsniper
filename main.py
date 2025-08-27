@@ -562,6 +562,13 @@ def production_scan() -> Tuple[int, int]:
                 if not stats_coverage_ok(feat, minute):
                     continue
 
+                # HARVEST snapshots for training (rate-limit to every ~3 min by minute%3)
+                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
+                    try:
+                        save_snapshot_from_match(m, feat)
+                    except Exception as e:
+                        logger.warning("[HARVEST] snapshot failed for %s: %s", fid, e)
+
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
                 score_txt = _pretty_score(m)
@@ -655,171 +662,402 @@ def production_scan() -> Tuple[int, int]:
     logger.info(f"[PROD] saved={saved} live_seen={live_seen}")
     return saved, live_seen
 
-# ── Security headers & routes
-@app.after_request
-def add_security_headers(resp):
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+# ── Results backfill & accuracy
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
-def _require_api_key():
-    key = request.headers.get("X-API-Key") or request.args.get("key")
+def _fixture_by_id(match_id: int) -> Optional[Dict[str, Any]]:
+    js = _api_get(FOOTBALL_API_URL, {"id": match_id})
+    if not isinstance(js, dict):
+        return None
+    arr = js.get("response") or []
+    return arr[0] if arr else None
+
+def _is_final_status(short: str) -> bool:
+    short = (short or "").upper()
+    return short in {"FT", "AET", "PEN"}
+
+def backfill_results_for_open_matches(max_rows: int = 200) -> int:
+    """
+    Find matches we tipped on but don't have results for yet; query API, store finals.
+    """
+    now_ts = int(time.time())
+    cutoff = now_ts - 2 * 24 * 3600  # don't chase ancient games too aggressively
+    updated = 0
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT t.match_id
+            FROM tips t
+            LEFT JOIN match_results r ON r.match_id = t.match_id
+            WHERE r.match_id IS NULL AND t.created_ts >= %s
+            ORDER BY t.created_ts DESC
+            LIMIT %s
+            """,
+            (cutoff, max_rows),
+        ).fetchall()
+
+    for (mid,) in rows:
+        try:
+            fx = _fixture_by_id(int(mid))
+            if not fx:
+                continue
+            status = ((fx.get("fixture") or {}).get("status") or {}).get("short", "")
+            if not _is_final_status(status):
+                continue
+            goals = fx.get("goals") or {}
+            gh = int(goals.get("home") or 0)
+            ga = int(goals.get("away") or 0)
+            btts = 1 if (gh > 0 and ga > 0) else 0
+            with db_conn() as conn2:
+                conn2.execute(
+                    "INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
+                    "VALUES(%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
+                    "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
+                    (int(mid), gh, ga, btts, int(time.time())),
+                )
+            updated += 1
+        except Exception as e:
+            logger.warning("[RESULTS] update failed for %s: %s", mid, e)
+            continue
+    if updated:
+        logger.info("[RESULTS] backfilled %d results", updated)
+    return updated
+
+def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
+    try:
+        # "Over 2.5 Goals" / "Under 1.5 Goals"
+        parts = (s or "").split()
+        for tok in parts:
+            try:
+                return float(tok)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+def _tip_outcome_for_result(suggestion: str, res: Dict[str, Any]) -> Optional[int]:
+    """
+    Returns 1=win, 0=loss, None=push/unknown/not gradable.
+    """
+    if not res:
+        return None
+    gh = int(res.get("final_goals_h") or 0)
+    ga = int(res.get("final_goals_a") or 0)
+    total = gh + ga
+    btts = int(res.get("btts_yes") or 0)
+
+    s = (suggestion or "").strip()
+    if s.startswith("Over") or s.startswith("Under"):
+        line = _parse_ou_line_from_suggestion(s)
+        if line is None:
+            return None
+        if s.startswith("Over"):
+            if total > line: return 1
+            if abs(total - line) < 1e-9: return None
+            return 0
+        else:
+            if total < line: return 1
+            if abs(total - line) < 1e-9: return None
+            return 0
+
+    if s == "BTTS: Yes":
+        return 1 if btts == 1 else 0
+    if s == "BTTS: No":
+        return 1 if btts == 0 else 0
+
+    if s == "Home Win":
+        return 1 if gh > ga else 0
+    if s == "Away Win":
+        return 1 if ga > gh else 0
+    if s == "Draw":
+        return 1 if gh == ga else 0
+    return None
+
+def daily_accuracy_digest() -> Optional[str]:
+    """
+    Compute yesterday's accuracy (Berlin time) and send Telegram digest.
+    """
+    if not DAILY_ACCURACY_DIGEST_ENABLE:
+        return None
+
+    now_local = datetime.now(BERLIN_TZ)
+    y_start = (now_local - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    y_end = y_start + timedelta(days=1)
+
+    y_start_ts = int(y_start.timestamp())
+    y_end_ts = int(y_end.timestamp())
+
+    # Ensure we have as many finals as possible
+    backfill_results_for_open_matches(max_rows=400)
+
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT t.match_id, t.market, t.suggestion, t.confidence, t.created_ts,
+                   r.final_goals_h, r.final_goals_a, r.btts_yes
+            FROM tips t
+            LEFT JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts >= %s AND t.created_ts < %s
+              AND t.suggestion <> 'HARVEST'
+              AND t.sent_ok = 1
+            """,
+            (y_start_ts, y_end_ts),
+        ).fetchall()
+
+    total = graded = wins = 0
+    by_market: Dict[str, Dict[str, int]] = {}
+    for (mid, market, sugg, conf, cts, gh, ga, btts) in rows:
+        total += 1
+        res = {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts}
+        out = _tip_outcome_for_result(sugg, res)
+        if out is None:
+            continue
+        graded += 1
+        wins += 1 if out == 1 else 0
+        m = by_market.setdefault(market or "?", {"graded": 0, "wins": 0})
+        m["graded"] += 1
+        m["wins"] += 1 if out == 1 else 0
+
+    if graded == 0:
+        msg = "📊 Daily Digest\nNo graded tips for yesterday."
+    else:
+        acc = 100.0 * wins / max(1, graded)
+        lines = [f"📊 <b>Daily Digest</b> (yesterday, Berlin time)",
+                 f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"]
+        for mk, st in sorted(by_market.items()):
+            if st["graded"] == 0:
+                continue
+            a = 100.0 * st["wins"] / st["graded"]
+            lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} ({a:.1f}%)")
+        msg = "\n".join(lines)
+
+    send_telegram(msg)
+    return msg
+
+# ── Admin / Auth helpers
+def _require_admin() -> None:
+    key = request.headers.get("X-API-Key") or request.args.get("key") or (request.json or {}).get("key") if request.is_json else None
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
+# ── Flask endpoints
 @app.route("/")
-def home():
-    mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
-    return f"🤖 Robi Superbrain is active ({mode}) · DB=Postgres"
+def root():
+    return jsonify({"ok": True, "name": "live-tips-backend", "version": 1})
 
-# Harvest routes
-@app.route("/harvest")
-def harvest_route():
-    _require_api_key()
-    saved, live_seen = harvest_scan()
-    return jsonify({"ok": True, "live_seen": live_seen, "snapshots_saved": saved})
+@app.route("/health")
+def health():
+    try:
+        with db_conn() as conn:
+            c = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+        return jsonify({"ok": True, "db": "ok", "tips_count": int(c)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/harvest/bulk_leagues", methods=["POST"])
-def harvest_bulk_leagues_post():
-    _require_api_key()
-    body = request.get_json(silent=True) or {}
-    leagues = body.get("leagues") or []
-    seasons = body.get("seasons") or [2024]
-    return jsonify(_run_bulk_leagues(leagues, seasons))
-
-@app.route("/harvest/bulk_leagues", methods=["GET"])
-def harvest_bulk_leagues_get():
-    _require_api_key()
-    seasons_q = (request.args.get("seasons") or "").strip()
-    seasons = [int(s) for s in seasons_q.split(",") if s.strip().isdigit()] or [2024]
-    leagues = []
-    return jsonify(_run_bulk_leagues(leagues, seasons))
-
-# Backfill routes
-@app.route("/backfill")
-def backfill_route():
-    _require_api_key()
-    hours = int(request.args.get("hours", 48))
-    updated, checked = backfill_results_from_snapshots(hours=hours)
-    return jsonify({"ok": True, "hours": hours, "checked": checked, "updated": updated})
-
-@app.route("/backfill/all")
-def backfill_all_unlabeled_route():
-    _require_api_key()
-    ids = _list_unlabeled_ids()
-    updated, checked = _backfill_for_ids(ids)
-    return jsonify({"ok": True, "checked": checked, "updated": updated})
-
-# Prediction routes
-@app.route("/predict/scan")
-def predict_scan_route():
-    _require_api_key()
-    saved, live = production_scan()
-    return jsonify({"ok": True, "mode": "PRODUCTION", "live_seen": live, "tips_saved": saved})
-
-@app.route("/predict/models")
-def predict_models_route():
-    _require_api_key()
-    found = {}
-    for ln in OU_LINES:
-        name = f"OU_{_fmt_line(ln)}"
-        found[name] = bool(load_model_from_settings(name))
-    found["O25"] = bool(load_model_from_settings("O25"))
-    found["BTTS_YES"] = bool(load_model_from_settings("BTTS_YES"))
-    return jsonify({"found": found})
-
-# Training
-@app.route("/train", methods=["POST", "GET"])
-def train_route():
-    _require_api_key()
-    return jsonify(train_models())
-
-# Stats routes
-@app.route("/stats/snapshots_count")
-def snapshots_count():
-    _require_api_key()
-    with db_conn() as conn:
-        snap = conn.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
-        tips = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
-        res  = conn.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
-    return jsonify({"tip_snapshots": int(snap), "tips_rows": int(tips), "match_results": int(res)})
-
-@app.route("/stats/progress")
-def stats_progress():
-    _require_api_key()
-    now = int(time.time())
-    day_ago = now - 24*3600
-    c24 = _counts_since(day_ago)
-    return jsonify({
-        "window_24h": {"snapshots_added": c24["snap_24h"], "results_added": c24["res_24h"]},
-        "totals": {"tip_snapshots": c24["snap_total"], "tips_rows": c24["tips_total"], "match_results": c24["res_total"]}
-    })
-
-@app.route("/stats/daily_accuracy")
-def stats_daily_accuracy_route():
-    _require_api_key()
-    date_q = request.args.get("date")  # YYYY-MM-DD
-    send = request.args.get("send", "0") not in ("0","false","False","no","NO")
-    start_ts, end_ts, day = _date_range_local_utc_ts(date_q)
-    summary = _daily_accuracy_summary(start_ts, end_ts)
-    if send:
-        msg = _format_accuracy_msg(day, summary)
-        send_telegram(msg)
-    return jsonify({"ok": True, "date": day, "summary": summary, "sent": bool(send)})
-
-# Debug route
-@app.route("/debug/env")
-def debug_env():
-    _require_api_key()
-    return jsonify({
-        "API_KEY": bool(API_KEY),
-        "ADMIN_API_KEY": bool(ADMIN_API_KEY),
-        "TELEGRAM_BOT_TOKEN": bool(TELEGRAM_BOT_TOKEN),
-        "TELEGRAM_CHAT_ID": bool(TELEGRAM_CHAT_ID),
-        "HARVEST_MODE": HARVEST_MODE
-    })
-
-# ── Entrypoint / Scheduler
-def main():
+@app.route("/init-db", methods=["POST"])
+def http_init_db():
+    _require_admin()
     init_db()
-    mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
-    logger.info(f"🤖 Robi Superbrain starting in {mode} mode.")
+    return jsonify({"ok": True})
 
-    scheduler = BackgroundScheduler()
+@app.route("/admin/scan", methods=["POST", "GET"])
+def http_scan():
+    _require_admin()
+    saved, live = production_scan()
+    return jsonify({"ok": True, "saved": saved, "live_seen": live})
 
-    if HARVEST_MODE:
-        scheduler.add_job(harvest_scan, CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")),
-                          id="harvest", replace_existing=True)
-        scheduler.add_job(backfill_results_from_snapshots, "interval", minutes=15,
-                          id="backfill", replace_existing=True)
-    else:
-        scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
-                          id="production_scan", replace_existing=True)
+@app.route("/admin/backfill-results", methods=["POST"])
+def http_backfill():
+    _require_admin()
+    n = backfill_results_for_open_matches()
+    return jsonify({"ok": True, "updated": n})
 
-    scheduler.add_job(train_models, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-                      id="train", replace_existing=True)
-    scheduler.add_job(nightly_digest_job, CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
-                      id="digest", replace_existing=True)
+@app.route("/admin/train", methods=["POST"])
+def http_train():
+    _require_admin()
+    if not TRAIN_ENABLE:
+        return jsonify({"ok": False, "reason": "training disabled"}), 400
+    try:
+        out = train_models()
+        return jsonify({"ok": True, "result": out})
+    except Exception as e:
+        logger.exception("train_models failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    if MOTD_PREDICT:
-        motd_hour = int(os.getenv("MOTD_HOUR", "9"))
-        motd_minute = int(os.getenv("MOTD_MINUTE", "0"))
-        scheduler.add_job(motd_announce, CronTrigger(hour=motd_hour, minute=motd_minute, timezone=ZoneInfo("Europe/Berlin")),
-                          id="motd_announce", replace_existing=True)
-        logger.info(f"🌟 MOTD daily announcement at {motd_hour:02d}:{motd_minute:02d}")
+@app.route("/tips/latest")
+def http_latest_tips():
+    limit = int(request.args.get("limit", "50"))
+    market = request.args.get("market")
+    sent_only = request.args.get("sent_only", "1") not in ("0","false","False","no","NO")
+    include_harvest = request.args.get("include_harvest", "0") not in ("0","false","False","no","NO")
+    where = []
+    params: List[Any] = []
+    if sent_only:
+        where.append("sent_ok=1")
+    if not include_harvest:
+        where.append("suggestion<>'HARVEST'")
+    if market:
+        where.append("market=%s")
+        params.append(market)
+    sql = "SELECT match_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts FROM tips"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_ts DESC LIMIT %s"
+    params.append(max(1, min(500, limit)))
+    with db_conn() as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    tips = []
+    for r in rows:
+        tips.append({
+            "match_id": int(r[0]),
+            "league": r[1],
+            "home": r[2],
+            "away": r[3],
+            "market": r[4],
+            "suggestion": r[5],
+            "confidence": float(r[6]),
+            "score_at_tip": r[7],
+            "minute": int(r[8]),
+            "created_ts": int(r[9]),
+        })
+    return jsonify({"ok": True, "tips": tips})
 
+@app.route("/tips/<int:match_id>")
+def http_tips_by_match(match_id: int):
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok "
+            "FROM tips WHERE match_id=%s ORDER BY created_ts ASC",
+            (match_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "league": r[0], "home": r[1], "away": r[2], "market": r[3], "suggestion": r[4],
+            "confidence": float(r[5]), "score_at_tip": r[6], "minute": int(r[7]),
+            "created_ts": int(r[8]), "sent_ok": int(r[9]),
+        })
+    return jsonify({"ok": True, "match_id": match_id, "tips": out})
+
+@app.route("/settings/<key>", methods=["GET", "POST"])
+def http_settings(key: str):
+    if request.method == "GET":
+        val = get_setting(key)
+        return jsonify({"ok": True, "key": key, "value": val})
+    _require_admin()
+    js = request.get_json(silent=True) or {}
+    val = js.get("value")
+    if val is None:
+        abort(400)
+    set_setting(key, str(val))
+    return jsonify({"ok": True})
+
+@app.route("/feedback", methods=["POST"])
+def http_feedback():
+    js = request.get_json(silent=True) or {}
+    mid = js.get("match_id")
+    verdict = js.get("verdict")
+    if mid is None or verdict not in (0, 1):
+        abort(400)
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO feedback(match_id, verdict, created_ts) VALUES(%s,%s,%s) "
+            "ON CONFLICT (match_id) DO UPDATE SET verdict=EXCLUDED.verdict, created_ts=EXCLUDED.created_ts",
+            (int(mid), int(verdict), int(time.time()))
+        )
+    return jsonify({"ok": True})
+
+@app.route("/telegram/webhook/<secret>", methods=["POST"])
+def telegram_webhook(secret: str):
+    if (WEBHOOK_SECRET or "") != secret:
+        abort(403)
+    update = request.get_json(silent=True) or {}
+    # Simple command responder to keep Telegram webhook alive
+    try:
+        msg = (update.get("message") or {}).get("text") or ""
+        chat_id = ((update.get("message") or {}).get("chat") or {}).get("id")
+        if msg.startswith("/start"):
+            send_telegram("👋 Live tips bot is online.")
+        elif msg.startswith("/ping"):
+            send_telegram("✅ Pong")
+        elif msg.startswith("/digest"):
+            daily_accuracy_digest()
+        elif msg.startswith("/scan"):
+            # Protect with admin key if provided as "/scan <key>"
+            parts = msg.split()
+            if len(parts) > 1 and ADMIN_API_KEY and parts[1] == ADMIN_API_KEY:
+                saved, live = production_scan()
+                send_telegram(f"🔁 Scan done. Saved: {saved}, Live seen: {live}")
+            else:
+                send_telegram("🔒 Admin key required.")
+        elif msg.startswith("/latest"):
+            with db_conn() as conn:
+                r = conn.execute(
+                    "SELECT home,away,market,suggestion,confidence,minute FROM tips "
+                    "WHERE suggestion<>'HARVEST' ORDER BY created_ts DESC LIMIT 5"
+                ).fetchall()
+            if not r:
+                send_telegram("No tips yet.")
+            else:
+                lines = []
+                for (h,a,mk,sugg,conf,minute) in r:
+                    lines.append(f"{escape(h)}–{escape(a)} • {mk} • {sugg} • {conf:.1f}% @ {minute}'")
+                send_telegram("Last tips:\n" + "\n".join(lines))
+    except Exception as e:
+        logger.warning("telegram webhook parse error: %s", e)
+    return jsonify({"ok": True})
+
+# ── Scheduler setup
+scheduler: Optional[BackgroundScheduler] = None
+
+def _start_scheduler():
+    global scheduler
+    if scheduler is not None:
+        return
+    scheduler = BackgroundScheduler(timezone=BERLIN_TZ)
+
+    # Frequent live scan
+    scheduler.add_job(production_scan, "interval", seconds=30, id="scan", max_instances=1, coalesce=True)
+
+    # Results backfill every 10 minutes
+    scheduler.add_job(backfill_results_for_open_matches, "interval", minutes=10, id="results_backfill",
+                      kwargs={"max_rows": 400}, max_instances=1, coalesce=True)
+
+    # Heartbeat: record setting & optional log
+    if HEARTBEAT_ENABLE:
+        def _heartbeat():
+            set_setting("heartbeat_ts", str(int(time.time())))
+            logger.info("[HEARTBEAT] alive")
+        scheduler.add_job(_heartbeat, "interval", minutes=5, id="heartbeat", max_instances=1, coalesce=True)
+
+    # Daily accuracy digest at configured local time
     if DAILY_ACCURACY_DIGEST_ENABLE:
-        scheduler.add_job(daily_accuracy_digest_job,
-            CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=ZoneInfo("Europe/Berlin")),
-            id="daily_accuracy_digest", replace_existing=True)
+        trig = CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=BERLIN_TZ)
+        scheduler.add_job(daily_accuracy_digest, trig, id="daily_digest", max_instances=1, coalesce=True)
 
     scheduler.start()
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    logger.info("[SCHED] started")
+
+# ── App startup
+def _on_boot():
+    init_db()
+    set_setting("boot_ts", str(int(time.time())))
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            send_telegram("🚀 Live tips backend started.")
+        except Exception:
+            pass
+    if os.getenv("DISABLE_SCHEDULER", "0") in ("1","true","True","YES","yes"):
+        logger.info("[SCHED] disabled by env")
+    else:
+        _start_scheduler()
+
+_on_boot()
 
 if __name__ == "__main__":
-    main()
-    
-
+    # Production WSGI servers (gunicorn/uvicorn) will ignore this and import app only.
+    port = int(os.getenv("PORT", "8080"))
+    host = os.getenv("HOST", "0.0.0.0")
+    app.run(host=host, port=port)
