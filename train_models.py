@@ -1,12 +1,23 @@
 # file: train_models.py
 """
 Postgres-only training with Platt calibration + auto-thresholding.
-Saves models:
-  - model_latest:BTTS_YES
-  - model_latest:OU_{line}   (also mirrors as model:*)
-Also writes per-market decision thresholds (percent) into settings:
-  - conf_threshold:BTTS
-  - conf_threshold:Over/Under {line}
+Trains:
+  • BTTS_YES (binary LR)
+  • OU_{line} (binary LR for multiple lines)
+  • WLD (1X2) via one-vs-rest LR: WLD_HOME, WLD_DRAW, WLD_AWAY
+
+Saves models to settings:
+  model_latest:BTTS_YES
+  model_latest:OU_{line}      (and O25 alias for 2.5)
+  model_latest:WLD_HOME
+  model_latest:WLD_DRAW
+  model_latest:WLD_AWAY
+(also mirrored as model:* keys)
+
+Writes decision thresholds (percent) to settings:
+  conf_threshold:BTTS
+  conf_threshold:Over/Under {line}
+  conf_threshold:1X2
 """
 
 import argparse
@@ -14,7 +25,6 @@ import json
 import os
 import logging
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -26,8 +36,6 @@ from sklearn.metrics import (
     precision_score,
     f1_score,
 )
-from sklearn.model_selection import train_test_split
-
 import psycopg2
 
 try:
@@ -52,7 +60,7 @@ FEATURES: List[str] = [
 EPS = 1e-6
 
 
-# ─────────────────────────── DB helpers ─────────────────────────── #
+# ─────────────────────── DB helpers ─────────────────────── #
 
 def _connect(db_url: str):
     if not db_url:
@@ -80,7 +88,7 @@ def _set_setting(conn, key: str, value: str) -> None:
           (key, value))
 
 
-# ─────────────────────────── Data load ─────────────────────────── #
+# ─────────────────────── Data load ─────────────────────── #
 
 def load_data(conn, min_minute: int = 15) -> pd.DataFrame:
     q = """
@@ -125,6 +133,7 @@ def load_data(conn, min_minute: int = 15) -> pd.DataFrame:
         except Exception:
             continue
 
+        # Derived features
         f["goals_sum"] = f["goals_h"] + f["goals_a"]
         f["goals_diff"] = f["goals_h"] - f["goals_a"]
         f["xg_sum"] = f["xg_h"] + f["xg_a"]
@@ -136,7 +145,9 @@ def load_data(conn, min_minute: int = 15) -> pd.DataFrame:
 
         gh_f = int(row["final_goals_h"] or 0)
         ga_f = int(row["final_goals_a"] or 0)
+        f["_ts"] = int(row["created_ts"] or 0)          # keep snapshot time for time-based split
         f["final_goals_sum"] = gh_f + ga_f
+        f["final_goals_diff"] = gh_f - ga_f
         f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
 
         feats.append(f)
@@ -151,7 +162,7 @@ def load_data(conn, min_minute: int = 15) -> pd.DataFrame:
     return df
 
 
-# ─────────────────────────── Model utils ─────────────────────────── #
+# ─────────────────────── Model utils ─────────────────────── #
 
 def fit_lr_safe(X: np.ndarray, y: np.ndarray) -> Optional[LogisticRegression]:
     if len(np.unique(y)) < 2:
@@ -169,6 +180,7 @@ def _logit_vec(p: np.ndarray) -> np.ndarray:
 
 
 def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
+    # 1D Platt using logistic regression on logits
     z = _logit_vec(p_raw).reshape(-1, 1)
     y = y_true.astype(int)
     lr = LogisticRegression(max_iter=1000, solver="lbfgs")
@@ -195,14 +207,13 @@ def _fmt_line(line: float) -> str:
     return f"{line}".rstrip("0").rstrip(".")
 
 
-# ─────────────────────────── Thresholding ─────────────────────────── #
+# ─────────────────────── Thresholding ─────────────────────── #
 
 def _percent(x: float) -> float:
     return float(x) * 100.0
 
 
 def _grid_thresholds(lo=0.50, hi=0.95, step=0.005) -> np.ndarray:
-    # probabilities domain (0..1)
     return np.arange(lo, hi + 1e-9, step)
 
 
@@ -223,8 +234,7 @@ def _pick_threshold_for_target_precision(
     best_t = None
     candidates = _grid_thresholds(0.5, 0.95, 0.005)
 
-    # 1) Try to meet target precision
-    feasible: List[Tuple[float, float, int]] = []  # (thr, precision, n_pred)
+    feasible: List[Tuple[float, float, int]] = []
     for t in candidates:
         pred = (p >= t).astype(int)
         n_pred = int(pred.sum())
@@ -234,11 +244,9 @@ def _pick_threshold_for_target_precision(
         if prec >= target_precision:
             feasible.append((t, float(prec), n_pred))
     if feasible:
-        # pick the smallest t (more recall) among those meeting target; tie-break by higher precision
-        feasible.sort(key=lambda z: (z[0], -z[1]))
+        feasible.sort(key=lambda z: (z[0], -z[1]))  # smallest threshold, tie-break by precision
         best_t = feasible[0][0]
 
-    # 2) Fallback: maximize F1
     if best_t is None:
         best_f1 = -1.0
         for t in candidates:
@@ -251,7 +259,6 @@ def _pick_threshold_for_target_precision(
                 best_f1 = f1
                 best_t = float(t)
 
-    # 3) Fallback: maximize accuracy
     if best_t is None:
         best_acc = -1.0
         for t in candidates:
@@ -264,7 +271,35 @@ def _pick_threshold_for_target_precision(
     return float(best_t if best_t is not None else default_threshold)
 
 
-# ─────────────────────────── Training entry ─────────────────────────── #
+# ─────────────────────── Time-based split ─────────────────────── #
+
+def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns boolean masks (train_mask, test_mask) by time order.
+    Latest `test_size` fraction goes to test.
+    """
+    if "_ts" not in df.columns:
+        # fallback to random if timestamps missing
+        n = len(df)
+        idx = np.arange(n)
+        np.random.seed(42)
+        np.random.shuffle(idx)
+        cut = int((1 - test_size) * n)
+        tr = np.zeros(n, dtype=bool); te = np.zeros(n, dtype=bool)
+        tr[idx[:cut]] = True; te[idx[cut:]] = True
+        return tr, te
+
+    df_sorted = df.sort_values("_ts").reset_index(drop=True)
+    n = len(df_sorted)
+    cut = int(max(1, (1 - test_size) * n))
+    train_idx = df_sorted.index[:cut].to_numpy()
+    test_idx = df_sorted.index[cut:].to_numpy()
+    tr = np.zeros(n, dtype=bool); te = np.zeros(n, dtype=bool)
+    tr[train_idx] = True; te[test_idx] = True
+    return tr, te
+
+
+# ─────────────────────── Training ─────────────────────── #
 
 def train_models(
     db_url: Optional[str] = None,
@@ -292,7 +327,7 @@ def train_models(
     if not ou_lines:
         ou_lines = [1.5, 2.5, 3.5]
 
-    # Thresholding policy
+    # Threshold policy
     target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
     min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
     min_thresh = float(os.getenv("MIN_THRESH", "55"))
@@ -307,34 +342,31 @@ def train_models(
             logger.info(msg)
             return {"ok": False, "reason": msg}
 
+        # Time-based split masks (used across all markets to align test sets)
+        tr_mask, te_mask = time_order_split(df, test_size=test_size)
+        X_all = df[FEATURES].values
+
         # --- BTTS ---
-        Xb = df[FEATURES].values
         yb = df["label_btts"].values.astype(int)
-        strat_b = yb if (yb.sum() and yb.sum() != len(yb)) else None
-        Xb_tr, Xb_te, yb_tr, yb_te = train_test_split(Xb, yb, test_size=test_size, random_state=42, stratify=strat_b)
+        Xb_tr, Xb_te = X_all[tr_mask], X_all[te_mask]
+        yb_tr, yb_te = yb[tr_mask], yb[te_mask]
         mb = fit_lr_safe(Xb_tr, yb_tr)
         if mb is not None:
             p_te_b_raw = mb.predict_proba(Xb_te)[:, 1]
             a_b, b_b = fit_platt(yb_te, p_te_b_raw)
             p_te_b_cal = 1.0 / (1.0 + np.exp(-(a_b * _logit_vec(p_te_b_raw) + b_b)))
-            # metrics
             brier_b = float(brier_score_loss(yb_te, p_te_b_cal))
             acc_b = float(accuracy_score(yb_te, (p_te_b_cal >= 0.5).astype(int)))
             ll_b = float(log_loss(yb_te, p_te_b_cal, labels=[0, 1]))
             blob_btts = build_model_blob(mb, FEATURES, (a_b, b_b))
-            # save model
             for k in ("model_latest:BTTS_YES", "model:BTTS_YES"):
                 _set_setting(conn, k, json.dumps(blob_btts))
             summary["trained"]["BTTS_YES"] = True
             summary["metrics"]["BTTS_YES"] = {"brier": brier_b, "acc": acc_b, "logloss": ll_b,
                                               "n_test": int(len(yb_te)), "prevalence": float(yb.mean())}
-            # derive threshold for BTTS market
             thr_btts_prob = _pick_threshold_for_target_precision(
-                y_true=yb_te,
-                p_cal=p_te_b_cal,
-                target_precision=target_precision,
-                min_preds=min_preds,
-                default_threshold=0.65,
+                y_true=yb_te, p_cal=p_te_b_cal,
+                target_precision=target_precision, min_preds=min_preds, default_threshold=0.65,
             )
             thr_btts_pct = float(np.clip(_percent(thr_btts_prob), min_thresh, max_thresh))
             _set_setting(conn, "conf_threshold:BTTS", f"{thr_btts_pct:.2f}")
@@ -344,19 +376,22 @@ def train_models(
 
         # --- O/U lines ---
         total_goals = df["final_goals_sum"].values.astype(int)
+        yo_all = {line: (total_goals > line).astype(int) for line in ou_lines}
+
         for line in ou_lines:
             name = f"OU_{_fmt_line(line)}"
-            yo = (total_goals > line).astype(int)
+            yo = yo_all[line]
             if yo.sum() == 0 or yo.sum() == len(yo):
                 summary["trained"][name] = False
                 continue
-            Xo = df[FEATURES].values
-            strat_o = yo if (yo.sum() and yo.sum() != len(yo)) else None
-            Xo_tr, Xo_te, yo_tr, yo_te = train_test_split(Xo, yo, test_size=test_size, random_state=42, stratify=strat_o)
+
+            Xo_tr, Xo_te = X_all[tr_mask], X_all[te_mask]
+            yo_tr, yo_te = yo[tr_mask], yo[te_mask]
             mo = fit_lr_safe(Xo_tr, yo_tr)
             if mo is None:
                 summary["trained"][name] = False
                 continue
+
             p_te_o_raw = mo.predict_proba(Xo_te)[:, 1]
             a_o, b_o = fit_platt(yo_te, p_te_o_raw)
             p_te_o_cal = 1.0 / (1.0 + np.exp(-(a_o * _logit_vec(p_te_o_raw) + b_o)))
@@ -364,7 +399,6 @@ def train_models(
             acc_o = float(accuracy_score(yo_te, (p_te_o_cal >= 0.5).astype(int)))
             ll_o = float(log_loss(yo_te, p_te_o_cal, labels=[0, 1]))
             blob_o = build_model_blob(mo, FEATURES, (a_o, b_o))
-            # save model
             for k in (f"model_latest:{name}", f"model:{name}"):
                 _set_setting(conn, k, json.dumps(blob_o))
             if abs(line - 2.5) < 1e-6:
@@ -373,89 +407,82 @@ def train_models(
             summary["trained"][name] = True
             summary["metrics"][name] = {"brier": brier_o, "acc": acc_o, "logloss": ll_o,
                                         "n_test": int(len(yo_te)), "prevalence": float(yo.mean())}
-
-            # threshold per Over/Under {line} market
             market_name = f"Over/Under {_fmt_line(line)}"
             thr_ou_prob = _pick_threshold_for_target_precision(
-                y_true=yo_te,
-                p_cal=p_te_o_cal,
-                target_precision=target_precision,
-                min_preds=min_preds,
-                default_threshold=0.65,
+                y_true=yo_te, p_cal=p_te_o_cal,
+                target_precision=target_precision, min_preds=min_preds, default_threshold=0.65,
             )
             thr_ou_pct = float(np.clip(_percent(thr_ou_prob), min_thresh, max_thresh))
             _set_setting(conn, f"conf_threshold:{market_name}", f"{thr_ou_pct:.2f}")
             summary["thresholds"][market_name] = thr_ou_pct
 
-              # --- 1X2 (Win/Draw/Loss) via One-vs-Rest logistic regressions ---
-        # labels
-        gd = (df["goals_h"] - df["goals_a"]).values.astype(int)
+        # --- 1X2 (WLD) via one-vs-rest LR ---
+        # Labels from final result
+        gd = df["final_goals_diff"].values.astype(int)
         y_home = (gd > 0).astype(int)
         y_draw = (gd == 0).astype(int)
         y_away = (gd < 0).astype(int)
 
-        def _fit_ovr(name, ybin):
+        def _fit_ovr(name: str, ybin: np.ndarray):
             if len(np.unique(ybin)) < 2:
-                return None, None, None
-            X = df[FEATURES].values
-            strat = ybin if (ybin.sum() and ybin.sum() != len(ybin)) else None
-            X_tr, X_te, y_tr, y_te = train_test_split(X, ybin, test_size=test_size, random_state=42, stratify=strat)
+                return None, None
+            X_tr, X_te = X_all[tr_mask], X_all[te_mask]
+            y_tr, y_te = ybin[tr_mask], ybin[te_mask]
             m = fit_lr_safe(X_tr, y_tr)
             if m is None:
-                return None, None, None
+                return None, None
             p_raw = m.predict_proba(X_te)[:, 1]
             a, b = fit_platt(y_te, p_raw)
             p_cal = 1.0 / (1.0 + np.exp(-(a * _logit_vec(p_raw) + b)))
             bri = float(brier_score_loss(y_te, p_cal))
             acc = float(accuracy_score(y_te, (p_cal >= 0.5).astype(int)))
-            ll  = float(log_loss(y_te, p_cal, labels=[0,1]))
-            blob = build_model_blob(m, FEATURES, (a,b))
+            ll  = float(log_loss(y_te, p_cal, labels=[0, 1]))
+            blob = build_model_blob(m, FEATURES, (a, b))
             for k in (f"model_latest:{name}", f"model:{name}"):
                 _set_setting(conn, k, json.dumps(blob))
-            return {"brier": bri, "acc": acc, "logloss": ll, "n_test": int(len(y_te)), "prevalence": float(ybin.mean())}, X_te, p_cal
+            summary["metrics"][name] = {"brier": bri, "acc": acc, "logloss": ll,
+                                        "n_test": int(len(y_te)), "prevalence": float(ybin.mean())}
+            summary["trained"][name] = True
+            return (p_cal,)
 
-        met_h, Xh, p_h = _fit_ovr("WLD_HOME", y_home)
-        met_d, Xd, p_d = _fit_ovr("WLD_DRAW", y_draw)
-        met_a, Xa, p_a = _fit_ovr("WLD_AWAY", y_away)
+        wld_models_ok = True
+        res_h = _fit_ovr("WLD_HOME", y_home)
+        res_d = _fit_ovr("WLD_DRAW", y_draw)
+        res_a = _fit_ovr("WLD_AWAY", y_away)
+        if not (res_h and res_d and res_a):
+            wld_models_ok = False
 
-        # save metrics (if any)
-        wld_any = False
-        if met_h: summary["metrics"]["WLD_HOME"] = met_h; wld_any = True
-        if met_d: summary["metrics"]["WLD_DRAW"] = met_d; wld_any = True
-        if met_a: summary["metrics"]["WLD_AWAY"] = met_a; wld_any = True
-
-        # Derive a single threshold for "emit 1X2 tip if max(prob) >= thr)"
-        if wld_any and (p_h is not None and p_d is not None and p_a is not None):
-            # align lengths (same test split sizes assumed above)
-            n = min(len(p_h), len(p_d), len(p_a))
-            p_h, p_d, p_a = p_h[:n], p_d[:n], p_a[:n]
-            # renormalize OvR probs to sum to 1 per sample
-            ps = np.clip(p_h, EPS, 1- EPS) + np.clip(p_d, EPS, 1- EPS) + np.clip(p_a, EPS, 1- EPS)
-            p_hn, p_dn, p_an = p_h/ps, p_d/ps, p_a/ps
+        if wld_models_ok:
+            p_h, = res_h
+            p_d, = res_d
+            p_a, = res_a
+            # Renormalize calibrated OvR probs to sum to 1 per sample
+            ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_d, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
+            p_hn, p_dn, p_an = p_h / ps, p_d / ps, p_a / ps
             p_max = np.maximum.reduce([p_hn, p_dn, p_an])
-            # true class index
-            # build y_true_class from the same rows used for test; approximate using Xh rows indices aren’t tracked, so we map by n
-            # (since all three used same random_state and stratify sizes, their test sets align)
-            gd_te = gd[:len(p_max)]  # approximate alignment
-            y_class = np.zeros_like(p_max, dtype=int)
+
+            # True class index for the same test rows (time split keeps alignment)
+            gd_te = gd[te_mask]
+            y_class = np.zeros_like(gd_te, dtype=int)
             y_class[gd_te == 0] = 1
-            y_class[gd_te < 0]  = 2
+            y_class[gd_te < 0] = 2
             correct = (np.argmax(np.stack([p_hn, p_dn, p_an], axis=1), axis=1) == y_class).astype(int)
 
             thr_1x2_prob = _pick_threshold_for_target_precision(
-                y_true=correct,
-                p_cal=p_max,
-                target_precision=target_precision,
-                min_preds=min_preds,
-                default_threshold=0.45,
+                y_true=correct, p_cal=p_max,
+                target_precision=target_precision, min_preds=min_preds, default_threshold=0.45,
             )
             thr_1x2_pct = float(np.clip(_percent(thr_1x2_prob), min_thresh, max_thresh))
             _set_setting(conn, "conf_threshold:1X2", f"{thr_1x2_pct:.2f}")
             summary["thresholds"]["1X2"] = thr_1x2_pct
+        else:
+            summary["trained"]["WLD_HOME"] = bool(res_h)
+            summary["trained"]["WLD_DRAW"] = bool(res_d)
+            summary["trained"]["WLD_AWAY"] = bool(res_a)
 
-        # bundle metrics
+        # Bundle metrics snapshot
         metrics_bundle = {
-            "trained_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "trained_at_utc": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
             **summary["metrics"],
             "features": FEATURES,
             "thresholds": summary["thresholds"],
@@ -474,7 +501,7 @@ def train_models(
             pass
 
 
-# ─────────────────────────── CLI ─────────────────────────── #
+# ─────────────────────── CLI ─────────────────────── #
 
 def _cli_main() -> None:
     ap = argparse.ArgumentParser()
