@@ -868,6 +868,23 @@ def _ou_under_already_lost(goals_sum: int, line: float) -> bool:
 def _btts_decided(gh: int, ga: int) -> bool:
     return (gh > 0 and ga > 0)  # BTTS:Yes already true; also BTTS:No impossible
 
+def _load_wld_models() -> Tuple[Optional[Dict], Optional[Dict], Optional[Dict]]:
+    return (
+        load_model_from_settings("WLD_HOME"),
+        load_model_from_settings("WLD_DRAW"),
+        load_model_from_settings("WLD_AWAY"),
+    )
+
+def _score_wld_probs(feat: Dict[str,float]) -> Optional[Tuple[float,float,float]]:
+    mh, md, ma = _load_wld_models()
+    if not (mh and md and ma):
+        return None
+    ph = _score_prob(feat, mh)
+    pd = _score_prob(feat, md)
+    pa = _score_prob(feat, ma)
+    s = max(1e-9, ph + pd + pa)
+    return ph/s, pd/s, pa/s
+
 def _apply_early_conf_cap(prob_pct: float, minute: int) -> float:
     """
     Linearly cap displayed confidence early-game to avoid unrealistic 90%+ at 1'.
@@ -1191,18 +1208,27 @@ def production_scan() -> Tuple[int, int]:
                         prob_adj = p_btts_no * _market_score("BTTS")
                         candidates.append(("BTTS", "BTTS: No", prob_adj))
 
-                # 1X2 (pick only best side above threshold)
-                p_home, p_draw, p_away = wld_probabilities(feat, TOTAL_MATCH_MINUTES)
-                wld_map = [("1X2", "Home Win", p_home), ("1X2", "Draw", p_draw), ("1X2", "Away Win", p_away)]
-                best_market = max(wld_map, key=lambda x: x[2])
-                best_market = (best_market[0], best_market[1], _soften_final_prob(best_market[2]))
-                thr_1x2 = _get_market_threshold("1X2")
-                if best_market[2] * 100.0 >= thr_1x2:
-                    prob_adj = best_market[2] * _market_score("1X2")
-                    candidates.append((best_market[0], best_market[1], prob_adj))
+                                # 1X2: prefer ML OvR models if available; fall back to math Poisson
+                                thr_1x2 = _get_market_threshold("1X2")
+                                wld_ml = _score_wld_probs(feat)
+                                if wld_ml:
+                                    p_home, p_draw, p_away = wld_ml
+                                    # optional tempering & softening (reuse your PROB_TEMPERATURE path if added)
+                                    try:
+                                        p_home = _soften_final_prob(_temp_scale(p_home, PROB_TEMPERATURE))
+                                        p_draw = _soften_final_prob(_temp_scale(p_draw, PROB_TEMPERATURE))
+                                        p_away = _soften_final_prob(_temp_scale(p_away, PROB_TEMPERATURE))
+                                    except Exception:
+                                        p_home, p_draw, p_away = map(_soften_final_prob, (p_home, p_draw, p_away))
+                                else:
+                                    # fallback to math
+                                    p_home, p_draw, p_away = wld_probabilities(feat, TOTAL_MATCH_MINUTES)
 
-                if not candidates:
-                    continue
+                                wld_map = [("1X2", "Home Win", p_home), ("1X2", "Draw", p_draw), ("1X2", "Away Win", p_away)]
+                                best_market = max(wld_map, key=lambda x: x[2])
+                                if best_market[2] * 100.0 >= thr_1x2:
+                                    prob_adj = best_market[2] * _market_score("1X2")
+                                    candidates.append((best_market[0], best_market[1], prob_adj))
 
                 candidates.sort(key=lambda x: x[2], reverse=True)
                 per_match = 0
