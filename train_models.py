@@ -200,8 +200,8 @@ def train_models(
 
     try:
         df = load_data(conn, min_minute)
-        if df.empty:
-            msg = "Not enough labeled data yet."
+        if df.empty or len(df) < int(min_rows):
+            msg = f"Not enough labeled data yet (have {len(df)}, need >= {min_rows})."
             logger.info(msg)
             return {"ok": False, "reason": msg}
 
