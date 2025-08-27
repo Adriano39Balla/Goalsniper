@@ -1117,10 +1117,10 @@ def production_scan() -> Tuple[int, int]:
 
                     # Under side: skip if already impossible or late suppress; otherwise consider
                     if minute <= UNDER_SUPPRESS_AFTER_MIN and not _ou_under_already_lost(goals_sum_now, line):
-              p_under = _soften_final_prob(1.0 - p_over)
-        if p_under * 100.0 >= thr_ou:
-            prob_adj = p_under * _market_score(market_name)
-            candidates.append((market_name, f"Under {_fmt_line(line)} Goals", prob_adj))
+                        p_under = _soften_final_prob(1.0 - p_over)
+                        if p_under * 100.0 >= thr_ou:
+                            prob_adj = p_under * _market_score(market_name)
+                            candidates.append((market_name, f"Under {_fmt_line(line)} Goals", prob_adj))
 
                 # BTTS
                 gh_now = int(feat.get("goals_h", 0))
