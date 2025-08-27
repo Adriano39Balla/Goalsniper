@@ -928,6 +928,237 @@ def _apply_early_conf_cap(prob_pct: float, minute: int) -> float:
     cap = lo + (100.0 - lo) * (minute / m)
     return min(prob_pct, cap)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FULL AUTOMATION: harvest + backfill + train + digest + scheduler bootstrap
+# ─────────────────────────────────────────────────────────────────────────────
+
+# === Env knobs (safe defaults) ===
+SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "20"))     # live scan cadence
+BACKFILL_EVERY_MIN     = int(os.getenv("BACKFILL_EVERY_MIN", "15"))    # how often we fetch finished results
+BACKFILL_WINDOW_HOURS  = int(os.getenv("BACKFILL_WINDOW_HOURS", "36")) # how far back we look for FT results
+
+TRAIN_ENABLE           = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
+TRAIN_HOUR_UTC         = int(os.getenv("TRAIN_HOUR_UTC", "2"))
+TRAIN_MINUTE_UTC       = int(os.getenv("TRAIN_MINUTE_UTC", "12"))
+
+DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
+DAILY_ACCURACY_HOUR    = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
+DAILY_ACCURACY_MINUTE  = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
+
+TZ_UTC = ZoneInfo("UTC")
+
+
+# === HARVEST hook (store a snapshot even if we don’t send a tip) ===
+def _maybe_harvest_snapshot(m: Dict[str, Any], feat: Dict[str, float]) -> None:
+    if not HARVEST_MODE:
+        return
+    try:
+        save_snapshot_from_match(m, feat)
+    except Exception as e:
+        logger.warning("[HARVEST] snapshot failed: %s", e)
+
+
+# === RESULTS BACKFILL: write final scores to match_results ===
+def backfill_recent_results(hours: int = BACKFILL_WINDOW_HOURS) -> int:
+    """
+    Pull finished fixtures in the last `hours` and upsert into match_results.
+    Uses API-Sports: /fixtures?from=YYYY-MM-DD&to=YYYY-MM-DD&status=FT
+    """
+    try:
+        now = datetime.now(TZ_UTC)
+        start = now - timedelta(hours=int(hours))
+        # widen the window by date (API-Sports filters by day, not timestamp)
+        params = {
+            "from": start.strftime("%Y-%m-%d"),
+            "to":   now.strftime("%Y-%m-%d"),
+            "status": "FT",
+        }
+        js = _api_get(FOOTBALL_API_URL, params)
+        if not isinstance(js, dict):
+            return 0
+        rows = js.get("response", []) or []
+        updated = 0
+        with db_conn() as conn:
+            for r in rows:
+                try:
+                    fx = r.get("fixture") or {}
+                    fid = int(fx.get("id") or 0)
+                    if not fid:
+                        continue
+                    g  = r.get("goals") or {}
+                    gh = int(g.get("home") or 0)
+                    ga = int(g.get("away") or 0)
+                    btts_yes = 1 if (gh > 0 and ga > 0) else 0
+                    ts = int(time.time())
+                    conn.execute(
+                        "INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
+                        "VALUES (%s,%s,%s,%s,%s) "
+                        "ON CONFLICT(match_id) DO UPDATE SET "
+                        "final_goals_h=EXCLUDED.final_goals_h, final_goals_a=EXCLUDED.final_goals_a, "
+                        "btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
+                        (fid, gh, ga, btts_yes, ts),
+                    )
+                    updated += 1
+                except Exception:
+                    logger.exception("[BACKFILL] row failure")
+                    continue
+        logger.info("[BACKFILL] upserted results: %d", updated)
+        return updated
+    except Exception as e:
+        logger.exception("[BACKFILL] failed: %s", e)
+        return 0
+
+
+# === DAILY ACCURACY DIGEST (yesterday, graded only) ===
+def _tip_outcome_for_result(suggestion: str, res: Dict[str, Any]) -> Optional[int]:
+    """Return 1/0 for win/loss, None if cannot grade."""
+    gh = res.get("final_goals_h"); ga = res.get("final_goals_a"); by = res.get("btts_yes")
+    if gh is None or ga is None: return None
+    s = (suggestion or "").strip()
+    # OU
+    if s.startswith("Over ") and " Goals" in s:
+        try:
+            line = float(s.replace("Over","").replace("Goals","").strip())
+        except Exception:
+            return None
+        return 1 if (gh + ga) > line else 0
+    if s.startswith("Under ") and " Goals" in s:
+        try:
+            line = float(s.replace("Under","").replace("Goals","").strip())
+        except Exception:
+            return None
+        return 1 if (gh + ga) < line else 0
+    # BTTS
+    if s == "BTTS: Yes":
+        if by is None: return None
+        return 1 if int(by)==1 else 0
+    if s == "BTTS: No":
+        if by is None: return None
+        return 1 if int(by)==0 else 0
+    # 1X2
+    if s == "Home Win": return 1 if gh > ga else 0
+    if s == "Draw":     return 1 if gh == ga else 0
+    if s == "Away Win": return 1 if ga > gh else 0
+    return None
+
+def send_daily_accuracy_digest() -> bool:
+    if not DAILY_ACCURACY_DIGEST_ENABLE:
+        return False
+    try:
+        # "yesterday" in UTC
+        now = datetime.now(TZ_UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        start = int((now - timedelta(days=1)).timestamp())
+        end   = int(now.timestamp())
+        with db_conn() as conn:
+            rows = conn.execute("""
+                SELECT t.market, t.suggestion, t.confidence, t.created_ts,
+                       r.final_goals_h, r.final_goals_a, r.btts_yes
+                FROM tips t
+                LEFT JOIN match_results r ON r.match_id = t.match_id
+                WHERE t.created_ts BETWEEN %s AND %s
+                  AND t.suggestion <> 'HARVEST' AND t.sent_ok=1
+            """, (start, end)).fetchall()
+
+        total = 0; wins = 0
+        by_market: Dict[str, Dict[str, int]] = {}
+        for market, sugg, conf, ts, gh, ga, by in rows:
+            out = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": by})
+            if out is None:
+                continue
+            total += 1; wins += int(out)
+            d = by_market.setdefault(market, {"n":0, "w":0})
+            d["n"] += 1; d["w"] += int(out)
+
+        if total == 0:
+            return send_telegram("📊 Daily digest: no graded tips yesterday.")
+
+        win_pct = (100.0 * wins / total)
+        lines = [f"📊 <b>Daily Accuracy</b> (UTC yesterday)\n✅ {wins}/{total}  •  {win_pct:.1f}%\n"]
+        for mk, d in sorted(by_market.items()):
+            if d["n"] == 0: continue
+            pct = 100.0 * d["w"] / d["n"]
+            lines.append(f"• {escape(mk)}: {d['w']}/{d['n']}  ({pct:.1f}%)")
+        return send_telegram("\n".join(lines))
+    except Exception as e:
+        logger.exception("[DIGEST] failed: %s", e)
+        return False
+
+
+# === NIGHTLY TRAIN JOB ===
+def auto_train_job() -> None:
+    if not TRAIN_ENABLE:
+        return
+    try:
+        res = train_models()
+        ok = bool(res.get("ok"))
+        trained = ", ".join([k for k,v in (res.get("trained") or {}).items() if v])
+        msg = "🤖 Model training " + ("<b>OK</b>" if ok else "<b>FAILED</b>")
+        if trained:
+            msg += f"\n• Trained: {escape(trained)}"
+        thr = res.get("thresholds") or {}
+        if thr:
+            kv = "  |  ".join([f"{escape(k)}: {v:.1f}%" for k,v in thr.items()])
+            msg += f"\n• Thresholds: {kv}"
+        send_telegram(msg)
+    except Exception as e:
+        logger.exception("[TRAIN] job failed: %s", e)
+        send_telegram(f"⚠️ Training failed: {escape(str(e))}")
+
+
+# === SCAN WRAPPER (adds HARVEST on every pass) ===
+def scan_once_with_harvest() -> Tuple[int, int]:
+    """Fetch live matches, harvest snapshots, then run production scan."""
+    try:
+        matches = fetch_live_matches()
+        for m in matches:
+            try:
+                feat = extract_features(m)
+                _maybe_harvest_snapshot(m, feat)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning("[SCAN] harvest phase failed: %s", e)
+    # run your existing scan (it will also do its own filtering/tips)
+    return production_scan()
+
+
+# === SCHEDULER BOOTSTRAP ===
+_scheduler_started = False
+def _start_scheduler_once() -> None:
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    try:
+        sched = BackgroundScheduler(timezone=TZ_UTC)
+        # live scan loop
+        sched.add_job(scan_once_with_harvest, "interval", seconds=SCAN_INTERVAL_SEC, id="scan_loop", max_instances=1, coalesce=True)
+        # backfill loop
+        sched.add_job(lambda: backfill_recent_results(BACKFILL_WINDOW_HOURS),
+                      "interval", minutes=BACKFILL_EVERY_MIN, id="backfill_loop", max_instances=1, coalesce=True)
+        # daily accuracy digest
+        if DAILY_ACCURACY_DIGEST_ENABLE:
+            sched.add_job(send_daily_accuracy_digest,
+                          CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=TZ_UTC),
+                          id="daily_digest", max_instances=1, coalesce=True)
+        # nightly training
+        if TRAIN_ENABLE:
+            sched.add_job(auto_train_job,
+                          CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
+                          id="nightly_train", max_instances=1, coalesce=True)
+
+        sched.start()
+        _scheduler_started = True
+        if HEARTBEAT_ENABLE:
+            send_telegram("🚀 Live tips backend started.")
+        logger.info("[SCHED] started: scan=%ss backfill=%smin train=%02d:%02dZ digest=%02d:%02dZ",
+                    SCAN_INTERVAL_SEC, BACKFILL_EVERY_MIN, TRAIN_HOUR_UTC, TRAIN_MINUTE_UTC,
+                    DAILY_ACCURACY_HOUR, DAILY_ACCURACY_MINUTE)
+    except Exception as e:
+        logger.exception("[SCHED] failed to start: %s", e)
+
+# start the scheduler when the module is imported (works under gunicorn too)
+_start_scheduler_once()
+
 # ── Flask endpoints
 @app.route("/")
 def root():
