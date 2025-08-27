@@ -64,7 +64,7 @@ DAILY_ACCURACY_HOUR = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
 DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
 TIP_MIN_MINUTE = int(os.getenv("TIP_MIN_MINUTE", "8")) 
-EARLY_CONF_CAP_ENABLE = os.getenv("EARLY_CONF_CAP_ENABLE", "1") not in ("0","false","False","no","
+EARLY_CONF_CAP_ENABLE = os.getenv("EARLY_CONF_CAP_ENABLE", "1") not in ("0","false","False","no","NO")
 EARLY_CONF_CAP_MINUTE = int(os.getenv("EARLY_CONF_CAP_MINUTE", "15"))  
 EARLY_CONF_CAP_LO = float(os.getenv("EARLY_CONF_CAP_LO", "70.0"))
 
