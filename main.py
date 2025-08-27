@@ -5,6 +5,7 @@ Softened probabilities (no 0%/100%), Platt-calibrated ML, multi-line O/U, BTTS, 
 """
 
 import os
+import sys
 import json
 import time
 import logging
@@ -28,7 +29,11 @@ except Exception:
 
 from analytics import ou_over_probability, btts_yes_probability, wld_probabilities
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
