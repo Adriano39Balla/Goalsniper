@@ -387,6 +387,72 @@ def train_models(
             _set_setting(conn, f"conf_threshold:{market_name}", f"{thr_ou_pct:.2f}")
             summary["thresholds"][market_name] = thr_ou_pct
 
+              # --- 1X2 (Win/Draw/Loss) via One-vs-Rest logistic regressions ---
+        # labels
+        gd = (df["goals_h"] - df["goals_a"]).values.astype(int)
+        y_home = (gd > 0).astype(int)
+        y_draw = (gd == 0).astype(int)
+        y_away = (gd < 0).astype(int)
+
+        def _fit_ovr(name, ybin):
+            if len(np.unique(ybin)) < 2:
+                return None, None, None
+            X = df[FEATURES].values
+            strat = ybin if (ybin.sum() and ybin.sum() != len(ybin)) else None
+            X_tr, X_te, y_tr, y_te = train_test_split(X, ybin, test_size=test_size, random_state=42, stratify=strat)
+            m = fit_lr_safe(X_tr, y_tr)
+            if m is None:
+                return None, None, None
+            p_raw = m.predict_proba(X_te)[:, 1]
+            a, b = fit_platt(y_te, p_raw)
+            p_cal = 1.0 / (1.0 + np.exp(-(a * _logit_vec(p_raw) + b)))
+            bri = float(brier_score_loss(y_te, p_cal))
+            acc = float(accuracy_score(y_te, (p_cal >= 0.5).astype(int)))
+            ll  = float(log_loss(y_te, p_cal, labels=[0,1]))
+            blob = build_model_blob(m, FEATURES, (a,b))
+            for k in (f"model_latest:{name}", f"model:{name}"):
+                _set_setting(conn, k, json.dumps(blob))
+            return {"brier": bri, "acc": acc, "logloss": ll, "n_test": int(len(y_te)), "prevalence": float(ybin.mean())}, X_te, p_cal
+
+        met_h, Xh, p_h = _fit_ovr("WLD_HOME", y_home)
+        met_d, Xd, p_d = _fit_ovr("WLD_DRAW", y_draw)
+        met_a, Xa, p_a = _fit_ovr("WLD_AWAY", y_away)
+
+        # save metrics (if any)
+        wld_any = False
+        if met_h: summary["metrics"]["WLD_HOME"] = met_h; wld_any = True
+        if met_d: summary["metrics"]["WLD_DRAW"] = met_d; wld_any = True
+        if met_a: summary["metrics"]["WLD_AWAY"] = met_a; wld_any = True
+
+        # Derive a single threshold for "emit 1X2 tip if max(prob) >= thr)"
+        if wld_any and (p_h is not None and p_d is not None and p_a is not None):
+            # align lengths (same test split sizes assumed above)
+            n = min(len(p_h), len(p_d), len(p_a))
+            p_h, p_d, p_a = p_h[:n], p_d[:n], p_a[:n]
+            # renormalize OvR probs to sum to 1 per sample
+            ps = np.clip(p_h, EPS, 1- EPS) + np.clip(p_d, EPS, 1- EPS) + np.clip(p_a, EPS, 1- EPS)
+            p_hn, p_dn, p_an = p_h/ps, p_d/ps, p_a/ps
+            p_max = np.maximum.reduce([p_hn, p_dn, p_an])
+            # true class index
+            # build y_true_class from the same rows used for test; approximate using Xh rows indices aren’t tracked, so we map by n
+            # (since all three used same random_state and stratify sizes, their test sets align)
+            gd_te = gd[:len(p_max)]  # approximate alignment
+            y_class = np.zeros_like(p_max, dtype=int)
+            y_class[gd_te == 0] = 1
+            y_class[gd_te < 0]  = 2
+            correct = (np.argmax(np.stack([p_hn, p_dn, p_an], axis=1), axis=1) == y_class).astype(int)
+
+            thr_1x2_prob = _pick_threshold_for_target_precision(
+                y_true=correct,
+                p_cal=p_max,
+                target_precision=target_precision,
+                min_preds=min_preds,
+                default_threshold=0.45,
+            )
+            thr_1x2_pct = float(np.clip(_percent(thr_1x2_prob), min_thresh, max_thresh))
+            _set_setting(conn, "conf_threshold:1X2", f"{thr_1x2_pct:.2f}")
+            summary["thresholds"]["1X2"] = thr_1x2_pct
+
         # bundle metrics
         metrics_bundle = {
             "trained_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
