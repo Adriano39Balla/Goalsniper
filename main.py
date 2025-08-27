@@ -875,7 +875,7 @@ def _load_wld_models() -> Tuple[Optional[Dict], Optional[Dict], Optional[Dict]]:
         load_model_from_settings("WLD_AWAY"),
     )
 
-def _score_wld_probs(feat: Dict[str,float]) -> Optional[Tuple[float,float,float]]:
+def _score_wld_probs(feat: Dict[str,float])
     mh, md, ma = _load_wld_models()
     if not (mh and md and ma):
         return None
@@ -1210,8 +1210,9 @@ def production_scan() -> Tuple[int, int]:
 
                  # 1X2: prefer ML OvR models if available; fall back to math Poisson
                  thr_1x2 = _get_market_threshold("1X2")
+                
                  wld_ml = _score_wld_probs(feat)
-                 if wld_ml:
+                 if wld_ml is not None:
                      p_home, p_draw, p_away = wld_ml
                      # optional tempering & softening (reuse your PROB_TEMPERATURE path if added)
                      try:
@@ -1221,10 +1222,13 @@ def production_scan() -> Tuple[int, int]:
                      except Exception:
                          p_home, p_draw, p_away = map(_soften_final_prob, (p_home, p_draw, p_away))
                  else:
-                     # fallback to math
                      p_home, p_draw, p_away = wld_probabilities(feat, TOTAL_MATCH_MINUTES)
 
-                 wld_map = [("1X2", "Home Win", p_home), ("1X2", "Draw", p_draw), ("1X2", "Away Win", p_away)]
+                 wld_map = [
+                     ("1X2", "Home Win", p_home), 
+                     ("1X2", "Draw", p_draw), 
+                     ("1X2", "Away Win", p_away)
+                 ]
                  best_market = max(wld_map, key=lambda x: x[2])
                  if best_market[2] * 100.0 >= thr_1x2:
                      prob_adj = best_market[2] * _market_score("1X2")
