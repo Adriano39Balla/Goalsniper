@@ -77,6 +77,10 @@ MAX_THRESH = float(os.getenv("MAX_THRESH", "85"))
 MARKET_SCORE_ENABLE = os.getenv("MARKET_SCORE_ENABLE", "0") not in ("0","false","False","no","NO")
 MARKET_SCORE_DAYS = int(os.getenv("MARKET_SCORE_DAYS", "7"))
 
+PROB_TEMPERATURE = float(os.getenv("PROB_TEMPERATURE", "1.35"))
+PROB_MATH_MARGIN = float(os.getenv("PROB_MATH_MARGIN", "0.07"))
+GLOBAL_SOFT_ALPHA = float(os.getenv("GLOBAL_SOFT_ALPHA", "0.70"))
+
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     out: List[float] = []
     for tok in (env_val or "").split(","):
@@ -841,6 +845,13 @@ def _require_admin() -> None:
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
+def _temp_scale(p: float, T: float) -> float:
+    # Temperature scaling in probability space: logit(p)/T → sigmoid
+    import math
+    p = max(1e-12, min(1-1e-12, float(p)))
+    z = math.log(p/(1-p)) / max(1e-6, float(T))
+    return 1/(1+math.exp(-z))
+
 def _ou_n_needed_over(goals_sum: int, line: float) -> int:
     # how many goals needed to finish above the line
     import math
@@ -1039,6 +1050,38 @@ def telegram_webhook(secret: str):
     except Exception as e:
         logger.warning("telegram webhook parse error: %s", e)
     return jsonify({"ok": True})
+
+@app.route("/admin/calibration", methods=["GET"])
+def http_calibration():
+    _require_admin()
+    days = int(request.args.get("days","2"))
+    start = int(time.time()) - days*24*3600
+    with db_conn() as conn:
+        rows = conn.execute("""
+          SELECT t.market, t.suggestion, t.confidence, r.final_goals_h, r.final_goals_a, r.btts_yes
+          FROM tips t
+          LEFT JOIN match_results r ON r.match_id = t.match_id
+          WHERE t.created_ts >= %s AND t.suggestion<>'HARVEST' AND t.sent_ok=1
+        """,(start,)).fetchall()
+    # bucket by deciles of displayed confidence
+    buckets = {i: {"n":0,"wins":0} for i in range(10)}  # 0:[0-10), 9:[90-100]
+    def bucket_idx(pct: float)->int:
+        return max(0, min(9, int(float(pct)//10)))
+    graded_total = 0
+    for (market, sugg, conf, gh, ga, btts) in rows:
+        out = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
+        if out is None:
+            continue
+        graded_total += 1
+        b = bucket_idx(float(conf))
+        buckets[b]["n"] += 1
+        buckets[b]["wins"] += 1 if out==1 else 0
+    curve = []
+    for b in range(10):
+        n=buckets[b]["n"]; w=buckets[b]["wins"]
+        obs = (100.0*w/n) if n else None
+        curve.append({"bin": f"{b*10}-{b*10+10}", "n": n, "observed_win_pct": round(obs,1) if obs is not None else None})
+    return jsonify({"ok": True, "graded": graded_total, "deciles": curve})
 
 # ── Production scan
 def production_scan() -> Tuple[int, int]:
