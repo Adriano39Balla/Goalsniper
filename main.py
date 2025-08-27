@@ -81,6 +81,20 @@ PROB_TEMPERATURE = float(os.getenv("PROB_TEMPERATURE", "1.35"))
 PROB_MATH_MARGIN = float(os.getenv("PROB_MATH_MARGIN", "0.07"))
 GLOBAL_SOFT_ALPHA = float(os.getenv("GLOBAL_SOFT_ALPHA", "0.70"))
 
+SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "20"))     # live scan cadence
+BACKFILL_EVERY_MIN     = int(os.getenv("BACKFILL_EVERY_MIN", "15"))    # how often we fetch finished results
+BACKFILL_WINDOW_HOURS  = int(os.getenv("BACKFILL_WINDOW_HOURS", "36")) # how far back we look for FT results
+
+TRAIN_ENABLE           = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
+TRAIN_HOUR_UTC         = int(os.getenv("TRAIN_HOUR_UTC", "2"))
+TRAIN_MINUTE_UTC       = int(os.getenv("TRAIN_MINUTE_UTC", "12"))
+
+DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
+DAILY_ACCURACY_HOUR    = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
+DAILY_ACCURACY_MINUTE  = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
+
+TZ_UTC = ZoneInfo("UTC")
+
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     out: List[float] = []
     for tok in (env_val or "").split(","):
@@ -927,25 +941,6 @@ def _apply_early_conf_cap(prob_pct: float, minute: int) -> float:
     lo = max(0.0, min(100.0, float(EARLY_CONF_CAP_LO)))
     cap = lo + (100.0 - lo) * (minute / m)
     return min(prob_pct, cap)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FULL AUTOMATION: harvest + backfill + train + digest + scheduler bootstrap
-# ─────────────────────────────────────────────────────────────────────────────
-
-# === Env knobs (safe defaults) ===
-SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "20"))     # live scan cadence
-BACKFILL_EVERY_MIN     = int(os.getenv("BACKFILL_EVERY_MIN", "15"))    # how often we fetch finished results
-BACKFILL_WINDOW_HOURS  = int(os.getenv("BACKFILL_WINDOW_HOURS", "36")) # how far back we look for FT results
-
-TRAIN_ENABLE           = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
-TRAIN_HOUR_UTC         = int(os.getenv("TRAIN_HOUR_UTC", "2"))
-TRAIN_MINUTE_UTC       = int(os.getenv("TRAIN_MINUTE_UTC", "12"))
-
-DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
-DAILY_ACCURACY_HOUR    = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
-DAILY_ACCURACY_MINUTE  = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
-
-TZ_UTC = ZoneInfo("UTC")
 
 
 # === HARVEST hook (store a snapshot even if we don’t send a tip) ===
