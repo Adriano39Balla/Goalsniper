@@ -1,0 +1,4 @@
+# Procfile (must be named exactly "Procfile" without extension)
+
+# Recommended: run via Gunicorn in production
+web: gunicorn main:app --log-level=info --workers=1 --threads=2 --timeout 120
