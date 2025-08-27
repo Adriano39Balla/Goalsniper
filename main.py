@@ -63,6 +63,11 @@ DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") no
 DAILY_ACCURACY_HOUR = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
 DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
+TIP_MIN_MINUTE = int(os.getenv("TIP_MIN_MINUTE", "8")) 
+EARLY_CONF_CAP_ENABLE = os.getenv("EARLY_CONF_CAP_ENABLE", "1") not in ("0","false","False","no","
+EARLY_CONF_CAP_MINUTE = int(os.getenv("EARLY_CONF_CAP_MINUTE", "15"))  
+EARLY_CONF_CAP_LO = float(os.getenv("EARLY_CONF_CAP_LO", "70.0"))
+
 # ── Autonomous mode / policy tuning
 AUTO_TUNE_ENABLE = os.getenv("AUTO_TUNE_ENABLE", "1") not in ("0","false","False","no","NO")
 TARGET_PRECISION = float(os.getenv("TARGET_PRECISION", "0.60"))   # aim precision per market
@@ -836,6 +841,22 @@ def _require_admin() -> None:
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
+def _apply_early_conf_cap(prob_pct: float, minute: int) -> float:
+    """
+    Linearly cap displayed confidence early-game to avoid unrealistic 90%+ at 1'.
+    At 0': cap = EARLY_CONF_CAP_LO (e.g., 70%)
+    At EARLY_CONF_CAP_MINUTE or later: cap = 100%
+    Between: linear interpolation.
+    """
+    if not EARLY_CONF_CAP_ENABLE:
+        return prob_pct
+    m = max(1, int(EARLY_CONF_CAP_MINUTE))
+    if minute >= m:
+        return prob_pct
+    lo = max(0.0, min(100.0, float(EARLY_CONF_CAP_LO)))
+    cap = lo + (100.0 - lo) * (minute / m)
+    return min(prob_pct, cap)
+
 # ── Flask endpoints
 @app.route("/")
 def root():
@@ -1035,6 +1056,8 @@ def production_scan() -> Tuple[int, int]:
                 minute = int(feat.get("minute", 0))
                 if not stats_coverage_ok(feat, minute):
                     continue
+                if minute < TIP_MIN_MINUTE:
+                    continue
 
                 # HARVEST snapshots for training (rate-limit to every ~3 min by minute%3)
                 if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
@@ -1117,8 +1140,9 @@ def production_scan() -> Tuple[int, int]:
 
                     created_ts = base_now + idx
                     prob_pct = round(prob * 100.0, 1)
+                    prob_pct = _apply_early_conf_cap(prob_pct, minute)
                     if prob_pct >= 100.0: prob_pct = DISPLAY_MAX_PCT
-                    if prob_pct <= 0.0: prob_pct = DISPLAY_MIN_PCT
+                    if prob_pct <= 0.0:  prob_pct = DISPLAY_MIN_PCT
 
                     with db_conn() as conn2:
                         conn2.execute(
