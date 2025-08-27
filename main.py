@@ -841,6 +841,22 @@ def _require_admin() -> None:
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
+def _ou_n_needed_over(goals_sum: int, line: float) -> int:
+    # how many goals needed to finish above the line
+    import math
+    return max(0, int(math.floor(line + 1e-9) + 1) - int(goals_sum))
+
+def _ou_over_already_won(goals_sum: int, line: float) -> bool:
+    return _ou_n_needed_over(goals_sum, line) <= 0
+
+def _ou_under_already_lost(goals_sum: int, line: float) -> bool:
+    # under X.5 is already lost when goals_sum >= ceil(line+epsilon)
+    import math
+    return int(goals_sum) >= int(math.floor(line + 1e-9) + 1)
+
+def _btts_decided(gh: int, ga: int) -> bool:
+    return (gh > 0 and ga > 0)  # BTTS:Yes already true; also BTTS:No impossible
+
 def _apply_early_conf_cap(prob_pct: float, minute: int) -> float:
     """
     Linearly cap displayed confidence early-game to avoid unrealistic 90%+ at 1'.
@@ -1073,7 +1089,15 @@ def production_scan() -> Tuple[int, int]:
                 candidates: List[Tuple[str, str, float]] = []
 
                 # O/U lines (math+ML blend or ML-only per ONLY_MODEL_MODE)
+                goals_sum_now = int(feat.get("goals_sum", 0))
                 for line in OU_LINES:
+                    # Skip trivial/decided cases
+                    if _ou_over_already_won(goals_sum_now, line):
+                        continue  # Over already true; don't tip
+                    if _ou_under_already_lost(goals_sum_now, line):
+                        # Under already impossible; no point scoring probabilities
+                        pass  # we'll still compute p_over for Over side; Under is skipped below
+
                     p_over_math = ou_over_probability(feat, line, TOTAL_MATCH_MINUTES)
                     mdl_line = _load_ou_model_for_line(line)
                     if mdl_line:
@@ -1085,35 +1109,44 @@ def production_scan() -> Tuple[int, int]:
 
                     market_name = f"Over/Under {_fmt_line(line)}"
                     thr_ou = _get_market_threshold(market_name)
+
+                    # Over side (only if not already won)
                     if p_over * 100.0 >= thr_ou:
                         prob_adj = p_over * _market_score(market_name)
                         candidates.append((market_name, f"Over {_fmt_line(line)} Goals", prob_adj))
 
-                    if minute <= UNDER_SUPPRESS_AFTER_MIN:
-                        p_under = _soften_final_prob(1.0 - p_over)
-                        if p_under * 100.0 >= thr_ou:
-                            prob_adj = p_under * _market_score(market_name)
-                            candidates.append((market_name, f"Under {_fmt_line(line)} Goals", prob_adj))
+                    # Under side: skip if already impossible or late suppress; otherwise consider
+                    if minute <= UNDER_SUPPRESS_AFTER_MIN and not _ou_under_already_lost(goals_sum_now, line):
+              p_under = _soften_final_prob(1.0 - p_over)
+        if p_under * 100.0 >= thr_ou:
+            prob_adj = p_under * _market_score(market_name)
+            candidates.append((market_name, f"Under {_fmt_line(line)} Goals", prob_adj))
 
                 # BTTS
-                p_btts_math = btts_yes_probability(feat, TOTAL_MATCH_MINUTES)
-                mdl_btts = load_model_from_settings("BTTS_YES")
-                if mdl_btts:
-                    p_btts_ml = _score_prob(feat, mdl_btts)
-                    p_btts = BLEND_ML_WEIGHT * p_btts_ml + BLEND_MATH_WEIGHT * p_btts_math
-                else:
-                    p_btts = p_btts_math
-                p_btts = _soften_final_prob(p_btts)
+                gh_now = int(feat.get("goals_h", 0))
+                ga_now = int(feat.get("goals_a", 0))
 
-                thr_btts = _get_market_threshold("BTTS")
-                if not (minute >= BTTS_LATE_MINUTE and (feat.get("goals_h", 0) == 0 or feat.get("goals_a", 0) == 0)):
-                    if p_btts * 100.0 >= thr_btts:
-                        prob_adj = p_btts * _market_score("BTTS")
-                        candidates.append(("BTTS", "BTTS: Yes", prob_adj))
-                p_btts_no = _soften_final_prob(1.0 - p_btts)
-                if minute <= UNDER_SUPPRESS_AFTER_MIN and p_btts_no * 100.0 >= thr_btts:
-                    prob_adj = p_btts_no * _market_score("BTTS")
-                    candidates.append(("BTTS", "BTTS: No", prob_adj))
+                # If BTTS is already decided (both scored), skip BTTS tips entirely
+                if not _btts_decided(gh_now, ga_now):
+                    p_btts_math = btts_yes_probability(feat, TOTAL_MATCH_MINUTES)
+                    mdl_btts = load_model_from_settings("BTTS_YES")
+                    if mdl_btts:
+                        p_btts_ml = _score_prob(feat, mdl_btts)
+                        p_btts = BLEND_ML_WEIGHT * p_btts_ml + BLEND_MATH_WEIGHT * p_btts_math
+                    else:
+                        p_btts = p_btts_math
+                    p_btts = _soften_final_prob(p_btts)
+
+                    thr_btts = _get_market_threshold("BTTS")
+                    if not (minute >= BTTS_LATE_MINUTE and (gh_now == 0 or ga_now == 0)):
+                        if p_btts * 100.0 >= thr_btts:
+                            prob_adj = p_btts * _market_score("BTTS")
+                            candidates.append(("BTTS", "BTTS: Yes", prob_adj))
+
+                    p_btts_no = _soften_final_prob(1.0 - p_btts)
+                    if minute <= UNDER_SUPPRESS_AFTER_MIN and p_btts_no * 100.0 >= thr_btts:
+                        prob_adj = p_btts_no * _market_score("BTTS")
+                        candidates.append(("BTTS", "BTTS: No", prob_adj))
 
                 # 1X2 (pick only best side above threshold)
                 p_home, p_draw, p_away = wld_probabilities(feat, TOTAL_MATCH_MINUTES)
