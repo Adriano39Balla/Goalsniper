@@ -1266,35 +1266,78 @@ def main():
     init_db()
     mode = "HARVEST" if HARVEST_MODE else "PRODUCTION"
     logger.info(f"🤖 Robi Superbrain starting in {mode} mode.")
+
     scheduler = BackgroundScheduler()
+
+    # 24/7 loop (Berlin time)
     if HARVEST_MODE:
-        scheduler.add_job(harvest_scan, CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")),
-                          id="harvest", replace_existing=True)
-        scheduler.add_job(backfill_results_from_snapshots, "interval", minutes=15,
-                          id="backfill", replace_existing=True)
+        scheduler.add_job(
+            harvest_scan,
+            CronTrigger(minute="*/10", timezone=ZoneInfo("Europe/Berlin")),
+            id="harvest", replace_existing=True
+        )
+        scheduler.add_job(
+            backfill_results_from_snapshots,
+            "interval", minutes=15,
+            id="backfill", replace_existing=True
+        )
         logger.info("⛏️ Running in HARVEST mode.")
     else:
-        scheduler.add_job(production_scan, CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
-                          id="production_scan", replace_existing=True)
+        scheduler.add_job(
+            production_scan,
+            CronTrigger(minute="*/5", timezone=ZoneInfo("Europe/Berlin")),
+            id="production_scan", replace_existing=True
+        )
         logger.info("🎯 Running in PRODUCTION mode.")
-    scheduler.add_job(train_models, CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
-                      id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True)
-    scheduler.add_job(nightly_digest_job, CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
-                      id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True)
+
+    # Nightly training & digest (03:00 / 03:02 Berlin)
+    scheduler.add_job(
+        train_models,
+        CronTrigger(hour=3, minute=0, timezone=ZoneInfo("Europe/Berlin")),
+        id="train", replace_existing=True, misfire_grace_time=3600, coalesce=True
+    )
+    scheduler.add_job(
+        nightly_digest_job,
+        CronTrigger(hour=3, minute=2, timezone=ZoneInfo("Europe/Berlin")),
+        id="digest", replace_existing=True, misfire_grace_time=3600, coalesce=True
+    )
+
+    # Daily accuracy digest (enable/disable via env)  ← MOVED ABOVE app.run()
+    if DAILY_ACCURACY_DIGEST_ENABLE:
+        scheduler.add_job(
+            daily_accuracy_digest_job,
+            CronTrigger(
+                hour=DAILY_ACCURACY_HOUR,
+                minute=DAILY_ACCURACY_MINUTE,
+                timezone=ZoneInfo("Europe/Berlin")
+            ),
+            id="daily_accuracy_digest",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+        logger.info(
+            "📊 Daily accuracy digest scheduled at %02d:%02d Europe/Berlin.",
+            DAILY_ACCURACY_HOUR, DAILY_ACCURACY_MINUTE
+        )
+
+    # MOTD — default morning 09:00 unless MOTD_HOUR/MOTD_MINUTE set
     if MOTD_PREDICT:
         motd_hour = int(os.getenv("MOTD_HOUR", "9"))
         motd_minute = int(os.getenv("MOTD_MINUTE", "0"))
-        scheduler.add_job(motd_announce, CronTrigger(hour=motd_hour, minute=motd_minute, timezone=ZoneInfo("Europe/Berlin")),
-                          id="motd_announce", replace_existing=True, misfire_grace_time=3600, coalesce=True)
-        logger.info(f"🌟 MOTD daily announcement at {motd_hour:02d}:{motd_minute:02d} Europe/Berlin.")
+        scheduler.add_job(
+            motd_announce,
+            CronTrigger(hour=motd_hour, minute=motd_minute, timezone=ZoneInfo("Europe/Berlin")),
+            id="motd_announce", replace_existing=True, misfire_grace_time=3600, coalesce=True
+        )
+        logger.info(
+            "🌟 MOTD daily announcement at %02d:%02d Europe/Berlin.",
+            motd_hour, motd_minute
+        )
+
     scheduler.start()
+
+    # Start web server (blocks, but scheduler keeps running in background thread)
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 
-    if DAILY_ACCURACY_DIGEST_ENABLE:
-        scheduler.add_job(daily_accuracy_digest_job,
-            CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=ZoneInfo("Europe/Berlin")),
-            id="daily_accuracy_digest", replace_existing=True, misfire_grace_time=3600, coalesce=True)
-
-if __name__ == "__main__":
-    main()
