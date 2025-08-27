@@ -1,7 +1,12 @@
 # file: train_models.py
 """
-Postgres-only training with Platt calibration.
-Saves models as: model_latest:BTTS_YES, model_latest:OU_{line} (+ model:* mirrors).
+Postgres-only training with Platt calibration + auto-thresholding.
+Saves models:
+  - model_latest:BTTS_YES
+  - model_latest:OU_{line}   (also mirrors as model:*)
+Also writes per-market decision thresholds (percent) into settings:
+  - conf_threshold:BTTS
+  - conf_threshold:Over/Under {line}
 """
 
 import argparse
@@ -14,7 +19,13 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, accuracy_score, log_loss
+from sklearn.metrics import (
+    brier_score_loss,
+    accuracy_score,
+    log_loss,
+    precision_score,
+    f1_score,
+)
 from sklearn.model_selection import train_test_split
 
 import psycopg2
@@ -41,6 +52,8 @@ FEATURES: List[str] = [
 EPS = 1e-6
 
 
+# ─────────────────────────── DB helpers ─────────────────────────── #
+
 def _connect(db_url: str):
     if not db_url:
         raise SystemExit("DATABASE_URL must be set.")
@@ -59,6 +72,15 @@ def _exec(conn, sql: str, params: Tuple) -> None:
     with conn.cursor() as cur:
         cur.execute(sql, params)
 
+
+def _set_setting(conn, key: str, value: str) -> None:
+    _exec(conn,
+          "INSERT INTO settings(key,value) VALUES(%s,%s) "
+          "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+          (key, value))
+
+
+# ─────────────────────────── Data load ─────────────────────────── #
 
 def load_data(conn, min_minute: int = 15) -> pd.DataFrame:
     q = """
@@ -129,6 +151,8 @@ def load_data(conn, min_minute: int = 15) -> pd.DataFrame:
     return df
 
 
+# ─────────────────────────── Model utils ─────────────────────────── #
+
 def fit_lr_safe(X: np.ndarray, y: np.ndarray) -> Optional[LogisticRegression]:
     if len(np.unique(y)) < 2:
         return None
@@ -171,6 +195,77 @@ def _fmt_line(line: float) -> str:
     return f"{line}".rstrip("0").rstrip(".")
 
 
+# ─────────────────────────── Thresholding ─────────────────────────── #
+
+def _percent(x: float) -> float:
+    return float(x) * 100.0
+
+
+def _grid_thresholds(lo=0.50, hi=0.95, step=0.005) -> np.ndarray:
+    # probabilities domain (0..1)
+    return np.arange(lo, hi + 1e-9, step)
+
+
+def _pick_threshold_for_target_precision(
+    y_true: np.ndarray,
+    p_cal: np.ndarray,
+    target_precision: float,
+    min_preds: int = 25,
+    default_threshold: float = 0.65,
+) -> float:
+    """
+    Search for smallest threshold that achieves >= target_precision with enough positives.
+    Fallback to best F1, then best accuracy, then default.
+    Returns a threshold in probability space (0..1).
+    """
+    y = y_true.astype(int)
+    p = np.asarray(p_cal).astype(float)
+    best_t = None
+    candidates = _grid_thresholds(0.5, 0.95, 0.005)
+
+    # 1) Try to meet target precision
+    feasible: List[Tuple[float, float, int]] = []  # (thr, precision, n_pred)
+    for t in candidates:
+        pred = (p >= t).astype(int)
+        n_pred = int(pred.sum())
+        if n_pred < min_preds:
+            continue
+        prec = precision_score(y, pred, zero_division=0)
+        if prec >= target_precision:
+            feasible.append((t, float(prec), n_pred))
+    if feasible:
+        # pick the smallest t (more recall) among those meeting target; tie-break by higher precision
+        feasible.sort(key=lambda z: (z[0], -z[1]))
+        best_t = feasible[0][0]
+
+    # 2) Fallback: maximize F1
+    if best_t is None:
+        best_f1 = -1.0
+        for t in candidates:
+            pred = (p >= t).astype(int)
+            n_pred = int(pred.sum())
+            if n_pred < min_preds:
+                continue
+            f1 = f1_score(y, pred, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_t = float(t)
+
+    # 3) Fallback: maximize accuracy
+    if best_t is None:
+        best_acc = -1.0
+        for t in candidates:
+            pred = (p >= t).astype(int)
+            acc = accuracy_score(y, pred)
+            if acc > best_acc:
+                best_acc = acc
+                best_t = float(t)
+
+    return float(best_t if best_t is not None else default_threshold)
+
+
+# ─────────────────────────── Training entry ─────────────────────────── #
+
 def train_models(
     db_url: Optional[str] = None,
     min_minute: Optional[int] = None,
@@ -183,6 +278,7 @@ def train_models(
     min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
     test_size = float(test_size if test_size is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
 
+    # Markets to train
     ou_lines_env = os.getenv("OU_TRAIN_LINES", "1.5,2.5,3.5")
     ou_lines: List[float] = []
     for t in ou_lines_env.split(","):
@@ -196,7 +292,13 @@ def train_models(
     if not ou_lines:
         ou_lines = [1.5, 2.5, 3.5]
 
-    summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "features": FEATURES}
+    # Thresholding policy
+    target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
+    min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
+    min_thresh = float(os.getenv("MIN_THRESH", "55"))
+    max_thresh = float(os.getenv("MAX_THRESH", "85"))
+
+    summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "features": FEATURES, "thresholds": {}}
 
     try:
         df = load_data(conn, min_minute)
@@ -212,21 +314,31 @@ def train_models(
         Xb_tr, Xb_te, yb_tr, yb_te = train_test_split(Xb, yb, test_size=test_size, random_state=42, stratify=strat_b)
         mb = fit_lr_safe(Xb_tr, yb_tr)
         if mb is not None:
-            p_te_b = mb.predict_proba(Xb_te)[:, 1]
-            a_b, b_b = fit_platt(yb_te, p_te_b)
-            p_te_b_cal = 1.0 / (1.0 + np.exp(-(a_b * _logit_vec(p_te_b) + b_b)))
+            p_te_b_raw = mb.predict_proba(Xb_te)[:, 1]
+            a_b, b_b = fit_platt(yb_te, p_te_b_raw)
+            p_te_b_cal = 1.0 / (1.0 + np.exp(-(a_b * _logit_vec(p_te_b_raw) + b_b)))
+            # metrics
             brier_b = float(brier_score_loss(yb_te, p_te_b_cal))
             acc_b = float(accuracy_score(yb_te, (p_te_b_cal >= 0.5).astype(int)))
             ll_b = float(log_loss(yb_te, p_te_b_cal, labels=[0, 1]))
             blob_btts = build_model_blob(mb, FEATURES, (a_b, b_b))
+            # save model
             for k in ("model_latest:BTTS_YES", "model:BTTS_YES"):
-                _exec(conn,
-                      "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                      "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                      (k, json.dumps(blob_btts)))
+                _set_setting(conn, k, json.dumps(blob_btts))
             summary["trained"]["BTTS_YES"] = True
             summary["metrics"]["BTTS_YES"] = {"brier": brier_b, "acc": acc_b, "logloss": ll_b,
                                               "n_test": int(len(yb_te)), "prevalence": float(yb.mean())}
+            # derive threshold for BTTS market
+            thr_btts_prob = _pick_threshold_for_target_precision(
+                y_true=yb_te,
+                p_cal=p_te_b_cal,
+                target_precision=target_precision,
+                min_preds=min_preds,
+                default_threshold=0.65,
+            )
+            thr_btts_pct = float(np.clip(_percent(thr_btts_prob), min_thresh, max_thresh))
+            _set_setting(conn, "conf_threshold:BTTS", f"{thr_btts_pct:.2f}")
+            summary["thresholds"]["BTTS"] = thr_btts_pct
         else:
             summary["trained"]["BTTS_YES"] = False
 
@@ -245,37 +357,45 @@ def train_models(
             if mo is None:
                 summary["trained"][name] = False
                 continue
-            p_te_o = mo.predict_proba(Xo_te)[:, 1]
-            a_o, b_o = fit_platt(yo_te, p_te_o)
-            p_te_o_cal = 1.0 / (1.0 + np.exp(-(a_o * _logit_vec(p_te_o) + b_o)))
+            p_te_o_raw = mo.predict_proba(Xo_te)[:, 1]
+            a_o, b_o = fit_platt(yo_te, p_te_o_raw)
+            p_te_o_cal = 1.0 / (1.0 + np.exp(-(a_o * _logit_vec(p_te_o_raw) + b_o)))
             brier_o = float(brier_score_loss(yo_te, p_te_o_cal))
             acc_o = float(accuracy_score(yo_te, (p_te_o_cal >= 0.5).astype(int)))
             ll_o = float(log_loss(yo_te, p_te_o_cal, labels=[0, 1]))
             blob_o = build_model_blob(mo, FEATURES, (a_o, b_o))
+            # save model
             for k in (f"model_latest:{name}", f"model:{name}"):
-                _exec(conn,
-                      "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                      "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                      (k, json.dumps(blob_o)))
+                _set_setting(conn, k, json.dumps(blob_o))
             if abs(line - 2.5) < 1e-6:
                 for k in ("model_latest:O25", "model:O25"):
-                    _exec(conn,
-                          "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                          "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                          (k, json.dumps(blob_o)))
+                    _set_setting(conn, k, json.dumps(blob_o))
             summary["trained"][name] = True
             summary["metrics"][name] = {"brier": brier_o, "acc": acc_o, "logloss": ll_o,
                                         "n_test": int(len(yo_te)), "prevalence": float(yo.mean())}
 
+            # threshold per Over/Under {line} market
+            market_name = f"Over/Under {_fmt_line(line)}"
+            thr_ou_prob = _pick_threshold_for_target_precision(
+                y_true=yo_te,
+                p_cal=p_te_o_cal,
+                target_precision=target_precision,
+                min_preds=min_preds,
+                default_threshold=0.65,
+            )
+            thr_ou_pct = float(np.clip(_percent(thr_ou_prob), min_thresh, max_thresh))
+            _set_setting(conn, f"conf_threshold:{market_name}", f"{thr_ou_pct:.2f}")
+            summary["thresholds"][market_name] = thr_ou_pct
+
+        # bundle metrics
         metrics_bundle = {
             "trained_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             **summary["metrics"],
             "features": FEATURES,
+            "thresholds": summary["thresholds"],
+            "target_precision": target_precision,
         }
-        _exec(conn,
-              "INSERT INTO settings(key,value) VALUES(%s,%s) "
-              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-              ("model_metrics_latest", json.dumps(metrics_bundle)))
+        _set_setting(conn, "model_metrics_latest", json.dumps(metrics_bundle))
         return summary
 
     except Exception as e:
@@ -287,6 +407,8 @@ def train_models(
         except Exception:
             pass
 
+
+# ─────────────────────────── CLI ─────────────────────────── #
 
 def _cli_main() -> None:
     ap = argparse.ArgumentParser()
