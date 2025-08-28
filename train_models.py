@@ -4,13 +4,12 @@ Postgres-only training with Platt calibration + auto-thresholding.
 Trains:
   • BTTS_YES (binary LR)
   • OU_{line} (binary LR for multiple lines)
-  • WLD (1X2) via one-vs-rest LR: WLD_HOME, WLD_DRAW, WLD_AWAY
+  • WLD (1X2) via one-vs-rest LR: WLD_HOME, WLD_AWAY
 
 Saves models to settings:
   model_latest:BTTS_YES
   model_latest:OU_{line}      (and O25 alias for 2.5)
   model_latest:WLD_HOME
-  model_latest:WLD_DRAW
   model_latest:WLD_AWAY
 (also mirrored as model:* keys)
 
@@ -314,7 +313,7 @@ def train_models(
     test_size = float(test_size if test_size is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
 
     # Markets to train
-    ou_lines_env = os.getenv("OU_TRAIN_LINES", "1.5,2.5,3.5")
+    ou_lines_env = os.getenv("OU_TRAIN_LINES", "2.5,3.5")
     ou_lines: List[float] = []
     for t in ou_lines_env.split(","):
         t = t.strip()
@@ -325,7 +324,7 @@ def train_models(
         except Exception:
             continue
     if not ou_lines:
-        ou_lines = [1.5, 2.5, 3.5]
+        ou_lines = [2.5, 3.5]
 
     # Threshold policy
     target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
@@ -420,7 +419,6 @@ def train_models(
         # Labels from final result
         gd = df["final_goals_diff"].values.astype(int)
         y_home = (gd > 0).astype(int)
-        y_draw = (gd == 0).astype(int)
         y_away = (gd < 0).astype(int)
 
         def _fit_ovr(name: str, ybin: np.ndarray):
@@ -447,7 +445,6 @@ def train_models(
 
         wld_models_ok = True
         res_h = _fit_ovr("WLD_HOME", y_home)
-        res_d = _fit_ovr("WLD_DRAW", y_draw)
         res_a = _fit_ovr("WLD_AWAY", y_away)
         if not (res_h and res_d and res_a):
             wld_models_ok = False
