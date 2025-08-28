@@ -126,9 +126,11 @@ DISPLAY_MAX_PCT = float(os.getenv("DISPLAY_MAX_PCT", "99.0"))
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Draw", "Away Win"}
 for ln in OU_LINES:
     s = f"{ln}".rstrip("0").rstrip(".")
-    ALLOWED_SUGGESTIONS.add(f"Over {s} Goals")
-    ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
-    if os.getenv("BLOCK_DRAW", "0") not in ("0","false","False","no","NO"):
+    
+ALLOWED_SUGGESTIONS.add(f"Over {s} Goals")
+ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
+    
+if os.getenv("BLOCK_DRAW", "0") not in ("0","false","False","no","NO"):
     ALLOWED_SUGGESTIONS.discard("Draw")
 
 TRAIN_ENABLE = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
