@@ -128,6 +128,8 @@ for ln in OU_LINES:
     s = f"{ln}".rstrip("0").rstrip(".")
     ALLOWED_SUGGESTIONS.add(f"Over {s} Goals")
     ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
+    if os.getenv("BLOCK_DRAW", "0") not in ("0","false","False","no","NO"):
+    ALLOWED_SUGGESTIONS.discard("Draw")
 
 TRAIN_ENABLE = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_MIN_MINUTE = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
