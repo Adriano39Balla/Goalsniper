@@ -676,6 +676,54 @@ def _require_admin() -> None:
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
+# ── Match of the Day (MOTD) from already-sent tips
+MOTD_PREDICT = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
+MOTD_HOUR    = int(os.getenv("MOTD_HOUR", "19"))
+MOTD_MINUTE  = int(os.getenv("MOTD_MINUTE", "15"))
+MOTD_CONF_MIN = float(os.getenv("MOTD_CONF_MIN", "70"))
+try:
+    MOTD_LEAGUE_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS","").split(",")) if x.strip().isdigit()]
+except Exception:
+    MOTD_LEAGUE_IDS = []
+
+def _pick_motd_window_berlin() -> tuple[int,int]:
+    """Yesterday [00:00, 24:00) in Berlin time."""
+    now_local = datetime.now(BERLIN_TZ)
+    y_start = (now_local - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    y_end = y_start + timedelta(days=1)
+    return int(y_start.timestamp()), int(y_end.timestamp())
+
+def _format_motd_row(r) -> str:
+    home, away, league, market, sugg, conf, minute, score = r
+    return (
+        "🏅 <b>Match of the Day</b>\n"
+        f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
+        f"🏆 <b>League:</b> {escape(league)}\n"
+        f"🕒 <b>Minute at tip:</b> {int(minute)}'  |  <b>Score:</b> {escape(score)}\n"
+        f"<b>Tip:</b> {escape(sugg)} ({escape(market)})\n"
+        f"📈 <b>Confidence:</b> {float(conf):.1f}%"
+    )
+
+def send_match_of_the_day() -> bool:
+    if not MOTD_PREDICT:
+        return False
+    start_ts, end_ts = _pick_motd_window_berlin()
+    where = ["t.created_ts >= %s", "t.created_ts < %s", "t.sent_ok=1", "t.suggestion <> 'HARVEST'", "t.confidence >= %s"]
+    params = [start_ts, end_ts, float(MOTD_CONF_MIN)]
+    if MOTD_LEAGUE_IDS:
+        where.append("t.league_id = ANY(%s)")
+        params.append(MOTD_LEAGUE_IDS)
+    sql = (
+        "SELECT t.home, t.away, t.league, t.market, t.suggestion, t.confidence, t.minute, t.score_at_tip "
+        "FROM tips t WHERE " + " AND ".join(where) +
+        " ORDER BY t.confidence DESC, t.created_ts ASC LIMIT 1"
+    )
+    with db_conn() as conn:
+        row = conn.execute(sql, tuple(params)).fetchone()
+    if not row:
+        return send_telegram("🏅 Match of the Day: no eligible tips yesterday.")
+    return send_telegram(_format_motd_row(row))
+
 # ────────────────────────────────
 # Core production scan (ML only)
 # ────────────────────────────────
@@ -863,6 +911,15 @@ def _start_scheduler_once() -> None:
             sched.add_job(daily_accuracy_digest,
                           CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=TZ_UTC),
                           id="daily_digest", max_instances=1, coalesce=True)
+        # Match of the Day (Berlin time)
+        if MOTD_PREDICT:
+            sched.add_job(
+                send_match_of_the_day,
+                CronTrigger(hour=MOTD_HOUR, minute=MOTD_MINUTE, timezone=BERLIN_TZ),
+                id="motd_daily",
+                max_instances=1,
+                coalesce=True
+            )
         # nightly training
         if TRAIN_ENABLE:
             sched.add_job(lambda: send_telegram("🤖 Training started.") or train_models(),
