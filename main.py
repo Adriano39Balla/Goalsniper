@@ -2,7 +2,7 @@
 Postgres-only Flask backend for live football tips — FULL AI MODE.
 Pure ML scoring (no math fallbacks), Platt-calibrated models from DB.
 Markets: O/U (1.5 removed), BTTS (Yes/No), 1X2 (Draw blocked at send-time).
-Automation: harvest snapshots, nightly train, periodic backfill, daily digest, MOTD.
+Automation: harvest snapshots, nightly train, periodic backfill, daily digest, MOTD, daily auto-tune.
 Scan interval: 5 minutes.
 """
 
@@ -16,7 +16,7 @@ from html import escape
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
-from flask import Flask, jsonify, request, abort, Response
+from flask import Flask, jsonify, request, abort
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -28,45 +28,55 @@ try:
 except Exception:
     pass
 
-# ────────────────────────────────
-# App / logging
-# ────────────────────────────────
+# ── Logging / app
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# ────────────────────────────────
-# Env / constants (lean)
-# ────────────────────────────────
+# ── ENV
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY = os.getenv("API_KEY")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY            = os.getenv("API_KEY")
+ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY")
+WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
-CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "65"))  # default threshold if none per-market
-MAX_TIPS_PER_SCAN = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
+CONF_THRESHOLD   = float(os.getenv("CONF_THRESHOLD", "65"))
+MAX_TIPS_PER_SCAN= int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
-TIP_MIN_MINUTE = int(os.getenv("TIP_MIN_MINUTE", "8"))
+TIP_MIN_MINUTE   = int(os.getenv("TIP_MIN_MINUTE", "8"))
+SCAN_INTERVAL_SEC= int(os.getenv("SCAN_INTERVAL_SEC", "300"))  # 5 min
 
-# Scan every 5 minutes in full AI mode
-SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
-
-# Harvest & training
-HARVEST_MODE = os.getenv("HARVEST_MODE", "1") not in ("0","false","False","no","NO")
-TRAIN_ENABLE = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
-TRAIN_HOUR_UTC = int(os.getenv("TRAIN_HOUR_UTC", "2"))
+HARVEST_MODE     = os.getenv("HARVEST_MODE", "1") not in ("0","false","False","no","NO")
+TRAIN_ENABLE     = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
+TRAIN_HOUR_UTC   = int(os.getenv("TRAIN_HOUR_UTC", "2"))
 TRAIN_MINUTE_UTC = int(os.getenv("TRAIN_MINUTE_UTC", "12"))
 TRAIN_MIN_MINUTE = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 
-# Backfill & digest
-BACKFILL_EVERY_MIN = int(os.getenv("BACKFILL_EVERY_MIN", "15"))
-BACKFILL_WINDOW_HOURS = int(os.getenv("BACKFILL_WINDOW_HOURS", "36"))
-DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
-DAILY_ACCURACY_HOUR = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
-DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
+BACKFILL_EVERY_MIN     = int(os.getenv("BACKFILL_EVERY_MIN", "15"))
+BACKFILL_WINDOW_HOURS  = int(os.getenv("BACKFILL_WINDOW_HOURS", "36"))
+DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO"))
+DAILY_ACCURACY_HOUR    = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
+DAILY_ACCURACY_MINUTE  = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
-# Markets / lines: remove 1.5
+# Auto-tune thresholds
+AUTO_TUNE_ENABLE   = os.getenv("AUTO_TUNE_ENABLE","1") not in ("0","false","False","no","NO")
+TARGET_PRECISION   = float(os.getenv("TARGET_PRECISION","0.60"))
+TUNE_STEP          = float(os.getenv("TUNE_STEP","2.5"))        # pct points
+MIN_THRESH_CLAMP   = float(os.getenv("MIN_THRESH","55"))
+MAX_THRESH_CLAMP   = float(os.getenv("MAX_THRESH","85"))
+TUNE_LOOKBACK_DAYS = int(os.getenv("TUNE_LOOKBACK_DAYS","1"))
+
+# League blocking
+BLOCK_YOUTH_FRIENDLY = os.getenv("BLOCK_YOUTH_FRIENDLY", "1") not in ("0","false","False","no","NO")
+BLOCK_PATTERNS_RAW   = (os.getenv("LEAGUE_BLOCK_PATTERNS") or
+                        "Friendly,Friendlies,U19,U20,U21,U18,U23,Youth,Reserve,Res.,B Team,B-Team,Development,Academy,Testimonial,All Stars").split(",")
+LEAGUE_BLOCK_PATTERNS = [p.strip().lower() for p in BLOCK_PATTERNS_RAW if p.strip()]
+try:
+    LEAGUE_BLOCK_IDS = [int(x) for x in (os.getenv("LEAGUE_BLOCK_IDS","").split(",")) if x.strip().isdigit()]
+except Exception:
+    LEAGUE_BLOCK_IDS = []
+
+# Markets / lines
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     out: List[float] = []
     for tok in (env_val or "").split(","):
@@ -80,12 +90,12 @@ def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     return out or default
 
 OU_LINES: List[float] = _parse_lines(os.getenv("OU_LINES", "0.5,2.5,3.5"), [0.5, 2.5, 3.5])
-OU_LINES = [ln for ln in OU_LINES if abs(ln - 1.5) > 1e-6]  # ensure 1.5 is out
+OU_LINES = [ln for ln in OU_LINES if abs(ln - 1.5) > 1e-6]  # ensure 1.5 out
 
-TOTAL_MATCH_MINUTES = int(os.getenv("TOTAL_MATCH_MINUTES", "95"))
+TOTAL_MATCH_MINUTES   = int(os.getenv("TOTAL_MATCH_MINUTES", "95"))
 PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "2"))
 
-# Allowed suggestions — Draw removed
+# Allowed suggestions (no Draw)
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
 for _ln in OU_LINES:
     s = f"{_ln}".rstrip("0").rstrip(".")
@@ -104,22 +114,18 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES = {"1H","HT","2H","ET","BT","P"}
 
-# HTTP session
+# HTTP
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], respect_retry_after_header=True)
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
-# Caches
+# Caches / TZ
 STATS_CACHE: Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
-
-# Timezones
 TZ_UTC = ZoneInfo("UTC")
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
-# ────────────────────────────────
-# Optional import: trainer
-# ────────────────────────────────
+# Optional: trainer
 try:
     from train_models import train_models
 except Exception as _imp_err:
@@ -127,9 +133,7 @@ except Exception as _imp_err:
         logger.warning("train_models not available: %s", _imp_err)
         return {"ok": False, "reason": "train_models not available"}
 
-# ────────────────────────────────
-# DB adapter
-# ────────────────────────────────
+# ── DB adapter
 class PgCursor:
     def __init__(self, cur): self.cur = cur
     def fetchone(self): return self.cur.fetchone()
@@ -168,9 +172,7 @@ def set_setting(key: str, value: str) -> None:
             (key, value),
         )
 
-# ────────────────────────────────
-# Init DB
-# ────────────────────────────────
+# ── Init DB
 def init_db():
     with db_conn() as conn:
         conn.execute("""
@@ -217,9 +219,7 @@ def init_db():
             updated_ts    BIGINT
         )""")
 
-# ────────────────────────────────
-# Telegram
-# ────────────────────────────────
+# ── Telegram
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
@@ -235,9 +235,7 @@ def send_telegram(message: str) -> bool:
     except Exception:
         return False
 
-# ────────────────────────────────
-# API helpers
-# ────────────────────────────────
+# ── API helpers
 def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY:
         return None
@@ -271,6 +269,26 @@ def fetch_match_events(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     EVENTS_CACHE[fixture_id] = (now, evs or [])
     return evs
 
+# ── League blocking
+def _league_blocked(lg: Dict[str, Any]) -> bool:
+    if not BLOCK_YOUTH_FRIENDLY:
+        return False
+    try:
+        lid = int((lg or {}).get("id") or 0)
+        if lid and lid in set(LEAGUE_BLOCK_IDS):
+            return True
+        name = ((lg or {}).get("name") or "").lower()
+        country = ((lg or {}).get("country") or "").lower()
+        ltype = ((lg or {}).get("type") or "").lower()
+        hay = f"{name} {country} {ltype}"
+        for pat in LEAGUE_BLOCK_PATTERNS:
+            if pat and pat in hay:
+                return True
+    except Exception:
+        pass
+    return False
+
+# ── Live fixtures
 def fetch_live_matches() -> List[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"live": "all"})
     if not isinstance(js, dict):
@@ -278,6 +296,9 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     matches = js.get("response", []) or []
     out = []
     for m in matches:
+        lg = (m.get("league") or {}) or {}
+        if _league_blocked(lg):
+            continue
         status = (m.get("fixture", {}) or {}).get("status", {}) or {}
         elapsed = status.get("elapsed")
         short = (status.get("short") or "").upper()
@@ -291,9 +312,7 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
         out.append(m)
     return out
 
-# ────────────────────────────────
-# Feature extraction
-# ────────────────────────────────
+# ── Features
 def _num(v) -> float:
     try:
         if isinstance(v, str) and v.endswith("%"):
@@ -338,7 +357,7 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
         try:
             if (ev.get("type", "").lower() == "card"):
                 detail = (ev.get("detail", "") or "").lower()
-                if ("red" in detail) or ("second yellow" in detail):
+                if ("red" in detail) or ("second yellow" in detail"):
                     tname = (ev.get("team") or {}).get("name") or ""
                     if tname == home_name: red_h += 1
                     elif tname == away_name: red_a += 1
@@ -370,7 +389,6 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     }
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
-    """Require at least some stats once past REQUIRE_STATS_MINUTE (kept minimal)."""
     require_stats_minute = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
     require_fields = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
     if minute < require_stats_minute:
@@ -395,9 +413,7 @@ def _teams(m: Dict[str, Any]) -> Tuple[str, str]:
     t = (m.get("teams") or {}) or {}
     return (t.get("home", {}).get("name", ""), t.get("away", {}).get("name", ""))
 
-# ────────────────────────────────
-# ML model utilities (only)
-# ────────────────────────────────
+# ── ML model utils
 MODEL_KEYS_ORDER = ["model_v2:{name}", "model_latest:{name}", "model:{name}"]
 
 def _sigmoid(x: float) -> float:
@@ -446,7 +462,6 @@ def _calibrate(p: float, cal: Dict[str, Any]) -> float:
     a = float((cal or {}).get("a", 1.0)); b = float((cal or {}).get("b", 0.0))
     if method == "platt":
         return _sigmoid(a * _logit(p) + b)
-    # default: identity-like (a,b) on logit
     import math
     p = max(1e-12, min(1 - 1e-12, float(p)))
     z = math.log(p / (1.0 - p))
@@ -480,9 +495,7 @@ def _load_wld_models() -> Tuple[Optional[Dict], Optional[Dict], Optional[Dict]]:
         load_model_from_settings("WLD_AWAY"),
     )
 
-# ────────────────────────────────
-# Harvest
-# ────────────────────────────────
+# ── Harvest snapshot
 def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
     fx = m.get("fixture", {}) or {}; lg = m.get("league", {}) or {}
     fid = int(fx.get("id")); league_id = int(lg.get("id") or 0)
@@ -514,9 +527,7 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
             (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now),
         )
 
-# ────────────────────────────────
-# Tip outcome helpers (for digest/backfill)
-# ────────────────────────────────
+# ── Tip outcome (grading)
 def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     try:
         for tok in (s or "").split():
@@ -534,7 +545,6 @@ def _tip_outcome_for_result(suggestion: str, res: Dict[str, Any]) -> Optional[in
     total = gh + ga
     btts = int(res.get("btts_yes") or 0)
     s = (suggestion or "").strip()
-
     if s.startswith("Over") or s.startswith("Under"):
         line = _parse_ou_line_from_suggestion(s)
         if line is None:
@@ -554,9 +564,7 @@ def _tip_outcome_for_result(suggestion: str, res: Dict[str, Any]) -> Optional[in
     if s == "Draw":      return 1 if gh == ga else 0
     return None
 
-# ────────────────────────────────
-# Backfill & digest
-# ────────────────────────────────
+# ── Backfill + digest
 def _fixture_by_id(match_id: int) -> Optional[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"id": match_id})
     if not isinstance(js, dict):
@@ -584,7 +592,6 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
             """,
             (cutoff, max_rows),
         ).fetchall()
-
     for (mid,) in rows:
         try:
             fx = _fixture_by_id(int(mid))
@@ -619,11 +626,8 @@ def daily_accuracy_digest() -> Optional[str]:
     now_local = datetime.now(BERLIN_TZ)
     y_start = (now_local - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     y_end = y_start + timedelta(days=1)
-    y_start_ts = int(y_start.timestamp())
-    y_end_ts = int(y_end.timestamp())
-
+    y_start_ts = int(y_start.timestamp()); y_end_ts = int(y_end.timestamp())
     backfill_results_for_open_matches(max_rows=400)
-
     with db_conn() as conn:
         rows = conn.execute(
             """
@@ -637,21 +641,16 @@ def daily_accuracy_digest() -> Optional[str]:
             """,
             (y_start_ts, y_end_ts),
         ).fetchall()
-
     total = graded = wins = 0
     by_market: Dict[str, Dict[str, int]] = {}
-    for (mid, market, sugg, conf, cts, gh, ga, btts) in rows:
+    for (_mid, market, sugg, _conf, _cts, gh, ga, btts) in rows:
         res = {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts}
         out = _tip_outcome_for_result(sugg, res)
         if out is None:
             continue
-        total += 1
-        graded += 1
-        wins += 1 if out == 1 else 0
+        total += 1; graded += 1; wins += 1 if out == 1 else 0
         m = by_market.setdefault(market or "?", {"graded": 0, "wins": 0})
-        m["graded"] += 1
-        m["wins"] += 1 if out == 1 else 0
-
+        m["graded"] += 1; m["wins"] += 1 if out == 1 else 0
     if graded == 0:
         msg = "📊 Daily Digest\nNo graded tips for yesterday."
     else:
@@ -659,16 +658,14 @@ def daily_accuracy_digest() -> Optional[str]:
         lines = [f"📊 <b>Daily Digest</b> (yesterday, Berlin time)",
                  f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"]
         for mk, st in sorted(by_market.items()):
-            if st["graded"] == 0:
-                continue
+            if st["graded"] == 0: continue
             a = 100.0 * st["wins"] / st["graded"]
             lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} ({a:.1f}%)")
         msg = "\n".join(lines)
-
     send_telegram(msg)
     return msg
 
-# ── Match of the Day (MOTD): choose a FUTURE match (today) ─────────────────────
+# ── MOTD (future match today, with blocking)
 MOTD_PREDICT   = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
 MOTD_HOUR      = int(os.getenv("MOTD_HOUR", "19"))
 MOTD_MINUTE    = int(os.getenv("MOTD_MINUTE", "15"))
@@ -679,7 +676,6 @@ except Exception:
     MOTD_LEAGUE_IDS = []
 
 def _kickoff_berlin(utc_iso: str|None) -> str:
-    """Return 'HH:MM' Berlin time for a fixture's UTC ISO kickoff."""
     try:
         if not utc_iso:
             return "TBD"
@@ -689,7 +685,6 @@ def _kickoff_berlin(utc_iso: str|None) -> str:
         return "TBD"
 
 def _api_fixtures_for_date_utc(date_utc: datetime) -> list[dict]:
-    """Fetch fixtures for the given UTC date; filter to not-started (NS)."""
     js = _api_get(FOOTBALL_API_URL, {"date": date_utc.strftime("%Y-%m-%d")})
     if not isinstance(js, dict):
         return []
@@ -701,7 +696,6 @@ def _api_fixtures_for_date_utc(date_utc: datetime) -> list[dict]:
     return out
 
 def _prematch_features() -> Dict[str, float]:
-    """Features at kickoff (no goals, no stats yet)."""
     return {
         "minute": 0.0,
         "goals_h": 0.0, "goals_a": 0.0, "goals_sum": 0.0, "goals_diff": 0.0,
@@ -723,35 +717,23 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, market_nam
     )
 
 def send_match_of_the_day() -> bool:
-    """
-    Pick the strongest pre-match tip for TODAY among fixtures that haven't started.
-    Uses ML models only; requires prob >= per-market threshold AND >= MOTD_CONF_MIN.
-    """
     if not MOTD_PREDICT:
         return False
-
-    # Today by Berlin calendar, but query API by UTC date(s) that overlap Berlin's today
     today_local = datetime.now(BERLIN_TZ).date()
     start_local = datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
     end_local   = start_local + timedelta(days=1)
-
-    # Two UTC dates may overlap (edge timezone cases), so query both if needed
     dates_utc = {start_local.astimezone(TZ_UTC).date(), (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
-
     fixtures: list[dict] = []
     for d in sorted(dates_utc):
         fixtures.extend(_api_fixtures_for_date_utc(datetime(d.year, d.month, d.day, tzinfo=TZ_UTC)))
-
-    # Optional league filter
+    # Block low-quality comps & optional league filter
+    fixtures = [f for f in fixtures if not _league_blocked(f.get("league") or {})]
     if MOTD_LEAGUE_IDS:
         fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
-
     if not fixtures:
         return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
-
     feat0 = _prematch_features()
-
-    best = None  # (prob_pct, market_name, suggestion, home, away, league, kickoff_text)
+    best = None  # (prob_pct, market_name, suggestion, home, away, league, kickoff_txt)
     for fx in fixtures:
         fixture = fx.get("fixture") or {}
         lg      = fx.get("league")  or {}
@@ -760,15 +742,11 @@ def send_match_of_the_day() -> bool:
         away = (teams.get("away") or {}).get("name", "")
         league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
         kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
-
-        # Score ALL markets ML-only (same logic as production_scan but prematch)
-        candidates: list[tuple[str, str, float]] = []  # (market_name, suggestion, prob)
-
-        # Over/Under
+        candidates: list[tuple[str, str, float]] = []
+        # O/U
         for line in OU_LINES:
             mdl_line = _load_ou_model_for_line(line)
-            if not mdl_line:
-                continue
+            if not mdl_line: continue
             p_over = _score_prob(feat0, mdl_line)
             market_name = f"Over/Under {_fmt_line(line)}"
             thr = _get_market_threshold(market_name)
@@ -777,7 +755,6 @@ def send_match_of_the_day() -> bool:
             p_under = 1.0 - p_over
             if p_under * 100.0 >= thr:
                 candidates.append((market_name, f"Under {_fmt_line(line)} Goals", p_under))
-
         # BTTS
         mdl_btts = load_model_from_settings("BTTS_YES")
         if mdl_btts:
@@ -788,47 +765,33 @@ def send_match_of_the_day() -> bool:
             p_btts_no = 1.0 - p_btts
             if p_btts_no * 100.0 >= thr_b:
                 candidates.append(("BTTS", "BTTS: No", p_btts_no))
-
-        # 1X2 (Draw blocked)
+        # 1X2
         mh, md, ma = _load_wld_models()
         if mh and md and ma:
-            ph = _score_prob(feat0, mh)
-            pd = _score_prob(feat0, md)
-            pa = _score_prob(feat0, ma)
-            s = max(1e-9, ph + pd + pa)
-            ph, pd, pa = ph/s, pd/s, pa/s
+            ph = _score_prob(feat0, mh); pd = _score_prob(feat0, md); pa = _score_prob(feat0, ma)
+            s = max(1e-9, ph + pd + pa); ph, pd, pa = ph/s, pd/s, pa/s
             thr_1x2 = _get_market_threshold("1X2")
-            if ph * 100.0 >= thr_1x2:
-                candidates.append(("1X2", "Home Win", ph))
-            if pa * 100.0 >= thr_1x2:
-                candidates.append(("1X2", "Away Win", pa))
-
+            if ph * 100.0 >= thr_1x2: candidates.append(("1X2", "Home Win", ph))
+            if pa * 100.0 >= thr_1x2: candidates.append(("1X2", "Away Win", pa))
         if not candidates:
             continue
-
         market_name, suggestion, prob = max(candidates, key=lambda x: x[2])
         prob_pct = prob * 100.0
         if prob_pct < MOTD_CONF_MIN:
             continue
-
         item = (prob_pct, market_name, suggestion, home, away, league, kickoff_txt)
         if (best is None) or (prob_pct > best[0]):
             best = item
-
     if not best:
         return send_telegram("🏅 Match of the Day: no pick met the confidence/thresholds today.")
-
     prob_pct, market_name, suggestion, home, away, league, kickoff_txt = best
     return send_telegram(_format_motd_message(home, away, league, kickoff_txt, suggestion, market_name, prob_pct))
 
-# ────────────────────────────────
-# Training job wrapper (with Telegram output)
-# ────────────────────────────────
+# ── Training job (with Telegram)
 def auto_train_job() -> None:
     if not TRAIN_ENABLE:
         send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
         return
-
     send_telegram("🤖 Training started.")
     try:
         res = train_models() or {}
@@ -837,23 +800,17 @@ def auto_train_job() -> None:
             reason = res.get("reason") or res.get("error") or "unknown reason"
             send_telegram(f"⚠️ Training finished: <b>SKIPPED</b>\nReason: {escape(str(reason))}")
             return
-
         trained = [k for k, v in (res.get("trained") or {}).items() if v]
         thr     = (res.get("thresholds") or {})
         mets    = (res.get("metrics") or {})
-
         lines = ["🤖 <b>Model training OK</b>"]
-        if trained:
-            lines.append("• Trained: " + ", ".join(sorted(trained)))
-        if thr:
-            lines.append("• Thresholds: " + "  |  ".join([f"{escape(k)}: {float(v):.1f}%" for k, v in thr.items()]))
-
+        if trained: lines.append("• Trained: " + ", ".join(sorted(trained)))
+        if thr:     lines.append("• Thresholds: " + "  |  ".join([f"{escape(k)}: {float(v):.1f}%" for k, v in thr.items()]))
         def _m(name):
             m = mets.get(name) or {}
             if m:
                 return f"{name}: acc {m.get('acc',0):.2f}, brier {m.get('brier',0):.3f}, logloss {m.get('logloss',0):.3f}"
             return None
-
         metric_lines = list(filter(None, [
             _m("BTTS_YES"),
             _m("OU_2.5"), _m("OU_3.5"),
@@ -861,26 +818,80 @@ def auto_train_job() -> None:
         ]))
         if metric_lines:
             lines.append("• Metrics:\n  " + "\n  ".join(metric_lines))
-
         send_telegram("\n".join(lines))
-
     except Exception as e:
         logger.exception("[TRAIN] job failed: %s", e)
         send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
 
-# ────────────────────────────────
-# Core production scan (ML only)
-# ────────────────────────────────
-def _get_market_threshold_key(market: str) -> str:
+# ── Auto-tune thresholds (daily)
+def _market_threshold_key(market: str) -> str:
     return f"conf_threshold:{market}"
 
-def _get_market_threshold(market: str) -> float:
+def _get_or_default_threshold(market: str) -> float:
     try:
-        val = get_setting(_get_market_threshold_key(market))
+        val = get_setting(_market_threshold_key(market))
         return float(val) if val is not None else float(CONF_THRESHOLD)
     except Exception:
         return float(CONF_THRESHOLD)
 
+def _set_threshold(market: str, val_pct: float) -> None:
+    clamped = max(MIN_THRESH_CLAMP, min(MAX_THRESH_CLAMP, float(val_pct)))
+    set_setting(_market_threshold_key(market), f"{clamped:.2f}")
+
+def _graded_precision_for_market(market: str, start_ts: int, end_ts: int) -> tuple[int,int,float]:
+    with db_conn() as conn:
+        rows = conn.execute("""
+            SELECT t.suggestion, r.final_goals_h, r.final_goals_a, r.btts_yes
+            FROM tips t
+            LEFT JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts BETWEEN %s AND %s
+              AND t.market = %s
+              AND t.suggestion <> 'HARVEST'
+              AND t.sent_ok = 1
+        """, (start_ts, end_ts, market)).fetchall()
+    graded = wins = 0
+    for (sugg, gh, ga, btts) in rows:
+        out = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
+        if out is None:
+            continue
+        graded += 1; wins += 1 if out == 1 else 0
+    prec = (wins/graded) if graded else 0.0
+    return graded, wins, prec
+
+def _yesterday_window_utc() -> tuple[int,int]:
+    now = datetime.now(TZ_UTC)
+    y_start = (now - timedelta(days=TUNE_LOOKBACK_DAYS)).replace(hour=0, minute=0, second=0, microsecond=0)
+    y_end = y_start + timedelta(days=TUNE_LOOKBACK_DAYS)
+    return int(y_start.timestamp()), int(y_end.timestamp())
+
+def auto_tune_thresholds() -> dict:
+    if not AUTO_TUNE_ENABLE:
+        return {"ok": False, "reason": "auto-tune disabled"}
+    start_ts, end_ts = _yesterday_window_utc()
+    markets = ["BTTS", "1X2"] + [f"Over/Under { _fmt_line(ln) }" for ln in OU_LINES]
+    changes = {}
+    for mk in markets:
+        graded, wins, prec = _graded_precision_for_market(mk, start_ts, end_ts)
+        if graded < 25:
+            continue
+        cur = _get_or_default_threshold(mk)
+        new_thr = cur
+        if prec < TARGET_PRECISION - 0.02:
+            new_thr = min(MAX_THRESH_CLAMP, cur + TUNE_STEP)
+        elif prec > TARGET_PRECISION + 0.02:
+            new_thr = max(MIN_THRESH_CLAMP, cur - TUNE_STEP)
+        if abs(new_thr - cur) >= 1e-9:
+            _set_threshold(mk, new_thr)
+            changes[mk] = {"graded": graded, "wins": wins, "prec": round(prec,3), "old": cur, "new": new_thr}
+    if changes:
+        send_telegram("🛠️ Auto-tune updated thresholds:\n" + "\n".join(
+            [f"• {k}: {v['old']:.1f}% → {v['new']:.1f}% (prec {v['prec']*100:.1f}%, n={v['graded']})" for k,v in changes.items()]
+        ))
+    else:
+        send_telegram("🛠️ Auto-tune ran: no changes (insufficient data or already on target).")
+    return {"ok": True, "changes": changes}
+
+# ── Tip formatting/sending
 def _format_tip_message(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> str:
     stat_line = ""
     if any([feat.get("xg_h", 0), feat.get("xg_a", 0), feat.get("sot_h", 0), feat.get("sot_a", 0),
@@ -906,23 +917,27 @@ def _format_tip_message(home, away, league, minute, score_txt, suggestion, prob_
 def _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> bool:
     return send_telegram(_format_tip_message(home, away, league, minute, score_txt, suggestion, prob_pct, feat))
 
+# ── Production scan (ML-only)
+def _get_market_threshold(market: str) -> float:
+    try:
+        val = get_setting(f"conf_threshold:{market}")
+        return float(val) if val is not None else float(CONF_THRESHOLD)
+    except Exception:
+        return float(CONF_THRESHOLD)
+
 def production_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
         logger.info("[PROD] no live matches")
         return 0, 0
-
     saved = 0
     now_ts = int(time.time())
-
     with db_conn() as conn:
         for m in matches:
             try:
                 fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-                if not fid:
-                    continue
-
+                if not fid: continue
                 # cooldown
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
@@ -932,44 +947,31 @@ def production_scan() -> Tuple[int, int]:
                     ).fetchone()
                     if dup:
                         continue
-
                 feat = extract_features(m)
                 minute = int(feat.get("minute", 0))
-                if not stats_coverage_ok(feat, minute):
-                    continue
-                if minute < TIP_MIN_MINUTE:
-                    continue
-
-                # HARVEST snapshots for training
+                if not stats_coverage_ok(feat, minute): continue
+                if minute < TIP_MIN_MINUTE: continue
+                # harvest
                 if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
-                    try:
-                        save_snapshot_from_match(m, feat)
-                    except Exception:
-                        pass
-
+                    try: save_snapshot_from_match(m, feat)
+                    except Exception: pass
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
                 score_txt = _pretty_score(m)
-
                 candidates: List[Tuple[str, str, float]] = []
-
-                # ===== Over/Under (ML only) =====
+                # O/U
                 for line in OU_LINES:
                     mdl_line = _load_ou_model_for_line(line)
-                    if not mdl_line:
-                        continue
+                    if not mdl_line: continue
                     p_over = _score_prob(feat, mdl_line)
                     market_name = f"Over/Under {_fmt_line(line)}"
                     thr = _get_market_threshold(market_name)
-                    # Over
                     if p_over * 100.0 >= thr:
                         candidates.append((market_name, f"Over {_fmt_line(line)} Goals", p_over))
-                    # Under
                     p_under = 1.0 - p_over
                     if p_under * 100.0 >= thr:
                         candidates.append((market_name, f"Under {_fmt_line(line)} Goals", p_under))
-
-                # ===== BTTS (ML only) =====
+                # BTTS
                 mdl_btts = load_model_from_settings("BTTS_YES")
                 if mdl_btts:
                     p_btts = _score_prob(feat, mdl_btts)
@@ -979,8 +981,7 @@ def production_scan() -> Tuple[int, int]:
                     p_btts_no = 1.0 - p_btts
                     if p_btts_no * 100.0 >= thr_b:
                         candidates.append(("BTTS", "BTTS: No", p_btts_no))
-
-                # ===== 1X2 (ML only; Draw blocked at send-time) =====
+                # 1X2 (no Draw)
                 mh, md, ma = _load_wld_models()
                 if mh and md and ma:
                     ph = _score_prob(feat, mh)
@@ -989,26 +990,17 @@ def production_scan() -> Tuple[int, int]:
                     s = max(1e-9, ph + pd + pa)
                     ph, pd, pa = ph/s, pd/s, pa/s
                     thr_1x2 = _get_market_threshold("1X2")
-                    if ph * 100.0 >= thr_1x2:
-                        candidates.append(("1X2", "Home Win", ph))
-                    # 'Draw' intentionally NOT appended
-                    if pa * 100.0 >= thr_1x2:
-                        candidates.append(("1X2", "Away Win", pa))
-
-                # pick best few
+                    if ph * 100.0 >= thr_1x2: candidates.append(("1X2", "Home Win", ph))
+                    if pa * 100.0 >= thr_1x2: candidates.append(("1X2", "Away Win", pa))
+                # send top few
                 candidates.sort(key=lambda x: x[2], reverse=True)
                 per_match = 0
                 base_now = int(time.time())
-
                 for idx, (market_txt, suggestion, prob) in enumerate(candidates):
-                    if suggestion not in ALLOWED_SUGGESTIONS:
-                        continue
-                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                        break
-
+                    if suggestion not in ALLOWED_SUGGESTIONS: continue
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH): break
                     created_ts = base_now + idx
                     prob_pct = round(prob * 100.0, 1)
-
                     with db_conn() as conn2:
                         conn2.execute(
                             "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
@@ -1018,25 +1010,16 @@ def production_scan() -> Tuple[int, int]:
                         sent_ok = _send_tip(home, away, league, minute, score_txt, suggestion, float(prob_pct), feat)
                         if sent_ok:
                             conn2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
-
-                    saved += 1
-                    per_match += 1
-                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                        break
-
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
-
+                    saved += 1; per_match += 1
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
             except Exception as e:
                 logger.exception("[PROD] failure on match: %s", e)
                 continue
-
     logger.info(f"[PROD] saved={saved} live_seen={live_seen}")
     return saved, live_seen
 
-# ────────────────────────────────
-# Scheduler (5-min scan; backfill; digest; nightly train; MOTD)
-# ────────────────────────────────
+# ── Scheduler
 _scheduler_started = False
 def _start_scheduler_once() -> None:
     global _scheduler_started
@@ -1044,17 +1027,13 @@ def _start_scheduler_once() -> None:
         return
     try:
         sched = BackgroundScheduler(timezone=TZ_UTC)
-        # live scan loop (5 minutes)
         sched.add_job(production_scan, "interval", seconds=SCAN_INTERVAL_SEC, id="scan_loop", max_instances=1, coalesce=True)
-        # backfill loop
         sched.add_job(lambda: backfill_results_for_open_matches(400), "interval", minutes=BACKFILL_EVERY_MIN,
                       id="backfill_loop", max_instances=1, coalesce=True)
-        # daily accuracy digest
         if DAILY_ACCURACY_DIGEST_ENABLE:
             sched.add_job(daily_accuracy_digest,
                           CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=TZ_UTC),
                           id="daily_digest", max_instances=1, coalesce=True)
-        # Match of the Day (Berlin time)
         if MOTD_PREDICT:
             sched.add_job(
                 send_match_of_the_day,
@@ -1063,7 +1042,14 @@ def _start_scheduler_once() -> None:
                 max_instances=1,
                 coalesce=True
             )
-        # nightly training
+        if AUTO_TUNE_ENABLE:
+            sched.add_job(
+                auto_tune_thresholds,
+                CronTrigger(hour=4, minute=12, timezone=BERLIN_TZ),
+                id="auto_tune",
+                max_instances=1,
+                coalesce=True
+            )
         if TRAIN_ENABLE:
             sched.add_job(
                 auto_train_job,
@@ -1081,17 +1067,13 @@ def _start_scheduler_once() -> None:
 
 _start_scheduler_once()
 
-# ────────────────────────────────
-# Admin / auth
-# ────────────────────────────────
+# ── Admin / auth
 def _require_admin() -> None:
     key = request.headers.get("X-API-Key") or request.args.get("key") or (request.json or {}).get("key") if request.is_json else None
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
-# ────────────────────────────────
-# Flask endpoints (lean & complete)
-# ────────────────────────────────
+# ── Routes
 @app.route("/")
 def root():
     return jsonify({"ok": True, "name": "live-tips-backend", "mode": "FULL_AI"})
@@ -1105,93 +1087,6 @@ def health():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# Admin check (helps debug 401)
-@app.route("/admin/check", methods=["GET"])
-def admin_check():
-    _require_admin()
-    return jsonify({"ok": True, "admin": True})
-
-# HTML Admin Panel (no auth to view; actions require key)
-@app.route("/admin/panel", methods=["GET"])
-def admin_panel():
-    html = f"""
-<!doctype html>
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Live Tips Admin Panel</title>
-<style>
-  body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; max-width: 900px; margin: auto; }}
-  h1 {{ margin-top: 0; }}
-  .row {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }}
-  button {{ padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; cursor: pointer; }}
-  input[type=text] {{ padding: 10px; border: 1px solid #ddd; border-radius: 8px; width: 380px; max-width: 100%; }}
-  pre {{ background: #f7f7f7; padding: 12px; border-radius: 8px; overflow:auto; max-height: 420px; }}
-  small {{ color: #666; }}
-</style>
-<h1>Live Tips — Admin Panel</h1>
-<div class="row">
-  <input id="key" type="text" placeholder="ADMIN_API_KEY" />
-  <button onclick="saveKey()">Save key</button>
-  <small id="status"></small>
-</div>
-<div class="row">
-  <button onclick="hit('/admin/check')">Check admin</button>
-  <button onclick="hit('/init-db','POST')">Init DB</button>
-  <button onclick="hit('/admin/scan')">Scan (live)</button>
-  <button onclick="hit('/admin/backfill-results')">Backfill results</button>
-  <button onclick="hit('/admin/train')">Train (JSON)</button>
-  <button onclick="hit('/admin/train-notify')">Train + notify</button>
-</div>
-<div class="row">
-  <button onclick="hit('/admin/digest')">Send Digest</button>
-  <button onclick="hit('/admin/motd')">Send MOTD</button>
-  <button onclick="openTips()">Open latest tips</button>
-  <button onclick="openHealth()">Open health</button>
-</div>
-<pre id="out">Ready.</pre>
-<script>
-  const q = new URLSearchParams(location.search);
-  const elKey = document.getElementById('key');
-  const elOut = document.getElementById('out');
-  const elStatus = document.getElementById('status');
-
-  function loadKey() {{
-    const fromQs = q.get('key');
-    const fromLs = localStorage.getItem('ADMIN_API_KEY');
-    elKey.value = fromQs || fromLs || '';
-    if (fromQs) localStorage.setItem('ADMIN_API_KEY', fromQs);
-    elStatus.textContent = elKey.value ? 'key loaded' : 'no key saved';
-  }}
-
-  function saveKey() {{
-    localStorage.setItem('ADMIN_API_KEY', elKey.value.trim());
-    elStatus.textContent = elKey.value ? 'key saved' : 'no key saved';
-  }}
-
-  async function hit(path, method='GET') {{
-    const key = (elKey.value || '').trim();
-    if (!key) {{ elOut.textContent = 'Set your ADMIN_API_KEY first.'; return; }}
-    const url = path + '?key=' + encodeURIComponent(key);
-    try {{
-      const res = await fetch(url, {{ method, headers: {{ 'X-API-Key': key }} }});
-      const txt = await res.text();
-      elOut.textContent = res.status + ' ' + res.statusText + '\\n\\n' + txt;
-    }} catch (e) {{
-      elOut.textContent = 'Request failed: ' + e;
-    }}
-  }}
-
-  function openTips() {{
-    window.open('/tips/latest', '_blank');
-  }}
-  function openHealth() {{
-    window.open('/health', '_blank');
-  }}
-  loadKey();
-</script>
-"""
-    return Response(html, mimetype="text/html")
-
-# ── Admin ops (require ?key=ADMIN_API_KEY or header X-API-Key)
 @app.route("/init-db", methods=["POST"])
 def http_init_db():
     _require_admin()
@@ -1204,13 +1099,13 @@ def http_scan():
     saved, live = production_scan()
     return jsonify({"ok": True, "saved": saved, "live_seen": live})
 
-@app.route("/admin/backfill-results", methods=["POST", "GET"])
+@app.route("/admin/backfill-results", methods=["POST","GET"])
 def http_backfill():
     _require_admin()
     n = backfill_results_for_open_matches(400)
     return jsonify({"ok": True, "updated": n})
 
-@app.route("/admin/train", methods=["POST", "GET"])
+@app.route("/admin/train", methods=["POST","GET"])
 def http_train():
     _require_admin()
     if not TRAIN_ENABLE:
@@ -1240,7 +1135,12 @@ def http_motd():
     ok = send_match_of_the_day()
     return jsonify({"ok": bool(ok)})
 
-# ── Settings (get/set)
+@app.route("/admin/auto-tune", methods=["POST","GET"])
+def http_auto_tune():
+    _require_admin()
+    res = auto_tune_thresholds()
+    return jsonify({"ok": True, "result": res})
+
 @app.route("/settings/<key>", methods=["GET", "POST"])
 def http_settings(key: str):
     if request.method == "GET":
@@ -1254,7 +1154,6 @@ def http_settings(key: str):
     set_setting(key, str(val))
     return jsonify({"ok": True})
 
-# ── Tip reads
 @app.route("/tips/latest")
 def http_latest_tips():
     limit = int(request.args.get("limit", "50"))
@@ -1290,7 +1189,6 @@ def http_tips_by_match(match_id: int):
         })
     return jsonify({"ok": True, "match_id": match_id, "tips": out})
 
-# ── Telegram webhook (kept basic for liveness)
 @app.route("/telegram/webhook/<secret>", methods=["POST"])
 def telegram_webhook(secret: str):
     if (WEBHOOK_SECRET or "") != secret:
@@ -1315,9 +1213,7 @@ def telegram_webhook(secret: str):
         logger.warning("telegram webhook parse error: %s", e)
     return jsonify({"ok": True})
 
-# ────────────────────────────────
-# App startup
-# ────────────────────────────────
+# ── Boot
 def _on_boot():
     init_db()
     set_setting("boot_ts", str(int(time.time())))
