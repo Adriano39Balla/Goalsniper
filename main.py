@@ -556,26 +556,33 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
     gh = (m.get("goals") or {}).get("home") or 0
     ga = (m.get("goals") or {}).get("away") or 0
     minute = int(feat.get("minute", 0))
+
     snapshot = {
         "minute": minute, "gh": gh, "ga": ga, "league_id": league_id,
         "market": "HARVEST", "suggestion": "HARVEST", "confidence": 0,
-        "stat": {"xg_h": feat.get("xg_h", 0), "xg_a": feat.get("xg_a", 0),
-                 "sot_h": feat.get("sot_h", 0), "sot_a": feat.get("sot_a", 0),
-                 "cor_h": feat.get("cor_h", 0), "cor_a": feat.get("cor_a", 0),
-                 "pos_h": feat.get("pos_h", 0), "pos_a": feat.get("pos_a", 0),
-                 "red_h": feat.get("red_h", 0), "red_a": feat.get("red_a", 0)}
+        "stat": {
+            "xg_h": feat.get("xg_h", 0), "xg_a": feat.get("xg_a", 0),
+            "sot_h": feat.get("sot_h", 0), "sot_a": feat.get("sot_a", 0),
+            "cor_h": feat.get("cor_h", 0), "cor_a": feat.get("cor_a", 0),
+            "pos_h": feat.get("pos_h", 0), "pos_a": feat.get("pos_a", 0),
+            "red_h": feat.get("red_h", 0), "red_a": feat.get("red_a", 0)
+        }
     }
+
     now = int(time.time())
     with db_conn() as conn:
+        # store the raw snapshot (for training)
         conn.execute(
-            "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
+            "INSERT INTO tip_snapshots(match_id, created_ts, payload) "
+            "VALUES (%s,%s,%s) "
             "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
             (fid, now, json.dumps(snapshot)[:200000]),
         )
+        # store a HARVEST marker row in tips — but mark as already 'sent'
         conn.execute(
-            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
-            (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, None, f"{gh}-{ga}", minute, now),
+            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)",
+            (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now),
         )
 
 # ────────────────────────────────
@@ -1015,13 +1022,18 @@ def production_scan() -> Tuple[int, int]:
                     created_ts = base_now + idx; prob_pct = round(prob*100.0, 1)
                     with db_conn() as conn2:
                         conn2.execute(
-                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
-                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
-                            (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), float(prob), score_txt, minute, created_ts),
+                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
+                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                            (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), score_txt, minute, created_ts),
                         )
-                        sent_ok = _send_tip(home, away, league, minute, score_txt, suggestion, float(prob_pct), feat)
-                        if sent_ok:
-                            conn2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(fid,created_ts))
+                        # Do not send any HARVEST markers to Telegram
+                        if suggestion != "HARVEST":
+                            sent_ok = _send_tip(home, away, league, minute, score_txt, suggestion, float(prob_pct), feat)
+                            if sent_ok:
+                                conn2.execute(
+                                    "UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
+                                    (fid, created_ts),
+                                )
                     saved += 1; per_match += 1
                     if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
                 if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
