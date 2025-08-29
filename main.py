@@ -1,8 +1,8 @@
 """
 Postgres-only Flask backend for live football tips — FULL AI MODE.
 Pure ML scoring (no math fallbacks), Platt-calibrated models from DB.
-Markets: O/U (except 1.5 removed), BTTS (Yes/No), 1X2 (Draw blocked).
-Automation: harvest snapshots, nightly train, periodic backfill, daily digest.
+Markets: O/U (1.5 removed), BTTS (Yes/No), 1X2 (Draw blocked at send-time).
+Automation: harvest snapshots, nightly train, periodic backfill, daily digest, MOTD.
 Scan interval: 5 minutes.
 """
 
@@ -62,11 +62,11 @@ TRAIN_MIN_MINUTE = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 # Backfill & digest
 BACKFILL_EVERY_MIN = int(os.getenv("BACKFILL_EVERY_MIN", "15"))
 BACKFILL_WINDOW_HOURS = int(os.getenv("BACKFILL_WINDOW_HOURS", "36"))
-DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
+DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO"))
 DAILY_ACCURACY_HOUR = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
 DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
-# Markets / lines: remove 1.5 hard
+# Markets / lines: remove 1.5
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     out: List[float] = []
     for tok in (env_val or "").split(","):
@@ -87,8 +87,8 @@ PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "2"))
 
 # Allowed suggestions — Draw removed
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
-for ln in OU_LINES:
-    s = f"{ln}".rstrip("0").rstrip(".")
+for _ln in OU_LINES:
+    s = f"{_ln}".rstrip("0").rstrip(".")
     ALLOWED_SUGGESTIONS.add(f"Over {s} Goals")
     ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
 
@@ -668,64 +668,9 @@ def daily_accuracy_digest() -> Optional[str]:
     send_telegram(msg)
     return msg
 
-def auto_train_job() -> None:
-    """Run training and ALWAYS send a completion message to Telegram."""
-    if not TRAIN_ENABLE:
-        send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
-        return
-
-    # explicit start ping so you know it fired
-    send_telegram("🤖 Training started.")
-
-    try:
-        res = train_models() or {}
-        ok   = bool(res.get("ok"))
-        if not ok:
-            # e.g. not enough data
-            reason = res.get("reason") or res.get("error") or "unknown reason"
-            send_telegram(f"⚠️ Training finished: <b>SKIPPED</b>\nReason: {escape(str(reason))}")
-            return
-
-        trained = [k for k, v in (res.get("trained") or {}).items() if v]
-        thr     = (res.get("thresholds") or {})
-        mets    = (res.get("metrics") or {})
-
-        lines = ["🤖 <b>Model training OK</b>"]
-        if trained:
-            lines.append("• Trained: " + ", ".join(sorted(trained)))
-        if thr:
-            lines.append("• Thresholds: " + "  |  ".join([f"{escape(k)}: {float(v):.1f}%" for k, v in thr.items()]))
-
-        # include a compact metrics digest (brier/logloss/acc) for the main models if present
-        def _m(name):
-            m = mets.get(name) or {}
-            if m:
-                return f"{name}: acc {m.get('acc',0):.2f}, brier {m.get('brier',0):.3f}, logloss {m.get('logloss',0):.3f}"
-            return None
-
-        metric_lines = list(filter(None, [
-            _m("BTTS_YES"),
-            _m("OU_2.5"), _m("OU_3.5"),
-            _m("WLD_HOME"), _m("WLD_AWAY"),
-        ]))
-        if metric_lines:
-            lines.append("• Metrics:\n  " + "\n  ".join(metric_lines))
-
-        send_telegram("\n".join(lines))
-
-    except Exception as e:
-        logger.exception("[TRAIN] job failed: %s", e)
-        send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
-
 # ────────────────────────────────
-# Admin / auth
+# MOTD (from already sent tips)
 # ────────────────────────────────
-def _require_admin() -> None:
-    key = request.headers.get("X-API-Key") or request.args.get("key") or (request.json or {}).get("key") if request.is_json else None
-    if not ADMIN_API_KEY or key != ADMIN_API_KEY:
-        abort(401)
-
-# ── Match of the Day (MOTD) from already-sent tips
 MOTD_PREDICT = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
 MOTD_HOUR    = int(os.getenv("MOTD_HOUR", "19"))
 MOTD_MINUTE  = int(os.getenv("MOTD_MINUTE", "15"))
@@ -736,7 +681,6 @@ except Exception:
     MOTD_LEAGUE_IDS = []
 
 def _pick_motd_window_berlin() -> tuple[int,int]:
-    """Yesterday [00:00, 24:00) in Berlin time."""
     now_local = datetime.now(BERLIN_TZ)
     y_start = (now_local - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     y_end = y_start + timedelta(days=1)
@@ -772,6 +716,53 @@ def send_match_of_the_day() -> bool:
     if not row:
         return send_telegram("🏅 Match of the Day: no eligible tips yesterday.")
     return send_telegram(_format_motd_row(row))
+
+# ────────────────────────────────
+# Training job wrapper (with Telegram output)
+# ────────────────────────────────
+def auto_train_job() -> None:
+    if not TRAIN_ENABLE:
+        send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
+        return
+
+    send_telegram("🤖 Training started.")
+    try:
+        res = train_models() or {}
+        ok   = bool(res.get("ok"))
+        if not ok:
+            reason = res.get("reason") or res.get("error") or "unknown reason"
+            send_telegram(f"⚠️ Training finished: <b>SKIPPED</b>\nReason: {escape(str(reason))}")
+            return
+
+        trained = [k for k, v in (res.get("trained") or {}).items() if v]
+        thr     = (res.get("thresholds") or {})
+        mets    = (res.get("metrics") or {})
+
+        lines = ["🤖 <b>Model training OK</b>"]
+        if trained:
+            lines.append("• Trained: " + ", ".join(sorted(trained)))
+        if thr:
+            lines.append("• Thresholds: " + "  |  ".join([f"{escape(k)}: {float(v):.1f}%" for k, v in thr.items()]))
+
+        def _m(name):
+            m = mets.get(name) or {}
+            if m:
+                return f"{name}: acc {m.get('acc',0):.2f}, brier {m.get('brier',0):.3f}, logloss {m.get('logloss',0):.3f}"
+            return None
+
+        metric_lines = list(filter(None, [
+            _m("BTTS_YES"),
+            _m("OU_2.5"), _m("OU_3.5"),
+            _m("WLD_HOME"), _m("WLD_AWAY"),
+        ]))
+        if metric_lines:
+            lines.append("• Metrics:\n  " + "\n  ".join(metric_lines))
+
+        send_telegram("\n".join(lines))
+
+    except Exception as e:
+        logger.exception("[TRAIN] job failed: %s", e)
+        send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
 
 # ────────────────────────────────
 # Core production scan (ML only)
@@ -859,7 +850,6 @@ def production_scan() -> Tuple[int, int]:
                 candidates: List[Tuple[str, str, float]] = []
 
                 # ===== Over/Under (ML only) =====
-                goals_sum_now = int(feat.get("goals_sum", 0))
                 for line in OU_LINES:
                     mdl_line = _load_ou_model_for_line(line)
                     if not mdl_line:
@@ -941,7 +931,7 @@ def production_scan() -> Tuple[int, int]:
     return saved, live_seen
 
 # ────────────────────────────────
-# Scheduler (5-min scan; backfill; digest; nightly train)
+# Scheduler (5-min scan; backfill; digest; nightly train; MOTD)
 # ────────────────────────────────
 _scheduler_started = False
 def _start_scheduler_once() -> None:
@@ -988,7 +978,15 @@ def _start_scheduler_once() -> None:
 _start_scheduler_once()
 
 # ────────────────────────────────
-# Flask endpoints (lean)
+# Admin / auth
+# ────────────────────────────────
+def _require_admin() -> None:
+    key = request.headers.get("X-API-Key") or request.args.get("key") or (request.json or {}).get("key") if request.is_json else None
+    if not ADMIN_API_KEY or key != ADMIN_API_KEY:
+        abort(401)
+
+# ────────────────────────────────
+# Flask endpoints (lean & complete)
 # ────────────────────────────────
 @app.route("/")
 def root():
@@ -1003,12 +1001,7 @@ def health():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/admin/train-notify", methods=["POST","GET"])
-def http_train_notify():
-    _require_admin()
-    auto_train_job()
-    return jsonify({"ok": True})
-
+# ── Admin ops (require ?key=ADMIN_API_KEY or header X-API-Key)
 @app.route("/init-db", methods=["POST"])
 def http_init_db():
     _require_admin()
@@ -1021,13 +1014,13 @@ def http_scan():
     saved, live = production_scan()
     return jsonify({"ok": True, "saved": saved, "live_seen": live})
 
-@app.route("/admin/backfill-results", methods=["POST"])
+@app.route("/admin/backfill-results", methods=["POST", "GET"])
 def http_backfill():
     _require_admin()
     n = backfill_results_for_open_matches(400)
     return jsonify({"ok": True, "updated": n})
 
-@app.route("/admin/train", methods=["POST"])
+@app.route("/admin/train", methods=["POST", "GET"])
 def http_train():
     _require_admin()
     if not TRAIN_ENABLE:
@@ -1039,6 +1032,39 @@ def http_train():
         logger.exception("train_models failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/admin/train-notify", methods=["POST","GET"])
+def http_train_notify():
+    _require_admin()
+    auto_train_job()
+    return jsonify({"ok": True})
+
+@app.route("/admin/digest", methods=["POST","GET"])
+def http_digest():
+    _require_admin()
+    msg = daily_accuracy_digest()
+    return jsonify({"ok": True, "sent": bool(msg)})
+
+@app.route("/admin/motd", methods=["POST","GET"])
+def http_motd():
+    _require_admin()
+    ok = send_match_of_the_day()
+    return jsonify({"ok": bool(ok)})
+
+# ── Settings (get/set)
+@app.route("/settings/<key>", methods=["GET", "POST"])
+def http_settings(key: str):
+    if request.method == "GET":
+        val = get_setting(key)
+        return jsonify({"ok": True, "key": key, "value": val})
+    _require_admin()
+    js = request.get_json(silent=True) or {}
+    val = js.get("value")
+    if val is None:
+        abort(400)
+    set_setting(key, str(val))
+    return jsonify({"ok": True})
+
+# ── Tip reads
 @app.route("/tips/latest")
 def http_latest_tips():
     limit = int(request.args.get("limit", "50"))
@@ -1057,7 +1083,24 @@ def http_latest_tips():
         })
     return jsonify({"ok": True, "tips": tips})
 
-# Telegram webhook (kept basic for liveness)
+@app.route("/tips/<int:match_id>")
+def http_tips_by_match(match_id: int):
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok "
+            "FROM tips WHERE match_id=%s ORDER BY created_ts ASC",
+            (match_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "league": r[0], "home": r[1], "away": r[2], "market": r[3], "suggestion": r[4],
+            "confidence": float(r[5]), "score_at_tip": r[6], "minute": int(r[7]),
+            "created_ts": int(r[8]), "sent_ok": int(r[9]),
+        })
+    return jsonify({"ok": True, "match_id": match_id, "tips": out})
+
+# ── Telegram webhook (kept basic for liveness)
 @app.route("/telegram/webhook/<secret>", methods=["POST"])
 def telegram_webhook(secret: str):
     if (WEBHOOK_SECRET or "") != secret:
@@ -1069,6 +1112,8 @@ def telegram_webhook(secret: str):
             send_telegram("👋 Live tips bot (FULL AI mode) is online.")
         elif msg.startswith("/digest"):
             daily_accuracy_digest()
+        elif msg.startswith("/motd"):
+            send_match_of_the_day()
         elif msg.startswith("/scan"):
             parts = msg.split()
             if len(parts) > 1 and ADMIN_API_KEY and parts[1] == ADMIN_API_KEY:
