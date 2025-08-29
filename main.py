@@ -678,9 +678,6 @@ try:
 except Exception:
     MOTD_LEAGUE_IDS = []
 
-def _fmt_line(line: float) -> str:
-    return f"{line}".rstrip("0").rstrip(".")
-
 def _kickoff_berlin(utc_iso: str|None) -> str:
     """Return 'HH:MM' Berlin time for a fixture's UTC ISO kickoff."""
     try:
@@ -691,12 +688,12 @@ def _kickoff_berlin(utc_iso: str|None) -> str:
     except Exception:
         return "TBD"
 
-def _api_fixtures_for_date_utc(date_utc: datetime) -> list[dict]:
+def _api_fixtures_for_date_utc(date_utc: datetime) -> List[Dict[str, Any]]:
     """Fetch fixtures for the given UTC date; filter to not-started (NS)."""
     js = _api_get(FOOTBALL_API_URL, {"date": date_utc.strftime("%Y-%m-%d")})
     if not isinstance(js, dict):
         return []
-    out = []
+    out: List[Dict[str, Any]] = []
     for r in js.get("response", []) or []:
         st = (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
         if st == "NS":
@@ -721,7 +718,7 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, market_nam
         f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
         f"🏆 <b>League:</b> {escape(league)}\n"
         f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
-        f"<b>Tip:</b> {escape(sugg)}\n"
+        f"<b>Tip:</b> {escape(suggestion)}\n"
         f"📈 <b>Confidence:</b> {prob_pct:.1f}%"
     )
 
@@ -741,7 +738,7 @@ def send_match_of_the_day() -> bool:
     # Two UTC dates may overlap (edge timezone cases), so query both if needed
     dates_utc = {start_local.astimezone(TZ_UTC).date(), (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
 
-    fixtures: list[dict] = []
+    fixtures: List[Dict[str, Any]] = []
     for d in sorted(dates_utc):
         fixtures.extend(_api_fixtures_for_date_utc(datetime(d.year, d.month, d.day, tzinfo=TZ_UTC)))
 
@@ -754,7 +751,7 @@ def send_match_of_the_day() -> bool:
 
     feat0 = _prematch_features()
 
-    best = None  # (prob, market_name, suggestion, home, away, league, kickoff_text)
+    best = None  # (prob_pct, market_name, suggestion, home, away, league, kickoff_text)
     for fx in fixtures:
         fixture = fx.get("fixture") or {}
         lg      = fx.get("league")  or {}
@@ -765,7 +762,7 @@ def send_match_of_the_day() -> bool:
         kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
 
         # Score ALL markets ML-only (same logic as production_scan but prematch)
-        candidates: list[tuple[str, str, float]] = []  # (market_name, suggestion, prob)
+        candidates: List[Tuple[str, str, float]] = []  # (market_name, suggestion, prob)
 
         # Over/Under
         for line in OU_LINES:
