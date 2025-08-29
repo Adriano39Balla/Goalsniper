@@ -135,11 +135,14 @@ BERLIN_TZ = ZoneInfo("Europe/Berlin")
 # Optional import: trainer
 # ────────────────────────────────
 try:
-    from train_models import train_models
-except Exception as _imp_err:
-    def train_models() -> Dict[str, Any]:
-        logger.warning("train_models not available: %s", _imp_err)
-        return {"ok": False, "reason": "train_models not available"}
+    from train_models import train_models  # real trainer
+except Exception as e:
+    # Safe fallback that does NOT reference an undefined name
+    _IMPORT_ERR = repr(e)
+
+    def train_models(*args, **kwargs) -> Dict[str, Any]:
+        logger.warning("train_models not available: %s", _IMPORT_ERR)
+        return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
 # ────────────────────────────────
 # DB pool
