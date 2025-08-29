@@ -668,6 +668,55 @@ def daily_accuracy_digest() -> Optional[str]:
     send_telegram(msg)
     return msg
 
+def auto_train_job() -> None:
+    """Run training and ALWAYS send a completion message to Telegram."""
+    if not TRAIN_ENABLE:
+        send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
+        return
+
+    # explicit start ping so you know it fired
+    send_telegram("🤖 Training started.")
+
+    try:
+        res = train_models() or {}
+        ok   = bool(res.get("ok"))
+        if not ok:
+            # e.g. not enough data
+            reason = res.get("reason") or res.get("error") or "unknown reason"
+            send_telegram(f"⚠️ Training finished: <b>SKIPPED</b>\nReason: {escape(str(reason))}")
+            return
+
+        trained = [k for k, v in (res.get("trained") or {}).items() if v]
+        thr     = (res.get("thresholds") or {})
+        mets    = (res.get("metrics") or {})
+
+        lines = ["🤖 <b>Model training OK</b>"]
+        if trained:
+            lines.append("• Trained: " + ", ".join(sorted(trained)))
+        if thr:
+            lines.append("• Thresholds: " + "  |  ".join([f"{escape(k)}: {float(v):.1f}%" for k, v in thr.items()]))
+
+        # include a compact metrics digest (brier/logloss/acc) for the main models if present
+        def _m(name):
+            m = mets.get(name) or {}
+            if m:
+                return f"{name}: acc {m.get('acc',0):.2f}, brier {m.get('brier',0):.3f}, logloss {m.get('logloss',0):.3f}"
+            return None
+
+        metric_lines = list(filter(None, [
+            _m("BTTS_YES"),
+            _m("OU_1.5"), _m("OU_2.5"), _m("OU_3.5"),
+            _m("WLD_HOME"), _m("WLD_DRAW"), _m("WLD_AWAY"),
+        ]))
+        if metric_lines:
+            lines.append("• Metrics:\n  " + "\n  ".join(metric_lines))
+
+        send_telegram("\n".join(lines))
+
+    except Exception as e:
+        logger.exception("[TRAIN] job failed: %s", e)
+        send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
+
 # ────────────────────────────────
 # Admin / auth
 # ────────────────────────────────
@@ -922,9 +971,11 @@ def _start_scheduler_once() -> None:
             )
         # nightly training
         if TRAIN_ENABLE:
-            sched.add_job(lambda: send_telegram("🤖 Training started.") or train_models(),
-                          CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
-                          id="nightly_train", max_instances=1, coalesce=True)
+            sched.add_job(
+                auto_train_job,
+                CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
+                id="nightly_train", max_instances=1, coalesce=True
+            )
         sched.start()
         _scheduler_started = True
         send_telegram("🚀 Full AI mode backend started.")
@@ -951,6 +1002,12 @@ def health():
         return jsonify({"ok": True, "db": "ok", "tips_count": int(c)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/train-notify", methods=["POST","GET"])
+def http_train_notify():
+    _require_admin()
+    auto_train_job()
+    return jsonify({"ok": True})
 
 @app.route("/init-db", methods=["POST"])
 def http_init_db():
