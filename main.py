@@ -705,8 +705,8 @@ def auto_train_job() -> None:
 
         metric_lines = list(filter(None, [
             _m("BTTS_YES"),
-            _m("OU_1.5"), _m("OU_2.5"), _m("OU_3.5"),
-            _m("WLD_HOME"), _m("WLD_DRAW"), _m("WLD_AWAY"),
+            _m("OU_2.5"), _m("OU_3.5"),
+            _m("WLD_HOME"), _m("WLD_AWAY"),
         ]))
         if metric_lines:
             lines.append("• Metrics:\n  " + "\n  ".join(metric_lines))
