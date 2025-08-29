@@ -137,10 +137,10 @@ BERLIN_TZ = ZoneInfo("Europe/Berlin")
 try:
     from train_models import train_models  # real trainer
 except Exception as e:
-    # Safe fallback that does NOT reference an undefined name
-    _IMPORT_ERR = repr(e)
+    _IMPORT_ERR = repr(e)  # capture once, safe global
 
     def train_models(*args, **kwargs) -> Dict[str, Any]:
+        # clean fallback that never references an undefined name
         logger.warning("train_models not available: %s", _IMPORT_ERR)
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
