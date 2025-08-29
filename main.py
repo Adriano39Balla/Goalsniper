@@ -54,7 +54,7 @@ TRAIN_MIN_MINUTE = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 
 BACKFILL_EVERY_MIN     = int(os.getenv("BACKFILL_EVERY_MIN", "15"))
 BACKFILL_WINDOW_HOURS  = int(os.getenv("BACKFILL_WINDOW_HOURS", "36"))
-DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO"))
+DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
 DAILY_ACCURACY_HOUR    = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
 DAILY_ACCURACY_MINUTE  = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
@@ -712,7 +712,7 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, market_nam
         f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
         f"🏆 <b>League:</b> {escape(league)}\n"
         f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
-        f"<b>Tip:</b> {escape(suggestion)} ({escape(market_name)})\n"
+        f"<b>Tip:</b> {escape(suggestion)}\n"
         f"📈 <b>Confidence:</b> {prob_pct:.1f}%"
     )
 
