@@ -721,7 +721,7 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, market_nam
         f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
         f"🏆 <b>League:</b> {escape(league)}\n"
         f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
-        f"<b>Tip:</b> {escape(suggestion)} ({escape(market_name)})\n"
+        f"<b>Tip:</b> {escape(sugg)}\n"
         f"📈 <b>Confidence:</b> {prob_pct:.1f}%"
     )
 
