@@ -668,54 +668,162 @@ def daily_accuracy_digest() -> Optional[str]:
     send_telegram(msg)
     return msg
 
-# ────────────────────────────────
-# MOTD (from already sent tips)
-# ────────────────────────────────
-MOTD_PREDICT = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
-MOTD_HOUR    = int(os.getenv("MOTD_HOUR", "19"))
-MOTD_MINUTE  = int(os.getenv("MOTD_MINUTE", "15"))
-MOTD_CONF_MIN = float(os.getenv("MOTD_CONF_MIN", "70"))
+# ── Match of the Day (MOTD): choose a FUTURE match (today) ─────────────────────
+MOTD_PREDICT   = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
+MOTD_HOUR      = int(os.getenv("MOTD_HOUR", "19"))
+MOTD_MINUTE    = int(os.getenv("MOTD_MINUTE", "15"))
+MOTD_CONF_MIN  = float(os.getenv("MOTD_CONF_MIN", "70"))
 try:
     MOTD_LEAGUE_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS","").split(",")) if x.strip().isdigit()]
 except Exception:
     MOTD_LEAGUE_IDS = []
 
-def _pick_motd_window_berlin() -> tuple[int,int]:
-    now_local = datetime.now(BERLIN_TZ)
-    y_start = (now_local - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    y_end = y_start + timedelta(days=1)
-    return int(y_start.timestamp()), int(y_end.timestamp())
+def _fmt_line(line: float) -> str:
+    return f"{line}".rstrip("0").rstrip(".")
 
-def _format_motd_row(r) -> str:
-    home, away, league, market, sugg, conf, minute, score = r
+def _kickoff_berlin(utc_iso: str|None) -> str:
+    """Return 'HH:MM' Berlin time for a fixture's UTC ISO kickoff."""
+    try:
+        if not utc_iso:
+            return "TBD"
+        dt_utc = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+        return dt_utc.astimezone(BERLIN_TZ).strftime("%H:%M")
+    except Exception:
+        return "TBD"
+
+def _api_fixtures_for_date_utc(date_utc: datetime) -> list[dict]:
+    """Fetch fixtures for the given UTC date; filter to not-started (NS)."""
+    js = _api_get(FOOTBALL_API_URL, {"date": date_utc.strftime("%Y-%m-%d")})
+    if not isinstance(js, dict):
+        return []
+    out = []
+    for r in js.get("response", []) or []:
+        st = (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st == "NS":
+            out.append(r)
+    return out
+
+def _prematch_features() -> Dict[str, float]:
+    """Features at kickoff (no goals, no stats yet)."""
+    return {
+        "minute": 0.0,
+        "goals_h": 0.0, "goals_a": 0.0, "goals_sum": 0.0, "goals_diff": 0.0,
+        "xg_h": 0.0, "xg_a": 0.0, "xg_sum": 0.0, "xg_diff": 0.0,
+        "sot_h": 0.0, "sot_a": 0.0, "sot_sum": 0.0,
+        "cor_h": 0.0, "cor_a": 0.0, "cor_sum": 0.0,
+        "pos_h": 0.0, "pos_a": 0.0, "pos_diff": 0.0,
+        "red_h": 0.0, "red_a": 0.0, "red_sum": 0.0,
+    }
+
+def _format_motd_message(home, away, league, kickoff_txt, suggestion, market_name, prob_pct) -> str:
     return (
         "🏅 <b>Match of the Day</b>\n"
         f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
         f"🏆 <b>League:</b> {escape(league)}\n"
-        f"🕒 <b>Minute at tip:</b> {int(minute)}'  |  <b>Score:</b> {escape(score)}\n"
-        f"<b>Tip:</b> {escape(sugg)} ({escape(market)})\n"
-        f"📈 <b>Confidence:</b> {float(conf):.1f}%"
+        f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
+        f"<b>Tip:</b> {escape(suggestion)} ({escape(market_name)})\n"
+        f"📈 <b>Confidence:</b> {prob_pct:.1f}%"
     )
 
 def send_match_of_the_day() -> bool:
+    """
+    Pick the strongest pre-match tip for TODAY among fixtures that haven't started.
+    Uses ML models only; requires prob >= per-market threshold AND >= MOTD_CONF_MIN.
+    """
     if not MOTD_PREDICT:
         return False
-    start_ts, end_ts = _pick_motd_window_berlin()
-    where = ["t.created_ts >= %s", "t.created_ts < %s", "t.sent_ok=1", "t.suggestion <> 'HARVEST'", "t.confidence >= %s"]
-    params = [start_ts, end_ts, float(MOTD_CONF_MIN)]
+
+    # Today by Berlin calendar, but query API by UTC date(s) that overlap Berlin's today
+    today_local = datetime.now(BERLIN_TZ).date()
+    start_local = datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
+    end_local   = start_local + timedelta(days=1)
+
+    # Two UTC dates may overlap (edge timezone cases), so query both if needed
+    dates_utc = {start_local.astimezone(TZ_UTC).date(), (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
+
+    fixtures: list[dict] = []
+    for d in sorted(dates_utc):
+        fixtures.extend(_api_fixtures_for_date_utc(datetime(d.year, d.month, d.day, tzinfo=TZ_UTC)))
+
+    # Optional league filter
     if MOTD_LEAGUE_IDS:
-        where.append("t.league_id = ANY(%s)")
-        params.append(MOTD_LEAGUE_IDS)
-    sql = (
-        "SELECT t.home, t.away, t.league, t.market, t.suggestion, t.confidence, t.minute, t.score_at_tip "
-        "FROM tips t WHERE " + " AND ".join(where) +
-        " ORDER BY t.confidence DESC, t.created_ts ASC LIMIT 1"
-    )
-    with db_conn() as conn:
-        row = conn.execute(sql, tuple(params)).fetchone()
-    if not row:
-        return send_telegram("🏅 Match of the Day: no eligible tips yesterday.")
-    return send_telegram(_format_motd_row(row))
+        fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
+
+    if not fixtures:
+        return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
+
+    feat0 = _prematch_features()
+
+    best = None  # (prob, market_name, suggestion, home, away, league, kickoff_text)
+    for fx in fixtures:
+        fixture = fx.get("fixture") or {}
+        lg      = fx.get("league")  or {}
+        teams   = fx.get("teams")   or {}
+        home = (teams.get("home") or {}).get("name", "")
+        away = (teams.get("away") or {}).get("name", "")
+        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+        kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
+
+        # Score ALL markets ML-only (same logic as production_scan but prematch)
+        candidates: list[tuple[str, str, float]] = []  # (market_name, suggestion, prob)
+
+        # Over/Under
+        for line in OU_LINES:
+            mdl_line = _load_ou_model_for_line(line)
+            if not mdl_line:
+                continue
+            p_over = _score_prob(feat0, mdl_line)
+            market_name = f"Over/Under {_fmt_line(line)}"
+            thr = _get_market_threshold(market_name)
+            if p_over * 100.0 >= thr:
+                candidates.append((market_name, f"Over {_fmt_line(line)} Goals", p_over))
+            p_under = 1.0 - p_over
+            if p_under * 100.0 >= thr:
+                candidates.append((market_name, f"Under {_fmt_line(line)} Goals", p_under))
+
+        # BTTS
+        mdl_btts = load_model_from_settings("BTTS_YES")
+        if mdl_btts:
+            p_btts = _score_prob(feat0, mdl_btts)
+            thr_b = _get_market_threshold("BTTS")
+            if p_btts * 100.0 >= thr_b:
+                candidates.append(("BTTS", "BTTS: Yes", p_btts))
+            p_btts_no = 1.0 - p_btts
+            if p_btts_no * 100.0 >= thr_b:
+                candidates.append(("BTTS", "BTTS: No", p_btts_no))
+
+        # 1X2 (Draw blocked)
+        mh, md, ma = _load_wld_models()
+        if mh and md and ma:
+            ph = _score_prob(feat0, mh)
+            pd = _score_prob(feat0, md)
+            pa = _score_prob(feat0, ma)
+            s = max(1e-9, ph + pd + pa)
+            ph, pd, pa = ph/s, pd/s, pa/s
+            thr_1x2 = _get_market_threshold("1X2")
+            if ph * 100.0 >= thr_1x2:
+                candidates.append(("1X2", "Home Win", ph))
+            if pa * 100.0 >= thr_1x2:
+                candidates.append(("1X2", "Away Win", pa))
+
+        if not candidates:
+            continue
+
+        # Keep the strongest candidate above MOTD_CONF_MIN
+        market_name, suggestion, prob = max(candidates, key=lambda x: x[2])
+        prob_pct = prob * 100.0
+        if prob_pct < MOTD_CONF_MIN:
+            continue
+
+        item = (prob_pct, market_name, suggestion, home, away, league, kickoff_txt)
+        if (best is None) or (prob_pct > best[0]):
+            best = item
+
+    if not best:
+        return send_telegram("🏅 Match of the Day: no pick met the confidence/thresholds today.")
+
+    prob_pct, market_name, suggestion, home, away, league, kickoff_txt = best
+    return send_telegram(_format_motd_message(home, away, league, kickoff_txt, suggestion, market_name, prob_pct))
 
 # ────────────────────────────────
 # Training job wrapper (with Telegram output)
