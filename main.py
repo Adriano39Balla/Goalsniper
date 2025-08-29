@@ -311,6 +311,35 @@ def _api_get(url: str, params: dict, timeout: int = 15):
 # League filters (block youth/reserves/friendlies)
 _BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
 
+def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
+    """Block tips that are already settled or impossible given current score."""
+    gh = int(feat.get("goals_h", 0))
+    ga = int(feat.get("goals_a", 0))
+    total = gh + ga
+    s = (suggestion or "").strip()
+
+    # Over/Under guards
+    if s.startswith("Over") or s.startswith("Under"):
+        line = _parse_ou_line_from_suggestion(s)
+        if line is None:
+            return False  # can't parse -> skip
+        if s.startswith("Over"):
+            # Over already settled/won -> don't send
+            if total > line - 1e-9:
+                return False
+        else:  # Under
+            # Under cannot win anymore -> don't send
+            if total >= line - 1e-9:
+                return False
+
+    # BTTS guards
+    if s.startswith("BTTS"):
+        # If both teams already scored, market is settled
+        if gh > 0 and ga > 0:
+            return False
+
+    return True
+
 def _blocked_league(league_obj: dict) -> bool:
     name = str((league_obj or {}).get("name","")).lower()
     country = str((league_obj or {}).get("country","")).lower()
@@ -977,42 +1006,76 @@ def production_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
-        logger.info("[PROD] no live matches"); return 0, 0
-    saved = 0; now_ts = int(time.time())
+        logger.info("[PROD] no live matches")
+        return 0, 0
+
+    saved = 0
+    now_ts = int(time.time())
+
     with db_conn() as conn:
         for m in matches:
             try:
                 fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-                if not fid: continue
+                if not fid:
+                    continue
+
+                # Dup cooldown
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - (DUP_COOLDOWN_MIN * 60)
-                    dup = conn.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",(fid,cutoff)).fetchone()
-                    if dup: continue
-                feat = extract_features(m); minute = int(feat.get("minute",0))
-                if not stats_coverage_ok(feat, minute): continue
-                if minute < TIP_MIN_MINUTE: continue
+                    dup = conn.execute(
+                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",
+                        (fid, cutoff)
+                    ).fetchone()
+                    if dup:
+                        continue
+
+                feat = extract_features(m)
+                minute = int(feat.get("minute", 0))
+
+                if not stats_coverage_ok(feat, minute):
+                    continue
+                if minute < TIP_MIN_MINUTE:
+                    continue
+
+                # Harvest snapshots
                 if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
-                    try: save_snapshot_from_match(m, feat)
-                    except Exception: pass
-                league_id, league = _league_name(m); home, away = _teams(m); score_txt = _pretty_score(m)
-                candidates: List[Tuple[str,str,float]] = []
+                    try:
+                        save_snapshot_from_match(m, feat)
+                    except Exception:
+                        pass
+
+                league_id, league = _league_name(m)
+                home, away = _teams(m)
+                score_txt = _pretty_score(m)
+                candidates: List[Tuple[str, str, float]] = []
+
+                # ===== Over/Under =====
                 for line in OU_LINES:
                     mdl_line = _load_ou_model_for_line(line)
-                    if not mdl_line: continue
-                    p_over = _score_prob(feat, mdl_line); market_name = f"Over/Under {_fmt_line(line)}"
+                    if not mdl_line:
+                        continue
+
+                    p_over = _score_prob(feat, mdl_line)
+                    market_name = f"Over/Under {_fmt_line(line)}"
                     thr = _get_market_threshold(market_name)
+
                     if p_over * 100.0 >= thr:
                         sug = f"Over {_fmt_line(line)} Goals"
                         if _candidate_is_sane(sug, feat):
                             candidates.append((market_name, sug, p_over))
 
                     p_under = 1.0 - p_over
-                        if p_under*100.0 >= thr:
-                            sug = f"Under {_fmt_line(line)} Goals"
-                            if _candidate_is_sane(sug, feat):
-                                candidates.append((market_name, sug, p_under))
+                    if p_under * 100.0 >= thr:
+                        sug = f"Under {_fmt_line(line)} Goals"
+                        if _candidate_is_sane(sug, feat):
+                            candidates.append((market_name, sug, p_under))
+
+                # ===== BTTS =====
                 mdl_btts = load_model_from_settings("BTTS_YES")
                 if mdl_btts:
+                    p_btts = _score_prob(feat, mdl_btts)
+                    thr_b = _get_market_threshold("BTTS")
+
                     if p_btts * 100.0 >= thr_b:
                         sug = "BTTS: Yes"
                         if _candidate_is_sane(sug, feat):
@@ -1023,40 +1086,64 @@ def production_scan() -> Tuple[int, int]:
                         sug = "BTTS: No"
                         if _candidate_is_sane(sug, feat):
                             candidates.append(("BTTS", sug, p_btts_no))
+
+                # ===== 1X2 =====
                 mh, md, ma = _load_wld_models()
                 if mh and md and ma:
-                    ph = _score_prob(feat, mh); pd = _score_prob(feat, md); pa = _score_prob(feat, ma)
-                    s = max(EPS, ph+pd+pa); ph,pd,pa = ph/s,pd/s,pa/s
+                    ph = _score_prob(feat, mh)
+                    pd = _score_prob(feat, md)
+                    pa = _score_prob(feat, ma)
+                    s = max(EPS, ph + pd + pa)
+                    ph, pd, pa = ph / s, pd / s, pa / s
                     thr_1x2 = _get_market_threshold("1X2")
-                    if ph*100.0 >= thr_1x2: candidates.append(("1X2","Home Win", ph))
-                    if pa*100.0 >= thr_1x2: candidates.append(("1X2","Away Win", pa))
-                candidates.sort(key=lambda x:x[2], reverse=True)
-                per_match = 0; base_now = int(time.time())
-                for idx,(market_txt,suggestion,prob) in enumerate(candidates):
-                    if suggestion not in ALLOWED_SUGGESTIONS: continue
-                    if per_match >= max(1,PREDICTIONS_PER_MATCH): break
-                    created_ts = base_now + idx; 
-                    prob_pct = round(prob*100.0, 1)
+
+                    if ph * 100.0 >= thr_1x2:
+                        candidates.append(("1X2", "Home Win", ph))
+                    if pa * 100.0 >= thr_1x2:
+                        candidates.append(("1X2", "Away Win", pa))
+
+                # ===== Save/send =====
+                candidates.sort(key=lambda x: x[2], reverse=True)
+                per_match = 0
+                base_now = int(time.time())
+                for idx, (market_txt, suggestion, prob) in enumerate(candidates):
+                    if suggestion not in ALLOWED_SUGGESTIONS:
+                        continue
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        break
+
+                    created_ts = base_now + idx
+                    prob_pct = round(prob * 100.0, 1)
+
                     with db_conn() as conn2:
                         conn2.execute(
-                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
-                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
-                            (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), float(prob), score_txt, minute, created_ts),
+                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
+                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                            (fid, league_id, league, home, away,
+                             market_txt, suggestion, float(prob_pct),
+                             score_txt, minute, created_ts),
                         )
-                        # Do not send any HARVEST markers to Telegram
                         if suggestion != "HARVEST":
-                            sent_ok = _send_tip(home, away, league, minute, score_txt, suggestion, float(prob_pct), feat)
+                            sent_ok = _send_tip(home, away, league, minute,
+                                                score_txt, suggestion, float(prob_pct), feat)
                             if sent_ok:
                                 conn2.execute(
                                     "UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
                                     (fid, created_ts),
                                 )
-                    saved += 1; per_match += 1
-                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
+                    saved += 1
+                    per_match += 1
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        break
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break
+
             except Exception as e:
-                logger.exception("[PROD] failure on match: %s", e); continue
-    logger.info(f"[PROD] saved={saved} live_seen={live_seen}"); return saved, live_seen
+                logger.exception("[PROD] failure on match: %s", e)
+                continue
+
+    logger.info(f"[PROD] saved={saved} live_seen={live_seen}")
+    return saved, live_seen
 
 # ────────────────────────────────
 # Leader lock (advisory)
