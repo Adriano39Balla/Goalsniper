@@ -16,7 +16,7 @@ from html import escape
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
-from flask import Flask, jsonify, request, abort
+from flask import Flask, jsonify, request, abort, Response
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -688,12 +688,12 @@ def _kickoff_berlin(utc_iso: str|None) -> str:
     except Exception:
         return "TBD"
 
-def _api_fixtures_for_date_utc(date_utc: datetime) -> List[Dict[str, Any]]:
+def _api_fixtures_for_date_utc(date_utc: datetime) -> list[dict]:
     """Fetch fixtures for the given UTC date; filter to not-started (NS)."""
     js = _api_get(FOOTBALL_API_URL, {"date": date_utc.strftime("%Y-%m-%d")})
     if not isinstance(js, dict):
         return []
-    out: List[Dict[str, Any]] = []
+    out = []
     for r in js.get("response", []) or []:
         st = (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
         if st == "NS":
@@ -718,7 +718,7 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, market_nam
         f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
         f"🏆 <b>League:</b> {escape(league)}\n"
         f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
-        f"<b>Tip:</b> {escape(suggestion)}\n"
+        f"<b>Tip:</b> {escape(suggestion)} ({escape(market_name)})\n"
         f"📈 <b>Confidence:</b> {prob_pct:.1f}%"
     )
 
@@ -738,7 +738,7 @@ def send_match_of_the_day() -> bool:
     # Two UTC dates may overlap (edge timezone cases), so query both if needed
     dates_utc = {start_local.astimezone(TZ_UTC).date(), (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
 
-    fixtures: List[Dict[str, Any]] = []
+    fixtures: list[dict] = []
     for d in sorted(dates_utc):
         fixtures.extend(_api_fixtures_for_date_utc(datetime(d.year, d.month, d.day, tzinfo=TZ_UTC)))
 
@@ -762,7 +762,7 @@ def send_match_of_the_day() -> bool:
         kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
 
         # Score ALL markets ML-only (same logic as production_scan but prematch)
-        candidates: List[Tuple[str, str, float]] = []  # (market_name, suggestion, prob)
+        candidates: list[tuple[str, str, float]] = []  # (market_name, suggestion, prob)
 
         # Over/Under
         for line in OU_LINES:
@@ -806,7 +806,6 @@ def send_match_of_the_day() -> bool:
         if not candidates:
             continue
 
-        # Keep the strongest candidate above MOTD_CONF_MIN
         market_name, suggestion, prob = max(candidates, key=lambda x: x[2])
         prob_pct = prob * 100.0
         if prob_pct < MOTD_CONF_MIN:
@@ -1105,6 +1104,92 @@ def health():
         return jsonify({"ok": True, "db": "ok", "tips_count": int(c)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+# Admin check (helps debug 401)
+@app.route("/admin/check", methods=["GET"])
+def admin_check():
+    _require_admin()
+    return jsonify({"ok": True, "admin": True})
+
+# HTML Admin Panel (no auth to view; actions require key)
+@app.route("/admin/panel", methods=["GET"])
+def admin_panel():
+    html = f"""
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Live Tips Admin Panel</title>
+<style>
+  body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; max-width: 900px; margin: auto; }}
+  h1 {{ margin-top: 0; }}
+  .row {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }}
+  button {{ padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; cursor: pointer; }}
+  input[type=text] {{ padding: 10px; border: 1px solid #ddd; border-radius: 8px; width: 380px; max-width: 100%; }}
+  pre {{ background: #f7f7f7; padding: 12px; border-radius: 8px; overflow:auto; max-height: 420px; }}
+  small {{ color: #666; }}
+</style>
+<h1>Live Tips — Admin Panel</h1>
+<div class="row">
+  <input id="key" type="text" placeholder="ADMIN_API_KEY" />
+  <button onclick="saveKey()">Save key</button>
+  <small id="status"></small>
+</div>
+<div class="row">
+  <button onclick="hit('/admin/check')">Check admin</button>
+  <button onclick="hit('/init-db','POST')">Init DB</button>
+  <button onclick="hit('/admin/scan')">Scan (live)</button>
+  <button onclick="hit('/admin/backfill-results')">Backfill results</button>
+  <button onclick="hit('/admin/train')">Train (JSON)</button>
+  <button onclick="hit('/admin/train-notify')">Train + notify</button>
+</div>
+<div class="row">
+  <button onclick="hit('/admin/digest')">Send Digest</button>
+  <button onclick="hit('/admin/motd')">Send MOTD</button>
+  <button onclick="openTips()">Open latest tips</button>
+  <button onclick="openHealth()">Open health</button>
+</div>
+<pre id="out">Ready.</pre>
+<script>
+  const q = new URLSearchParams(location.search);
+  const elKey = document.getElementById('key');
+  const elOut = document.getElementById('out');
+  const elStatus = document.getElementById('status');
+
+  function loadKey() {{
+    const fromQs = q.get('key');
+    const fromLs = localStorage.getItem('ADMIN_API_KEY');
+    elKey.value = fromQs || fromLs || '';
+    if (fromQs) localStorage.setItem('ADMIN_API_KEY', fromQs);
+    elStatus.textContent = elKey.value ? 'key loaded' : 'no key saved';
+  }}
+
+  function saveKey() {{
+    localStorage.setItem('ADMIN_API_KEY', elKey.value.trim());
+    elStatus.textContent = elKey.value ? 'key saved' : 'no key saved';
+  }}
+
+  async function hit(path, method='GET') {{
+    const key = (elKey.value || '').trim();
+    if (!key) {{ elOut.textContent = 'Set your ADMIN_API_KEY first.'; return; }}
+    const url = path + '?key=' + encodeURIComponent(key);
+    try {{
+      const res = await fetch(url, {{ method, headers: {{ 'X-API-Key': key }} }});
+      const txt = await res.text();
+      elOut.textContent = res.status + ' ' + res.statusText + '\\n\\n' + txt;
+    }} catch (e) {{
+      elOut.textContent = 'Request failed: ' + e;
+    }}
+  }}
+
+  function openTips() {{
+    window.open('/tips/latest', '_blank');
+  }}
+  function openHealth() {{
+    window.open('/health', '_blank');
+  }}
+  loadKey();
+</script>
+"""
+    return Response(html, mimetype="text/html")
 
 # ── Admin ops (require ?key=ADMIN_API_KEY or header X-API-Key)
 @app.route("/init-db", methods=["POST"])
