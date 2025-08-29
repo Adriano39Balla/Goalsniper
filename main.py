@@ -1022,12 +1022,13 @@ def production_scan() -> Tuple[int, int]:
                 for idx,(market_txt,suggestion,prob) in enumerate(candidates):
                     if suggestion not in ALLOWED_SUGGESTIONS: continue
                     if per_match >= max(1,PREDICTIONS_PER_MATCH): break
-                    created_ts = base_now + idx; prob_pct = round(prob*100.0, 1)
+                    created_ts = base_now + idx; 
+                    prob_pct = round(prob*100.0, 1)
                     with db_conn() as conn2:
                         conn2.execute(
-                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
-                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
-                            (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), score_txt, minute, created_ts),
+                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
+                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                            (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), float(prob), score_txt, minute, created_ts),
                         )
                         # Do not send any HARVEST markers to Telegram
                         if suggestion != "HARVEST":
