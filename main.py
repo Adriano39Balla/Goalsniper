@@ -1007,7 +1007,7 @@ def production_scan() -> Tuple[int, int]:
                             candidates.append((market_name, sug, p_over))
 
                     p_under = 1.0 - p_over
-                        if p_under * 100.0 >= thr:
+                        if p_under*100.0 >= thr:
                             sug = f"Under {_fmt_line(line)} Goals"
                             if _candidate_is_sane(sug, feat):
                                 candidates.append((market_name, sug, p_under))
