@@ -415,67 +415,77 @@ def train_models(
             _set_setting(conn, f"conf_threshold:{market_name}", f"{thr_ou_pct:.2f}")
             summary["thresholds"][market_name] = thr_ou_pct
 
-        # --- 1X2 (WLD) via one-vs-rest LR ---
-        # Labels from final result
-        gd = df["final_goals_diff"].values.astype(int)
-        y_home = (gd > 0).astype(int)
-        y_away = (gd < 0).astype(int)
+       # --- 1X2 (WLD) via one-vs-rest LR ---
+       gd = df["final_goals_diff"].values.astype(int)
+       y_home = (gd > 0).astype(int)
+       y_draw = (gd == 0).astype(int)
+       y_away = (gd < 0).astype(int)
 
-        def _fit_ovr(name: str, ybin: np.ndarray):
-            if len(np.unique(ybin)) < 2:
-                return None, None
-            X_tr, X_te = X_all[tr_mask], X_all[te_mask]
-            y_tr, y_te = ybin[tr_mask], ybin[te_mask]
-            m = fit_lr_safe(X_tr, y_tr)
-            if m is None:
-                return None, None
-            p_raw = m.predict_proba(X_te)[:, 1]
-            a, b = fit_platt(y_te, p_raw)
-            p_cal = 1.0 / (1.0 + np.exp(-(a * _logit_vec(p_raw) + b)))
-            bri = float(brier_score_loss(y_te, p_cal))
-            acc = float(accuracy_score(y_te, (p_cal >= 0.5).astype(int)))
-            ll  = float(log_loss(y_te, p_cal, labels=[0, 1]))
-            blob = build_model_blob(m, FEATURES, (a, b))
-            for k in (f"model_latest:{name}", f"model:{name}"):
-                _set_setting(conn, k, json.dumps(blob))
-            summary["metrics"][name] = {"brier": bri, "acc": acc, "logloss": ll,
-                                        "n_test": int(len(y_te)), "prevalence": float(ybin.mean())}
-            summary["trained"][name] = True
-            return (p_cal,)
+       def _fit_ovr_return_probs(label_name: str, ybin: np.ndarray):
+           """
+           Fit a one-vs-rest LR head and return CALIBRATED test-set probabilities (p_cal),
+           or None if training is not possible. Also saves the model + metrics into settings.
+           """
+           if len(np.unique(ybin)) < 2:
+               summary["trained"][label_name] = False
+               return None
 
-        wld_models_ok = True
-        res_h = _fit_ovr("WLD_HOME", y_home)
-        res_a = _fit_ovr("WLD_AWAY", y_away)
-        if not (res_h and res_d and res_a):
-            wld_models_ok = False
+           X_tr, X_te = X_all[tr_mask], X_all[te_mask]
+           y_tr, y_te = ybin[tr_mask], ybin[te_mask]
 
-        if wld_models_ok:
-            p_h, = res_h
-            p_d, = res_d
-            p_a, = res_a
-            # Renormalize calibrated OvR probs to sum to 1 per sample
-            ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_d, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
-            p_hn, p_dn, p_an = p_h / ps, p_d / ps, p_a / ps
-            p_max = np.maximum.reduce([p_hn, p_dn, p_an])
+           m = fit_lr_safe(X_tr, y_tr)
+           if m is None:
+               summary["trained"][label_name] = False
+               return None
 
-            # True class index for the same test rows (time split keeps alignment)
-            gd_te = gd[te_mask]
-            y_class = np.zeros_like(gd_te, dtype=int)
-            y_class[gd_te == 0] = 1
-            y_class[gd_te < 0] = 2
-            correct = (np.argmax(np.stack([p_hn, p_dn, p_an], axis=1), axis=1) == y_class).astype(int)
+           p_raw = m.predict_proba(X_te)[:, 1]
+           a, b = fit_platt(y_te, p_raw)
+           p_cal = 1.0 / (1.0 + np.exp(-(a * _logit_vec(p_raw) + b)))
 
-            thr_1x2_prob = _pick_threshold_for_target_precision(
-                y_true=correct, p_cal=p_max,
-                target_precision=target_precision, min_preds=min_preds, default_threshold=0.45,
-            )
-            thr_1x2_pct = float(np.clip(_percent(thr_1x2_prob), min_thresh, max_thresh))
-            _set_setting(conn, "conf_threshold:1X2", f"{thr_1x2_pct:.2f}")
-            summary["thresholds"]["1X2"] = thr_1x2_pct
-        else:
-            summary["trained"]["WLD_HOME"] = bool(res_h)
-            summary["trained"]["WLD_DRAW"] = bool(res_d)
-            summary["trained"]["WLD_AWAY"] = bool(res_a)
+           bri = float(brier_score_loss(y_te, p_cal))
+           acc = float(accuracy_score(y_te, (p_cal >= 0.5).astype(int)))
+           ll  = float(log_loss(y_te, p_cal, labels=[0, 1]))
+
+           blob = build_model_blob(m, FEATURES, (a, b))
+           for k in (f"model_latest:{label_name}", f"model:{label_name}"):
+               _set_setting(conn, k, json.dumps(blob))
+
+           summary["metrics"][label_name] = {
+               "brier": bri, "acc": acc, "logloss": ll,
+               "n_test": int(len(y_te)), "prevalence": float(ybin.mean())
+           }
+           summary["trained"][label_name] = True
+           return p_cal
+
+       # Try to train all three heads; None means that head couldn't be trained.
+       p_h = _fit_ovr_return_probs("WLD_HOME", y_home)
+       p_d = _fit_ovr_return_probs("WLD_DRAW", y_draw)
+       p_a = _fit_ovr_return_probs("WLD_AWAY", y_away)
+
+       if (p_h is not None) and (p_d is not None) and (p_a is not None):
+           # Compose a 3-way distribution and pick a decision-confidence threshold
+           ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_d, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
+           p_hn, p_dn, p_an = p_h / ps, p_d / ps, p_a / ps
+           p_max = np.maximum.reduce([p_hn, p_dn, p_an])
+
+           gd_te = gd[te_mask]
+           y_class = np.zeros_like(gd_te, dtype=int)
+           y_class[gd_te == 0] = 1
+           y_class[gd_te < 0] = 2
+           correct = (np.argmax(np.stack([p_hn, p_dn, p_an], axis=1), axis=1) == y_class).astype(int)
+
+           thr_1x2_prob = _pick_threshold_for_target_precision(
+               y_true=correct, p_cal=p_max,
+               target_precision=target_precision, min_preds=min_preds, default_threshold=0.45,
+           )
+           thr_1x2_pct = float(np.clip(_percent(thr_1x2_prob), min_thresh, max_thresh))
+           _set_setting(conn, "conf_threshold:1X2", f"{thr_1x2_pct:.2f}")
+           summary["thresholds"]["1X2"] = thr_1x2_pct
+       else:
+           # Mark which heads trained; avoid NameError entirely.
+           summary["trained"]["WLD_HOME"] = bool(p_h is not None)
+           summary["trained"]["WLD_DRAW"] = bool(p_d is not None)
+           summary["trained"]["WLD_AWAY"] = bool(p_a is not None)
 
         # Bundle metrics snapshot
         metrics_bundle = {
