@@ -1001,15 +1001,28 @@ def production_scan() -> Tuple[int, int]:
                     if not mdl_line: continue
                     p_over = _score_prob(feat, mdl_line); market_name = f"Over/Under {_fmt_line(line)}"
                     thr = _get_market_threshold(market_name)
-                    if p_over*100.0 >= thr: candidates.append((market_name, f"Over {_fmt_line(line)} Goals", p_over))
+                    if p_over * 100.0 >= thr:
+                        sug = f"Over {_fmt_line(line)} Goals"
+                        if _candidate_is_sane(sug, feat):
+                            candidates.append((market_name, sug, p_over))
+
                     p_under = 1.0 - p_over
-                    if p_under*100.0 >= thr: candidates.append((market_name, f"Under {_fmt_line(line)} Goals", p_under))
+                        if p_under * 100.0 >= thr:
+                            sug = f"Under {_fmt_line(line)} Goals"
+                            if _candidate_is_sane(sug, feat):
+                                candidates.append((market_name, sug, p_under))
                 mdl_btts = load_model_from_settings("BTTS_YES")
                 if mdl_btts:
-                    p_btts = _score_prob(feat, mdl_btts); thr_b = _get_market_threshold("BTTS")
-                    if p_btts*100.0 >= thr_b: candidates.append(("BTTS","BTTS: Yes", p_btts))
+                    if p_btts * 100.0 >= thr_b:
+                        sug = "BTTS: Yes"
+                        if _candidate_is_sane(sug, feat):
+                            candidates.append(("BTTS", sug, p_btts))
+
                     p_btts_no = 1.0 - p_btts
-                    if p_btts_no*100.0 >= thr_b: candidates.append(("BTTS","BTTS: No", p_btts_no))
+                    if p_btts_no * 100.0 >= thr_b:
+                        sug = "BTTS: No"
+                        if _candidate_is_sane(sug, feat):
+                            candidates.append(("BTTS", sug, p_btts_no))
                 mh, md, ma = _load_wld_models()
                 if mh and md and ma:
                     ph = _score_prob(feat, mh); pd = _score_prob(feat, md); pa = _score_prob(feat, ma)
