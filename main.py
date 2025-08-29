@@ -355,12 +355,16 @@ def extract_features(match: Dict[str, Any]) -> Dict[str, float]:
     red_h = red_a = 0
     for ev in (match.get("events") or []):
         try:
-            if (ev.get("type", "").lower() == "card"):
-                detail = (ev.get("detail", "") or "").lower()
-                if ("red" in detail) or ("second yellow" in detail"):
-                    tname = (ev.get("team") or {}).get("name") or ""
-                    if tname == home_name: red_h += 1
-                    elif tname == away_name: red_a += 1
+            if (str(ev.get("type", "")).lower() == "card"):
+                detail_raw = ev.get("detail", "")
+                d = str(detail_raw).strip().lower()
+                # count straight reds and second yellows as reds
+                if ("red" in d) or ("second yellow" in d):
+                    tname = ((ev.get("team") or {}).get("name") or "")
+                    if tname == home_name:
+                        red_h += 1
+                    elif tname == away_name:
+                        red_a += 1
         except Exception:
             pass
 
