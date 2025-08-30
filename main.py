@@ -47,7 +47,7 @@ WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 RUN_SCHEDULER      = os.getenv("RUN_SCHEDULER", "1") not in ("0","false","False","no","NO")
 
-CONF_THRESHOLD     = float(os.getenv("CONF_THRESHOLD", "65"))  # default if no per-market threshold
+CONF_THRESHOLD     = float(os.getenv("CONF_THRESHOLD", "85"))  # default if no per-market threshold
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 TIP_MIN_MINUTE     = int(os.getenv("TIP_MIN_MINUTE", "8"))
@@ -1174,7 +1174,9 @@ def _start_scheduler_once() -> None:
                       minutes=BACKFILL_EVERY_MIN, id="backfill_loop", max_instances=1, coalesce=True)
         if DAILY_ACCURACY_DIGEST_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1003, daily_accuracy_digest),
-                          CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=TZ_UTC),
+                          CronTrigger(hour=DAILY_ACCURACY_HOUR,
+                                      minute=DAILY_ACCURACY_MINUTE,
+                                      timezone=BERLIN_TZ),   # was TZ_UTC
                           id="daily_digest", max_instances=1, coalesce=True)
         if MOTD_PREDICT:
             sched.add_job(lambda: _run_with_pg_lock(1004, send_match_of_the_day),
@@ -1192,7 +1194,7 @@ def _start_scheduler_once() -> None:
         sched.add_job(lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200), "interval",
                       minutes=10, id="retry_unsent", max_instances=1, coalesce=True)
         sched.start(); _scheduler_started = True
-        send_telegram("🚀 Full AI mode backend started."); 
+        send_telegram("🚀 goalsniper AI mode started."); 
         logger.info("[SCHED] started (scan=%ss, backfill=%smin, run=%s)", SCAN_INTERVAL_SEC, BACKFILL_EVERY_MIN, RUN_SCHEDULER)
     except Exception as e:
         logger.exception("[SCHED] failed to start: %s", e)
@@ -1322,7 +1324,7 @@ def telegram_webhook(secret: str):
     try:
         msg = (update.get("message") or {}).get("text") or ""
         if msg.startswith("/start"):
-            send_telegram("👋 Live tips bot (FULL AI mode) is online.")
+            send_telegram("👋 goalsniper bot (FULL AI mode) is online.")
         elif msg.startswith("/digest"):
             daily_accuracy_digest()
         elif msg.startswith("/motd"):
