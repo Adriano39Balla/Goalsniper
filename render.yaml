@@ -3,7 +3,7 @@ services:
     name: Goalsniper-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python3 main.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
