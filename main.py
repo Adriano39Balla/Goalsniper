@@ -1,9 +1,13 @@
 """
-Postgres-only Flask backend for live football tips — FULL AI MODE.
-Pure ML scoring (no math fallbacks), Platt-calibrated models from DB.
-Markets: O/U (1.5 removed), BTTS (Yes/No), 1X2 (Draw blocked at send-time).
-Automation: harvest snapshots, nightly train, periodic backfill, daily digest, MOTD (prematch optional).
-Scan interval: 5 minutes.
+Postgres-only Flask backend for live + prematch football tips — FULL AI MODE.
+Pure ML scoring (no rule fallbacks), Platt-calibrated models loaded from DB.
+
+Markets:
+  In-Play: O/U (2.5, 3.5), BTTS (Yes/No), 1X2 (Draw suppressed)
+  Prematch: same markets via PRE_* models (Draw suppressed)
+
+Automation: harvest snapshots, nightly train, results backfill, daily digest, MOTD (prematch).
+Scan interval: 5 minutes (configurable).
 """
 
 import os
@@ -47,7 +51,8 @@ WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 RUN_SCHEDULER      = os.getenv("RUN_SCHEDULER", "1") not in ("0","false","False","no","NO")
 
-CONF_THRESHOLD     = float(os.getenv("CONF_THRESHOLD", "85"))  # default if no per-market threshold
+# Default per-market threshold if none set in DB (you can override per-market via settings)
+CONF_THRESHOLD     = float(os.getenv("CONF_THRESHOLD", "70"))
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 TIP_MIN_MINUTE     = int(os.getenv("TIP_MIN_MINUTE", "8"))
@@ -76,9 +81,17 @@ MIN_THRESH              = float(os.getenv("MIN_THRESH", "55"))
 MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
 # MOTD prematch scoring gate
-MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "0") not in ("0","false","False","no","NO")
+MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
+MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
+MOTD_HOUR               = int(os.getenv("MOTD_HOUR", "19"))
+MOTD_MINUTE             = int(os.getenv("MOTD_MINUTE", "15"))
+MOTD_CONF_MIN           = float(os.getenv("MOTD_CONF_MIN", "70"))
+try:
+    MOTD_LEAGUE_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS","").split(",")) if x.strip().isdigit()]
+except Exception:
+    MOTD_LEAGUE_IDS = []
 
-# Markets / lines: remove 1.5
+# Markets / lines: default to 2.5 and 3.5, 1.5 removed
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     out: List[float] = []
     for tok in (env_val or "").split(","):
@@ -91,13 +104,13 @@ def _parse_lines(env_val: str, default: List[float]) -> List[float]:
             pass
     return out or default
 
-OU_LINES: List[float] = _parse_lines(os.getenv("OU_LINES", "0.5,2.5,3.5"), [0.5, 2.5, 3.5])
+OU_LINES: List[float] = _parse_lines(os.getenv("OU_LINES", "2.5,3.5"), [2.5, 3.5])
 OU_LINES = [ln for ln in OU_LINES if abs(ln - 1.5) > 1e-6]
 
 TOTAL_MATCH_MINUTES   = int(os.getenv("TOTAL_MATCH_MINUTES", "95"))
 PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "2"))
 
-# Allowed suggestions — Draw removed
+# Allowed suggestions — Draw suppressed by design
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
 for _ln in OU_LINES:
     s = f"{_ln}".rstrip("0").rstrip(".")
@@ -114,7 +127,7 @@ BASE_URL         = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS          = {"x-apisports-key": API_KEY, "Accept": "application/json"}
-INPLAY_STATUSES  = {"1H","HT","2H","ET","BT","P"}
+INPLAY_STATUSES  = {"1H","HT","2H","ET","BT","P"}  # api-football "short" codes
 
 # HTTP session
 session = requests.Session()
@@ -138,9 +151,7 @@ try:
     from train_models import train_models  # real trainer
 except Exception as e:
     _IMPORT_ERR = repr(e)  # capture once, safe global
-
     def train_models(*args, **kwargs) -> Dict[str, Any]:
-        # clean fallback that never references an undefined name
         logger.warning("train_models not available: %s", _IMPORT_ERR)
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
@@ -218,8 +229,7 @@ def get_setting_cached(key: str) -> Optional[str]:
     return val
 
 def invalidate_model_caches_for_key(key: str):
-    """If a settings key looks like model*, invalidate model caches."""
-    if key.lower().startswith(("model", "model_latest", "model_v2")):
+    if key.lower().startswith(("model", "model_latest", "model_v2", "pre_")):
         _MODELS_CACHE.invalidate()
 
 # ────────────────────────────────
@@ -271,10 +281,8 @@ def init_db():
             btts_yes      INTEGER,
             updated_ts    BIGINT
         )""")
-        # Add columns if missing
         try: conn.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS confidence_raw DOUBLE PRECISION")
         except Exception: pass
-        # Indexes
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
@@ -311,35 +319,6 @@ def _api_get(url: str, params: dict, timeout: int = 15):
 # League filters (block youth/reserves/friendlies)
 _BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
 
-def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
-    """Block tips that are already settled or impossible given current score."""
-    gh = int(feat.get("goals_h", 0))
-    ga = int(feat.get("goals_a", 0))
-    total = gh + ga
-    s = (suggestion or "").strip()
-
-    # Over/Under guards
-    if s.startswith("Over") or s.startswith("Under"):
-        line = _parse_ou_line_from_suggestion(s)
-        if line is None:
-            return False  # can't parse -> skip
-        if s.startswith("Over"):
-            # Over already settled/won -> don't send
-            if total > line - 1e-9:
-                return False
-        else:  # Under
-            # Under cannot win anymore -> don't send
-            if total >= line - 1e-9:
-                return False
-
-    # BTTS guards
-    if s.startswith("BTTS"):
-        # If both teams already scored, market is settled
-        if gh > 0 and ga > 0:
-            return False
-
-    return True
-
 def _blocked_league(league_obj: dict) -> bool:
     name = str((league_obj or {}).get("name","")).lower()
     country = str((league_obj or {}).get("country","")).lower()
@@ -356,7 +335,9 @@ def _blocked_league(league_obj: dict) -> bool:
         return lid not in allow
     return False
 
-# Stats/events fetch
+# ────────────────────────────────
+# Live (in-play) fetches
+# ────────────────────────────────
 def fetch_match_stats(fixture_id: int) -> Optional[List[Dict[str, Any]]]:
     now = time.time()
     if fixture_id in STATS_CACHE:
@@ -399,7 +380,116 @@ def fetch_live_matches() -> List[Dict[str, Any]]:
     return out
 
 # ────────────────────────────────
-# Features
+# Prematch helpers (new)
+# ────────────────────────────────
+def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
+    js = _api_get(f"{BASE_URL}/fixtures", {"team": team_id, "last": n})
+    return (js or {}).get("response", []) if isinstance(js, dict) else []
+
+def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
+    js = _api_get(f"{BASE_URL}/fixtures/headtohead", {"h2h": f"{home_id}-{away_id}", "last": n})
+    return (js or {}).get("response", []) if isinstance(js, dict) else []
+
+def _collect_todays_prematch_fixtures() -> List[dict]:
+    # Berlin 'today' → fetch overlapping UTC dates (to cover late-night matches)
+    today_local = datetime.now(BERLIN_TZ).date()
+    start_local = datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
+    end_local   = start_local + timedelta(days=1)
+    dates_utc = {start_local.astimezone(TZ_UTC).date(),
+                 (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
+    fixtures: List[dict] = []
+    for d in sorted(dates_utc):
+        js = _api_get(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")})
+        if not isinstance(js, dict): continue
+        for r in js.get("response", []) or []:
+            st = (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+            if st == "NS":
+                fixtures.append(r)
+    fixtures = [f for f in fixtures if not _blocked_league(f.get("league") or {})]
+    if MOTD_LEAGUE_IDS:
+        fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
+    return fixtures
+
+def _pm_rate_from_games(games: List[dict]) -> Tuple[float,float,float]:
+    ov25=ov35=btts=played=0
+    for fx in games:
+        st = (((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st not in {"FT","AET","PEN"}: continue
+        g = fx.get("goals") or {}; gh=int(g.get("home") or 0); ga=int(g.get("away") or 0)
+        tot = gh+ga; played += 1
+        if tot>2: ov25+=1
+        if tot>3: ov35+=1
+        if gh>0 and ga>0: btts+=1
+    if played == 0: return 0.0, 0.0, 0.0
+    return ov25/played, ov35/played, btts/played
+
+def _pm_rest_days(games: List[dict]) -> float:
+    latest_dt = None
+    for g in games:
+        dt_iso = ((g.get("fixture") or {}).get("date") or "")
+        try:
+            dt = datetime.fromisoformat(dt_iso.replace("Z","+00:00"))
+            latest_dt = max(latest_dt, dt) if latest_dt else dt
+        except Exception:
+            continue
+    if not latest_dt:
+        return 7.0
+    return max(0.0, (datetime.now(TZ_UTC) - latest_dt).total_seconds()/86400.0)
+
+def extract_prematch_features(fx: dict) -> Dict[str, float]:
+    teams = fx.get("teams") or {}
+    th = (teams.get("home") or {}).get("id")
+    ta = (teams.get("away") or {}).get("id")
+    if not th or not ta:
+        return {}
+
+    last_h = _api_last_fixtures(th, 5)
+    last_a = _api_last_fixtures(ta, 5)
+    h2h    = _api_h2h(th, ta, 5)
+
+    # Perspective stats
+    def _perspective(games: List[dict], as_home: bool) -> Tuple[float,float,float]:
+        gf=ga=w=played=0
+        for g in games:
+            st = (((g.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+            if st not in {"FT","AET","PEN"}: continue
+            gh=int((g.get("goals") or {}).get("home") or 0)
+            ga_=int((g.get("goals") or {}).get("away") or 0)
+            played+=1
+            if as_home:
+                gf += gh; ga += ga_
+                if gh > ga_: w += 1
+            else:
+                gf += ga_; ga += gh
+                if ga_ > gh: w += 1
+        if played == 0: return 0.0, 0.0, 0.0
+        return gf/played, ga/played, w/max(1,played)
+
+    gf_h, ga_h, win_h = _perspective(last_h, True)
+    gf_a, ga_a, win_a = _perspective(last_a, False)
+
+    ov25_h, ov35_h, btts_h = _pm_rate_from_games(last_h)
+    ov25_a, ov35_a, btts_a = _pm_rate_from_games(last_a)
+    ov25_h2h, ov35_h2h, btts_h2h = _pm_rate_from_games(h2h)
+
+    return {
+        # outcome-related signals
+        "pm_gf_h": gf_h, "pm_ga_h": ga_h, "pm_win_h": win_h,
+        "pm_gf_a": gf_a, "pm_ga_a": ga_a, "pm_win_a": win_a,
+        # O/U & BTTS rates (form + H2H)
+        "pm_ov25_h": ov25_h, "pm_ov35_h": ov35_h, "pm_btts_h": btts_h,
+        "pm_ov25_a": ov25_a, "pm_ov35_a": ov35_a, "pm_btts_a": btts_a,
+        "pm_ov25_h2h": ov25_h2h, "pm_ov35_h2h": ov35_h2h, "pm_btts_h2h": btts_h2h,
+        # rest differential
+        "pm_rest_diff": _pm_rest_days(last_h) - _pm_rest_days(last_a),
+        # baseline live features kept for model compatibility (0 for prematch)
+        "minute":0.0,"goals_h":0.0,"goals_a":0.0,"goals_sum":0.0,"goals_diff":0.0,
+        "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
+        "cor_h":0.0,"cor_a":0.0,"cor_sum":0.0,"pos_h":0.0,"pos_a":0.0,"pos_diff":0.0,"red_h":0.0,"red_a":0.0,"red_sum":0.0
+    }
+
+# ────────────────────────────────
+# Feature extraction (in-play)
 # ────────────────────────────────
 def _num(v) -> float:
     try:
@@ -541,10 +631,11 @@ def _linpred(feat: Dict[str, float], weights: Dict[str, float], intercept: float
 def _calibrate(p: float, cal: Dict[str, Any]) -> float:
     method = (cal or {}).get("method", "sigmoid")
     a = float((cal or {}).get("a", 1.0)); b = float((cal or {}).get("b", 0.0))
-    if method == "platt":
+    if method.lower() == "platt":
         return _sigmoid(a * _logit(p) + b)
-    import math
+    # default: sigmoid on logit with a/b
     p = max(EPS, min(1 - EPS, float(p)))
+    import math
     z = math.log(p / (1.0 - p))
     return _sigmoid(a * z + b)
 
@@ -566,7 +657,7 @@ def _load_ou_model_for_line(line: float) -> Optional[Dict[str, Any]]:
     name = f"OU_{_fmt_line(line)}"
     mdl = load_model_from_settings(name)
     if not mdl and abs(line - 2.5) < 1e-6:
-        mdl = load_model_from_settings("O25")
+        mdl = load_model_from_settings("O25")  # legacy alias
     return mdl
 
 def _load_wld_models() -> Tuple[Optional[Dict], Optional[Dict], Optional[Dict]]:
@@ -575,6 +666,20 @@ def _load_wld_models() -> Tuple[Optional[Dict], Optional[Dict], Optional[Dict]]:
         load_model_from_settings("WLD_DRAW"),
         load_model_from_settings("WLD_AWAY"),
     )
+
+# Prematch model loaders (namespaced)
+def _load_pre_ou_model_for_line(line: float) -> Optional[Dict[str, Any]]:
+    name = f"PRE_OU_{_fmt_line(line)}"
+    return load_model_from_settings(name)
+
+def _load_pre_wld_models() -> Tuple[Optional[Dict], Optional[Dict]]:
+    return (
+        load_model_from_settings("PRE_WLD_HOME"),
+        load_model_from_settings("PRE_WLD_AWAY"),
+    )
+
+def _load_pre_btts_model() -> Optional[Dict[str, Any]]:
+    return load_model_from_settings("PRE_BTTS_YES")
 
 # ────────────────────────────────
 # Harvest
@@ -603,18 +708,16 @@ def save_snapshot_from_match(m: Dict[str, Any], feat: Dict[str, float]) -> None:
 
     now = int(time.time())
     with db_conn() as conn:
-        # store the raw snapshot (for training)
         conn.execute(
             "INSERT INTO tip_snapshots(match_id, created_ts, payload) "
             "VALUES (%s,%s,%s) "
             "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
             (fid, now, json.dumps(snapshot)[:200000]),
         )
-        # store a HARVEST marker row in tips — but mark as already 'sent'
         conn.execute(
-            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)",
-            (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, f"{gh}-{ga}", minute, now),
+            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)",
+            (fid, league_id, league, home, away, "HARVEST", "HARVEST", 0.0, 0.0, f"{gh}-{ga}", minute, now),
         )
 
 # ────────────────────────────────
@@ -649,8 +752,7 @@ def _tip_outcome_for_result(suggestion: str, res: Dict[str, Any]) -> Optional[in
     if s == "BTTS: No":  return 1 if btts == 0 else 0
     if s == "Home Win":  return 1 if gh > ga else 0
     if s == "Away Win":  return 1 if ga > gh else 0
-    if s == "Draw":      return 1 if gh == ga else 0
-    return None
+    return None  # Draw suppressed
 
 def _fixture_by_id(match_id: int) -> Optional[Dict[str, Any]]:
     js = _api_get(FOOTBALL_API_URL, {"id": match_id})
@@ -716,7 +818,7 @@ def daily_accuracy_digest() -> Optional[str]:
     with db_conn() as conn:
         rows = conn.execute(
             """
-            SELECT t.match_id, t.market, t.suggestion, t.confidence, t.created_ts,
+            SELECT t.match_id, t.market, t.suggestion, t.confidence, t.confidence_raw, t.created_ts,
                    r.final_goals_h, r.final_goals_a, r.btts_yes
             FROM tips t
             LEFT JOIN match_results r ON r.match_id = t.match_id
@@ -729,7 +831,7 @@ def daily_accuracy_digest() -> Optional[str]:
 
     total = graded = wins = 0
     by_market: Dict[str, Dict[str, int]] = {}
-    for (mid, market, sugg, conf, cts, gh, ga, btts) in rows:
+    for (mid, market, sugg, conf, conf_raw, cts, gh, ga, btts) in rows:
         res = {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts}
         out = _tip_outcome_for_result(sugg, res)
         if out is None: continue
@@ -750,115 +852,6 @@ def daily_accuracy_digest() -> Optional[str]:
         msg = "\n".join(lines)
     send_telegram(msg); return msg
 
-# ── Match of the Day (MOTD): FUTURE matches (today only)
-MOTD_PREDICT  = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
-MOTD_HOUR     = int(os.getenv("MOTD_HOUR", "19"))
-MOTD_MINUTE   = int(os.getenv("MOTD_MINUTE", "15"))
-MOTD_CONF_MIN = float(os.getenv("MOTD_CONF_MIN", "70"))
-try:
-    MOTD_LEAGUE_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS","").split(",")) if x.strip().isdigit()]
-except Exception:
-    MOTD_LEAGUE_IDS = []
-
-def _kickoff_berlin(utc_iso: str|None) -> str:
-    try:
-        if not utc_iso: return "TBD"
-        dt_utc = datetime.fromisoformat(utc_iso.replace("Z","+00:00"))
-        return dt_utc.astimezone(BERLIN_TZ).strftime("%H:%M")
-    except Exception: return "TBD"
-
-def _api_fixtures_for_date_utc(date_utc: datetime) -> List[dict]:
-    js = _api_get(FOOTBALL_API_URL, {"date": date_utc.strftime("%Y-%m-%d")})
-    if not isinstance(js, dict): return []
-    out = []
-    for r in js.get("response", []) or []:
-        st = (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-        if st == "NS": out.append(r)
-    return out
-
-def _prematch_features() -> Dict[str, float]:
-    return {"minute":0.0,"goals_h":0.0,"goals_a":0.0,"goals_sum":0.0,"goals_diff":0.0,
-            "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
-            "cor_h":0.0,"cor_a":0.0,"cor_sum":0.0,"pos_h":0.0,"pos_a":0.0,"pos_diff":0.0,"red_h":0.0,"red_a":0.0,"red_sum":0.0}
-
-def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct) -> str:
-    return ("🏅 <b>Match of the Day</b>\n"
-            f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
-            f"🏆 <b>League:</b> {escape(league)}\n"
-            f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
-            f"<b>Tip:</b> {escape(suggestion)}\n"
-            f"📈 <b>Confidence:</b> {prob_pct:.1f}%")
-
-def send_match_of_the_day() -> bool:
-    if not MOTD_PREDICT:
-        return False
-    if not MOTD_PREMATCH_ENABLE:
-        return send_telegram("🏅 Match of the Day: prematch models disabled (MOTD_PREMATCH_ENABLE=0).")
-
-    # Berlin 'today' -> query overlapping UTC dates
-    today_local = datetime.now(BERLIN_TZ).date()
-    start_local = datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
-    end_local   = start_local + timedelta(days=1)
-    dates_utc = {start_local.astimezone(TZ_UTC).date(),
-                 (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
-
-    fixtures: List[dict] = []
-    for d in sorted(dates_utc):
-        fixtures.extend(_api_fixtures_for_date_utc(datetime(d.year,d.month,d.day,tzinfo=TZ_UTC)))
-    fixtures = [f for f in fixtures if not _blocked_league(f.get("league") or {})]
-    if MOTD_LEAGUE_IDS:
-        fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
-    if not fixtures:
-        return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
-
-    feat0 = _prematch_features()
-    best = None  # (prob_pct, suggestion, home, away, league, kickoff_txt)
-
-    for fx in fixtures:
-        fixture = fx.get("fixture") or {}; lg = fx.get("league") or {}; teams = fx.get("teams") or {}
-        home = (teams.get("home") or {}).get("name",""); away = (teams.get("away") or {}).get("name","")
-        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-        kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
-
-        candidates: List[Tuple[str,str,float]] = []
-        # OU
-        for line in OU_LINES:
-            mdl_line = _load_ou_model_for_line(line)
-            if not mdl_line: continue
-            p_over = _score_prob(feat0, mdl_line)
-            market_name = f"Over/Under {_fmt_line(line)}"
-            thr = _get_market_threshold(market_name)
-            if p_over*100.0 >= thr: candidates.append((market_name, f"Over {_fmt_line(line)} Goals", p_over))
-            p_under = 1.0 - p_over
-            if p_under*100.0 >= thr: candidates.append((market_name, f"Under {_fmt_line(line)} Goals", p_under))
-        # BTTS
-        mdl_btts = load_model_from_settings("BTTS_YES")
-        if mdl_btts:
-            p_btts = _score_prob(feat0, mdl_btts); thr_b = _get_market_threshold("BTTS")
-            if p_btts*100.0 >= thr_b: candidates.append(("BTTS","BTTS: Yes", p_btts))
-            p_btts_no = 1.0 - p_btts
-            if p_btts_no*100.0 >= thr_b: candidates.append(("BTTS","BTTS: No", p_btts_no))
-        # 1X2
-        mh, md, ma = _load_wld_models()
-        if mh and md and ma:
-            ph = _score_prob(feat0, mh); pd = _score_prob(feat0, md); pa = _score_prob(feat0, ma)
-            s = max(EPS, ph+pd+pa); ph,pd,pa = ph/s,pd/s,pa/s
-            thr_1x2 = _get_market_threshold("1X2")
-            if ph*100.0 >= thr_1x2: candidates.append(("1X2","Home Win", ph))
-            if pa*100.0 >= thr_1x2: candidates.append(("1X2","Away Win", pa))
-
-        if not candidates: continue
-        _, suggestion, prob = max(candidates, key=lambda x:x[2])
-        prob_pct = prob*100.0
-        if prob_pct < MOTD_CONF_MIN: continue
-        item = (prob_pct, suggestion, home, away, league, kickoff_txt)
-        if (best is None) or (prob_pct > best[0]): best = item
-
-    if not best:
-        return send_telegram("🏅 Match of the Day: no pick met the confidence/thresholds today.")
-    prob_pct, suggestion, home, away, league, kickoff_txt = best
-    return send_telegram(_format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct))
-
 # ────────────────────────────────
 # Training + auto-tune + retry outbox
 # ────────────────────────────────
@@ -877,9 +870,8 @@ def auto_train_job() -> None:
         lines = ["🤖 <b>Model training OK</b>"]
         if trained: lines.append("• Trained: " + ", ".join(sorted(trained)))
         if thr:     lines.append("• Thresholds: " + "  |  ".join([f"{escape(k)}: {float(v):.1f}%" for k,v in thr.items()]))
-        def _m(n): m=mets.get(n) or {}; 
         metric_lines=[]
-        for n in ["BTTS_YES","OU_2.5","OU_3.5","WLD_HOME","WLD_AWAY"]:
+        for n in ["BTTS_YES","OU_2.5","OU_3.5","WLD_HOME","WLD_AWAY","PRE_BTTS_YES","PRE_OU_2.5","PRE_OU_3.5","PRE_WLD_HOME","PRE_WLD_AWAY"]:
             m = mets.get(n) or {}
             if m: metric_lines.append(f"{n}: acc {m.get('acc',0):.2f}, brier {m.get('brier',0):.3f}, logloss {m.get('logloss',0):.3f}")
         if metric_lines: lines.append("• Metrics:\n  " + "\n  ".join(metric_lines))
@@ -888,6 +880,7 @@ def auto_train_job() -> None:
         logger.exception("[TRAIN] job failed: %s", e)
         send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
 
+# Auto-tune helpers (unchanged core, now benefits from confidence_raw always present)
 def _pick_threshold(y_true: List[int], y_prob: List[float],
                     target_precision: float, min_preds: int,
                     default_pct: float) -> float:
@@ -906,7 +899,6 @@ def _pick_threshold(y_true: List[int], y_prob: List[float],
     return float(best*100.0)
 
 def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
-    """Simple precision-based tuner using stored confidence_raw on last N days."""
     if not AUTO_TUNE_ENABLE:
         return {}
     cutoff = int(time.time()) - days*24*3600
@@ -943,16 +935,15 @@ def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
     return tuned
 
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
-    """Retry Telegram sends for tips with sent_ok=0 in the recent window."""
     cutoff = int(time.time()) - minutes*60
     with db_conn() as conn:
         rows = conn.execute(
-            "SELECT match_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts "
+            "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts "
             "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",
             (cutoff, limit)
         ).fetchall()
     retried = 0
-    for (mid, league, home, away, market, sugg, conf, score, minute, cts) in rows:
+    for (mid, league, home, away, market, sugg, conf, conf_raw, score, minute, cts) in rows:
         msg = ("⚽️ <b>New Tip!</b>\n"
                f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
                f"🕒 <b>Minute:</b> {int(minute)}'  |  <b>Score:</b> {escape(score)}\n"
@@ -972,13 +963,14 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
 # Threshold helpers, tip format/send, production scan
 # ────────────────────────────────
 def _get_market_threshold_key(market: str) -> str: return f"conf_threshold:{market}"
-
 def _get_market_threshold(market: str) -> float:
     try:
         val = get_setting_cached(_get_market_threshold_key(market))
         return float(val) if val is not None else float(CONF_THRESHOLD)
     except Exception:
         return float(CONF_THRESHOLD)
+def _get_market_threshold_pre(market: str) -> float:
+    return _get_market_threshold(f"PRE {market}")
 
 def _format_tip_message(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> str:
     stat_line = ""
@@ -1001,6 +993,27 @@ def _format_tip_message(home, away, league, minute, score_txt, suggestion, prob_
 
 def _send_tip(home, away, league, minute, score_txt, suggestion, prob_pct, feat) -> bool:
     return send_telegram(_format_tip_message(home, away, league, minute, score_txt, suggestion, prob_pct, feat))
+
+def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
+    """Prevent settled/impossible picks; does NOT fabricate predictions."""
+    gh = int(feat.get("goals_h", 0))
+    ga = int(feat.get("goals_a", 0))
+    total = gh + ga
+    s = (suggestion or "").strip()
+    if s.startswith("Over") or s.startswith("Under"):
+        line = _parse_ou_line_from_suggestion(s)
+        if line is None:
+            return False
+        if s.startswith("Over"):
+            if total > line - 1e-9:  # already won
+                return False
+        else:
+            if total >= line - 1e-9: # cannot win
+                return False
+    if s.startswith("BTTS"):
+        if gh > 0 and ga > 0:
+            return False
+    return True
 
 def production_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
@@ -1049,54 +1062,48 @@ def production_scan() -> Tuple[int, int]:
                 score_txt = _pretty_score(m)
                 candidates: List[Tuple[str, str, float]] = []
 
-                # ===== Over/Under =====
+                # ===== Over/Under (in-play) =====
                 for line in OU_LINES:
                     mdl_line = _load_ou_model_for_line(line)
                     if not mdl_line:
                         continue
-
                     p_over = _score_prob(feat, mdl_line)
                     market_name = f"Over/Under {_fmt_line(line)}"
                     thr = _get_market_threshold(market_name)
-
                     if p_over * 100.0 >= thr:
                         sug = f"Over {_fmt_line(line)} Goals"
                         if _candidate_is_sane(sug, feat):
                             candidates.append((market_name, sug, p_over))
-
                     p_under = 1.0 - p_over
                     if p_under * 100.0 >= thr:
                         sug = f"Under {_fmt_line(line)} Goals"
                         if _candidate_is_sane(sug, feat):
                             candidates.append((market_name, sug, p_under))
 
-                # ===== BTTS =====
+                # ===== BTTS (in-play) =====
                 mdl_btts = load_model_from_settings("BTTS_YES")
                 if mdl_btts:
                     p_btts = _score_prob(feat, mdl_btts)
                     thr_b = _get_market_threshold("BTTS")
-
                     if p_btts * 100.0 >= thr_b:
                         sug = "BTTS: Yes"
                         if _candidate_is_sane(sug, feat):
                             candidates.append(("BTTS", sug, p_btts))
-
                     p_btts_no = 1.0 - p_btts
                     if p_btts_no * 100.0 >= thr_b:
                         sug = "BTTS: No"
                         if _candidate_is_sane(sug, feat):
                             candidates.append(("BTTS", sug, p_btts_no))
 
-                # ===== 1X2 =====
+                # ===== 1X2 (in-play, Draw suppressed) =====
                 mh, md, ma = _load_wld_models()
                 if mh and md and ma:
                     ph = _score_prob(feat, mh)
-                    pd = _score_prob(feat, md)
+                    pd = _score_prob(feat, md)  # computed but not emitted
                     pa = _score_prob(feat, ma)
                     s = max(EPS, ph + pd + pa)
-                    ph, pd, pa = ph / s, pd / s, pa / s
+                    ph, pa = ph / s, pa / s
                     thr_1x2 = _get_market_threshold("1X2")
-
                     if ph * 100.0 >= thr_1x2:
                         candidates.append(("1X2", "Home Win", ph))
                     if pa * 100.0 >= thr_1x2:
@@ -1113,14 +1120,15 @@ def production_scan() -> Tuple[int, int]:
                         break
 
                     created_ts = base_now + idx
-                    prob_pct = round(prob * 100.0, 1)
+                    raw = float(prob)
+                    prob_pct = round(raw * 100.0, 1)
 
                     with db_conn() as conn2:
                         conn2.execute(
-                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,created_ts,sent_ok) "
-                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
+                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
                             (fid, league_id, league, home, away,
-                             market_txt, suggestion, float(prob_pct),
+                             market_txt, suggestion, float(prob_pct), raw,
                              score_txt, minute, created_ts),
                         )
                         if suggestion != "HARVEST":
@@ -1146,6 +1154,167 @@ def production_scan() -> Tuple[int, int]:
     return saved, live_seen
 
 # ────────────────────────────────
+# Prematch scoring (MOTD + sweep)
+# ────────────────────────────────
+def _kickoff_berlin(utc_iso: str|None) -> str:
+    try:
+        if not utc_iso: return "TBD"
+        dt_utc = datetime.fromisoformat(utc_iso.replace("Z","+00:00"))
+        return dt_utc.astimezone(BERLIN_TZ).strftime("%H:%M")
+    except Exception: return "TBD"
+
+def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct) -> str:
+    return ("🏅 <b>Match of the Day</b>\n"
+            f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
+            f"🏆 <b>League:</b> {escape(league)}\n"
+            f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
+            f"<b>Tip:</b> {escape(suggestion)}\n"
+            f"📈 <b>Confidence:</b> {prob_pct:.1f}%")
+
+def send_match_of_the_day() -> bool:
+    if not MOTD_PREDICT:
+        return False
+    if not MOTD_PREMATCH_ENABLE:
+        return send_telegram("🏅 Match of the Day: prematch models disabled (MOTD_PREMATCH_ENABLE=0).")
+
+    fixtures = _collect_todays_prematch_fixtures()
+    if not fixtures:
+        return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
+
+    best = None  # (prob_pct, suggestion, home, away, league, kickoff_txt)
+
+    for fx in fixtures:
+        fixture = fx.get("fixture") or {}; lg = fx.get("league") or {}; teams = fx.get("teams") or {}
+        home = (teams.get("home") or {}).get("name",""); away = (teams.get("away") or {}).get("name","")
+        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+        kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
+
+        feat = extract_prematch_features(fx)
+        if not feat:
+            continue
+
+        candidates: List[Tuple[str,str,float]] = []
+
+        # PRE OU
+        for line in OU_LINES:
+            mdl_line = _load_pre_ou_model_for_line(line)
+            if not mdl_line: continue
+            p_over = _score_prob(feat, mdl_line)
+            mk = f"Over/Under {_fmt_line(line)}"
+            thr = _get_market_threshold_pre(mk)
+            if p_over*100.0 >= thr: candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p_over))
+            p_under = 1.0 - p_over
+            if p_under*100.0 >= thr: candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", p_under))
+
+        # PRE BTTS
+        mdl_btts = _load_pre_btts_model()
+        if mdl_btts:
+            p = _score_prob(feat, mdl_btts); thr = _get_market_threshold_pre("BTTS")
+            if p*100.0 >= thr: candidates.append(("PRE BTTS","BTTS: Yes", p))
+            q = 1.0 - p
+            if q*100.0 >= thr: candidates.append(("PRE BTTS","BTTS: No", q))
+
+        # PRE 1X2 (Draw suppressed)
+        mh, ma = _load_pre_wld_models()
+        if mh and ma:
+            ph = _score_prob(feat, mh); pa = _score_prob(feat, ma)
+            s = max(EPS, ph+pa); ph, pa = ph/s, pa/s
+            thr = _get_market_threshold_pre("1X2")
+            if ph*100.0 >= thr: candidates.append(("PRE 1X2","Home Win", ph))
+            if pa*100.0 >= thr: candidates.append(("PRE 1X2","Away Win", pa))
+
+        if not candidates:
+            continue
+        # pick best
+        suggestion, prob = max([(sug, pr) for (_,sug,pr) in candidates], key=lambda x:x[1])
+        prob_pct = prob*100.0
+        if prob_pct < MOTD_CONF_MIN: continue
+        item = (prob_pct, suggestion, home, away, league, kickoff_txt)
+        if (best is None) or (prob_pct > best[0]): best = item
+
+    if not best:
+        return send_telegram("🏅 Match of the Day: no prematch pick met thresholds.")
+    prob_pct, suggestion, home, away, league, kickoff_txt = best
+    return send_telegram(_format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct))
+
+def prematch_scan_save() -> int:
+    """Generate prematch tips for today's fixtures using PRE_* models; save (do not auto-send)."""
+    fixtures = _collect_todays_prematch_fixtures()
+    if not fixtures:
+        return 0
+
+    saved = 0
+    for fx in fixtures:
+        fixture = fx.get("fixture") or {}; lg = fx.get("league") or {}; teams = fx.get("teams") or {}
+        home = (teams.get("home") or {}).get("name",""); away = (teams.get("away") or {}).get("name","")
+        league_id = int((lg.get("id") or 0)); league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+        fid = int((fixture.get("id") or 0))
+        if not fid:
+            continue
+
+        feat = extract_prematch_features(fx)
+        if not feat:
+            continue
+
+        candidates: List[Tuple[str,str,float]] = []
+
+        # PRE OU
+        for line in OU_LINES:
+            mdl_line = _load_pre_ou_model_for_line(line)
+            if not mdl_line: continue
+            p_over = _score_prob(feat, mdl_line)
+            mk = f"Over/Under {_fmt_line(line)}"
+            thr = _get_market_threshold_pre(mk)
+            if p_over*100.0 >= thr: candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p_over))
+            p_under = 1.0 - p_over
+            if p_under*100.0 >= thr: candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", p_under))
+
+        # PRE BTTS
+        mdl_btts = _load_pre_btts_model()
+        if mdl_btts:
+            p = _score_prob(feat, mdl_btts); thr = _get_market_threshold_pre("BTTS")
+            if p*100.0 >= thr: candidates.append(("PRE BTTS","BTTS: Yes", p))
+            q = 1.0 - p
+            if q*100.0 >= thr: candidates.append(("PRE BTTS","BTTS: No", q))
+
+        # PRE 1X2 (Draw suppressed)
+        mh, ma = _load_pre_wld_models()
+        if mh and ma:
+            ph = _score_prob(feat, mh); pa = _score_prob(feat, ma)
+            s = max(EPS, ph+pa); ph, pa = ph/s, pa/s
+            thr = _get_market_threshold_pre("1X2")
+            if ph*100.0 >= thr: candidates.append(("PRE 1X2","Home Win", ph))
+            if pa*100.0 >= thr: candidates.append(("PRE 1X2","Away Win", pa))
+
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        per_match = 0
+        base_now = int(time.time())
+
+        for idx, (market_txt, suggestion, prob) in enumerate(candidates):
+            if suggestion not in ALLOWED_SUGGESTIONS:
+                continue
+            if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                break
+            created_ts = base_now + idx
+            raw = float(prob)
+            prob_pct = round(raw * 100.0, 1)
+            with db_conn() as conn2:
+                conn2.execute(
+                    "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                    (fid, league_id, league, home, away,
+                     market_txt, suggestion, float(prob_pct), raw,
+                     "0-0", 0, created_ts),
+                )
+            saved += 1
+            per_match += 1
+    logger.info("[PREMATCH] saved=%d", saved)
+    return saved
+
+# ────────────────────────────────
 # Leader lock (advisory)
 # ────────────────────────────────
 def _run_with_pg_lock(lock_key: int, fn, *args, **kwargs):
@@ -1168,24 +1337,28 @@ def _start_scheduler_once() -> None:
     if _scheduler_started or not RUN_SCHEDULER: return
     try:
         sched = BackgroundScheduler(timezone=TZ_UTC)
+        # in-play loop
         sched.add_job(lambda: _run_with_pg_lock(1001, production_scan), "interval",
                       seconds=SCAN_INTERVAL_SEC, id="scan_loop", max_instances=1, coalesce=True)
+        # result backfill
         sched.add_job(lambda: _run_with_pg_lock(1002, backfill_results_for_open_matches, 400), "interval",
                       minutes=BACKFILL_EVERY_MIN, id="backfill_loop", max_instances=1, coalesce=True)
+        # digest
         if DAILY_ACCURACY_DIGEST_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1003, daily_accuracy_digest),
-                          CronTrigger(hour=DAILY_ACCURACY_HOUR,
-                                      minute=DAILY_ACCURACY_MINUTE,
-                                      timezone=BERLIN_TZ),   # was TZ_UTC
+                          CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=BERLIN_TZ),
                           id="daily_digest", max_instances=1, coalesce=True)
+        # MOTD prematch (uses PRE models)
         if MOTD_PREDICT:
             sched.add_job(lambda: _run_with_pg_lock(1004, send_match_of_the_day),
                           CronTrigger(hour=MOTD_HOUR, minute=MOTD_MINUTE, timezone=BERLIN_TZ),
                           id="motd_daily", max_instances=1, coalesce=True)
+        # nightly train
         if TRAIN_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1005, auto_train_job),
                           CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
                           id="nightly_train", max_instances=1, coalesce=True)
+        # auto-tune
         if AUTO_TUNE_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1006, auto_tune_thresholds, 14),
                           CronTrigger(hour=4, minute=7, timezone=TZ_UTC),
@@ -1193,8 +1366,9 @@ def _start_scheduler_once() -> None:
         # retry unsent
         sched.add_job(lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200), "interval",
                       minutes=10, id="retry_unsent", max_instances=1, coalesce=True)
+        # optional daily prematch sweep (off by default; enable by calling endpoint)
         sched.start(); _scheduler_started = True
-        send_telegram("🚀 goalsniper AI mode started."); 
+        send_telegram("🚀 goalsniper AI mode (in-play + prematch) started.")
         logger.info("[SCHED] started (scan=%ss, backfill=%smin, run=%s)", SCAN_INTERVAL_SEC, BACKFILL_EVERY_MIN, RUN_SCHEDULER)
     except Exception as e:
         logger.exception("[SCHED] failed to start: %s", e)
@@ -1264,6 +1438,13 @@ def http_auto_tune():
 @app.route("/admin/retry-unsent", methods=["POST","GET"])
 def http_retry_unsent():
     _require_admin(); n = retry_unsent_tips(30, 200); return jsonify({"ok": True, "resent": n})
+
+# NEW: Prematch sweep (save-only, AI-only)
+@app.route("/admin/prematch-scan", methods=["POST","GET"])
+def http_prematch_scan():
+    _require_admin()
+    saved = prematch_scan_save()
+    return jsonify({"ok": True, "saved": int(saved)})
 
 # Settings (secured) + cache invalidation
 @app.route("/settings/<key>", methods=["GET", "POST"])
