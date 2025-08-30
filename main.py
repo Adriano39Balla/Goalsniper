@@ -771,11 +771,17 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     with db_conn() as conn:
         rows = conn.execute(
             """
-            SELECT DISTINCT t.match_id
-            FROM tips t
-            LEFT JOIN match_results r ON r.match_id = t.match_id
-            WHERE r.match_id IS NULL AND t.created_ts >= %s
-            ORDER BY t.created_ts DESC
+            WITH last_tips AS (
+              SELECT match_id, MAX(created_ts) AS last_ts
+              FROM tips
+              WHERE created_ts >= %s
+              GROUP BY match_id
+            )
+            SELECT lt.match_id
+            FROM last_tips lt
+            LEFT JOIN match_results r ON r.match_id = lt.match_id
+            WHERE r.match_id IS NULL
+            ORDER BY lt.last_ts DESC
             LIMIT %s
             """,
             (cutoff, max_rows),
