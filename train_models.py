@@ -20,16 +20,16 @@ Models & thresholds written to `settings`:
   • model_latest:* and model:* keys (JSON: intercept, weights, calibration)
   • conf_threshold:* per market (percent; serving uses if present)
 
-Environment knobs (sane defaults):
+Environment knobs:
   DATABASE_URL
   OU_TRAIN_LINES="2.5,3.5"
-  TRAIN_MIN_MINUTE=15           (min in-play minute for snapshot inclusion)
+  TRAIN_MIN_MINUTE=15
   TRAIN_TEST_SIZE=0.25
   TARGET_PRECISION=0.60
   THRESH_MIN_PREDICTIONS=25
-  MIN_THRESH=55                 (min allowed threshold %)
-  MAX_THRESH=85                 (max allowed threshold %)
-  MIN_ROWS=150                  (early-exit if dataset smaller)
+  MIN_THRESH=55
+  MAX_THRESH=85
+  MIN_ROWS=150
 """
 
 import argparse
@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 # ───────────────────────── Feature sets ───────────────────────── #
 
-# Must match main.py extract_features() keys used by the in-play models
+# Must match main.py extract_features()
 FEATURES: List[str] = [
     "minute",
     "goals_h", "goals_a", "goals_sum", "goals_diff",
@@ -72,7 +72,7 @@ FEATURES: List[str] = [
     "red_h", "red_a", "red_sum",
 ]
 
-# Must match main.py extract_prematch_features() keys for PRE_* models
+# Must match main.py extract_prematch_features()
 PRE_FEATURES: List[str] = [
     "pm_gf_h","pm_ga_h","pm_win_h",
     "pm_gf_a","pm_ga_a","pm_win_a",
@@ -80,7 +80,7 @@ PRE_FEATURES: List[str] = [
     "pm_ov25_a","pm_ov35_a","pm_btts_a",
     "pm_ov25_h2h","pm_ov35_h2h","pm_btts_h2h",
     "pm_rest_diff",
-    # keep the live keys for compatibility (serve-time expects them to exist; they are 0.0 in prematch)
+    # keep live keys 0.0 for compatibility at serve time
     "minute","goals_h","goals_a","goals_sum","goals_diff",
     "xg_h","xg_a","xg_sum","xg_diff","sot_h","sot_a","sot_sum",
     "cor_h","cor_a","cor_sum","pos_h","pos_a","pos_diff","red_h","red_a","red_sum",
@@ -98,17 +98,14 @@ def _connect(db_url: str):
         db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
     conn = psycopg2.connect(db_url)
     conn.autocommit = True
-    return "pg", conn
-
+    return conn
 
 def _read_sql(conn, sql: str, params: Tuple = ()) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn, params=params)
 
-
-def _exec(conn, sql: str, params: Tuple) -> None:
+def _exec(conn, sql: str, params: Tuple = ()) -> None:
     with conn.cursor() as cur:
         cur.execute(sql, params)
-
 
 def _set_setting(conn, key: str, value: str) -> None:
     _exec(conn,
@@ -116,13 +113,27 @@ def _set_setting(conn, key: str, value: str) -> None:
           "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
           (key, value))
 
+def _ensure_training_tables(conn) -> None:
+    # safety: ensure prematch_snapshots/settings exist (others are created by main.py)
+    _exec(conn, """
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      )
+    """)
+    _exec(conn, """
+      CREATE TABLE IF NOT EXISTS prematch_snapshots (
+        match_id   BIGINT PRIMARY KEY,
+        created_ts BIGINT,
+        payload    TEXT
+      )
+    """)
+    _exec(conn, "CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
+
 
 # ─────────────────────── Data load ─────────────────────── #
 
 def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
-    """
-    Uses the latest tip_snapshots per match and joins final results.
-    """
     q = """
     WITH latest AS (
       SELECT match_id, MAX(created_ts) AS ts
@@ -141,29 +152,26 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
     feats: List[Dict[str, Any]] = []
     for _, row in rows.iterrows():
         try:
-            payload = json.loads(row["payload"])
+            payload = json.loads(row["payload"]) or {}
         except Exception:
             continue
-        stat = (payload.get("stat") or {}) if isinstance(payload, dict) else {}
+        stat = (payload.get("stat") or {})
 
-        try:
-            f: Dict[str, float] = {
-                "minute": float(payload.get("minute", 0)),
-                "goals_h": float(payload.get("gh", 0)),
-                "goals_a": float(payload.get("ga", 0)),
-                "xg_h": float(stat.get("xg_h", 0)),
-                "xg_a": float(stat.get("xg_a", 0)),
-                "sot_h": float(stat.get("sot_h", 0)),
-                "sot_a": float(stat.get("sot_a", 0)),
-                "cor_h": float(stat.get("cor_h", 0)),
-                "cor_a": float(stat.get("cor_a", 0)),
-                "pos_h": float(stat.get("pos_h", 0)),
-                "pos_a": float(stat.get("pos_a", 0)),
-                "red_h": float(stat.get("red_h", 0)),
-                "red_a": float(stat.get("red_a", 0)),
-            }
-        except Exception:
-            continue
+        f = {
+            "minute": float(payload.get("minute", 0) or 0),
+            "goals_h": float(payload.get("gh", 0) or 0),
+            "goals_a": float(payload.get("ga", 0) or 0),
+            "xg_h": float(stat.get("xg_h", 0) or 0),
+            "xg_a": float(stat.get("xg_a", 0) or 0),
+            "sot_h": float(stat.get("sot_h", 0) or 0),
+            "sot_a": float(stat.get("sot_a", 0) or 0),
+            "cor_h": float(stat.get("cor_h", 0) or 0),
+            "cor_a": float(stat.get("cor_a", 0) or 0),
+            "pos_h": float(stat.get("pos_h", 0) or 0),
+            "pos_a": float(stat.get("pos_a", 0) or 0),
+            "red_h": float(stat.get("red_h", 0) or 0),
+            "red_a": float(stat.get("red_a", 0) or 0),
+        }
 
         # Derived
         f["goals_sum"] = f["goals_h"] + f["goals_a"]
@@ -177,6 +185,7 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
 
         gh_f = int(row["final_goals_h"] or 0)
         ga_f = int(row["final_goals_a"] or 0)
+
         f["_ts"] = int(row["created_ts"] or 0)
         f["final_goals_sum"] = gh_f + ga_f
         f["final_goals_diff"] = gh_f - ga_f
@@ -195,10 +204,6 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
 
 
 def load_prematch_data(conn) -> pd.DataFrame:
-    """
-    Reads prematch_snapshots and joins final results.
-    Payload schema: {"feat": { ...PRE_FEATURES... }}
-    """
     q = """
     SELECT p.match_id, p.created_ts, p.payload,
            r.final_goals_h, r.final_goals_a, r.btts_yes
@@ -221,6 +226,7 @@ def load_prematch_data(conn) -> pd.DataFrame:
 
         gh_f = int(row["final_goals_h"] or 0)
         ga_f = int(row["final_goals_a"] or 0)
+
         f["_ts"] = int(row["created_ts"] or 0)
         f["final_goals_sum"]  = gh_f + ga_f
         f["final_goals_diff"] = gh_f - ga_f
@@ -230,33 +236,25 @@ def load_prematch_data(conn) -> pd.DataFrame:
 
     if not feats:
         return pd.DataFrame()
-    df = pd.DataFrame(feats).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return df
+
+    return pd.DataFrame(feats).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
 # ─────────────────────── Model utils ─────────────────────── #
 
 def fit_lr_safe(X: np.ndarray, y: np.ndarray) -> Optional[LogisticRegression]:
-    """Balanced LR to deal with skew; liblinear is stable for small-ish data."""
     if len(np.unique(y)) < 2:
         return None
     return LogisticRegression(max_iter=1000, class_weight="balanced", solver="liblinear").fit(X, y)
 
-
 def weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[str, float]:
     return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
-
 
 def _logit_vec(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, EPS, 1 - EPS)
     return np.log(p / (1 - p))
 
-
 def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
-    """
-    1D Platt scaling: logistic regression on logits of raw probabilities.
-    Returns a,b so that: p_cal = sigmoid(a * logit(p_raw) + b)
-    """
     z = _logit_vec(p_raw).reshape(-1, 1)
     y = y_true.astype(int)
     lr = LogisticRegression(max_iter=1000, solver="lbfgs")
@@ -264,7 +262,6 @@ def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
     a = float(lr.coef_.ravel()[0])
     b = float(lr.intercept_.ravel()[0])
     return a, b
-
 
 def build_model_blob(model: LogisticRegression, features: List[str],
                      cal: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
@@ -278,7 +275,6 @@ def build_model_blob(model: LogisticRegression, features: List[str],
         blob["calibration"] = {"method": "platt", "a": float(a), "b": float(b)}
     return blob
 
-
 def _fmt_line(line: float) -> str:
     return f"{line}".rstrip("0").rstrip(".")
 
@@ -288,10 +284,8 @@ def _fmt_line(line: float) -> str:
 def _percent(x: float) -> float:
     return float(x) * 100.0
 
-
 def _grid_thresholds(lo=0.50, hi=0.95, step=0.005) -> np.ndarray:
     return np.arange(lo, hi + 1e-9, step)
-
 
 def _pick_threshold_for_target_precision(
     y_true: np.ndarray,
@@ -301,9 +295,8 @@ def _pick_threshold_for_target_precision(
     default_threshold: float = 0.65,
 ) -> float:
     """
-    Choose the smallest threshold t achieving >= target_precision and >= min_preds positives.
-    If none, fall back to best F1, then best accuracy, then default.
-    Returns threshold in [0..1].
+    Choose smallest t achieving >= target_precision and >= min_preds positives.
+    Fallback: best F1, then best accuracy, then default.
     """
     y = y_true.astype(int)
     p = np.asarray(p_cal).astype(float)
@@ -320,7 +313,7 @@ def _pick_threshold_for_target_precision(
         if prec >= target_precision:
             feasible.append((t, float(prec), n_pred))
     if feasible:
-        feasible.sort(key=lambda z: (z[0], -z[1]))  # prefer smallest t, then higher precision
+        feasible.sort(key=lambda z: (z[0], -z[1]))
         best_t = feasible[0][0]
 
     if best_t is None:
@@ -373,7 +366,7 @@ def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray, np
     return tr, te
 
 
-# ─────────────────────── Training core ─────────────────────── #
+# ─────────────────────── Core fit ─────────────────────── #
 
 def _train_binary_head(
     conn,
@@ -383,18 +376,14 @@ def _train_binary_head(
     mask_te: np.ndarray,
     feature_names: List[str],
     model_key: str,
-    threshold_key: Optional[str],
+    threshold_label: Optional[str],  # if not None -> write conf_threshold:LABEL
     target_precision: float,
     min_preds: int,
     min_thresh_pct: float,
     max_thresh_pct: float,
     default_thr_prob: float,
     metrics_name: Optional[str] = None,
-    threshold_label: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
-    """
-    Fits LR + Platt, writes model blob to settings, returns (trained?, metrics, p_cal_test or None)
-    """
     if len(np.unique(y_all)) < 2:
         return False, {}, None
 
@@ -410,12 +399,10 @@ def _train_binary_head(
     z = _logit_vec(p_raw)
     p_cal = 1.0 / (1.0 + np.exp(-(a * z + b)))
 
-    # Persist model
     blob = build_model_blob(m, feature_names, (a, b))
     for k in (f"model_latest:{model_key}", f"model:{model_key}"):
         _set_setting(conn, k, json.dumps(blob))
 
-    # Metrics
     mets = {
         "brier": float(brier_score_loss(y_te, p_cal)),
         "acc": float(accuracy_score(y_te, (p_cal >= 0.5).astype(int))),
@@ -426,8 +413,7 @@ def _train_binary_head(
     if metrics_name:
         logger.info("[METRICS] %s: %s", metrics_name, mets)
 
-    # Threshold
-    if threshold_key and threshold_label:
+    if threshold_label:
         thr_prob = _pick_threshold_for_target_precision(
             y_true=y_te, p_cal=p_cal,
             target_precision=target_precision, min_preds=min_preds,
@@ -439,15 +425,16 @@ def _train_binary_head(
     return True, mets, p_cal
 
 
+# ─────────────────────── Training entry ─────────────────────── #
+
 def train_models(
     db_url: Optional[str] = None,
     min_minute: Optional[int] = None,
     test_size: Optional[float] = None,
     min_rows: Optional[int] = None,
 ) -> Dict[str, Any]:
-    # Env + inputs
-    db_url = db_url or os.getenv("DATABASE_URL")
-    engine, conn = _connect(db_url)
+    conn = _connect(db_url or os.getenv("DATABASE_URL"))
+    _ensure_training_tables(conn)
 
     min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
     test_size = float(test_size if test_size is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
@@ -459,10 +446,8 @@ def train_models(
         t = t.strip()
         if not t:
             continue
-        try:
-            ou_lines.append(float(t))
-        except Exception:
-            continue
+        try: ou_lines.append(float(t))
+        except Exception: pass
     if not ou_lines:
         ou_lines = [2.5, 3.5]
 
@@ -474,89 +459,62 @@ def train_models(
     summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "thresholds": {}}
 
     try:
-        # ───────── In-Play training ─────────
+        # ========== In-Play ==========
         df_ip = load_inplay_data(conn, min_minute=min_minute)
         if not df_ip.empty and len(df_ip) >= min_rows:
             tr_mask, te_mask = time_order_split(df_ip, test_size=test_size)
             X_all = df_ip[FEATURES].values
 
-            # BTTS (in-play)
-            yb = df_ip["label_btts"].values.astype(int)
-            ok, mets, p_b_cal = _train_binary_head(
-                conn, X_all, yb, tr_mask, te_mask, FEATURES,
+            # BTTS
+            ok, mets, _ = _train_binary_head(
+                conn, X_all, df_ip["label_btts"].values.astype(int),
+                tr_mask, te_mask, FEATURES,
                 model_key="BTTS_YES",
-                threshold_key="conf_threshold:BTTS",
                 threshold_label="BTTS",
-                target_precision=target_precision,
-                min_preds=min_preds,
-                min_thresh_pct=min_thresh,
-                max_thresh_pct=max_thresh,
-                default_thr_prob=0.65,
-                metrics_name="BTTS_YES",
+                target_precision=target_precision, min_preds=min_preds,
+                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                default_thr_prob=0.65, metrics_name="BTTS_YES",
             )
             summary["trained"]["BTTS_YES"] = ok
-            if ok:
-                summary["metrics"]["BTTS_YES"] = mets
-                # threshold already saved under conf_threshold:BTTS
+            if ok: summary["metrics"]["BTTS_YES"] = mets
 
-            # O/U (in-play)
+            # O/U
             totals = df_ip["final_goals_sum"].values.astype(int)
             for line in ou_lines:
-                y_over = (totals > line).astype(int)
                 name = f"OU_{_fmt_line(line)}"
-                ok, mets, p_cal = _train_binary_head(
-                    conn, X_all, y_over, tr_mask, te_mask, FEATURES,
+                ok, mets, _ = _train_binary_head(
+                    conn, X_all, (totals > line).astype(int),
+                    tr_mask, te_mask, FEATURES,
                     model_key=name,
-                    threshold_key=f"conf_threshold:Over/Under {_fmt_line(line)}",
                     threshold_label=f"Over/Under {_fmt_line(line)}",
-                    target_precision=target_precision,
-                    min_preds=min_preds,
-                    min_thresh_pct=min_thresh,
-                    max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65,
-                    metrics_name=name,
+                    target_precision=target_precision, min_preds=min_preds,
+                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                    default_thr_prob=0.65, metrics_name=name,
                 )
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
-                    # Alias for 2.5 -> O25 for serve-time legacy
-                    if abs(line - 2.5) < 1e-6:
-                        blob = get_setting_json(conn, f"model_latest:{name}")
+                    if abs(line - 2.5) < 1e-6:  # alias for serve compatibility
+                        blob = _get_setting_json(conn, f"model_latest:{name}")
                         if blob is not None:
                             for k in ("model_latest:O25", "model:O25"):
                                 _set_setting(conn, k, json.dumps(blob))
 
-            # 1X2 (in-play) via OvR
+            # 1X2 (OvR heads; serving suppresses draw)
             gd = df_ip["final_goals_diff"].values.astype(int)
             y_home = (gd > 0).astype(int)
             y_draw = (gd == 0).astype(int)
             y_away = (gd < 0).astype(int)
 
-            # Heads
-            ok_h, mets_h, p_h = _train_binary_head(
-                conn, X_all, y_home, tr_mask, te_mask, FEATURES,
-                model_key="WLD_HOME",
-                threshold_key=None, threshold_label=None,
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.45, metrics_name="WLD_HOME",
-            )
-            ok_d, mets_d, p_d = _train_binary_head(
-                conn, X_all, y_draw, tr_mask, te_mask, FEATURES,
-                model_key="WLD_DRAW",
-                threshold_key=None, threshold_label=None,
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.45, metrics_name="WLD_DRAW",
-            )
-            ok_a, mets_a, p_a = _train_binary_head(
-                conn, X_all, y_away, tr_mask, te_mask, FEATURES,
-                model_key="WLD_AWAY",
-                threshold_key=None, threshold_label=None,
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.45, metrics_name="WLD_AWAY",
-            )
+            ok_h, mets_h, p_h = _train_binary_head(conn, X_all, y_home, tr_mask, te_mask, FEATURES,
+                                                   "WLD_HOME", None, target_precision, min_preds,
+                                                   min_thresh, max_thresh, 0.45, "WLD_HOME")
+            ok_d, mets_d, p_d = _train_binary_head(conn, X_all, y_draw, tr_mask, te_mask, FEATURES,
+                                                   "WLD_DRAW", None, target_precision, min_preds,
+                                                   min_thresh, max_thresh, 0.45, "WLD_DRAW")
+            ok_a, mets_a, p_a = _train_binary_head(conn, X_all, y_away, tr_mask, te_mask, FEATURES,
+                                                   "WLD_AWAY", None, target_precision, min_preds,
+                                                   min_thresh, max_thresh, 0.45, "WLD_AWAY")
             summary["trained"]["WLD_HOME"] = ok_h
             summary["trained"]["WLD_DRAW"] = ok_d
             summary["trained"]["WLD_AWAY"] = ok_a
@@ -564,14 +522,13 @@ def train_models(
             if ok_d: summary["metrics"]["WLD_DRAW"] = mets_d
             if ok_a: summary["metrics"]["WLD_AWAY"] = mets_a
 
-            # Threshold for 1X2 = calibrated OvR, renormalized; choose smallest t hitting precision
             if ok_h and ok_d and ok_a and (p_h is not None) and (p_d is not None) and (p_a is not None):
                 ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_d, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
                 phn, pdn, pan = p_h / ps, p_d / ps, p_a / ps
                 p_max = np.maximum.reduce([phn, pdn, pan])
 
                 gd_te = gd[te_mask]
-                y_class = np.zeros_like(gd_te, dtype=int)  # 0=home,1=draw,2=away
+                y_class = np.zeros_like(gd_te, dtype=int)  # 0H/1D/2A
                 y_class[gd_te == 0] = 1
                 y_class[gd_te < 0]  = 2
                 correct = (np.argmax(np.stack([phn, pdn, pan], axis=1), axis=1) == y_class).astype(int)
@@ -583,77 +540,56 @@ def train_models(
                 thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
                 _set_setting(conn, "conf_threshold:1X2", f"{thr_pct:.2f}")
                 summary["thresholds"]["1X2"] = thr_pct
-
         else:
-            logger.info("In-Play: not enough labeled data yet (have %d, need >= %d).", len(df_ip), min_rows)
+            logger.info("In-Play: not enough labeled data (have %d, need >= %d).", len(df_ip), min_rows)
             summary["trained"]["BTTS_YES"] = False
 
-        # ───────── Prematch training (PRE_*) ─────────
+        # ========== Prematch ==========
         df_pre = load_prematch_data(conn)
         if not df_pre.empty and len(df_pre) >= min_rows:
             tr_mask, te_mask = time_order_split(df_pre, test_size=test_size)
             Xp_all = df_pre[PRE_FEATURES].values
 
             # PRE BTTS
-            yb = df_pre["label_btts"].values.astype(int)
-            ok, mets, p_b_cal = _train_binary_head(
-                conn, Xp_all, yb, tr_mask, te_mask, PRE_FEATURES,
+            ok, mets, _ = _train_binary_head(
+                conn, Xp_all, df_pre["label_btts"].values.astype(int),
+                tr_mask, te_mask, PRE_FEATURES,
                 model_key="PRE_BTTS_YES",
-                threshold_key="conf_threshold:PRE BTTS",
                 threshold_label="PRE BTTS",
-                target_precision=target_precision,
-                min_preds=min_preds,
-                min_thresh_pct=min_thresh,
-                max_thresh_pct=max_thresh,
-                default_thr_prob=0.65,
-                metrics_name="PRE_BTTS_YES",
+                target_precision=target_precision, min_preds=min_preds,
+                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                default_thr_prob=0.65, metrics_name="PRE_BTTS_YES",
             )
             summary["trained"]["PRE_BTTS_YES"] = ok
-            if ok:
-                summary["metrics"]["PRE_BTTS_YES"] = mets
+            if ok: summary["metrics"]["PRE_BTTS_YES"] = mets
 
             # PRE O/U
             totals = df_pre["final_goals_sum"].values.astype(int)
             for line in ou_lines:
-                y_over = (totals > line).astype(int)
                 name = f"PRE_OU_{_fmt_line(line)}"
-                ok, mets, p_cal = _train_binary_head(
-                    conn, Xp_all, y_over, tr_mask, te_mask, PRE_FEATURES,
+                ok, mets, _ = _train_binary_head(
+                    conn, Xp_all, (totals > line).astype(int),
+                    tr_mask, te_mask, PRE_FEATURES,
                     model_key=name,
-                    threshold_key=f"conf_threshold:PRE Over/Under {_fmt_line(line)}",
                     threshold_label=f"PRE Over/Under {_fmt_line(line)}",
-                    target_precision=target_precision,
-                    min_preds=min_preds,
-                    min_thresh_pct=min_thresh,
-                    max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65,
-                    metrics_name=name,
+                    target_precision=target_precision, min_preds=min_preds,
+                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                    default_thr_prob=0.65, metrics_name=name,
                 )
                 summary["trained"][name] = ok
-                if ok:
-                    summary["metrics"][name] = mets
+                if ok: summary["metrics"][name] = mets
 
-            # PRE 1X2 (Draw suppressed at serve but we still train HOME & AWAY heads)
+            # PRE 1X2 (HOME & AWAY; draws ignored at serving)
             gd = df_pre["final_goals_diff"].values.astype(int)
             y_home = (gd > 0).astype(int)
             y_away = (gd < 0).astype(int)
 
-            ok_h, mets_h, p_h = _train_binary_head(
-                conn, Xp_all, y_home, tr_mask, te_mask, PRE_FEATURES,
-                model_key="PRE_WLD_HOME",
-                threshold_key=None, threshold_label=None,
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.45, metrics_name="PRE_WLD_HOME",
-            )
-            ok_a, mets_a, p_a = _train_binary_head(
-                conn, Xp_all, y_away, tr_mask, te_mask, PRE_FEATURES,
-                model_key="PRE_WLD_AWAY",
-                threshold_key=None, threshold_label=None,
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.45, metrics_name="PRE_WLD_AWAY",
-            )
+            ok_h, mets_h, p_h = _train_binary_head(conn, Xp_all, y_home, tr_mask, te_mask, PRE_FEATURES,
+                                                   "PRE_WLD_HOME", None, target_precision, min_preds,
+                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_HOME")
+            ok_a, mets_a, p_a = _train_binary_head(conn, Xp_all, y_away, tr_mask, te_mask, PRE_FEATURES,
+                                                   "PRE_WLD_AWAY", None, target_precision, min_preds,
+                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_AWAY")
             summary["trained"]["PRE_WLD_HOME"] = ok_h
             summary["trained"]["PRE_WLD_AWAY"] = ok_a
             if ok_h: summary["metrics"]["PRE_WLD_HOME"] = mets_h
@@ -663,8 +599,6 @@ def train_models(
                 ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
                 phn, pan = p_h / ps, p_a / ps
                 p_max = np.maximum(phn, pan)
-
-                # evaluate correctness ignoring draws (mask them out)
                 gd_te = gd[te_mask]
                 y_class = np.where(gd_te > 0, 0, np.where(gd_te < 0, 1, -1))
                 mask = (y_class != -1)
@@ -678,10 +612,10 @@ def train_models(
                     _set_setting(conn, "conf_threshold:PRE 1X2", f"{thr_pct:.2f}")
                     summary["thresholds"]["PRE 1X2"] = thr_pct
         else:
-            logger.info("Prematch: not enough labeled data yet (have %d, need >= %d).", len(df_pre), min_rows)
+            logger.info("Prematch: not enough labeled data (have %d, need >= %d).", len(df_pre), min_rows)
             summary["trained"]["PRE_BTTS_YES"] = False
 
-        # Bundle metrics snapshot for easy inspection
+        # Bundle metrics snapshot (handy for /settings fetch)
         metrics_bundle = {
             "trained_at_utc": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
             **summary["metrics"],
@@ -706,9 +640,9 @@ def train_models(
             pass
 
 
-# ─────────────────────── Small helpers for aliasing ─────────────────────── #
+# ─────────────────────── Settings read helper ─────────────────────── #
 
-def get_setting_json(conn, key: str) -> Optional[dict]:
+def _get_setting_json(conn, key: str) -> Optional[dict]:
     try:
         df = _read_sql(conn, "SELECT value FROM settings WHERE key=%s", (key,))
         if df.empty:
