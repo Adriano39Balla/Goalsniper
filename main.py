@@ -806,6 +806,22 @@ def _kickoff_berlin(utc_iso: str|None) -> str:
         return dt.astimezone(BERLIN_TZ).strftime("%H:%M")
     except: return "TBD"
 
+def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, odds=None, book=None, ev_pct=None):
+    money = ""
+    if odds:
+        if ev_pct is not None:
+            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
+        else:
+            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
+    return (
+        "🏅 <b>Match of the Day</b>\n"
+        f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
+        f"🏆 <b>League:</b> {escape(league)}\n"
+        f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
+        f"<b>Tip:</b> {escape(suggestion)}\n"
+        f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}"
+    )
+
 def _send_tip(home,away,league,minute,score,suggestion,prob_pct,feat,odds=None,book=None,ev_pct=None)->bool:
     return send_telegram(_format_tip_message(home,away,league,minute,score,suggestion,prob_pct,feat,odds,book,ev_pct))
 
@@ -892,6 +908,102 @@ def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
         tp=int(((pred==1)&(y==1)).sum()); prec=tp/max(1,n)
         if prec>=target_precision: best=float(t); break
     return best*100.0
+
+# Optional min EV for MOTD (basis points, e.g. 300 = +3.00%). 0 disables EV gate.
+MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
+
+def send_match_of_the_day() -> bool:
+    """Pick the single best prematch tip for today (PRE_* models). Sends to Telegram."""
+    fixtures = _collect_todays_prematch_fixtures()
+    if not fixtures:
+        return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
+
+    # Optional league allow-list just for MOTD
+    if MOTD_LEAGUE_IDS:
+        fixtures = [
+            f for f in fixtures
+            if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS
+        ]
+        if not fixtures:
+            return send_telegram("🏅 Match of the Day: no fixtures in configured leagues.")
+
+    best = None  # (prob_pct, suggestion, home, away, league, kickoff_txt, odds, book, ev_pct)
+
+    for fx in fixtures:
+        fixture = fx.get("fixture") or {}
+        lg      = fx.get("league") or {}
+        teams   = fx.get("teams") or {}
+        fid     = int((fixture.get("id") or 0))
+
+        home = (teams.get("home") or {}).get("name","")
+        away = (teams.get("away") or {}).get("name","")
+        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+        kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
+
+        feat = extract_prematch_features(fx)
+        if not feat:
+            continue
+
+        # Collect PRE candidates (same thresholds as prematch_scan_save)
+        candidates: List[Tuple[str,str,float]] = []
+
+        for line in OU_LINES:
+            mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
+            if not mdl: continue
+            p = _score_prob(feat, mdl)
+            mk = f"Over/Under {_fmt_line(line)}"
+            thr = _get_market_threshold_pre(mk)
+            if p*100.0 >= thr:   candidates.append((mk, f"Over {_fmt_line(line)} Goals", p))
+            q = 1.0 - p
+            if q*100.0 >= thr:   candidates.append((mk, f"Under {_fmt_line(line)} Goals", q))
+
+        mdl = load_model_from_settings("PRE_BTTS_YES")
+        if mdl:
+            p = _score_prob(feat, mdl); thr = _get_market_threshold_pre("BTTS")
+            if p*100.0 >= thr: candidates.append(("BTTS","BTTS: Yes", p))
+            q = 1.0 - p
+            if q*100.0 >= thr: candidates.append(("BTTS","BTTS: No",  q))
+
+        mh = load_model_from_settings("PRE_WLD_HOME")
+        ma = load_model_from_settings("PRE_WLD_AWAY")
+        if mh and ma:
+            ph = _score_prob(feat, mh); pa = _score_prob(feat, ma)
+            s = max(EPS, ph+pa); ph, pa = ph/s, pa/s
+            thr = _get_market_threshold_pre("1X2")
+            if ph*100.0 >= thr: candidates.append(("1X2","Home Win", ph))
+            if pa*100.0 >= thr: candidates.append(("1X2","Away Win", pa))
+
+        if not candidates:
+            continue
+
+        # Take the single best for this fixture (by probability) then apply odds/EV gate
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        mk, sug, prob = candidates[0]
+        prob_pct = prob * 100.0
+        if prob_pct < MOTD_CONF_MIN:
+            continue
+
+        # Odds/EV (reuse in-play price gate; market text must be without "PRE ")
+        pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
+        if not pass_odds:
+            continue
+
+        ev_pct = None
+        if odds is not None:
+            edge = _ev(prob, odds)            # decimal (e.g. 0.05)
+            ev_bps = int(round(edge * 10000)) # basis points
+            ev_pct = round(edge * 100.0, 1)
+            if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
+                continue
+
+        item = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
+        if best is None or prob_pct > best[0]:
+            best = item
+
+    if not best:
+        return send_telegram("🏅 Match of the Day: no prematch pick met thresholds.")
+    prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best
+    return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
 
 def auto_tune_thresholds(days: int = 14) -> Dict[str,float]:
     if not AUTO_TUNE_ENABLE: return {}
@@ -1025,6 +1137,10 @@ def http_retry_unsent(): _require_admin(); n=retry_unsent_tips(30,200); return j
 
 @app.route("/admin/prematch-scan", methods=["POST","GET"])
 def http_prematch_scan(): _require_admin(); saved=prematch_scan_save(); return jsonify({"ok": True, "saved": int(saved)})
+
+@app.route("/admin/motd", methods=["POST","GET"])
+def http_motd():
+    _require_admin(); ok = send_match_of_the_day(); return jsonify({"ok": bool(ok)})
 
 @app.route("/settings/<key>", methods=["GET","POST"])
 def http_settings(key: str):
