@@ -756,15 +756,19 @@ def production_scan() -> Tuple[int,int]:
 
                     created_ts=base_now+idx
                     raw=float(prob); prob_pct=round(raw*100.0,1)
-                    with db_conn() as c2:
-                        c2.execute(
-                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
-                            (fid,league_id,league,home,away,market_txt,suggestion,float(prob_pct),raw,score,minute,created_ts,
-                             (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None))
-                        )
-                        sent=_send_tip(home,away,league,minute,score,suggestion,float(prob_pct),feat,odds,book,ev_pct)
-                        if sent: c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(fid,created_ts))
+
+                    # PATCH: reuse the existing connection `c`
+                    c.execute(
+                        "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
+                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                        (fid,league_id,league,home,away,market_txt,suggestion,float(prob_pct),raw,score,minute,created_ts,
+                         (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None))
+                    )
+
+                    sent=_send_tip(home,away,league,minute,score,suggestion,float(prob_pct),feat,odds,book,ev_pct)
+                    if sent:
+                        c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(fid,created_ts))
+
                     saved+=1; per_match+=1
                     if MAX_TIPS_PER_SCAN and saved>=MAX_TIPS_PER_SCAN: break
                 if MAX_TIPS_PER_SCAN and saved>=MAX_TIPS_PER_SCAN: break
