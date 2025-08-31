@@ -1031,17 +1031,22 @@ def auto_tune_thresholds(days: int = 14) -> Dict[str,float]:
     return tuned
 
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
-    cutoff=int(time.time())-minutes*60
+    cutoff = int(time.time()) - minutes*60
+    retried = 0
     with db_conn() as c:
-        rows=c.execute("SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct "
-                       "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",(cutoff,limit)).fetchall()
-    retried=0
-    for (mid,league,home,away,market,sugg,conf,conf_raw,score,minute,cts,odds,book,ev_pct) in rows:
-        ok=send_telegram(_format_tip_message(home,away,league,int(minute),score,sugg,float(conf),{},odds,book,ev_pct))
-        if ok:
-            with db_conn() as c2: c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(mid,cts))
-            retried+=1
-    if retried: log.info("[RETRY] resent %d", retried)
+        rows = c.execute(
+            "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct "
+            "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",
+            (cutoff, limit)
+        ).fetchall()
+
+        for (mid, league, home, away, market, sugg, conf, conf_raw, score, minute, cts, odds, book, ev_pct) in rows:
+            ok = send_telegram(_format_tip_message(home, away, league, int(minute), score, sugg, float(conf), {}, odds, book, ev_pct))
+            if ok:
+                c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
+                retried += 1
+    if retried:
+        log.info("[RETRY] resent %d", retried)
     return retried
 
 # ───────── Scheduler ─────────
