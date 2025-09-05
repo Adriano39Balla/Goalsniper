@@ -574,26 +574,93 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
     return (True, odds, book, None)
 
 # ───────── Snapshots ─────────
-def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
-    fx=m.get("fixture",{}) or {}; lg=m.get("league",{}) or {}
-    fid=int(fx.get("id")); league_id=int(lg.get("id") or 0)
-    league=f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-    home=(m.get("teams") or {}).get("home",{}).get("name","")
-    away=(m.get("teams") or {}).get("away",{}).get("name","")
-    gh=(m.get("goals") or {}).get("home") or 0; ga=(m.get("goals") or {}).get("away") or 0
-    minute=int(feat.get("minute",0))
-    snapshot={"minute":minute,"gh":gh,"ga":ga,"league_id":league_id,"market":"HARVEST","suggestion":"HARVEST","confidence":0,
-              "stat":{"xg_h":feat.get("xg_h",0),"xg_a":feat.get("xg_a",0),"sot_h":feat.get("sot_h",0),"sot_a":feat.get("sot_a",0),
-                      "cor_h":feat.get("cor_h",0),"cor_a":feat.get("cor_a",0),"pos_h":feat.get("pos_h",0),"pos_a":feat.get("pos_a",0),
-                      "red_h":feat.get("red_h",0),"red_a":feat.get("red_a",0)}}
-    now=int(time.time())
+def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
+    """
+    Persist a compact, training-friendly snapshot for the current live state.
+    Adds sh_total_h/a and yellow_h/a (new signals) and a few derived fields
+    to improve downstream model training without changing any tables.
+    """
+    fx = (m.get("fixture") or {})
+    lg = (m.get("league") or {})
+    teams = (m.get("teams") or {})
+
+    fid = int(fx.get("id") or 0)
+    if not fid:
+        return  # no fixture id -> nothing to save
+
+    league_id = int(lg.get("id") or 0)
+    league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+    home = (teams.get("home") or {}).get("name", "")
+    away = (teams.get("away") or {}).get("name", "")
+
+    gh = int((m.get("goals") or {}).get("home") or 0)
+    ga = int((m.get("goals") or {}).get("away") or 0)
+    minute = int(feat.get("minute", 0))
+
+    # Base stats (existing)
+    xg_h = float(feat.get("xg_h", 0.0));      xg_a = float(feat.get("xg_a", 0.0))
+    sot_h = float(feat.get("sot_h", 0.0));    sot_a = float(feat.get("sot_a", 0.0))
+    cor_h = float(feat.get("cor_h", 0.0));    cor_a = float(feat.get("cor_a", 0.0))
+    pos_h = float(feat.get("pos_h", 0.0));    pos_a = float(feat.get("pos_a", 0.0))
+    red_h = float(feat.get("red_h", 0.0));    red_a = float(feat.get("red_a", 0.0))
+
+    # NEW signals (you added these in extract_features)
+    sh_total_h = float(feat.get("sh_total_h", 0.0))
+    sh_total_a = float(feat.get("sh_total_a", 0.0))
+    yellow_h   = float(feat.get("yellow_h", 0.0))
+    yellow_a   = float(feat.get("yellow_a", 0.0))
+
+    # Light derived metrics (helpful for training; zero-cost to store in JSON)
+    xg_sum = xg_h + xg_a;    xg_diff = xg_h - xg_a
+    sot_sum = sot_h + sot_a
+    cor_sum = cor_h + cor_a
+    pos_diff = pos_h - pos_a
+    red_sum = red_h + red_a
+    sh_total_sum = sh_total_h + sh_total_a
+    sh_total_diff = sh_total_h - sh_total_a
+    yellow_sum = yellow_h + yellow_a
+
+    snapshot = {
+        "minute": minute,
+        "gh": gh,
+        "ga": ga,
+        "league_id": league_id,
+        "market": "HARVEST",
+        "suggestion": "HARVEST",
+        "confidence": 0,
+        "stat": {
+            # Core stats
+            "xg_h": xg_h, "xg_a": xg_a, "xg_sum": xg_sum, "xg_diff": xg_diff,
+            "sot_h": sot_h, "sot_a": sot_a, "sot_sum": sot_sum,
+            "cor_h": cor_h, "cor_a": cor_a, "cor_sum": cor_sum,
+            "pos_h": pos_h, "pos_a": pos_a, "pos_diff": pos_diff,
+            "red_h": red_h, "red_a": red_a, "red_sum": red_sum,
+
+            # NEW: total shots + yellows
+            "sh_total_h": sh_total_h, "sh_total_a": sh_total_a,
+            "sh_total_sum": sh_total_sum, "sh_total_diff": sh_total_diff,
+            "yellow_h": yellow_h, "yellow_a": yellow_a, "yellow_sum": yellow_sum,
+        }
+    }
+
+    now = int(time.time())
+    payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)
+    # keep wide margin under Postgres text page limits; your previous cap was 200k
+    payload = payload[:200000]
+
     with db_conn() as c:
-        c.execute("INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
-                  "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
-                  (fid, now, json.dumps(snapshot)[:200000]))
-        c.execute("INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
-                  "VALUES (%s,%s,%s,%s,%s,'HARVEST','HARVEST',0.0,0.0,%s,%s,%s,1)",
-                  (fid, league_id, league, home, away, f"{gh}-{ga}", minute, now))
+        # Upsert snapshot for this match+ts (idempotent on conflict)
+        c.execute(
+            "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
+            "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
+            (fid, now, payload)
+        )
+        # Keep the lightweight HARVEST row for bookkeeping / joins
+        c.execute(
+            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
+            "VALUES (%s,%s,%s,%s,%s,'HARVEST','HARVEST',0.0,0.0,%s,%s,%s,1)",
+            (fid, league_id, league, home, away, f"{gh}-{ga}", minute, now)
+        )
 
 # ───────── Outcomes/backfill/digest (short) ─────────
 def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
