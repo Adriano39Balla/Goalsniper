@@ -904,62 +904,57 @@ def production_scan() -> Tuple[int,int]:
                 base_now = int(time.time())
 
                 for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank) in enumerate(ranked):
-                if suggestion not in ALLOWED_SUGGESTIONS:
-                    continue
-                if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                    break
+                    if suggestion not in ALLOWED_SUGGESTIONS:
+                        continue
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        break
 
-                created_ts = base_now + idx
-                raw = float(prob)
-                prob_pct = round(raw * 100.0, 1)
+                    created_ts = base_now + idx
+                    raw = float(prob)
+                    prob_pct = round(raw * 100.0, 1)
 
-                try:
-                    with db_conn() as c2:
-                        c2.execute(
-                            "INSERT INTO tips("
-                            "match_id,league_id,league,home,away,market,suggestion,"
-                            "confidence,confidence_raw,score_at_tip,minute,created_ts,"
-                            "odds,book,ev_pct,sent_ok"
-                            ") VALUES ("
-                            "%s,%s,%s,%s,%s,%s,%s,"
-                            "%s,%s,%s,%s,%s,"
-                            "%s,%s,%s,0"
-                            ")",
-                            (
-                                fid, league_id, league, home, away, market_txt, suggestion,
-                                float(prob_pct), raw, score, minute, created_ts,
-                                (float(odds) if odds is not None else None),
-                                (book or None),
-                                (float(ev_pct) if ev_pct is not None else None),
-                            ),
-                        )
-
-                        sent = _send_tip(
-                            home, away, league, minute, score, suggestion,
-                            float(prob_pct), feat, odds, book, ev_pct
-                        )
-                        if sent:
+                    try:
+                        with db_conn() as c2:
                             c2.execute(
-                                "UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
-                                (fid, created_ts),
+                                "INSERT INTO tips("
+                                "match_id,league_id,league,home,away,market,suggestion,"
+                                "confidence,confidence_raw,score_at_tip,minute,created_ts,"
+                                "odds,book,ev_pct,sent_ok"
+                                ") VALUES ("
+                                "%s,%s,%s,%s,%s,%s,%s,"
+                                "%s,%s,%s,%s,%s,"
+                                "%s,%s,%s,0"
+                                ")",
+                                (
+                                    fid, league_id, league, home, away, market_txt, suggestion,
+                                    float(prob_pct), raw, score, minute, created_ts,
+                                    (float(odds) if odds is not None else None),
+                                    (book or None),
+                                    (float(ev_pct) if ev_pct is not None else None),
+                                ),
                             )
-                except Exception as e:
-                    log.exception("[PROD] insert/send failed: %s", e)
-                    continue
 
-                saved += 1
-                per_match += 1
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
+                            sent = _send_tip(
+                                home, away, league, minute, score, suggestion,
+                                float(prob_pct), feat, odds, book, ev_pct
+                            )
+                            if sent:
+                                c2.execute(
+                                    "UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
+                                    (fid, created_ts),
+                                )
+                    except Exception as e:
+                        log.exception("[PROD] insert/send failed: %s", e)
+                        continue
 
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
+                    saved += 1
+                    per_match += 1
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        break
+            
 
-            except Exception as e:
-                log.exception("[PROD] failure: %s", e)
-                continue
-
-    log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
-    return saved, live_seen
+                    log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
+                    return saved, live_seen
 
 # ───────── Prematch (compact: save-only, thresholds respected) ─────────
 def extract_prematch_features(fx: dict) -> Dict[str,float]:
