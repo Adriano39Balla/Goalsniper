@@ -950,11 +950,17 @@ def production_scan() -> Tuple[int,int]:
                     saved += 1
                     per_match += 1
                     if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                        break
-            
+                        break  # stop per-match loop
 
-                    log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
-                    return saved, live_seen
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break  # stop outer matches loop
+
+            except Exception as e:
+                log.exception("[PROD] match loop failed: %s", e)
+                continue
+
+    log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
+    return saved, live_seen
 
 # ───────── Prematch (compact: save-only, thresholds respected) ─────────
 
