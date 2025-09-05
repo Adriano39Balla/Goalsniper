@@ -61,18 +61,21 @@ logger = logging.getLogger(__name__)
 
 # ───────────────────────── Feature sets ───────────────────────── #
 
-# Must match main.py extract_features()
+# Live/in-play features — MUST match main.py:extract_features()
 FEATURES: List[str] = [
     "minute",
     "goals_h", "goals_a", "goals_sum", "goals_diff",
     "xg_h", "xg_a", "xg_sum", "xg_diff",
     "sot_h", "sot_a", "sot_sum",
+    "sh_total_h", "sh_total_a",          # NEW
     "cor_h", "cor_a", "cor_sum",
     "pos_h", "pos_a", "pos_diff",
     "red_h", "red_a", "red_sum",
+    "yellow_h", "yellow_a",              # NEW
 ]
 
-# Must match main.py extract_prematch_features()
+# Prematch features — MUST match main.py:extract_prematch_features()
+# (We keep the live keys at 0.0 for serving-time compatibility.)
 PRE_FEATURES: List[str] = [
     "pm_gf_h","pm_ga_h","pm_win_h",
     "pm_gf_a","pm_ga_a","pm_win_a",
@@ -80,13 +83,27 @@ PRE_FEATURES: List[str] = [
     "pm_ov25_a","pm_ov35_a","pm_btts_a",
     "pm_ov25_h2h","pm_ov35_h2h","pm_btts_h2h",
     "pm_rest_diff",
-    # keep live keys 0.0 for compatibility at serve time
     "minute","goals_h","goals_a","goals_sum","goals_diff",
     "xg_h","xg_a","xg_sum","xg_diff","sot_h","sot_a","sot_sum",
-    "cor_h","cor_a","cor_sum","pos_h","pos_a","pos_diff","red_h","red_a","red_sum",
+    "sh_total_h","sh_total_a",           # NEW
+    "cor_h","cor_a","cor_sum","pos_h","pos_a","pos_diff",
+    "red_h","red_a","red_sum",
+    "yellow_h","yellow_a",               # NEW
 ]
 
 EPS = 1e-6
+
+def _ensure_columns(df: "pd.DataFrame", cols: List[str]) -> "pd.DataFrame":
+    """
+    Make sure every column in cols exists; if missing, create with 0.0.
+    Then return a view ordered exactly as cols.
+    """
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0.0
+    # sanitize
+    df[cols] = df[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return df[cols]
 
 
 # ─────────────────────── DB helpers ─────────────────────── #
@@ -134,10 +151,18 @@ def _ensure_training_tables(conn) -> None:
 # ─────────────────────── Data load ─────────────────────── #
 
 def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
+    """
+    Load one latest HARVEST snapshot per match (joined with final results),
+    add light QA filtering to reduce label/feature noise, and bound recency.
+
+    Expects your tip_snapshots payload to contain the expanded stat dict
+    (including sh_total_* and yellow_* if you adopted the upgraded snapshot).
+    """
     q = """
     WITH latest AS (
       SELECT match_id, MAX(created_ts) AS ts
-      FROM tip_snapshots GROUP BY match_id
+      FROM tip_snapshots
+      GROUP BY match_id
     )
     SELECT l.match_id, s.created_ts, s.payload,
            r.final_goals_h, r.final_goals_a, r.btts_yes
@@ -152,56 +177,79 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
     feats: List[Dict[str, Any]] = []
     for _, row in rows.iterrows():
         try:
-            payload = json.loads(row["payload"]) or {}
+            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else (row["payload"] or {})
+            stat = payload.get("stat") or {}
+
+            # Build feature row
+            f: Dict[str, Any] = {
+                "_mid": int(row["match_id"]),
+                "_ts": float(row["created_ts"]),
+                "minute": float(payload.get("minute", 0)),
+                "goals_h": float(payload.get("gh", 0)),
+                "goals_a": float(payload.get("ga", 0)),
+                "goals_sum": float(payload.get("gh", 0)) + float(payload.get("ga", 0)),
+                "goals_diff": float(payload.get("gh", 0)) - float(payload.get("ga", 0)),
+
+                # Core stats (+ derived if available)
+                "xg_h": float(stat.get("xg_h", 0)),
+                "xg_a": float(stat.get("xg_a", 0)),
+                "xg_sum": float(stat.get("xg_sum", float(stat.get("xg_h", 0)) + float(stat.get("xg_a", 0)))),
+                "xg_diff": float(stat.get("xg_diff", float(stat.get("xg_h", 0)) - float(stat.get("xg_a", 0)))),
+
+                "sot_h": float(stat.get("sot_h", 0)),
+                "sot_a": float(stat.get("sot_a", 0)),
+                "sot_sum": float(stat.get("sot_sum", float(stat.get("sot_h", 0)) + float(stat.get("sot_a", 0)))),
+
+                "cor_h": float(stat.get("cor_h", 0)),
+                "cor_a": float(stat.get("cor_a", 0)),
+                "cor_sum": float(stat.get("cor_sum", float(stat.get("cor_h", 0)) + float(stat.get("cor_a", 0)))),
+
+                "pos_h": float(stat.get("pos_h", 0)),
+                "pos_a": float(stat.get("pos_a", 0)),
+                "pos_diff": float(stat.get("pos_diff", float(stat.get("pos_h", 0)) - float(stat.get("pos_a", 0)))),
+
+                "red_h": float(stat.get("red_h", 0)),
+                "red_a": float(stat.get("red_a", 0)),
+                "red_sum": float(stat.get("red_sum", float(stat.get("red_h", 0)) + float(stat.get("red_a", 0)))),
+
+                # NEW: total shots + yellow cards (if present)
+                "sh_total_h": float(stat.get("sh_total_h", 0)),
+                "sh_total_a": float(stat.get("sh_total_a", 0)),
+                "sh_total_sum": float(stat.get("sh_total_sum", float(stat.get("sh_total_h", 0)) + float(stat.get("sh_total_a", 0)))),
+                "sh_total_diff": float(stat.get("sh_total_diff", float(stat.get("sh_total_h", 0)) - float(stat.get("sh_total_a", 0)))),
+
+                "yellow_h": float(stat.get("yellow_h", 0)),
+                "yellow_a": float(stat.get("yellow_a", 0)),
+                "yellow_sum": float(stat.get("yellow_sum", float(stat.get("yellow_h", 0)) + float(stat.get("yellow_a", 0)))),
+
+                # Labels
+                "final_goals_h": int(row["final_goals_h"] or 0),
+                "final_goals_a": int(row["final_goals_a"] or 0),
+                "btts_yes": int(row["btts_yes"] or 0),
+            }
+            feats.append(f)
         except Exception:
             continue
-        stat = (payload.get("stat") or {})
-
-        f = {
-            "minute": float(payload.get("minute", 0) or 0),
-            "goals_h": float(payload.get("gh", 0) or 0),
-            "goals_a": float(payload.get("ga", 0) or 0),
-            "xg_h": float(stat.get("xg_h", 0) or 0),
-            "xg_a": float(stat.get("xg_a", 0) or 0),
-            "sot_h": float(stat.get("sot_h", 0) or 0),
-            "sot_a": float(stat.get("sot_a", 0) or 0),
-            "cor_h": float(stat.get("cor_h", 0) or 0),
-            "cor_a": float(stat.get("cor_a", 0) or 0),
-            "pos_h": float(stat.get("pos_h", 0) or 0),
-            "pos_a": float(stat.get("pos_a", 0) or 0),
-            "red_h": float(stat.get("red_h", 0) or 0),
-            "red_a": float(stat.get("red_a", 0) or 0),
-        }
-
-        # Derived
-        f["goals_sum"] = f["goals_h"] + f["goals_a"]
-        f["goals_diff"] = f["goals_h"] - f["goals_a"]
-        f["xg_sum"] = f["xg_h"] + f["xg_a"]
-        f["xg_diff"] = f["xg_h"] - f["xg_a"]
-        f["sot_sum"] = f["sot_h"] + f["sot_a"]
-        f["cor_sum"] = f["cor_h"] + f["cor_a"]
-        f["pos_diff"] = f["pos_h"] - f["pos_a"]
-        f["red_sum"] = f["red_h"] + f["red_a"]
-
-        gh_f = int(row["final_goals_h"] or 0)
-        ga_f = int(row["final_goals_a"] or 0)
-
-        f["_ts"] = int(row["created_ts"] or 0)
-        f["final_goals_sum"] = gh_f + ga_f
-        f["final_goals_diff"] = gh_f - ga_f
-        f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
-
-        feats.append(f)
 
     if not feats:
         return pd.DataFrame()
 
     df = pd.DataFrame(feats)
-    df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    df["minute"] = df["minute"].clip(0, 120)
-    df = df[df["minute"] >= float(min_minute)].copy()
-    return df
 
+    # Replace inf/nan and clip minute
+    numeric_cols = [c for c in df.columns if c not in ("_mid", "_ts")]
+    df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df["minute"] = df["minute"].clip(0, 120)
+
+    # Keep snapshots with at least minimal signal when after a certain minute
+    df = df[df["minute"] >= float(min_minute)].copy()
+    df = df[(df["xg_sum"] > 0) | (df["sot_sum"] > 0) | (df["cor_sum"] > 0)]
+
+    # Recency filter: last ~18 months to reduce drift/stale distributions
+    cutoff_ts = pd.Timestamp.utcnow().timestamp() - 18 * 30 * 24 * 3600
+    df = df[df["_ts"] >= cutoff_ts].copy()
+
+    return df
 
 def load_prematch_data(conn) -> pd.DataFrame:
     q = """
@@ -243,9 +291,23 @@ def load_prematch_data(conn) -> pd.DataFrame:
 # ─────────────────────── Model utils ─────────────────────── #
 
 def fit_lr_safe(X: np.ndarray, y: np.ndarray) -> Optional[LogisticRegression]:
+    """
+    Fit a robust L2-regularized Logistic Regression that copes well with
+    class imbalance and large, sparse-ish feature sets.
+
+    Keeps the API identical; only the solver/params are tuned for stability
+    and better calibration downstream.
+    """
     if len(np.unique(y)) < 2:
         return None
-    return LogisticRegression(max_iter=1000, class_weight="balanced", solver="liblinear").fit(X, y)
+    return LogisticRegression(
+        max_iter=5000,
+        solver="saga",
+        penalty="l2",
+        class_weight="balanced",
+        n_jobs=-1,
+        # (leave C=1.0 default unless you grid-search; SAGA respects it)
+    ).fit(X, y)
 
 def weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[str, float]:
     return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
@@ -295,13 +357,17 @@ def _pick_threshold_for_target_precision(
     default_threshold: float = 0.65,
 ) -> float:
     """
-    Choose smallest t achieving >= target_precision and >= min_preds positives.
-    Fallback: best F1, then best accuracy, then default.
+    Choose a classification threshold with this priority:
+      1) First t achieving precision >= target_precision with at least min_preds positives,
+      2) Else threshold that maximizes F1,
+      3) Else threshold that maximizes accuracy,
+      4) Else falls back to default_threshold.
     """
     y = y_true.astype(int)
-    p = np.asarray(p_cal).astype(float)
+    p = np.asarray(p_cal, dtype=float)
+
     best_t: Optional[float] = None
-    candidates = _grid_thresholds(0.50, 0.95, 0.005)
+    candidates = _grid_thresholds(0.50, 0.95, 0.005)  # dense grid in the useful range
 
     feasible: List[Tuple[float, float, int]] = []
     for t in candidates:
@@ -311,23 +377,25 @@ def _pick_threshold_for_target_precision(
             continue
         prec = precision_score(y, pred, zero_division=0)
         if prec >= target_precision:
-            feasible.append((t, float(prec), n_pred))
+            feasible.append((float(t), float(prec), n_pred))
+
     if feasible:
+        # Prefer the *lowest* t that hits target precision (more recall, more tips)
         feasible.sort(key=lambda z: (z[0], -z[1]))
         best_t = feasible[0][0]
 
     if best_t is None:
-        best_f1 = -1.0
-        for t in candidates:
-            pred = (p >= t).astype(int)
-            if int(pred.sum()) < min_preds:
-                continue
-            f1 = f1_score(y, pred, zero_division=0)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_t = float(t)
+        # Fall back to F1 best (balances precision & recall)
+        prec, rec, thr = precision_recall_curve(y, p)
+        f1 = 2 * (prec * rec) / (prec + rec + 1e-9)
+        if len(f1) > 0:
+            best_idx = int(np.argmax(f1))
+            # precision_recall_curve returns thresholds of length n-1
+            if 0 <= best_idx < len(thr):
+                best_t = float(thr[best_idx])
 
     if best_t is None:
+        # Last resort: accuracy
         best_acc = -1.0
         for t in candidates:
             pred = (p >= t).astype(int)
@@ -337,7 +405,6 @@ def _pick_threshold_for_target_precision(
                 best_t = float(t)
 
     return float(best_t if best_t is not None else default_threshold)
-
 
 # ─────────────────────── Time-based split ─────────────────────── #
 
