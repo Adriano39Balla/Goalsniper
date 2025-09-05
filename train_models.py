@@ -227,6 +227,8 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
                 "final_goals_h": int(row["final_goals_h"] or 0),
                 "final_goals_a": int(row["final_goals_a"] or 0),
                 "btts_yes": int(row["btts_yes"] or 0),
+                "final_goals_sum": int(row["final_goals_h"] or 0) + int(row["final_goals_a"] or 0),
+                "final_goals_diff": int(row["final_goals_h"] or 0) - int(row["final_goals_a"] or 0),
             }
             feats.append(f)
         except Exception:
