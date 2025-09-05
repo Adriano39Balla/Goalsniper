@@ -316,41 +316,86 @@ def _pos_pct(v) -> float:
     except: return 0.0
 
 def extract_features(m: dict) -> Dict[str,float]:
-    home=m["teams"]["home"]["name"]; away=m["teams"]["away"]["name"]
-    gh=m["goals"]["home"] or 0; ga=m["goals"]["away"] or 0
-    minute=int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
-    stats={}; 
+    home = m["teams"]["home"]["name"]
+    away = m["teams"]["away"]["name"]
+    gh = m["goals"]["home"] or 0
+    ga = m["goals"]["away"] or 0
+    minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
+
+    # Build quick lookup for statistics by team name
+    stats = {}
     for s in (m.get("statistics") or []):
-        t=(s.get("team") or {}).get("name"); 
-        if t: stats[t]={ (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
-    sh=stats.get(home,{}) or {}; sa=stats.get(away,{}) or {}
-    xg_h=_num(sh.get("Expected Goals",0)); xg_a=_num(sa.get("Expected Goals",0))
-    sot_h=_num(sh.get("Shots on Target",0)); sot_a=_num(sa.get("Shots on Target",0))
-    cor_h=_num(sh.get("Corner Kicks",0)); cor_a=_num(sa.get("Corner Kicks",0))
-    pos_h=_pos_pct(sh.get("Ball Possession",0)); pos_a=_pos_pct(sa.get("Ball Possession",0))
-    red_h=red_a=0
+        t = (s.get("team") or {}).get("name")
+        if t:
+            stats[t] = { (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
+
+    sh = stats.get(home, {}) or {}
+    sa = stats.get(away, {}) or {}
+
+    # Robust fallbacks for provider label drift
+    xg_h = _num(sh.get("Expected Goals", 0))
+    xg_a = _num(sa.get("Expected Goals", 0))
+    sot_h = _num(sh.get("Shots on Target", sh.get("Shots on Goal", 0)))
+    sot_a = _num(sa.get("Shots on Target", sa.get("Shots on Goal", 0)))
+    sh_total_h = _num(sh.get("Total Shots", sh.get("Shots Total", 0)))
+    sh_total_a = _num(sa.get("Total Shots", sa.get("Shots Total", 0)))
+    cor_h = _num(sh.get("Corner Kicks", 0))
+    cor_a = _num(sa.get("Corner Kicks", 0))
+    pos_h = _pos_pct(sh.get("Ball Possession", 0))
+    pos_a = _pos_pct(sa.get("Ball Possession", 0))
+
+    red_h = red_a = yellow_h = yellow_a = 0
     for ev in (m.get("events") or []):
-        if (ev.get("type","").lower()=="card"):
-            d=(ev.get("detail","") or "").lower()
+        if (ev.get("type", "").lower() == "card"):
+            d = (ev.get("detail", "") or "").lower()
+            t = (ev.get("team") or {}).get("name") or ""
+            if "yellow" in d and "second" not in d:
+                if t == home: yellow_h += 1
+                elif t == away: yellow_a += 1
             if "red" in d or "second yellow" in d:
-                t=(ev.get("team") or {}).get("name") or ""
-                if t==home: red_h+=1
-                elif t==away: red_a+=1
-    return {"minute":float(minute),
-            "goals_h":float(gh),"goals_a":float(ga),"goals_sum":float(gh+ga),"goals_diff":float(gh-ga),
-            "xg_h":float(xg_h),"xg_a":float(xg_a),"xg_sum":float(xg_h+xg_a),"xg_diff":float(xg_h-xg_a),
-            "sot_h":float(sot_h),"sot_a":float(sot_a),"sot_sum":float(sot_h+sot_a),
-            "cor_h":float(cor_h),"cor_a":float(cor_a),"cor_sum":float(cor_h+cor_a),
-            "pos_h":float(pos_h),"pos_a":float(pos_a),"pos_diff":float(pos_h-pos_a),
-            "red_h":float(red_h),"red_a":float(red_a),"red_sum":float(red_h+red_a)}
+                if t == home: red_h += 1
+                elif t == away: red_a += 1
+
+    return {
+        "minute": float(minute),
+        "goals_h": float(gh), "goals_a": float(ga),
+        "goals_sum": float(gh + ga), "goals_diff": float(gh - ga),
+
+        "xg_h": float(xg_h), "xg_a": float(xg_a),
+        "xg_sum": float(xg_h + xg_a), "xg_diff": float(xg_h - xg_a),
+
+        "sot_h": float(sot_h), "sot_a": float(sot_a),
+        "sot_sum": float(sot_h + sot_a),
+
+        "sh_total_h": float(sh_total_h), "sh_total_a": float(sh_total_a),
+
+        "cor_h": float(cor_h), "cor_a": float(cor_a),
+        "cor_sum": float(cor_h + cor_a),
+
+        "pos_h": float(pos_h), "pos_a": float(pos_a),
+        "pos_diff": float(pos_h - pos_a),
+
+        "red_h": float(red_h), "red_a": float(red_a),
+        "red_sum": float(red_h + red_a),
+
+        "yellow_h": float(yellow_h), "yellow_a": float(yellow_a)
+    }
 
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
-    require_stats_minute=int(os.getenv("REQUIRE_STATS_MINUTE","35"))
-    require_fields=int(os.getenv("REQUIRE_DATA_FIELDS","2"))
-    if minute < require_stats_minute: return True
-    fields=[feat.get("xg_sum",0.0), feat.get("sot_sum",0.0), feat.get("cor_sum",0.0),
-            max(feat.get("pos_h",0.0), feat.get("pos_a",0.0))]
-    nonzero=sum(1 for v in fields if (v or 0)>0)
+    require_stats_minute = int(os.getenv("REQUIRE_STATS_MINUTE","35"))
+    require_fields = int(os.getenv("REQUIRE_DATA_FIELDS","2"))
+    if minute < require_stats_minute:
+        return True
+    # Allow shots/yellows to satisfy coverage when xG is missing
+    fields = [
+        feat.get("xg_sum", 0.0),
+        feat.get("sot_sum", 0.0),
+        feat.get("cor_sum", 0.0),
+        max(feat.get("pos_h", 0.0), feat.get("pos_a", 0.0)),
+        (feat.get("sh_total_h", 0.0) + feat.get("sh_total_a", 0.0)),
+        (feat.get("yellow_h", 0.0) + feat.get("yellow_a", 0.0)),
+    ]
+    nonzero = sum(1 for v in fields if (v or 0) > 0)
     return nonzero >= max(0, require_fields)
 
 def _league_name(m: dict) -> Tuple[int,str]:
@@ -686,95 +731,139 @@ def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
     return True
 
 def production_scan() -> Tuple[int,int]:
-    matches=fetch_live_matches(); live_seen=len(matches)
-    if live_seen==0: log.info("[PROD] no live"); return 0,0
-    saved=0; now_ts=int(time.time())
+    matches = fetch_live_matches(); live_seen = len(matches)
+    if live_seen == 0:
+        log.info("[PROD] no live"); return 0,0
+
+    saved = 0; now_ts = int(time.time())
     with db_conn() as c:
         for m in matches:
             try:
-                fid=int((m.get("fixture",{}) or {}).get("id") or 0)
+                fid = int((m.get("fixture",{}) or {}).get("id") or 0)
                 if not fid: continue
-                if DUP_COOLDOWN_MIN>0:
-                    cutoff=now_ts - DUP_COOLDOWN_MIN*60
-                    if c.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",(fid,cutoff)).fetchone(): 
+
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - DUP_COOLDOWN_MIN*60
+                    if c.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",(fid,cutoff)).fetchone():
                         continue
-                feat=extract_features(m); minute=int(feat.get("minute",0))
+
+                feat = extract_features(m); minute = int(feat.get("minute",0))
                 if not stats_coverage_ok(feat, minute): continue
                 if minute < TIP_MIN_MINUTE: continue
-                if HARVEST_MODE and minute>=TRAIN_MIN_MINUTE and minute%3==0:
+
+                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
                     try: save_snapshot_from_match(m, feat)
                     except: pass
 
-                league_id, league=_league_name(m); home,away=_teams(m); score=_pretty_score(m)
-                candidates: List[Tuple[str,str,float]]=[]
+                league_id, league = _league_name(m)
+                home, away = _teams(m)
+                score = _pretty_score(m)
+
+                # ---- candidates by ML probability ----
+                candidates: List[Tuple[str,str,float]] = []
 
                 # OU
                 for line in OU_LINES:
-                    mdl=_load_ou_model_for_line(line)
+                    mdl = _load_ou_model_for_line(line)
                     if not mdl: continue
-                    p_over=_score_prob(feat, mdl)
-                    mk=f"Over/Under {_fmt_line(line)}"; thr=_get_market_threshold(mk)
+                    p_over = _score_prob(feat, mdl)
+                    mk = f"Over/Under {_fmt_line(line)}"
+                    thr = _get_market_threshold(mk)
                     if p_over*100.0 >= thr and _candidate_is_sane(f"Over {_fmt_line(line)} Goals", feat):
                         candidates.append((mk, f"Over {_fmt_line(line)} Goals", p_over))
-                    p_under=1.0-p_over
+                    p_under = 1.0 - p_over
                     if p_under*100.0 >= thr and _candidate_is_sane(f"Under {_fmt_line(line)} Goals", feat):
                         candidates.append((mk, f"Under {_fmt_line(line)} Goals", p_under))
 
                 # BTTS
-                mdl_btts=load_model_from_settings("BTTS_YES")
+                mdl_btts = load_model_from_settings("BTTS_YES")
                 if mdl_btts:
-                    p=_score_prob(feat, mdl_btts); thr=_get_market_threshold("BTTS")
-                    if p*100.0>=thr and _candidate_is_sane("BTTS: Yes", feat): candidates.append(("BTTS","BTTS: Yes",p))
-                    q=1.0-p
-                    if q*100.0>=thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
+                    p = _score_prob(feat, mdl_btts); thr = _get_market_threshold("BTTS")
+                    if p*100.0 >= thr and _candidate_is_sane("BTTS: Yes", feat): candidates.append(("BTTS","BTTS: Yes",p))
+                    q = 1.0 - p
+                    if q*100.0 >= thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
 
-                # 1X2 (no draw)
-                mh,md,ma=_load_wld_models()
+                # 1X2 (draw suppressed)
+                mh, md, ma = _load_wld_models()
                 if mh and md and ma:
-                    ph=_score_prob(feat,mh); pd=_score_prob(feat,md); pa=_score_prob(feat,ma)
-                    s=max(EPS,ph+pd+pa); ph,pa=ph/s,pa/s
-                    thr=_get_market_threshold("1X2")
-                    if ph*100.0>=thr: candidates.append(("1X2","Home Win",ph))
-                    if pa*100.0>=thr: candidates.append(("1X2","Away Win",pa))
+                    ph = _score_prob(feat, mh); pd = _score_prob(feat, md); pa = _score_prob(feat, ma)
+                    s = max(EPS, ph + pd + pa); ph, pa = ph/s, pa/s
+                    thr = _get_market_threshold("1X2")
+                    if ph*100.0 >= thr: candidates.append(("1X2","Home Win",ph))
+                    if pa*100.0 >= thr: candidates.append(("1X2","Away Win",pa))
 
-                candidates.sort(key=lambda x:x[2], reverse=True)
-                per_match=0; base_now=int(time.time())
-                for idx,(market_txt,suggestion,prob) in enumerate(candidates):
-                    if suggestion not in ALLOWED_SUGGESTIONS: continue
-                    if per_match >= max(1,PREDICTIONS_PER_MATCH): break
+                # ---- prefetch odds once, compute edge, rank ----
+                odds_map = fetch_odds(fid) if API_KEY else {}
+                ranked = []
 
-                    # Odds/EV gate
-                    pass_odds, odds, book, _ = _price_gate(market_txt, suggestion, fid)
-                    if not pass_odds: 
-                        continue
-                    ev_pct=None
+                for mk, sug, prob in candidates:
+                    # Extract odds/book from prefetched map
+                    odds = None; book = None
+                    if mk == "BTTS":
+                        d = odds_map.get("BTTS", {})
+                        tgt = "Yes" if sug.endswith("Yes") else "No"
+                        if tgt in d: odds = d[tgt]["odds"]; book = d[tgt]["book"]
+                    elif mk == "1X2":
+                        d = odds_map.get("1X2", {})
+                        tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
+                        if tgt and tgt in d: odds = d[tgt]["odds"]; book = d[tgt]["book"]
+                    elif mk.startswith("Over/Under"):
+                        ln = _fmt_line(float(sug.split()[1]))
+                        d = odds_map.get(f"OU_{ln}", {})
+                        tgt = "Over" if sug.startswith("Over") else "Under"
+                        if tgt in d: odds = d[tgt]["odds"]; book = d[tgt]["book"]
+
+                    # price/EV gate
                     if odds is not None:
-                        edge=_ev(prob, odds)  # decimal (e.g. 0.05)
-                        ev_pct=round(edge*100.0,1)
-                        if int(round(edge*10000)) < EDGE_MIN_BPS:  # basis points compare
+                        min_odds = _min_odds_for_market(mk)
+                        if not (min_odds <= odds <= MAX_ODDS_ALL):
                             continue
+                        edge = _ev(prob, odds)                             # decimal (e.g. 0.12)
+                        if int(round(edge*10000)) < EDGE_MIN_BPS:          # bps threshold
+                            continue
+                        ev_pct = round(edge*100.0, 1)
+                        score = prob * (1.0 + edge)                        # combined rank metric
+                    else:
+                        if not ALLOW_TIPS_WITHOUT_ODDS:
+                            continue
+                        ev_pct = None; score = prob
 
-                    created_ts=base_now+idx
-                    raw=float(prob); prob_pct=round(raw*100.0,1)
+                    ranked.append((mk, sug, prob, odds, book, ev_pct, score))
 
-                    # PATCH: reuse the existing connection `c`
-                    c.execute(
-                        "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
-                        (fid,league_id,league,home,away,market_txt,suggestion,float(prob_pct),raw,score,minute,created_ts,
-                         (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None))
-                    )
+                ranked.sort(key=lambda x: x[6], reverse=True)
 
-                    sent=_send_tip(home,away,league,minute,score,suggestion,float(prob_pct),feat,odds,book,ev_pct)
-                    if sent:
-                        c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(fid,created_ts))
+                # ---- insert/send using ranked list ----
+                per_match = 0; base_now = int(time.time())
+                for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _score_) in enumerate(ranked):
+                    if suggestion not in ALLOWED_SUGGESTIONS: continue
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH): break
 
-                    saved+=1; per_match+=1
-                    if MAX_TIPS_PER_SCAN and saved>=MAX_TIPS_PER_SCAN: break
-                if MAX_TIPS_PER_SCAN and saved>=MAX_TIPS_PER_SCAN: break
+                    created_ts = base_now + idx
+                    raw = float(prob); prob_pct = round(raw*100.0, 1)
+
+                    with db_conn() as c2:
+                        c2.execute(
+                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
+                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                            (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), raw,
+                             score, minute, created_ts,
+                             (float(odds) if odds is not None else None),
+                             (book or None),
+                             (float(ev_pct) if ev_pct is not None else None))
+                        )
+                        sent = _send_tip(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct)
+                        if sent:
+                            c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
+
+                    saved += 1; per_match += 1
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
+
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
+
             except Exception as e:
                 log.exception("[PROD] failure: %s", e)
                 continue
+
     log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
     return saved, live_seen
 
