@@ -532,14 +532,17 @@ def train_models(
 
             # BTTS
             ok, mets, _ = _train_binary_head(
-                conn, X_all, df_ip["label_btts"].values.astype(int),
-                tr_mask, te_mask, FEATURES,
-                model_key="BTTS_YES",
-                threshold_label="BTTS",
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.65, metrics_name="BTTS_YES",
-            )
+-                conn, X_all, df_ip["label_btts"].values.astype(int),
++            # BTTS (in-play) — label column is btts_yes
++            ok, mets, _ = _train_binary_head(
++                conn, X_all, df_ip["btts_yes"].values.astype(int),
+                 tr_mask, te_mask, FEATURES,
+                 model_key="BTTS_YES",
+                 threshold_label="BTTS",
+                 target_precision=target_precision, min_preds=min_preds,
+                 min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                 default_thr_prob=0.65, metrics_name="BTTS_YES",
+             )
             summary["trained"]["BTTS_YES"] = ok
             if ok: summary["metrics"]["BTTS_YES"] = mets
 
