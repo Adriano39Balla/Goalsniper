@@ -381,6 +381,59 @@ def extract_features(m: dict) -> Dict[str,float]:
         "yellow_h": float(yellow_h), "yellow_a": float(yellow_a)
     }
 
+def calibrate_and_retune_from_tips(conn, target_precision: float,
+                                   min_preds: int, min_thr_pct: float, max_thr_pct: float,
+                                   days: int = 365) -> Dict[str, float]:
+    df = load_graded_tips(conn, days=days)
+    if df.empty:
+        logger.info("Tips calibration: no graded tips found.")
+        return {}
+
+    updates: Dict[str, float] = {}
+    def _do(market_name: str, mask_market):
+        sub = df[mask_market].copy()
+        if len(sub) < max(200, min_preds*3):  # need some mass
+            return
+        # Platt using tips
+        p_raw = sub["prob"].to_numpy()
+        y = sub["y"].to_numpy().astype(int)
+        a, b = fit_platt(y, p_raw)
+        # store calibration blob update for the model key(s)
+        key_map = {
+            "BTTS":           "BTTS_YES",
+            "Over/Under 2.5": "OU_2.5",
+            "Over/Under 3.5": "OU_3.5",
+            "1X2":            None,  # handled by threshold only (composite)
+        }
+        model_key = key_map.get(market_name)
+        if model_key:
+            blob = _get_setting_json(conn, f"model_latest:{model_key}")
+            if blob:
+                blob["calibration"] = {"method": "platt", "a": float(a), "b": float(b)}
+                for k in (f"model_latest:{model_key}", f"model:{model_key}"):
+                    _set_setting(conn, k, json.dumps(blob))
+
+        # choose threshold to hit target precision
+        # (use calibrated proba)
+        z = _logit_vec(p_raw); p_cal = 1.0/(1.0+np.exp(-(a*z + b)))
+        thr_prob = _pick_threshold_for_target_precision(
+            y_true=y, p_cal=p_cal, target_precision=target_precision,
+            min_preds=min_preds, default_threshold=0.65,
+        )
+        thr_pct = float(np.clip(_percent(thr_prob), min_thr_pct, max_thr_pct))
+        _set_setting(conn, f"conf_threshold:{market_name}", f"{thr_pct:.2f}")
+        updates[market_name] = thr_pct
+
+    # Markets
+    _do("BTTS",                 df["market"] == "BTTS")
+    _do("Over/Under 2.5",      df["market"].eq("Over/Under 2.5"))
+    _do("Over/Under 3.5",      df["market"].eq("Over/Under 3.5"))
+    _do("1X2",                 df["market"] == "1X2")
+
+    if updates:
+        logger.info("Tips calibration/threshold updates: %s", updates)
+    return updates
+
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
     require_stats_minute = int(os.getenv("REQUIRE_STATS_MINUTE","35"))
     require_fields = int(os.getenv("REQUIRE_DATA_FIELDS","2"))
