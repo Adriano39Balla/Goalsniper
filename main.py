@@ -957,6 +957,7 @@ def production_scan() -> Tuple[int,int]:
                     return saved, live_seen
 
 # ───────── Prematch (compact: save-only, thresholds respected) ─────────
+
 def extract_prematch_features(fx: dict) -> Dict[str,float]:
     teams=fx.get("teams") or {}; th=(teams.get("home") or {}).get("id"); ta=(teams.get("away") or {}).get("id")
     if not th or not ta: return {}
