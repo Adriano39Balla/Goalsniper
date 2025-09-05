@@ -524,27 +524,25 @@ def train_models(
     summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "thresholds": {}}
 
     try:
-        # ========== In-Play ==========
+                # ========== In-Play ==========
         df_ip = load_inplay_data(conn, min_minute=min_minute)
         if not df_ip.empty and len(df_ip) >= min_rows:
             tr_mask, te_mask = time_order_split(df_ip, test_size=test_size)
             X_all = df_ip[FEATURES].values
 
-            # BTTS
+            # BTTS (in-play) — label column is btts_yes
             ok, mets, _ = _train_binary_head(
-                 conn, X_all, df_ip["label_btts"].values.astype(int) 
-             # BTTS (in-play) — label column is btts_yes
-             ok, mets, _ = _train_binary_head(
-                 conn, X_all, df_ip["btts_yes"].values.astype(int),
-                 tr_mask, te_mask, FEATURES,
-                 model_key="BTTS_YES",
-                 threshold_label="BTTS",
-                 target_precision=target_precision, min_preds=min_preds,
-                 min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                 default_thr_prob=0.65, metrics_name="BTTS_YES",
-             )
+                conn, X_all, df_ip["btts_yes"].values.astype(int),
+                tr_mask, te_mask, FEATURES,
+                model_key="BTTS_YES",
+                threshold_label="BTTS",
+                target_precision=target_precision, min_preds=min_preds,
+                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                default_thr_prob=0.65, metrics_name="BTTS_YES",
+            )
             summary["trained"]["BTTS_YES"] = ok
-            if ok: summary["metrics"]["BTTS_YES"] = mets
+            if ok:
+                summary["metrics"]["BTTS_YES"] = mets
 
             # O/U
             totals = df_ip["final_goals_sum"].values.astype(int)
@@ -574,15 +572,21 @@ def train_models(
             y_draw = (gd == 0).astype(int)
             y_away = (gd < 0).astype(int)
 
-            ok_h, mets_h, p_h = _train_binary_head(conn, X_all, y_home, tr_mask, te_mask, FEATURES,
-                                                   "WLD_HOME", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_HOME")
-            ok_d, mets_d, p_d = _train_binary_head(conn, X_all, y_draw, tr_mask, te_mask, FEATURES,
-                                                   "WLD_DRAW", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_DRAW")
-            ok_a, mets_a, p_a = _train_binary_head(conn, X_all, y_away, tr_mask, te_mask, FEATURES,
-                                                   "WLD_AWAY", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_AWAY")
+            ok_h, mets_h, p_h = _train_binary_head(
+                conn, X_all, y_home, tr_mask, te_mask, FEATURES,
+                "WLD_HOME", None, target_precision, min_preds,
+                min_thresh, max_thresh, 0.45, "WLD_HOME",
+            )
+            ok_d, mets_d, p_d = _train_binary_head(
+                conn, X_all, y_draw, tr_mask, te_mask, FEATURES,
+                "WLD_DRAW", None, target_precision, min_preds,
+                min_thresh, max_thresh, 0.45, "WLD_DRAW",
+            )
+            ok_a, mets_a, p_a = _train_binary_head(
+                conn, X_all, y_away, tr_mask, te_mask, FEATURES,
+                "WLD_AWAY", None, target_precision, min_preds,
+                min_thresh, max_thresh, 0.45, "WLD_AWAY",
+            )
             summary["trained"]["WLD_HOME"] = ok_h
             summary["trained"]["WLD_DRAW"] = ok_d
             summary["trained"]["WLD_AWAY"] = ok_a
