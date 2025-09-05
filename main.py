@@ -921,7 +921,7 @@ def production_scan() -> Tuple[int,int]:
                             (book or None),
                             (float(ev_pct) if ev_pct is not None else None))
                        )
-                       sent = _send_tip(home, away, league, minute, score, suggestion,
+                       sent = _send_tip(home, away, league, minute, score, suggestion
                                         float(prob_pct), feat, odds, book, ev_pct)
                        if sent:
                            c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
