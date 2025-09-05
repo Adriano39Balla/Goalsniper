@@ -47,6 +47,7 @@ from sklearn.metrics import (
     log_loss,
     precision_score,
     f1_score,
+    precision_recall_curve,
 )
 import psycopg2
 
@@ -385,14 +386,11 @@ def _pick_threshold_for_target_precision(
         best_t = feasible[0][0]
 
     if best_t is None:
-        # Fall back to F1 best (balances precision & recall)
         prec, rec, thr = precision_recall_curve(y, p)
-        f1 = 2 * (prec * rec) / (prec + rec + 1e-9)
-        if len(f1) > 0:
-            best_idx = int(np.argmax(f1))
-            # precision_recall_curve returns thresholds of length n-1
-            if 0 <= best_idx < len(thr):
-                best_t = float(thr[best_idx])
+        if len(thr) > 0:
+            f1 = 2 * (prec * rec) / (prec + rec + 1e-9)
+            idx = int(np.argmax(f1[:-1])) if len(f1) > 1 else 0
+            best_t = float(thr[max(0, min(idx, len(thr)-1))])
 
     if best_t is None:
         # Last resort: accuracy
