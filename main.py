@@ -861,26 +861,29 @@ def production_scan() -> Tuple[int,int]:
 
                 # ---- prefetch odds once, compute edge, rank ----
                 odds_map = fetch_odds(fid) if API_KEY else {}
-                ranked = []
+                ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
 
-                for mk, sug, prob, _ in candidates:
+                for mk, sug, prob in candidates:
                     pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
                     if not pass_odds:
                         continue
+
                     ev_pct = None
+
+                    # Prefer pre-fetched odds if available
                     if mk == "BTTS":
                         d = odds_map.get("BTTS", {})
                         tgt = "Yes" if sug.endswith("Yes") else "No"
-                        if tgt in d: odds = d[tgt]["odds"]; book = d[tgt]["book"]
+                        if tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
                     elif mk == "1X2":
                         d = odds_map.get("1X2", {})
                         tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
-                        if tgt and tgt in d: odds = d[tgt]["odds"]; book = d[tgt]["book"]
+                        if tgt and tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
                     elif mk.startswith("Over/Under"):
-                        ln = _fmt_line(float(sug.split()[1]))
-                        d = odds_map.get(f"OU_{ln}", {})
+                        ln = _parse_ou_line_from_suggestion(sug)
+                        d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
                         tgt = "Over" if sug.startswith("Over") else "Under"
-                        if tgt in d: odds = d[tgt]["odds"]; book = d[tgt]["book"]
+                        if tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
 
                     # price/EV gate
                     if odds is not None:
@@ -888,7 +891,8 @@ def production_scan() -> Tuple[int,int]:
                         ev_pct = round(edge * 100.0, 1)
                         if int(round(edge * 10000)) < EDGE_MIN_BPS:
                             continue
-                    rank_score = prob * (1 + (ev_pct or 0) / 100.0)   # <-- renamed
+
+                    rank_score = prob * (1 + (ev_pct or 0) / 100.0)
                     ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score))
 
                 ranked.sort(key=lambda x: x[6], reverse=True)
