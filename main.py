@@ -863,9 +863,11 @@ def production_scan() -> Tuple[int,int]:
                 odds_map = fetch_odds(fid) if API_KEY else {}
                 ranked = []
 
-                for mk, sug, prob in candidates:
-                    # Extract odds/book from prefetched map
-                    odds = None; book = None
+                for mk, sug, prob, _ in candidates:
+                    pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
+                    if not pass_odds:
+                        continue
+                    ev_pct = None
                     if mk == "BTTS":
                         d = odds_map.get("BTTS", {})
                         tgt = "Yes" if sug.endswith("Yes") else "No"
@@ -882,48 +884,44 @@ def production_scan() -> Tuple[int,int]:
 
                     # price/EV gate
                     if odds is not None:
-                        min_odds = _min_odds_for_market(mk)
-                        if not (min_odds <= odds <= MAX_ODDS_ALL):
+                        edge = _ev(prob, odds)
+                        ev_pct = round(edge * 100.0, 1)
+                        if int(round(edge * 10000)) < EDGE_MIN_BPS:
                             continue
-                        edge = _ev(prob, odds)                             # decimal (e.g. 0.12)
-                        if int(round(edge*10000)) < EDGE_MIN_BPS:          # bps threshold
-                            continue
-                        ev_pct = round(edge*100.0, 1)
-                        score = prob * (1.0 + edge)                        # combined rank metric
-                    else:
-                        if not ALLOW_TIPS_WITHOUT_ODDS:
-                            continue
-                        ev_pct = None; score = prob
-
-                    ranked.append((mk, sug, prob, odds, book, ev_pct, score))
+                    rank_score = prob * (1 + (ev_pct or 0) / 100.0)   # <-- renamed
+                    ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score))
 
                 ranked.sort(key=lambda x: x[6], reverse=True)
 
                 # ---- insert/send using ranked list ----
                 per_match = 0; base_now = int(time.time())
-                for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _score_) in enumerate(ranked):
-                    if suggestion not in ALLOWED_SUGGESTIONS: continue
-                    if per_match >= max(1, PREDICTIONS_PER_MATCH): break
+                for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank) in enumerate(ranked):
+                    if suggestion not in ALLOWED_SUGGESTIONS:
+                        continue
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        break
 
                     created_ts = base_now + idx
-                    raw = float(prob); prob_pct = round(raw*100.0, 1)
+                    raw = float(prob)
+                    prob_pct = round(raw * 100.0, 1)
 
                     with db_conn() as c2:
                         c2.execute(
                             "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
                             "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
                             (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), raw,
-                             score, minute, created_ts,
+                             score_txt, minute, created_ts,
                              (float(odds) if odds is not None else None),
                              (book or None),
                              (float(ev_pct) if ev_pct is not None else None))
                         )
-                        sent = _send_tip(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct)
+                        sent = _send_tip(home, away, league, minute, score_txt, suggestion, float(prob_pct), feat, odds, book, ev_pct)
                         if sent:
                             c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
-
-                    saved += 1; per_match += 1
-                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
+                    saved += 1
+                    per_match += 1
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        break
 
                 if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN: break
 
