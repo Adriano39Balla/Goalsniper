@@ -68,6 +68,9 @@ MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
 STALE_GUARD_ENABLE = os.getenv("STALE_GUARD_ENABLE", "1") not in ("0","false","False","no","NO")
 STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
+MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
+TIP_MAX_MINUTE_ENV = os.getenv("TIP_MAX_MINUTE", "")
+
 
 MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
 MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
@@ -537,6 +540,61 @@ def _market_name_normalize(s: str) -> str:
     if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
     if "over/under" in s or "total" in s or "goals" in s: return "OU"
     return s
+
+def _parse_market_cutoffs(s: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok or "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        try:
+            out[k.strip().upper()] = int(float(v.strip()))
+        except Exception:
+            pass
+    return out
+
+_MARKET_CUTOFFS = _parse_market_cutoffs(MARKET_CUTOFFS_RAW)
+try:
+    _TIP_MAX_MINUTE = int(float(TIP_MAX_MINUTE_ENV)) if TIP_MAX_MINUTE_ENV.strip() else None
+except Exception:
+    _TIP_MAX_MINUTE = None
+
+def _market_family(market_text: str, suggestion: str) -> str:
+    """Normalize to OU / BTTS / 1X2 (draw suppressed)."""
+    s = (market_text or "").upper()
+    if s.startswith("OVER/UNDER") or "OVER/UNDER" in s:
+        return "OU"
+    if s == "BTTS" or "BTTS" in s:
+        return "BTTS"
+    if s == "1X2" or "WINNER" in s or "MATCH WINNER" in s:
+        return "1X2"
+    # PRE markets come in as "PRE XXX" upstream – serving uses bare name here
+    if s.startswith("PRE "):
+        return _market_family(s[4:], suggestion)
+    return s
+
+def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
+    """
+    True if we are still within the minute cutoff for this market.
+    Falls back to TIP_MAX_MINUTE or (TOTAL_MATCH_MINUTES - 5).
+    """
+    fam = _market_family(market_text, suggestion)
+    if minute is None:
+        return True
+    try:
+        m = int(minute)
+    except Exception:
+        m = 0
+
+    # specific market cutoff → else global → else TOTAL_MATCH_MINUTES - 5
+    cutoff = _MARKET_CUTOFFS.get(fam)
+    if cutoff is None:
+        cutoff = _TIP_MAX_MINUTE
+    if cutoff is None:
+        cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
+
+    return m <= int(cutoff)
 
 def fetch_odds(fid: int) -> dict:
     """
