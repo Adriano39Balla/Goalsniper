@@ -397,6 +397,76 @@ def build_model_blob(model: LogisticRegression, features: List[str],
         blob["calibration"] = {"method": "platt", "a": float(a), "b": float(b)}
     return blob
 
+def _logit_vec(p: np.ndarray) -> np.ndarray:
+    p = np.clip(p.astype(float), 1e-6, 1 - 1e-6)
+    return np.log(p / (1.0 - p))
+
+def _fit_platt(y_true: np.ndarray, p_raw: np.ndarray):
+    """
+    Select calibration with lowest Brier on validation:
+      - ("platt", (a,b))  using sigmoid on logit(p_raw)
+      - ("isotonic", fitted IsotonicRegression)
+    """
+    y = y_true.astype(int)
+    z = _logit_vec(p_raw).reshape(-1, 1)
+
+    # Platt
+    lr = LogisticRegression(max_iter=1000, solver="lbfgs")
+    lr.fit(z, y)
+    a = float(lr.coef_.ravel()[0]); b = float(lr.intercept_.ravel()[0])
+    p_platt = 1.0 / (1.0 + np.exp(-(a * z.ravel() + b)))
+    brier_platt = brier_score_loss(y, p_platt)
+
+    # Isotonic (only if enough mass & both classes present)
+    best_kind, best_obj, best_brier = "platt", (a, b), brier_platt
+    if len(y) >= 300 and 0 < y.mean() < 1:
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(p_raw, y)                 # ← correct API
+        p_iso = iso.predict(p_raw)
+        brier_iso = brier_score_loss(y, p_iso)
+        if brier_iso + 1e-6 < best_brier:
+            best_kind, best_obj, best_brier = "isotonic", iso, brier_iso
+
+    return best_kind, best_obj
+
+def _apply_calibration(p_raw: np.ndarray, cal_kind: str, cal_obj):
+    """Apply chosen calibration to raw probabilities."""
+    if cal_kind == "platt":
+        a, b = cal_obj
+        z = _logit_vec(p_raw)
+        return 1.0 / (1.0 + np.exp(-(a * z + b)))
+    # isotonic (fitted)
+    return np.asarray(cal_obj.predict(p_raw), dtype=float)
+
+def build_model_blob(model, features, cal_kind: str, cal_obj):
+    """
+    Store model + calibration. For isotonic, approximate with a sigmoid so
+    serving stays unchanged (expects {'method':'platt','a','b'}).
+    """
+    def _weights_dict(m, names):
+        return {name: float(w) for name, w in zip(names, m.coef_.ravel().tolist())}
+
+    blob = {
+        "intercept": float(model.intercept_.ravel()[0]),
+        "weights": _weights_dict(model, features),
+        "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0},
+    }
+
+    if cal_kind == "platt":
+        a, b = cal_obj
+        blob["calibration"] = {"method": "platt", "a": float(a), "b": float(b)}
+    else:
+        # Fit least-squares in logit space: logit(y) ≈ a*logit(x) + b
+        x = np.linspace(0.01, 0.99, 199)
+        y = np.asarray(cal_obj.predict(x), dtype=float)
+        zx = _logit_vec(x)
+        zy = _logit_vec(np.clip(y, 1e-4, 1 - 1e-4))
+        a, b = np.polyfit(zx, zy, 1)
+        blob["calibration"] = {"method": "platt", "a": float(a), "b": float(b)}
+
+    return blob
+# === END PATCH ===================================================================
+
 # ─────────────────────── Thresholding ─────────────────────── #
 
 def _percent(x: float) -> float:
