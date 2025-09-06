@@ -71,7 +71,6 @@ STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
 MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
 TIP_MAX_MINUTE_ENV = os.getenv("TIP_MAX_MINUTE", "")
 
-
 MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
 MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
 MOTD_HOUR               = int(os.getenv("MOTD_HOUR", "19"))
@@ -95,6 +94,7 @@ def _parse_lines(env_val: str, default: List[float]) -> List[float]:
 OU_LINES = [ln for ln in _parse_lines(os.getenv("OU_LINES","2.5,3.5"), [2.5,3.5]) if abs(ln-1.5)>1e-6]
 TOTAL_MATCH_MINUTES   = int(os.getenv("TOTAL_MATCH_MINUTES", "95"))
 PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "2"))
+PER_LEAGUE_CAP        = int(os.getenv("PER_LEAGUE_CAP", "0"))  # FIX: previously undefined
 
 # ───────── Odds/EV controls ─────────
 MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU",   "1.30"))
@@ -134,12 +134,14 @@ TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
 
 # ───────── Optional import: trainer ─────────
 try:
-    from train_models import train_models
+    # bring in train entrypoint AND a few helpers used by optional calibration fn
+    from train_models import train_models, fit_platt, _logit_vec, _percent, _pick_threshold_for_target_precision, _get_setting_json, _set_setting, load_graded_tips  # FIX
 except Exception as e:
     _IMPORT_ERR = repr(e)
     def train_models(*args, **kwargs):  # type: ignore
         log.warning("train_models not available: %s", _IMPORT_ERR)
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
+    # keep optional helpers undefined; the optional function will never be called when import fails
 
 # ───────── DB pool & helpers ─────────
 POOL: Optional[SimpleConnectionPool] = None
@@ -253,7 +255,6 @@ def _blocked_league(league_obj: dict) -> bool:
     typ=str((league_obj or {}).get("type","")).lower()
     txt=f"{country} {name} {typ}"
     if any(p in txt for p in _BLOCK_PATTERNS): return True
-    allow=[x.strip() for x in os.getenv("MOTD_LEAGUE_IDS","").split(",") if x.strip()]  # not used for live
     deny=[x.strip() for x in os.getenv("LEAGUE_DENY_IDS","").split(",") if x.strip()]
     lid=str((league_obj or {}).get("id") or "")
     if lid in deny: return True
@@ -300,7 +301,7 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
     today_local=datetime.now(ZoneInfo("Europe/Berlin")).date()
     start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=ZoneInfo("Europe/Berlin"))
     end_local=start_local+timedelta(days=1)
-    dates_utc={start_local.astimezone(TZ_UTC).date(), (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
+    dates_utc={start_local.astimezone(ZoneInfo("UTC")).date(), (end_local - timedelta(seconds=1)).astimezone(ZoneInfo("UTC")).date()}
     fixtures=[]
     for d in sorted(dates_utc):
         js=_api_get(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")}) or {}
@@ -387,12 +388,18 @@ def extract_features(m: dict) -> Dict[str,float]:
         "yellow_h": float(yellow_h), "yellow_a": float(yellow_a)
     }
 
+# ---- Optional: calibration from graded tips (kept but hardened) ----
 def calibrate_and_retune_from_tips(conn, target_precision: float,
                                    min_preds: int, min_thr_pct: float, max_thr_pct: float,
                                    days: int = 365) -> Dict[str, float]:
-    df = load_graded_tips(conn, days=days)
+    try:
+        df = load_graded_tips(conn, days=days)  # from train_models
+    except Exception as e:
+        log.info("Tips calibration skipped (helpers not available): %s", e)
+        return {}
+
     if df.empty:
-        logger.info("Tips calibration: no graded tips found.")
+        log.info("Tips calibration: no graded tips found.")
         return {}
 
     updates: Dict[str, float] = {}
@@ -420,7 +427,6 @@ def calibrate_and_retune_from_tips(conn, target_precision: float,
                     _set_setting(conn, k, json.dumps(blob))
 
         # choose threshold to hit target precision
-        # (use calibrated proba)
         z = _logit_vec(p_raw); p_cal = 1.0/(1.0+np.exp(-(a*z + b)))
         thr_prob = _pick_threshold_for_target_precision(
             y_true=y, p_cal=p_cal, target_precision=target_precision,
@@ -437,8 +443,9 @@ def calibrate_and_retune_from_tips(conn, target_precision: float,
     _do("1X2",                 df["market"] == "1X2")
 
     if updates:
-        logger.info("Tips calibration/threshold updates: %s", updates)
+        log.info("Tips calibration/threshold updates: %s", updates)  # FIX: logger -> log
     return updates
+# ---- end optional block ----
 
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
     require_stats_minute = int(os.getenv("REQUIRE_STATS_MINUTE","35"))
@@ -569,7 +576,6 @@ def _market_family(market_text: str, suggestion: str) -> str:
         return "BTTS"
     if s == "1X2" or "WINNER" in s or "MATCH WINNER" in s:
         return "1X2"
-    # PRE markets come in as "PRE XXX" upstream – serving uses bare name here
     if s.startswith("PRE "):
         return _market_family(s[4:], suggestion)
     return s
@@ -586,25 +592,17 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         m = int(minute)
     except Exception:
         m = 0
-
-    # specific market cutoff → else global → else TOTAL_MATCH_MINUTES - 5
     cutoff = _MARKET_CUTOFFS.get(fam)
     if cutoff is None:
         cutoff = _TIP_MAX_MINUTE
     if cutoff is None:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
-
     return m <= int(cutoff)
 
 def fetch_odds(fid: int) -> dict:
     """
     Returns a dict like:
-    {
-      "BTTS": {"Yes": {"odds":1.90,"book":"X"}, "No": {...}},
-      "1X2":  {"Home": {...}, "Away": {...}},
-      "OU_2.5": {"Over": {...}, "Under": {...}},
-      "OU_3.5": {...}
-    }
+      { "BTTS": {...}, "1X2": {...}, "OU_2.5": {...}, ... }
     Best-effort parsing of API-Football /odds endpoint; tolerate missing data.
     """
     cached=_odds_cache_get(fid)
@@ -621,7 +619,6 @@ def fetch_odds(fid: int) -> dict:
             for mkt in (bk.get("bets") or []):
                 mname=_market_name_normalize(mkt.get("name",""))
                 vals=mkt.get("values") or []
-                # BTTS
                 if mname=="BTTS":
                     d={}
                     for v in vals:
@@ -629,7 +626,6 @@ def fetch_odds(fid: int) -> dict:
                         if "yes" in lbl: d["Yes"]={"odds":float(v.get("odd") or 0), "book":book_name}
                         if "no"  in lbl: d["No"] ={"odds":float(v.get("odd") or 0), "book":book_name}
                     if d: out["BTTS"]=d
-                # 1X2
                 elif mname=="1X2":
                     d={}
                     for v in vals:
@@ -637,9 +633,7 @@ def fetch_odds(fid: int) -> dict:
                         if lbl in ("home","1"): d["Home"]={"odds":float(v.get("odd") or 0),"book":book_name}
                         if lbl in ("away","2"): d["Away"]={"odds":float(v.get("odd") or 0),"book":book_name}
                     if d: out["1X2"]=d
-                # OU lines
                 elif mname=="OU":
-                    # values like "Over 2.5", "Under 2.5"
                     by_line={}
                     for v in vals:
                         lbl=(v.get("value") or "").lower()
@@ -682,7 +676,6 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
     if odds is None:
         return (ALLOW_TIPS_WITHOUT_ODDS, None, None, None)
 
-    # price range gates
     min_odds=_min_odds_for_market(market_text)
     if not (min_odds <= odds <= MAX_ODDS_ALL):
         return (False, odds, book, None)
@@ -691,18 +684,13 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
 
 # ───────── Snapshots ─────────
 def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
-    """
-    Persist a compact, training-friendly snapshot for the current live state.
-    Adds sh_total_h/a and yellow_h/a (new signals) and a few derived fields
-    to improve downstream model training without changing any tables.
-    """
     fx = (m.get("fixture") or {})
     lg = (m.get("league") or {})
     teams = (m.get("teams") or {})
 
     fid = int(fx.get("id") or 0)
     if not fid:
-        return  # no fixture id -> nothing to save
+        return
 
     league_id = int(lg.get("id") or 0)
     league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
@@ -713,20 +701,17 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
     ga = int((m.get("goals") or {}).get("away") or 0)
     minute = int(feat.get("minute", 0))
 
-    # Base stats (existing)
     xg_h = float(feat.get("xg_h", 0.0));      xg_a = float(feat.get("xg_a", 0.0))
     sot_h = float(feat.get("sot_h", 0.0));    sot_a = float(feat.get("sot_a", 0.0))
     cor_h = float(feat.get("cor_h", 0.0));    cor_a = float(feat.get("cor_a", 0.0))
     pos_h = float(feat.get("pos_h", 0.0));    pos_a = float(feat.get("pos_a", 0.0))
     red_h = float(feat.get("red_h", 0.0));    red_a = float(feat.get("red_a", 0.0))
 
-    # NEW signals (you added these in extract_features)
     sh_total_h = float(feat.get("sh_total_h", 0.0))
     sh_total_a = float(feat.get("sh_total_a", 0.0))
     yellow_h   = float(feat.get("yellow_h", 0.0))
     yellow_a   = float(feat.get("yellow_a", 0.0))
 
-    # Light derived metrics (helpful for training; zero-cost to store in JSON)
     xg_sum = xg_h + xg_a;    xg_diff = xg_h - xg_a
     sot_sum = sot_h + sot_a
     cor_sum = cor_h + cor_a
@@ -745,14 +730,11 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
         "suggestion": "HARVEST",
         "confidence": 0,
         "stat": {
-            # Core stats
             "xg_h": xg_h, "xg_a": xg_a, "xg_sum": xg_sum, "xg_diff": xg_diff,
             "sot_h": sot_h, "sot_a": sot_a, "sot_sum": sot_sum,
             "cor_h": cor_h, "cor_a": cor_a, "cor_sum": cor_sum,
             "pos_h": pos_h, "pos_a": pos_a, "pos_diff": pos_diff,
             "red_h": red_h, "red_a": red_a, "red_sum": red_sum,
-
-            # NEW: total shots + yellows
             "sh_total_h": sh_total_h, "sh_total_a": sh_total_a,
             "sh_total_sum": sh_total_sum, "sh_total_diff": sh_total_diff,
             "yellow_h": yellow_h, "yellow_a": yellow_a, "yellow_sum": yellow_sum,
@@ -760,18 +742,14 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
     }
 
     now = int(time.time())
-    payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)
-    # keep wide margin under Postgres text page limits; your previous cap was 200k
-    payload = payload[:200000]
+    payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)[:200000]
 
     with db_conn() as c:
-        # Upsert snapshot for this match+ts (idempotent on conflict)
         c.execute(
             "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
             "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
             (fid, now, payload)
         )
-        # Keep the lightweight HARVEST row for bookkeeping / joins
         c.execute(
             "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
             "VALUES (%s,%s,%s,%s,%s,'HARVEST','HARVEST',0.0,0.0,%s,%s,%s,1)",
@@ -913,9 +891,7 @@ def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
     if sug.startswith("BTTS") and (gh>0 and ga>0): return False
     return True
 
-
-# Per-fixture staleness state
-_FEED_STATE: Dict[int, Dict[str, Any]] = {}  # {fid: {"fp": tuple, "last_change": float, "last_minute": int}}
+_FEED_STATE: Dict[int, Dict[str, Any]] = {}
 
 def _safe_num(x) -> float:
     try:
@@ -926,15 +902,10 @@ def _safe_num(x) -> float:
         return 0.0
 
 def _match_fingerprint(m: dict) -> Tuple:
-    """
-    Compact, tolerant fingerprint of live stats/events.
-    Why: detect "clock moves but stats don't".
-    """
     teams = (m.get("teams") or {})
     home = (teams.get("home") or {}).get("name", "")
     away = (teams.get("away") or {}).get("name", "")
 
-    # Build quick lookup by team
     stats_by_team = {}
     for s in (m.get("statistics") or []):
         tname = ((s.get("team") or {}).get("name") or "").strip()
@@ -961,7 +932,6 @@ def _match_fingerprint(m: dict) -> Tuple:
     pos_h = g(sh, ("ball possession",))
     pos_a = g(sa, ("ball possession",))
 
-    # Event counts
     ev = m.get("events") or []
     n_events = len(ev)
     n_cards = 0
@@ -969,11 +939,9 @@ def _match_fingerprint(m: dict) -> Tuple:
         if str(e.get("type", "")).lower() == "card":
             n_cards += 1
 
-    # Goals
     gh = int(((m.get("goals") or {}).get("home") or 0) or 0)
     ga = int(((m.get("goals") or {}).get("away") or 0) or 0)
 
-    # Fingerprint tuple (coarse rounded to avoid micro-flaps)
     return (
         round(xg_h + xg_a, 3),
         int(sot_h + sot_a),
@@ -985,14 +953,9 @@ def _match_fingerprint(m: dict) -> Tuple:
     )
 
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
-    """
-    True when clock advanced but stats fingerprint unchanged for STALE_STATS_MAX_SEC.
-    Disabled if STALE_GUARD_ENABLE=0.
-    """
     if not STALE_GUARD_ENABLE:
         return False
     if minute < 10:
-        # early minutes often sparse; avoid false positives
         st = _FEED_STATE.get(fid)
         fp = _match_fingerprint(m)
         _FEED_STATE[fid] = {"fp": fp, "last_change": time.time(), "last_minute": minute}
@@ -1006,29 +969,21 @@ def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
         _FEED_STATE[fid] = {"fp": fp, "last_change": now, "last_minute": minute}
         return False
 
-    # stats changed?
     if fp != st.get("fp"):
         st["fp"] = fp
         st["last_change"] = now
         st["last_minute"] = minute
         return False
 
-    # clock moved?
     last_min = int(st.get("last_minute") or 0)
-    st["last_minute"] = minute  # keep minute fresh even if unchanged fp
+    st["last_minute"] = minute
 
     if minute > last_min and (now - float(st.get("last_change") or now)) >= STALE_STATS_MAX_SEC:
-        # stale: time advanced but no stats/events change for too long
         return True
 
     return False
 
 def production_scan() -> Tuple[int, int]:
-    """
-    Live in-play scan:
-      - Adds feed staleness guard, market minute cutoffs, bookmaker allow/deny,
-        per-league caps, EV-aware ranking (unchanged semantics otherwise).
-    """
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
@@ -1046,7 +1001,6 @@ def production_scan() -> Tuple[int, int]:
                 if not fid:
                     continue
 
-                # Duplicate cooldown per match
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - DUP_COOLDOWN_MIN * 60
                     if c.execute(
@@ -1062,11 +1016,9 @@ def production_scan() -> Tuple[int, int]:
                 if minute < TIP_MIN_MINUTE:
                     continue
 
-                # Guard A: feed staleness (clock advances but stats do not)
                 if is_feed_stale(fid, m, minute):
                     continue
 
-                # Optional HARVEST snapshots (unchanged)
                 if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
                     try:
                         save_snapshot_from_match(m, feat)
@@ -1077,7 +1029,6 @@ def production_scan() -> Tuple[int, int]:
                 home, away = _teams(m)
                 score = _pretty_score(m)
 
-                # ---- candidates by ML probability ----
                 candidates: List[Tuple[str, str, float]] = []
 
                 # OU
@@ -1147,18 +1098,13 @@ def production_scan() -> Tuple[int, int]:
                 if not candidates:
                     continue
 
-                # ---- prefetch odds once, compute edge, rank ----
                 odds_map = fetch_odds(fid) if API_KEY else {}
-                ranked: List[
-                    Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]
-                ] = []
+                ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
 
                 for mk, sug, prob in candidates:
-                    # quick allow-list of markets
                     if sug not in ALLOWED_SUGGESTIONS:
                         continue
 
-                    # Use shared odds map first
                     odds = None
                     book = None
                     if mk == "BTTS":
@@ -1178,7 +1124,6 @@ def production_scan() -> Tuple[int, int]:
                         if tgt in d:
                             odds, book = d[tgt]["odds"], d[tgt]["book"]
 
-                    # Price/EV gate (bookmaker filters inside _price_gate)
                     pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
                     if not pass_odds:
                         continue
@@ -1201,15 +1146,12 @@ def production_scan() -> Tuple[int, int]:
 
                 ranked.sort(key=lambda x: x[6], reverse=True)
 
-                # ---- insert/send using ranked list ----
                 per_match = 0
                 base_now = int(time.time())
 
                 for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank) in enumerate(ranked):
-                    # Per-league cap
-                    if PER_LEAGUE_CAP > 0:
-                        if per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
-                            continue
+                    if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
+                        continue
 
                     created_ts = base_now + idx
                     raw = float(prob)
@@ -1228,42 +1170,18 @@ def production_scan() -> Tuple[int, int]:
                                 "%s,%s,%s,0"
                                 ")",
                                 (
-                                    fid,
-                                    league_id,
-                                    league,
-                                    home,
-                                    away,
-                                    market_txt,
-                                    suggestion,
-                                    float(prob_pct),
-                                    raw,
-                                    score,
-                                    minute,
-                                    created_ts,
+                                    fid, league_id, league, home, away,
+                                    market_txt, suggestion,
+                                    float(prob_pct), raw, score, minute, created_ts,
                                     (float(odds) if odds is not None else None),
                                     (book or None),
                                     (float(ev_pct) if ev_pct is not None else None),
                                 ),
                             )
 
-                            sent = _send_tip(
-                                home,
-                                away,
-                                league,
-                                minute,
-                                score,
-                                suggestion,
-                                float(prob_pct),
-                                feat,
-                                odds,
-                                book,
-                                ev_pct,
-                            )
+                            sent = _send_tip(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct)
                             if sent:
-                                c2.execute(
-                                    "UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
-                                    (fid, created_ts),
-                                )
+                                c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
                     except Exception as e:
                         log.exception("[PROD] insert/send failed: %s", e)
                         continue
@@ -1288,7 +1206,6 @@ def production_scan() -> Tuple[int, int]:
     return saved, live_seen
 
 # ───────── Prematch (compact: save-only, thresholds respected) ─────────
-
 def extract_prematch_features(fx: dict) -> Dict[str,float]:
     teams=fx.get("teams") or {}; th=(teams.get("home") or {}).get("id"); ta=(teams.get("away") or {}).get("id")
     if not th or not ta: return {}
@@ -1360,11 +1277,10 @@ def prematch_scan_save() -> int:
         if not fid or not feat:
             continue
 
-        # NEW: persist a prematch snapshot so training can find data
         try:
             save_prematch_snapshot(fx, feat)
         except Exception:
-            pass  # non-fatal for tip generation
+            pass
 
         candidates: List[Tuple[str, str, float]] = []
 
@@ -1454,10 +1370,6 @@ def prematch_scan_save() -> int:
     return saved
 
 def save_prematch_snapshot(fx: dict, feat: Dict[str, float]) -> None:
-    """
-    Store a compact prematch snapshot used by train_models.load_prematch_data().
-    One row per match_id; upsert latest payload.
-    """
     fixture = fx.get("fixture") or {}
     fid = int(fixture.get("id") or 0)
     if not fid:
@@ -1488,7 +1400,6 @@ def backfill_prematch_snapshots(days: int = 7, limit_per_day: int = 800) -> int:
                 status = ((r.get("fixture") or {}).get("status") or {}).get("short") or ""
                 if status.upper() == "NS":
                     fixtures.append(r)
-        # apply league filter + limit
         fixtures = [f for f in fixtures if not _blocked_league(f.get("league") or {})][:limit_per_day]
         for fx in fixtures:
             feat = extract_prematch_features(fx)
@@ -1530,25 +1441,21 @@ def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
         if prec>=target_precision: best=float(t); break
     return best*100.0
 
-# Optional min EV for MOTD (basis points, e.g. 300 = +3.00%). 0 disables EV gate.
 MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
 
 def send_match_of_the_day() -> bool:
-    """Pick the single best prematch tip for today (PRE_* models). Sends to Telegram."""
+    if not MOTD_PREDICT:
+        return send_telegram("🏅 MOTD disabled.")
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
         return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
 
-    # Optional league allow-list just for MOTD
     if MOTD_LEAGUE_IDS:
-        fixtures = [
-            f for f in fixtures
-            if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS
-        ]
+        fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
         if not fixtures:
             return send_telegram("🏅 Match of the Day: no fixtures in configured leagues.")
 
-    best = None  # (prob_pct, suggestion, home, away, league, kickoff_txt, odds, book, ev_pct)
+    best = None
 
     for fx in fixtures:
         fixture = fx.get("fixture") or {}
@@ -1565,7 +1472,6 @@ def send_match_of_the_day() -> bool:
         if not feat:
             continue
 
-        # Collect PRE candidates (same thresholds as prematch_scan_save)
         candidates: List[Tuple[str,str,float]] = []
 
         for line in OU_LINES:
@@ -1597,22 +1503,20 @@ def send_match_of_the_day() -> bool:
         if not candidates:
             continue
 
-        # Take the single best for this fixture (by probability) then apply odds/EV gate
         candidates.sort(key=lambda x: x[2], reverse=True)
         mk, sug, prob = candidates[0]
         prob_pct = prob * 100.0
         if prob_pct < MOTD_CONF_MIN:
             continue
 
-        # Odds/EV (reuse in-play price gate; market text must be without "PRE ")
         pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
         if not pass_odds:
             continue
 
         ev_pct = None
         if odds is not None:
-            edge = _ev(prob, odds)            # decimal (e.g. 0.05)
-            ev_bps = int(round(edge * 10000)) # basis points
+            edge = _ev(prob, odds)
+            ev_bps = int(round(edge * 10000))
             ev_pct = round(edge * 100.0, 1)
             if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
                 continue
