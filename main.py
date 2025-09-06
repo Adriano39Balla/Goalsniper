@@ -1311,10 +1311,13 @@ def backfill_prematch_snapshots(days: int = 7, limit_per_day: int = 800) -> int:
     for d in range(days):
         day = (now_local - timedelta(days=d)).date()
         js = _api_get(FOOTBALL_API_URL, {"date": day.strftime("%Y-%m-%d")}) or {}
-        fixtures = [
-            r for r in (js.get("response", []) if isinstance(js, dict) else [])
-            if (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper() == "NS")
-        ]
+        fixtures = []
+        if isinstance(js, dict):
+            for r in js.get("response", []):
+                status = ((r.get("fixture") or {}).get("status") or {}).get("short") or ""
+                if status.upper() == "NS":
+                    fixtures.append(r)
+        # apply league filter + limit
         fixtures = [f for f in fixtures if not _blocked_league(f.get("league") or {})][:limit_per_day]
         for fx in fixtures:
             feat = extract_prematch_features(fx)
