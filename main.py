@@ -1169,59 +1169,163 @@ def _send_tip(home,away,league,minute,score,suggestion,prob_pct,feat,odds=None,b
     return send_telegram(_format_tip_message(home,away,league,minute,score,suggestion,prob_pct,feat,odds,book,ev_pct))
 
 def prematch_scan_save() -> int:
-    fixtures=_collect_todays_prematch_fixtures(); 
-    if not fixtures: return 0
-    saved=0
+    fixtures = _collect_todays_prematch_fixtures()
+    if not fixtures:
+        return 0
+
+    saved = 0
     for fx in fixtures:
-        fixture=fx.get("fixture") or {}; lg=fx.get("league") or {}; teams=fx.get("teams") or {}
-        home=(teams.get("home") or {}).get("name",""); away=(teams.get("away") or {}).get("name","")
-        league_id=int((lg.get("id") or 0)); league=f"{lg.get('country','')} - {lg.get('name','')}".strip(" -"); fid=int((fixture.get("id") or 0))
-        feat=extract_prematch_features(fx); 
-        if not fid or not feat: continue
-        candidates: List[Tuple[str,str,float]]=[]
-        # PRE OU via PRE_OU_* models
+        fixture = fx.get("fixture") or {}
+        lg = fx.get("league") or {}
+        teams = fx.get("teams") or {}
+
+        home = (teams.get("home") or {}).get("name", "")
+        away = (teams.get("away") or {}).get("name", "")
+        league_id = int(lg.get("id") or 0)
+        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+        fid = int(fixture.get("id") or 0)
+
+        feat = extract_prematch_features(fx)
+        if not fid or not feat:
+            continue
+
+        # NEW: persist a prematch snapshot so training can find data
+        try:
+            save_prematch_snapshot(fx, feat)
+        except Exception:
+            pass  # non-fatal for tip generation
+
+        candidates: List[Tuple[str, str, float]] = []
+
+        # PRE OU
         for line in OU_LINES:
-            mdl=load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-            if not mdl: continue
-            p=_score_prob(feat, mdl); mk=f"Over/Under {_fmt_line(line)}"; thr=_get_market_threshold_pre(mk)
-            if p*100.0>=thr:   candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p))
-            q=1.0-p
-            if q*100.0>=thr:   candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", q))
+            mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
+            if not mdl:
+                continue
+            p = _score_prob(feat, mdl)
+            mk = f"Over/Under {_fmt_line(line)}"
+            thr = _get_market_threshold_pre(mk)
+            if p * 100.0 >= thr:
+                candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p))
+            q = 1.0 - p
+            if q * 100.0 >= thr:
+                candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", q))
+
         # PRE BTTS
-        mdl=load_model_from_settings("PRE_BTTS_YES")
+        mdl = load_model_from_settings("PRE_BTTS_YES")
         if mdl:
-            p=_score_prob(feat, mdl); thr=_get_market_threshold_pre("BTTS")
-            if p*100.0>=thr: candidates.append(("PRE BTTS","BTTS: Yes",p))
-            q=1.0-p
-            if q*100.0>=thr: candidates.append(("PRE BTTS","BTTS: No",q))
+            p = _score_prob(feat, mdl)
+            thr = _get_market_threshold_pre("BTTS")
+            if p * 100.0 >= thr:
+                candidates.append(("PRE BTTS", "BTTS: Yes", p))
+            q = 1.0 - p
+            if q * 100.0 >= thr:
+                candidates.append(("PRE BTTS", "BTTS: No", q))
+
         # PRE 1X2 (draw suppressed)
-        mh,ma=load_model_from_settings("PRE_WLD_HOME"), load_model_from_settings("PRE_WLD_AWAY")
+        mh, ma = load_model_from_settings("PRE_WLD_HOME"), load_model_from_settings("PRE_WLD_AWAY")
         if mh and ma:
-            ph=_score_prob(feat,mh); pa=_score_prob(feat,ma); s=max(EPS,ph+pa); ph,pa=ph/s,pa/s
-            thr=_get_market_threshold_pre("1X2")
-            if ph*100.0>=thr: candidates.append(("PRE 1X2","Home Win",ph))
-            if pa*100.0>=thr: candidates.append(("PRE 1X2","Away Win",pa))
-        if not candidates: continue
-        candidates.sort(key=lambda x:x[2], reverse=True)
-        base_now=int(time.time()); per_match=0
-        for idx,(mk,sug,prob) in enumerate(candidates):
-            if sug not in ALLOWED_SUGGESTIONS: continue
-            if per_match>=max(1,PREDICTIONS_PER_MATCH): break
-            # Odds/EV gate
-            pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ",""), sug, fid)
-            if not pass_odds: continue
-            ev_pct=None
+            ph = _score_prob(feat, mh)
+            pa = _score_prob(feat, ma)
+            s = max(EPS, ph + pa)
+            ph, pa = ph / s, pa / s
+            thr = _get_market_threshold_pre("1X2")
+            if ph * 100.0 >= thr:
+                candidates.append(("PRE 1X2", "Home Win", ph))
+            if pa * 100.0 >= thr:
+                candidates.append(("PRE 1X2", "Away Win", pa))
+
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        base_now = int(time.time())
+        per_match = 0
+
+        for idx, (mk, sug, prob) in enumerate(candidates):
+            if sug not in ALLOWED_SUGGESTIONS:
+                continue
+            if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                break
+
+            pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ", ""), sug, fid)
+            if not pass_odds:
+                continue
+
+            ev_pct = None
             if odds is not None:
-                edge=_ev(prob, odds); ev_pct=round(edge*100.0,1)
-                if int(round(edge*10000)) < EDGE_MIN_BPS: continue
-            created_ts=base_now+idx; raw=float(prob); pct=round(raw*100.0,1)
+                edge = _ev(prob, odds)
+                ev_pct = round(edge * 100.0, 1)
+                if int(round(edge * 10000)) < EDGE_MIN_BPS:
+                    continue
+
+            created_ts = base_now + idx
+            raw = float(prob)
+            pct = round(raw * 100.0, 1)
+
             with db_conn() as c2:
-                c2.execute("INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                           "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'0-0',0,%s,%s,%s,%s,0)",
-                           (fid,league_id,league,home,away,mk,sug,float(pct),raw,created_ts,
-                            (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None)))
-            saved+=1; per_match+=1
-    log.info("[PREMATCH] saved=%d", saved); return saved
+                c2.execute(
+                    "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,"
+                    "score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'0-0',0,%s,%s,%s,%s,0)",
+                    (
+                        fid, league_id, league, home, away, mk, sug,
+                        float(pct), raw, created_ts,
+                        (float(odds) if odds is not None else None),
+                        (book or None),
+                        (float(ev_pct) if ev_pct is not None else None),
+                    ),
+                )
+            saved += 1
+            per_match += 1
+
+    log.info("[PREMATCH] saved=%d", saved)
+    return saved
+
+def save_prematch_snapshot(fx: dict, feat: Dict[str, float]) -> None:
+    """
+    Store a compact prematch snapshot used by train_models.load_prematch_data().
+    One row per match_id; upsert latest payload.
+    """
+    fixture = fx.get("fixture") or {}
+    fid = int(fixture.get("id") or 0)
+    if not fid:
+        return
+    now = int(time.time())
+    payload = json.dumps({"feat": {k: float(feat.get(k, 0.0) or 0.0) for k in feat.keys()}},
+                         separators=(",", ":"), ensure_ascii=False)
+    with db_conn() as c:
+        c.execute(
+            "INSERT INTO prematch_snapshots(match_id, created_ts, payload) "
+            "VALUES (%s,%s,%s) "
+            "ON CONFLICT (match_id) DO UPDATE SET created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload",
+            (fid, now, payload)
+        )
+
+def backfill_prematch_snapshots(days: int = 7, limit_per_day: int = 800) -> int:
+    if not API_KEY:
+        return 0
+    wrote = 0
+    tz = ZoneInfo("Europe/Berlin")
+    now_local = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    for d in range(days):
+        day = (now_local - timedelta(days=d)).date()
+        js = _api_get(FOOTBALL_API_URL, {"date": day.strftime("%Y-%m-%d")}) or {}
+        fixtures = [
+            r for r in (js.get("response", []) if isinstance(js, dict) else [])
+            if (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper() == "NS")
+        ]
+        fixtures = [f for f in fixtures if not _blocked_league(f.get("league") or {})][:limit_per_day]
+        for fx in fixtures:
+            feat = extract_prematch_features(fx)
+            if not feat:
+                continue
+            try:
+                save_prematch_snapshot(fx, feat)
+                wrote += 1
+            except Exception:
+                continue
+    return wrote
 
 # ───────── Auto-train / tune / retry (unchanged signatures) ─────────
 def auto_train_job():
@@ -1499,6 +1603,13 @@ def http_settings(key: str):
     if val is None: abort(400)
     set_setting(key, str(val)); _SETTINGS_CACHE.invalidate(key); invalidate_model_caches_for_key(key)
     return jsonify({"ok": True})
+
+@app.route("/admin/backfill-prematch", methods=["POST","GET"])
+def http_backfill_prematch():
+    _require_admin()
+    days = int(request.args.get("days", "7"))
+    n = backfill_prematch_snapshots(days=days)
+    return jsonify({"ok": True, "snapshots_written": int(n)})
 
 @app.route("/tips/latest")
 def http_latest():
