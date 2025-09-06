@@ -66,6 +66,9 @@ THRESH_MIN_PREDICTIONS  = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
 MIN_THRESH              = float(os.getenv("MIN_THRESH", "55"))
 MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
+STALE_GUARD_ENABLE = os.getenv("STALE_GUARD_ENABLE", "1") not in ("0","false","False","no","NO")
+STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
+
 MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
 MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
 MOTD_HOUR               = int(os.getenv("MOTD_HOUR", "19"))
@@ -851,6 +854,116 @@ def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
         if total >= ln - 1e-9: return False
     if sug.startswith("BTTS") and (gh>0 and ga>0): return False
     return True
+
+
+# Per-fixture staleness state
+_FEED_STATE: Dict[int, Dict[str, Any]] = {}  # {fid: {"fp": tuple, "last_change": float, "last_minute": int}}
+
+def _safe_num(x) -> float:
+    try:
+        if isinstance(x, str) and x.endswith("%"):
+            return float(x[:-1])
+        return float(x or 0.0)
+    except Exception:
+        return 0.0
+
+def _match_fingerprint(m: dict) -> Tuple:
+    """
+    Compact, tolerant fingerprint of live stats/events.
+    Why: detect "clock moves but stats don't".
+    """
+    teams = (m.get("teams") or {})
+    home = (teams.get("home") or {}).get("name", "")
+    away = (teams.get("away") or {}).get("name", "")
+
+    # Build quick lookup by team
+    stats_by_team = {}
+    for s in (m.get("statistics") or []):
+        tname = ((s.get("team") or {}).get("name") or "").strip()
+        if tname:
+            stats_by_team[tname] = {str((i.get("type") or "")).lower(): i.get("value") for i in (s.get("statistics") or [])}
+
+    sh = stats_by_team.get(home, {}) or {}
+    sa = stats_by_team.get(away, {}) or {}
+
+    def g(d: dict, key_variants: Tuple[str, ...]) -> float:
+        for k in key_variants:
+            if k in d:
+                return _safe_num(d[k])
+        return 0.0
+
+    xg_h = g(sh, ("expected goals",))
+    xg_a = g(sa, ("expected goals",))
+    sot_h = g(sh, ("shots on target", "shots on goal"))
+    sot_a = g(sa, ("shots on target", "shots on goal"))
+    sh_tot_h = g(sh, ("total shots", "shots total"))
+    sh_tot_a = g(sa, ("total shots", "shots total"))
+    cor_h = g(sh, ("corner kicks",))
+    cor_a = g(sa, ("corner kicks",))
+    pos_h = g(sh, ("ball possession",))
+    pos_a = g(sa, ("ball possession",))
+
+    # Event counts
+    ev = m.get("events") or []
+    n_events = len(ev)
+    n_cards = 0
+    for e in ev:
+        if str(e.get("type", "")).lower() == "card":
+            n_cards += 1
+
+    # Goals
+    gh = int(((m.get("goals") or {}).get("home") or 0) or 0)
+    ga = int(((m.get("goals") or {}).get("away") or 0) or 0)
+
+    # Fingerprint tuple (coarse rounded to avoid micro-flaps)
+    return (
+        round(xg_h + xg_a, 3),
+        int(sot_h + sot_a),
+        int(sh_tot_h + sh_tot_a),
+        int(cor_h + cor_a),
+        int(round(pos_h)), int(round(pos_a)),
+        gh, ga,
+        n_events, n_cards,
+    )
+
+def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
+    """
+    True when clock advanced but stats fingerprint unchanged for STALE_STATS_MAX_SEC.
+    Disabled if STALE_GUARD_ENABLE=0.
+    """
+    if not STALE_GUARD_ENABLE:
+        return False
+    if minute < 10:
+        # early minutes often sparse; avoid false positives
+        st = _FEED_STATE.get(fid)
+        fp = _match_fingerprint(m)
+        _FEED_STATE[fid] = {"fp": fp, "last_change": time.time(), "last_minute": minute}
+        return False
+
+    now = time.time()
+    fp = _match_fingerprint(m)
+    st = _FEED_STATE.get(fid)
+
+    if st is None:
+        _FEED_STATE[fid] = {"fp": fp, "last_change": now, "last_minute": minute}
+        return False
+
+    # stats changed?
+    if fp != st.get("fp"):
+        st["fp"] = fp
+        st["last_change"] = now
+        st["last_minute"] = minute
+        return False
+
+    # clock moved?
+    last_min = int(st.get("last_minute") or 0)
+    st["last_minute"] = minute  # keep minute fresh even if unchanged fp
+
+    if minute > last_min and (now - float(st.get("last_change") or now)) >= STALE_STATS_MAX_SEC:
+        # stale: time advanced but no stats/events change for too long
+        return True
+
+    return False
 
 def production_scan() -> Tuple[int, int]:
     """
