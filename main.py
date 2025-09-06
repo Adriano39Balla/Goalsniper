@@ -717,52 +717,6 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
             (fid, league_id, league, home, away, f"{gh}-{ga}", minute, now)
         )
 
-def load_graded_tips(conn, days: Optional[int] = None) -> pd.DataFrame:
-    params = []
-    where = ["t.suggestion <> 'HARVEST'", "t.sent_ok = 1"]
-    if days and days > 0:
-        where.append("t.created_ts >= EXTRACT(EPOCH FROM NOW())::bigint - %s*24*3600")
-        params.append(int(days))
-
-    q = f"""
-    SELECT t.match_id, t.market, t.suggestion,
-           COALESCE(t.confidence_raw, t.confidence/100.0) AS prob,
-           t.created_ts, t.score_at_tip, t.minute,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
-    FROM tips t
-    JOIN match_results r ON r.match_id = t.match_id
-    WHERE {' AND '.join(where)}
-    """
-    df = _read_sql(conn, q, tuple(params))
-    if df.empty:
-        return df
-
-    # derive outcomes per suggestion
-    def outcome(row: pd.Series) -> Optional[int]:
-        gh = int(row["final_goals_h"] or 0)
-        ga = int(row["final_goals_a"] or 0)
-        total = gh + ga
-        s = str(row["suggestion"] or "")
-        if s.startswith("Over") or s.startswith("Under"):
-            # extract line
-            ln = None
-            for tok in s.split():
-                try: ln = float(tok); break
-                except: pass
-            if ln is None: return None
-            if s.startswith("Over"):  return 1 if total > ln else (None if abs(total-ln) < 1e-9 else 0)
-            else:                      return 1 if total < ln else (None if abs(total-ln) < 1e-9 else 0)
-        if s == "BTTS: Yes": return 1 if int(row["btts_yes"] or 0) == 1 else 0
-        if s == "BTTS: No":  return 1 if int(row["btts_yes"] or 0) == 0 else 0
-        if s == "Home Win":  return 1 if gh > ga else 0
-        if s == "Away Win":  return 1 if ga > gh else 0
-        return None
-
-    df["y"] = df.apply(outcome, axis=1)
-    df = df[df["y"].isin([0,1])].copy()
-    df["prob"] = df["prob"].astype(float).clip(1e-6, 1-1e-6)
-    return df
-
 # ───────── Outcomes/backfill/digest (short) ─────────
 def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     try:
