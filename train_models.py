@@ -154,10 +154,10 @@ def _ensure_training_tables(conn) -> None:
 def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
     """
     Load one latest HARVEST snapshot per match (joined with final results),
-    add light QA filtering to reduce label/feature noise, and bound recency.
-
-    Expects your tip_snapshots payload to contain the expanded stat dict
-    (including sh_total_* and yellow_* if you adopted the upgraded snapshot).
+    with relaxed gates to include more data:
+      - minute gate honored (env TRAIN_MIN_MINUTE)
+      - coverage filter removed
+      - recency window widened (RECENCY_MONTHS, 0 disables)
     """
     q = """
     WITH latest AS (
@@ -181,7 +181,6 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
             payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else (row["payload"] or {})
             stat = payload.get("stat") or {}
 
-            # Build feature row
             f: Dict[str, Any] = {
                 "_mid": int(row["match_id"]),
                 "_ts": float(row["created_ts"]),
@@ -191,7 +190,6 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
                 "goals_sum": float(payload.get("gh", 0)) + float(payload.get("ga", 0)),
                 "goals_diff": float(payload.get("gh", 0)) - float(payload.get("ga", 0)),
 
-                # Core stats (+ derived if available)
                 "xg_h": float(stat.get("xg_h", 0)),
                 "xg_a": float(stat.get("xg_a", 0)),
                 "xg_sum": float(stat.get("xg_sum", float(stat.get("xg_h", 0)) + float(stat.get("xg_a", 0)))),
@@ -213,7 +211,6 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
                 "red_a": float(stat.get("red_a", 0)),
                 "red_sum": float(stat.get("red_sum", float(stat.get("red_h", 0)) + float(stat.get("red_a", 0)))),
 
-                # NEW: total shots + yellow cards (if present)
                 "sh_total_h": float(stat.get("sh_total_h", 0)),
                 "sh_total_a": float(stat.get("sh_total_a", 0)),
                 "sh_total_sum": float(stat.get("sh_total_sum", float(stat.get("sh_total_h", 0)) + float(stat.get("sh_total_a", 0)))),
@@ -223,7 +220,7 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
                 "yellow_a": float(stat.get("yellow_a", 0)),
                 "yellow_sum": float(stat.get("yellow_sum", float(stat.get("yellow_h", 0)) + float(stat.get("yellow_a", 0)))),
 
-                # Labels
+                # labels used by trainer
                 "final_goals_h": int(row["final_goals_h"] or 0),
                 "final_goals_a": int(row["final_goals_a"] or 0),
                 "btts_yes": int(row["btts_yes"] or 0),
@@ -238,19 +235,21 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(feats)
-
-    # Replace inf/nan and clip minute
     numeric_cols = [c for c in df.columns if c not in ("_mid", "_ts")]
     df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     df["minute"] = df["minute"].clip(0, 120)
 
-    # Keep snapshots with at least minimal signal when after a certain minute
+    # minute gate (use TRAIN_MIN_MINUTE=10 via env for more data)
     df = df[df["minute"] >= float(min_minute)].copy()
-    df = df[(df["xg_sum"] > 0) | (df["sot_sum"] > 0) | (df["cor_sum"] > 0)]
 
-    # Recency filter: last ~18 months to reduce drift/stale distributions
-    cutoff_ts = pd.Timestamp.utcnow().timestamp() - 18 * 30 * 24 * 3600
-    df = df[df["_ts"] >= cutoff_ts].copy()
+    # 🔓 coverage filter REMOVED to keep zero-stat snapshots
+    # (previously: df = df[(df["xg_sum"] > 0) | (df["sot_sum"] > 0) | (df["cor_sum"] > 0)])
+
+    # wider recency window (set RECENCY_MONTHS=36; set 0 to disable)
+    months = int(os.getenv("RECENCY_MONTHS", "36"))
+    if months > 0:
+        cutoff_ts = pd.Timestamp.utcnow().timestamp() - months * 30 * 24 * 3600
+        df = df[df["_ts"] >= cutoff_ts].copy()
 
     return df
 
