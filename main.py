@@ -596,7 +596,8 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = _TIP_MAX_MINUTE
     if cutoff is None:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
-    return m <= int(cutoff)
+cutoff = min(cutoff, 80)  # never tip beyond 80'
+return m <= int(cutoff)
 
 def fetch_odds(fid: int) -> dict:
     """
@@ -673,7 +674,7 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
             book = d[tgt]["book"]
 
     if odds is None:
-        return (ALLOW_TIPS_WITHOUT_ODDS, None, None, None)
+        return (False, None, None, None)  # require odds for precision
 
     min_odds=_min_odds_for_market(market_text)
     if not (min_odds <= odds <= MAX_ODDS_ALL):
@@ -1137,7 +1138,7 @@ def production_scan() -> Tuple[int, int]:
                         if int(round(edge * 10000)) < EDGE_MIN_BPS:
                             continue
 
-                    rank_score = prob * (1 + (ev_pct or 0) / 100.0)
+                    rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0)
                     ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score))
 
                 if not ranked:
@@ -1505,7 +1506,7 @@ def send_match_of_the_day() -> bool:
         candidates.sort(key=lambda x: x[2], reverse=True)
         mk, sug, prob = candidates[0]
         prob_pct = prob * 100.0
-        if prob_pct < MOTD_CONF_MIN:
+        if prob_pct < max(MOTD_CONF_MIN, 75):  # stricter floor
             continue
 
         pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
