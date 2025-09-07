@@ -151,7 +151,12 @@ class PooledConn:
         try: self.cur and self.cur.close()
         finally: self.conn and self.pool.putconn(self.conn)
     def execute(self, sql: str, params: tuple|list=()):
-        self.cur.execute(sql, params or ()); return self.cur
+        try:
+            self.cur.execute(sql, params or ())
+            return self.cur
+        except Exception as e:
+            log.error("DB execute failed: %s\nSQL: %s\nParams: %s", e, sql, params)
+            raise
 
 def _init_pool():
     global POOL
