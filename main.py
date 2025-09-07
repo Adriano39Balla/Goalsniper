@@ -134,15 +134,14 @@ TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
 
 # ───────── Optional import: trainer ─────────
 try:
-    # bring in train entrypoint AND a few helpers used by optional calibration fn
-    from train_models import train_models, fit_platt, _logit_vec, _percent, _pick_threshold_for_target_precision, _get_setting_json, _set_setting, load_graded_tips  # FIX
+    import train_models as _tm        # import the module, not the symbol list
+    train_models = _tm.train_models   # expose just the function we use
 except Exception as e:
     _IMPORT_ERR = repr(e)
     def train_models(*args, **kwargs):  # type: ignore
         log.warning("train_models not available: %s", _IMPORT_ERR)
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
-    # keep optional helpers undefined; the optional function will never be called when import fails
-
+    
 # ───────── DB pool & helpers ─────────
 POOL: Optional[SimpleConnectionPool] = None
 class PooledConn:
