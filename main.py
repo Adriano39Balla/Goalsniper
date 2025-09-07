@@ -596,8 +596,8 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = _TIP_MAX_MINUTE
     if cutoff is None:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
-cutoff = min(cutoff, 80)  # never tip beyond 80'
-return m <= int(cutoff)
+    cutoff = min(cutoff, 80)  # never tip beyond 80'
+    return m <= int(cutoff)
 
 def fetch_odds(fid: int) -> dict:
     """
