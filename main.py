@@ -1172,7 +1172,7 @@ def production_scan() -> Tuple[int, int]:
                                 ") VALUES ("
                                 "%s,%s,%s,%s,%s,%s,%s,"
                                 "%s,%s,%s,%s,%s,"
-                                "%s,%s,%s,0"
+                                "%s,%s,%s,%s"
                                 ")",
                                 (
                                     fid, league_id, league, home, away,
@@ -1181,8 +1181,9 @@ def production_scan() -> Tuple[int, int]:
                                     (float(odds) if odds is not None else None),
                                     (book or None),
                                     (float(ev_pct) if ev_pct is not None else None),
+                                    0,   # sent_ok initially false
                                 ),
-                            )
+                             )
 
                             sent = _send_tip(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct)
                             if sent:
