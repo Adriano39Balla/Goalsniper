@@ -34,20 +34,36 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(
 log = logging.getLogger("goalsniper")
 app = Flask(__name__)
 
-# ───────── Core env ─────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY            = os.getenv("API_KEY")
-ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY")
-WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
-RUN_SCHEDULER      = os.getenv("RUN_SCHEDULER", "1") not in ("0","false","False","no","NO")
+# ───────── Required envs (fail fast) ─────────
+def _require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise SystemExit(f"Missing required environment variable: {name}")
+    return v
 
+# Enforce hard requirements
+DATABASE_URL = _require_env("DATABASE_URL")
+API_KEY = _require_env("API_KEY")
+TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = _require_env("TELEGRAM_CHAT_ID")
+
+# Optional-but-strongly-recommended (don’t fail; just warn if missing)
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+if not ADMIN_API_KEY:
+    log.warning("ADMIN_API_KEY is not set — /admin/* endpoints are less protected.")
+if not WEBHOOK_SECRET:
+    log.warning("TELEGRAM_WEBHOOK_SECRET is not set — webhook endpoint would be unsafe if exposed.")
+
+# ───────── Core env ─────────
+RUN_SCHEDULER      = os.getenv("RUN_SCHEDULER", "1") not in ("0","false","False","no","NO")
 CONF_THRESHOLD     = float(os.getenv("CONF_THRESHOLD", "70"))
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 TIP_MIN_MINUTE     = int(os.getenv("TIP_MIN_MINUTE", "8"))
 SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
 
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HARVEST_MODE       = os.getenv("HARVEST_MODE", "1") not in ("0","false","False","no","NO")
 TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_HOUR_UTC     = int(os.getenv("TRAIN_HOUR_UTC", "2"))
