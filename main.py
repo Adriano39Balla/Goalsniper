@@ -34,38 +34,29 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(
 log = logging.getLogger("goalsniper")
 app = Flask(__name__)
 
-# ───────── Required envs (fail fast) ─────────
+# ───────── Required envs (fail fast) — ADDED ─────────
 def _require_env(name: str) -> str:
     v = os.getenv(name)
     if not v:
         raise SystemExit(f"Missing required environment variable: {name}")
     return v
 
-# Enforce hard requirements
-DATABASE_URL = _require_env("DATABASE_URL")
-API_KEY = _require_env("API_KEY")
+# ───────── Core env (secrets: required; knobs: defaultable) — UPDATED ─────────
 TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = _require_env("TELEGRAM_CHAT_ID")
-
-# Optional-but-strongly-recommended (don’t fail; just warn if missing)
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
-if not ADMIN_API_KEY:
-    log.warning("ADMIN_API_KEY is not set — /admin/* endpoints are less protected.")
-if not WEBHOOK_SECRET:
-    log.warning("TELEGRAM_WEBHOOK_SECRET is not set — webhook endpoint would be unsafe if exposed.")
-
-# ───────── Core env ─────────
+TELEGRAM_CHAT_ID   = _require_env("TELEGRAM_CHAT_ID")
+API_KEY            = _require_env("API_KEY")
+ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY")
+WEBHOOK_SECRET     = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 RUN_SCHEDULER      = os.getenv("RUN_SCHEDULER", "1") not in ("0","false","False","no","NO")
+
 CONF_THRESHOLD     = float(os.getenv("CONF_THRESHOLD", "70"))
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 TIP_MIN_MINUTE     = int(os.getenv("TIP_MIN_MINUTE", "8"))
 SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
 
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HARVEST_MODE       = os.getenv("HARVEST_MODE", "1") not in ("0","false","False","no","NO")
-TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
+TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO"))
 TRAIN_HOUR_UTC     = int(os.getenv("TRAIN_HOUR_UTC", "2"))
 TRAIN_MINUTE_UTC   = int(os.getenv("TRAIN_MINUTE_UTC", "12"))
 TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
@@ -96,6 +87,12 @@ try:
     MOTD_LEAGUE_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS","").split(",")) if x.strip().isdigit()]
 except Exception:
     MOTD_LEAGUE_IDS = []
+
+# Optional-but-recommended warnings — ADDED
+if not ADMIN_API_KEY:
+    log.warning("ADMIN_API_KEY is not set — /admin/* endpoints are less protected.")
+if not WEBHOOK_SECRET:
+    log.warning("TELEGRAM_WEBHOOK_SECRET is not set — /telegram/webhook/<secret> would be unsafe if exposed.")
 
 # ───────── Lines ─────────
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
@@ -140,13 +137,13 @@ INPLAY_STATUSES = {"1H","HT","2H","ET","BT","P"}
 session = requests.Session()
 session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503,504], respect_retry_after_header=True)))
 
-# ───────── Caches & timezones ─────────
+# ───────── Caches & timezones (set to Europe/Amsterdam) — UPDATED ─────────
 STATS_CACHE:  Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 ODDS_CACHE:   Dict[int, Tuple[float, dict]] = {}
 SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
-TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
+TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Amsterdam")  # NOTE: BERLIN_TZ now points to Amsterdam
 
 # ───────── Optional import: trainer ─────────
 try:
@@ -318,8 +315,8 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
     return js.get("response",[]) if isinstance(js,dict) else []
 
 def _collect_todays_prematch_fixtures() -> List[dict]:
-    today_local=datetime.now(ZoneInfo("Europe/Berlin")).date()
-    start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=ZoneInfo("Europe/Berlin"))
+    today_local=datetime.now(ZoneInfo("Europe/Amsterdam")).date()
+    start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=ZoneInfo("Europe/Amsterdam"))
     end_local=start_local+timedelta(days=1)
     dates_utc={start_local.astimezone(ZoneInfo("UTC")).date(), (end_local - timedelta(seconds=1)).astimezone(ZoneInfo("UTC")).date()}
     fixtures=[]
@@ -365,7 +362,7 @@ def extract_features(m: dict) -> Dict[str,float]:
     sot_h = _num(sh.get("Shots on Target", sh.get("Shots on Goal", 0)))
     sot_a = _num(sa.get("Shots on Target", sa.get("Shots on Goal", 0)))
     sh_total_h = _num(sh.get("Total Shots", sh.get("Shots Total", 0)))
-    sh_total_a = _num(sa.get("Total Shots", sa.get("Shots Total", 0)))
+    sh_total_a = _num(sa.get("Total Shots", sh.get("Shots Total", 0)))
     cor_h = _num(sh.get("Corner Kicks", 0))
     cor_a = _num(sa.get("Corner Kicks", 0))
     pos_h = _pos_pct(sh.get("Ball Possession", 0))
@@ -1252,11 +1249,11 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
             "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
             "cor_h":0.0,"cor_a":0.0,"cor_sum":0.0,"pos_h":0.0,"pos_a":0.0,"pos_diff":0.0,"red_h":0.0,"red_a":0.0,"red_sum":0.0}
 
-def _kickoff_berlin(utc_iso: str|None) -> str:
+def _kickoff_berlin(utc_iso: str|None) -> str:  # name kept for compatibility; uses Amsterdam tz
     try:
         if not utc_iso: return "TBD"
         dt=datetime.fromisoformat(utc_iso.replace("Z","+00:00"))
-        return dt.astimezone(BERLIN_TZ).strftime("%H:%M")
+        return dt.astimezone(BERLIN_TZ).strftime("%H:%M")  # BERLIN_TZ is Europe/Amsterdam
     except: return "TBD"
 
 def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, odds=None, book=None, ev_pct=None):
@@ -1270,7 +1267,7 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, 
         "🏅 <b>Match of the Day</b>\n"
         f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
         f"🏆 <b>League:</b> {escape(league)}\n"
-        f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
+        f"⏰ <b>Kickoff (Amsterdam):</b> {kickoff_txt}\n"
         f"<b>Tip:</b> {escape(suggestion)}\n"
         f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}"
     )
@@ -1411,7 +1408,7 @@ def backfill_prematch_snapshots(days: int = 7, limit_per_day: int = 800) -> int:
     if not API_KEY:
         return 0
     wrote = 0
-    tz = ZoneInfo("Europe/Berlin")
+    tz = ZoneInfo("Europe/Amsterdam")
     now_local = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
     for d in range(days):
         day = (now_local - timedelta(days=d)).date()
