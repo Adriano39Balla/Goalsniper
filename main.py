@@ -614,7 +614,6 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = _TIP_MAX_MINUTE
     if cutoff is None:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
-    cutoff = min(cutoff, 80)  # never tip beyond 80'
     return m <= int(cutoff)
 
 def fetch_odds(fid: int) -> dict:
@@ -692,7 +691,8 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
             book = d[tgt]["book"]
 
     if odds is None:
-        return (False, None, None, None)  # require odds for precision
+        # Honor flag: allow tips to pass when odds are missing (EV check will be skipped)
+        return (ALLOW_TIPS_WITHOUT_ODDS, None, None, None)
 
     min_odds=_min_odds_for_market(market_text)
     if not (min_odds <= odds <= MAX_ODDS_ALL):
@@ -897,16 +897,23 @@ def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct,
 
 # ───────── Scan (in-play) ─────────
 def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
-    gh=int(feat.get("goals_h",0)); ga=int(feat.get("goals_a",0)); total=gh+ga
+    gh = int(feat.get("goals_h", 0))
+    ga = int(feat.get("goals_a", 0))
+    total = gh + ga
+
     if sug.startswith("Over"):
-        ln=_parse_ou_line_from_suggestion(sug)
-        if ln is None: return False
-        if total > ln - 1e-9: return False
+        ln = _parse_ou_line_from_suggestion(sug)
+        # Only send Over if current total is strictly below the line
+        return (ln is not None) and (total < ln)
+
     if sug.startswith("Under"):
-        ln=_parse_ou_line_from_suggestion(sug)
-        if ln is None: return False
-        if total >= ln - 1e-9: return False
-    if sug.startswith("BTTS") and (gh>0 and ga>0): return False
+        ln = _parse_ou_line_from_suggestion(sug)
+        # Only send Under if current total is strictly below the line (if already >= line, it's too late)
+        return (ln is not None) and (total < ln)
+
+    if sug.startswith("BTTS") and (gh > 0 and ga > 0):
+        return False
+
     return True
 
 _FEED_STATE: Dict[int, Dict[str, Any]] = {}
@@ -1021,8 +1028,9 @@ def production_scan() -> Tuple[int, int]:
 
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - DUP_COOLDOWN_MIN * 60
+                    # Ignore HARVEST rows in cooldown check
                     if c.execute(
-                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",
+                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
                         (fid, cutoff),
                     ).fetchone():
                         continue
