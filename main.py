@@ -1433,21 +1433,46 @@ def backfill_prematch_snapshots(days: int = 7, limit_per_day: int = 800) -> int:
 
 # ───────── Auto-train / tune / retry (unchanged signatures) ─────────
 def auto_train_job():
-    if not TRAIN_ENABLE: send_telegram("🤖 Training skipped: TRAIN_ENABLE=0"); return
+    if not TRAIN_ENABLE:
+        send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
+        return
     send_telegram("🤖 Training started.")
     try:
-        res=train_models() or {}; ok=bool(res.get("ok"))
+        res = train_models() or {}
+        ok = bool(res.get("ok"))
         if not ok:
-            reason=res.get("reason") or res.get("error") or "unknown"
-            send_telegram(f"⚠️ Training finished: <b>SKIPPED</b>\nReason: {escape(str(reason))}"); return
-        trained=[k for k,v in (res.get("trained") or {}).items() if v]
-        thr=(res.get("thresholds") or {}); mets=(res.get("metrics") or {})
-        lines=["🤖 <b>Model training OK</b>"]
-        if trained: lines.append("• Trained: " + ", ".join(sorted(trained)))
-        if thr: lines.append("• Thresholds: " + "  |  ".join([f"{escape(k)}: {float(v):.1f}%" for k,v in thr.items()]))
+            reason = res.get("reason") or res.get("error") or "unknown"
+            send_telegram(f"⚠️ Training finished: <b>SKIPPED</b>\nReason: {escape(str(reason))}")
+            return
+
+        # What the trainer reported
+        trained = [k for k, v in (res.get("trained") or {}).items() if v]
+        mets    = (res.get("metrics") or {})
+
+        # Always fetch the live thresholds actually stored in DB,
+        # so the message shows BTTS/OU too (not just 1X2).
+        keys = [
+            "BTTS", "Over/Under 2.5", "Over/Under 3.5", "1X2",
+            "PRE BTTS", "PRE Over/Under 2.5", "PRE Over/Under 3.5", "PRE 1X2",
+        ]
+        thr_lines = []
+        for k in keys:
+            try:
+                v = get_setting_cached(f"conf_threshold:{k}")
+                if v is not None:
+                    thr_lines.append(f"{escape(k)}: {float(v):.1f}%")
+            except Exception:
+                continue
+
+        lines = ["🤖 <b>Model training OK</b>"]
+        if trained:
+            lines.append("• Trained: " + ", ".join(sorted(trained)))
+        if thr_lines:
+            lines.append("• Thresholds: " + "  |  ".join(thr_lines))
         send_telegram("\n".join(lines))
     except Exception as e:
-        log.exception("[TRAIN] job failed: %s", e); send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
+        log.exception("[TRAIN] job failed: %s", e)
+        send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
 
 def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
     import numpy as np
