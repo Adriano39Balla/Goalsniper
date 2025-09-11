@@ -1,6 +1,0 @@
-jobs:
-  - name: live-match-alerts
-    schedule: "*/5 * * * *"  # Every 2 minutes
-    type: cron
-    runtime: python
-    command: curl https://Goalsniper-backend.onrender.com/match-alert
