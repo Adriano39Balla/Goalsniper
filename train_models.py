@@ -8,9 +8,10 @@ Highlights
 - Calibration model selection: Platt vs Isotonic (lower Brier on validation)
 - Configurable OU lines (OU_TRAIN_LINES, e.g. "1.5,2.5,3.5")
 - Metrics: AUC, Brier, ECE, acc@0.5, logloss
+- Writes: model blobs into `settings`, per-market thresholds, metrics & importances bundle
 """
 
-import argparse, json, os, logging
+import argparse, json, os, logging, math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -51,7 +52,7 @@ PRE_FEATURES: List[str] = [
     "pm_ov25_h","pm_ov35_h","pm_btts_h",
     "pm_ov25_a","pm_ov35_a","pm_btts_a",
     "pm_ov25_h2h","pm_ov35_h2h","pm_btts_h2h",
-    # keep a few live placeholders (zero) for compatibility
+    # live placeholders for shape-compat
     "minute","goals_h","goals_a","goals_sum","goals_diff",
     "xg_h","xg_a","xg_sum","xg_diff","sot_h","sot_a","sot_sum",
     "sh_total_h","sh_total_a","cor_h","cor_a","cor_sum",
@@ -64,8 +65,10 @@ EPS = 1e-6
 # ─────────────────────── Env knobs ─────────────────────── #
 
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "120"))  # 0 disables
+RECENCY_MONTHS         = int(os.getenv("RECENCY_MONTHS", "36"))             # training window cap
 MARKET_CUTOFFS_RAW     = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
 TIP_MAX_MINUTE_ENV     = os.getenv("TIP_MAX_MINUTE", "")
+OU_TRAIN_LINES_RAW     = os.getenv("OU_TRAIN_LINES", os.getenv("OU_LINES", "2.5,3.5"))
 
 def _parse_market_cutoffs(s: str) -> Dict[str,int]:
     out: Dict[str,int] = {}
@@ -82,6 +85,15 @@ try:
     TIP_MAX_MINUTE: Optional[int] = int(float(TIP_MAX_MINUTE_ENV)) if TIP_MAX_MINUTE_ENV.strip() else None
 except Exception:
     TIP_MAX_MINUTE = None
+
+def _parse_ou_lines(raw: str) -> List[float]:
+    vals: List[float] = []
+    for t in (raw or "").split(","):
+        t = t.strip()
+        if not t: continue
+        try: vals.append(float(t))
+        except: pass
+    return vals or [2.5, 3.5]
 
 # ─────────────────────── DB utils ─────────────────────── #
 
@@ -187,9 +199,8 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
     df["minute"] = df["minute"].clip(0, 120)
     df = df[df["minute"] >= float(min_minute)].copy()
 
-    months = int(os.getenv("RECENCY_MONTHS","36"))
-    if months > 0:
-        cutoff = pd.Timestamp.utcnow().timestamp() - months*30*24*3600
+    if RECENCY_MONTHS > 0:
+        cutoff = pd.Timestamp.utcnow().timestamp() - RECENCY_MONTHS*30*24*3600
         df = df[df["_ts"] >= cutoff].copy()
     return df
 
@@ -314,7 +325,6 @@ def _pick_threshold_for_target_precision(
             best_t = float(thr[max(0, min(idx, len(thr)-1))])
 
     if best_t is None:
-        # fall back to accuracy
         best_acc = -1.0
         for t in candidates:
             acc = accuracy_score(y, (p>=t).astype(int))
@@ -359,6 +369,17 @@ def _minute_cutoff_for_market(market: str) -> Optional[int]:
     if m == "1X2":  return MARKET_CUTOFFS.get("1X2", TIP_MAX_MINUTE)
     return TIP_MAX_MINUTE
 
+def _ece(y_true: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
+    y = y_true.astype(int); p = np.clip(p.astype(float), 0, 1)
+    edges = np.linspace(0.0, 1.0, bins+1); ece = 0.0
+    for i in range(bins):
+        lo,hi = edges[i], edges[i+1]
+        mask = (p>=lo)&(p<hi) if i<bins-1 else (p>=lo)&(p<=hi)
+        if not np.any(mask): continue
+        conf = float(np.mean(p[mask])); acc = float(np.mean(y[mask]))
+        ece += (np.sum(mask)/len(p)) * abs(conf-acc)
+    return float(ece)
+
 def _train_binary_head(
     conn, X_all: np.ndarray, y_all: np.ndarray, ts_all: np.ndarray,
     mask_tr: np.ndarray, mask_te: np.ndarray, feature_names: List[str],
@@ -370,7 +391,6 @@ def _train_binary_head(
 ) -> Tuple[bool, Dict[str,Any], Optional[np.ndarray]]:
     if len(np.unique(y_all)) < 2: return False, {}, None
 
-    # apply minute cutoff to training rows (first col is minute)
     if train_minute_cutoff is not None:
         mt = (X_all[:,0] <= float(train_minute_cutoff))
         mask_tr = mask_tr & mt
@@ -415,17 +435,6 @@ def _train_binary_head(
 
     return True, mets, p_cal
 
-def _ece(y_true: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
-    y = y_true.astype(int); p = np.clip(p.astype(float), 0, 1)
-    edges = np.linspace(0.0, 1.0, bins+1); ece = 0.0
-    for i in range(bins):
-        lo,hi = edges[i], edges[i+1]
-        mask = (p>=lo)&(p<hi) if i<bins-1 else (p>=lo)&(p<=hi)
-        if not np.any(mask): continue
-        conf = float(np.mean(p[mask])); acc = float(np.mean(y[mask]))
-        ece += (np.sum(mask)/len(p)) * abs(conf-acc)
-    return float(ece)
-
 # ─────────────────────── Entry point ─────────────────────── #
 
 def _fmt_line(line: float) -> str: return f"{line}".rstrip("0").rstrip(".")
@@ -443,14 +452,7 @@ def train_models(
     test_size  = float(test_size  if test_size  is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
     min_rows   = int(min_rows   if min_rows   is not None else os.getenv("MIN_ROWS", 150))
 
-    # OU lines to train (can include 1.5, 2.5, 3.5)
-    ou_lines: List[float] = []
-    for t in (os.getenv("OU_TRAIN_LINES","2.5,3.5") or "").split(","):
-        t=t.strip()
-        if not t: continue
-        try: ou_lines.append(float(t))
-        except: pass
-    if not ou_lines: ou_lines = [2.5, 3.5]
+    ou_lines = _parse_ou_lines(OU_TRAIN_LINES_RAW)
 
     target_precision = float(os.getenv("TARGET_PRECISION","0.60"))
     min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS","25"))
@@ -492,13 +494,12 @@ def train_models(
                 if ok:
                     summary["metrics"][name] = mets
                     if abs(line-2.5) < 1e-6:
-                        # backward-compat alias O25
                         blob = _get_setting_json(conn, f"model_latest:{name}")
                         if blob is not None:
                             for k in ("model_latest:O25","model:O25"):
                                 _set_setting(conn, k, json.dumps(blob))
 
-            # 1X2 (OvR)
+            # 1X2
             gd = df_ip["final_goals_diff"].values.astype(int)
             y_home = (gd > 0).astype(int); y_draw = (gd == 0).astype(int); y_away = (gd < 0).astype(int)
 
@@ -526,7 +527,7 @@ def train_models(
                 p_max = np.maximum.reduce([phn, pdn, pan])
 
                 gd_te = gd[te_mask]
-                y_class = np.zeros_like(gd_te, dtype=int)  # 0H/1D/2A
+                y_class = np.zeros_like(gd_te, dtype=int)
                 y_class[gd_te==0] = 1; y_class[gd_te<0] = 2
                 correct = (np.argmax(np.stack([phn,pdn,pan],axis=1), axis=1) == y_class).astype(int)
 
@@ -572,7 +573,7 @@ def train_models(
                 summary["trained"][name] = ok
                 if ok: summary["metrics"][name] = mets
 
-            # PRE 1X2 (draw suppressed downstream)
+            # PRE 1X2 (draw suppressed)
             gd = df_pre["final_goals_diff"].values.astype(int)
             y_home = (gd > 0).astype(int); y_away = (gd < 0).astype(int)
 
@@ -606,7 +607,6 @@ def train_models(
             logger.info("Prematch: not enough labeled data (have %d, need >= %d).", len(df_pre), min_rows)
             summary["trained"]["PRE_BTTS_YES"] = False
 
-        # Persist a metrics bundle for inspection
         metrics_bundle = {
             "trained_at_utc": pd.Timestamp.utcnow().isoformat(timespec="seconds")+"Z",
             **summary["metrics"],
