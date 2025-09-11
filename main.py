@@ -23,6 +23,7 @@ Changes in this version:
 """
 
 import os, json, time, logging, requests, psycopg2
+import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
@@ -1604,29 +1605,150 @@ def send_match_of_the_day() -> bool:
     prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best
     return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
 
-def auto_tune_thresholds(days: int = 14) -> Dict[str,float]:
-    if not AUTO_TUNE_ENABLE: return {}
-    cutoff=int(time.time())-days*24*3600
+def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
+    """
+    Pick per-market confidence thresholds that meet TARGET_PRECISION while maximizing realized ROI.
+
+    ROI definition (per 1u stake): y*(odds-1) - (1-y)
+      where y in {0,1}, odds is decimal. We average ROI across selected bets.
+    Tie-breakers: higher precision, then larger n. Requires >= THRESH_MIN_PREDICTIONS.
+    If no threshold meets target precision, accept within PREC_TOL below target *and* ROI > 0.
+    """
+    if not AUTO_TUNE_ENABLE:
+        return {}
+
+    PREC_TOL = float(os.getenv("AUTO_TUNE_PREC_TOL", "0.03"))  # allow 3pp below target if ROI>0
+    cutoff = int(time.time()) - days * 24 * 3600
+
     with db_conn() as c:
-        rows=c.execute("""
-            SELECT t.market, t.suggestion, COALESCE(t.confidence_raw, t.confidence/100.0) prob,
+        rows = c.execute(
+            """
+            SELECT t.market,
+                   t.suggestion,
+                   COALESCE(t.confidence_raw, t.confidence/100.0) AS prob,
+                   t.odds,
                    r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM tips t JOIN match_results r ON r.match_id=t.match_id
-            WHERE t.created_ts >= %s AND t.suggestion<>'HARVEST' AND t.sent_ok=1
-        """,(cutoff,)).fetchall()
-    by={}
-    for (mk,sugg,prob,gh,ga,btts) in rows:
-        out=_tip_outcome_for_result(sugg, {"final_goals_h":gh,"final_goals_a":ga,"btts_yes":btts})
-        if out is None: continue
-        by.setdefault(mk, []).append((float(prob), int(out)))
-    tuned={}
-    for mk,arr in by.items():
-        if len(arr)<THRESH_MIN_PREDICTIONS: continue
-        probs=[p for (p,_) in arr]; wins=[y for (_,y) in arr]
-        pct=_pick_threshold(wins, probs, TARGET_PRECISION, THRESH_MIN_PREDICTIONS, CONF_THRESHOLD)
-        set_setting(f"conf_threshold:{mk}", f"{pct:.2f}"); _SETTINGS_CACHE.invalidate(f"conf_threshold:{mk}"); tuned[mk]=pct
-    if tuned: send_telegram("🔧 Auto-tune updated thresholds:\n" + "\n".join([f"• {k}: {v:.1f}%" for k,v in tuned.items()]))
-    else: send_telegram("🔧 Auto-tune: no updates (insufficient data).")
+            FROM tips t
+            JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts >= %s
+              AND t.suggestion <> 'HARVEST'
+              AND t.sent_ok = 1
+              AND t.odds IS NOT NULL
+            """,
+            (cutoff,),
+        ).fetchall()
+
+    if not rows:
+        send_telegram("🔧 Auto-tune: no labeled tips with odds in window.")
+        return {}
+
+    # Prepare per-market arrays
+    by: dict[str, list[tuple[float, int, float]]] = {}
+    for (mk, sugg, prob, odds, gh, ga, btts) in rows:
+        try:
+            prob = float(prob or 0.0)
+            odds = float(odds or 0.0)
+        except Exception:
+            continue
+
+        # Grade outcome
+        res = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
+        if res is None:
+            continue
+        y = int(res)
+
+        # Only consider sane odds
+        if not (1.01 <= odds <= MAX_ODDS_ALL):
+            continue
+
+        by.setdefault(mk, []).append((prob, y, odds))
+
+    if not by:
+        send_telegram("🔧 Auto-tune: nothing to tune after filtering.")
+        return {}
+
+    target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
+    min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
+    min_thr = float(os.getenv("MIN_THRESH", "55"))
+    max_thr = float(os.getenv("MAX_THRESH", "85"))
+
+    tuned: Dict[str, float] = {}
+
+    def _eval_threshold(items: list[tuple[float, int, float]], thr_prob: float) -> tuple[int, float, float]:
+        """Return (n, precision, roi_avg)."""
+        sel = [(p, y, o) for (p, y, o) in items if p >= thr_prob]
+        n = len(sel)
+        if n == 0:
+            return 0, 0.0, 0.0
+        wins = sum(y for (_, y, _) in sel)
+        prec = wins / n
+        # avg ROI per 1u stake
+        roi = sum((y * (odds - 1.0) - (1 - y)) for (_, y, odds) in sel) / n
+        return n, float(prec), float(roi)
+
+    for mk, items in by.items():
+        if len(items) < min_preds:
+            continue
+
+        # Sweep thresholds in percentage space, convert to probability in [0,1]
+        candidates_pct = list(np.arange(min_thr, max_thr + 1e-9, 1.0))
+        best = None  # (roi, prec, n, thr_pct)
+
+        feasible_any = False
+        for thr_pct in candidates_pct:
+            thr_prob = float(thr_pct / 100.0)
+            n, prec, roi = _eval_threshold(items, thr_prob)
+            if n < min_preds:
+                continue
+
+            # Primary feasibility: meet or exceed target precision
+            if prec >= target_precision:
+                feasible_any = True
+                score = (roi, prec, n)
+                if (best is None) or (score > (best[0], best[1], best[2])):
+                    best = (roi, prec, n, thr_pct)
+
+        # If none meet target precision, allow PREC_TOL below if ROI positive
+        if not feasible_any:
+            for thr_pct in candidates_pct:
+                thr_prob = float(thr_pct / 100.0)
+                n, prec, roi = _eval_threshold(items, thr_prob)
+                if n < min_preds:
+                    continue
+                if (prec >= max(0.0, target_precision - PREC_TOL)) and (roi > 0.0):
+                    score = (roi, prec, n)
+                    if (best is None) or (score > (best[0], best[1], best[2])):
+                        best = (roi, prec, n, thr_pct)
+
+        # Fallback: maximize precision, then n, then ROI
+        if best is None:
+            fallback = None
+            for thr_pct in candidates_pct:
+                thr_prob = float(thr_pct / 100.0)
+                n, prec, roi = _eval_threshold(items, thr_prob)
+                if n < min_preds:
+                    continue
+                score = (prec, n, roi)
+                if (fallback is None) or (score > (fallback[0], fallback[1], fallback[2])):
+                    fallback = (prec, n, roi, thr_pct)
+            if fallback is not None:
+                tuned[mk] = float(fallback[3])
+        else:
+            tuned[mk] = float(best[3])
+
+    if tuned:
+        for mk, pct in tuned.items():
+            set_setting(f"conf_threshold:{mk}", f"{pct:.2f}")
+            _SETTINGS_CACHE.invalidate(f"conf_threshold:{mk}")
+
+        # Pretty notify
+        lines = ["🔧 Auto-tune (ROI-aware) updated thresholds:"]
+        for mk, pct in sorted(tuned.items()):
+            lines.append(f"• {mk}: {pct:.1f}%")
+        send_telegram("\n".join(lines))
+    else:
+        send_telegram("🔧 Auto-tune (ROI-aware): no markets met minimum data.")
+
     return tuned
 
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
