@@ -234,9 +234,17 @@ def load_prematch_data(conn) -> pd.DataFrame:
 # ─────────────────────── Modeling helpers ─────────────────────── #
 
 def fit_lr_safe(X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray]=None) -> Optional[LogisticRegression]:
-    if len(np.unique(y)) < 2: return None
+    if len(np.unique(y)) < 2:
+        return None
+    C = float(os.getenv("LR_C", "1.0"))  # tunable
     return LogisticRegression(
-        max_iter=5000, solver="saga", penalty="l2", class_weight="balanced", n_jobs=-1
+        max_iter=5000,
+        solver="saga",
+        penalty="l2",
+        class_weight="balanced",
+        n_jobs=-1,
+        C=C,
+        random_state=42,
     ).fit(X, y, sample_weight=sample_weight)
 
 def _logit_vec(p: np.ndarray) -> np.ndarray:
@@ -277,23 +285,55 @@ def _apply_calibration(p_raw: np.ndarray, cal_kind: str, cal_obj) -> np.ndarray:
 def _weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[str,float]:
     return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
 
-def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: str, cal_obj) -> Dict[str,Any]:
+def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: str, cal_obj,
+                     mean: Optional[np.ndarray]=None, scale: Optional[np.ndarray]=None) -> Dict[str,Any]:
+    # If mean/scale provided (we trained on standardized X), fold them into raw-space weights.
+    if mean is not None and scale is not None:
+        intercept, weights = _fold_std_into_weights(model, mean, scale, features)
+    else:
+        intercept = float(model.intercept_.ravel()[0])
+        weights = _weights_dict(model, features)
+
     blob = {
-        "intercept": float(model.intercept_.ravel()[0]),
-        "weights": _weights_dict(model, features),
+        "intercept": float(intercept),
+        "weights": weights,
         "calibration": {"method":"sigmoid","a":1.0,"b":0.0},
     }
     if cal_kind == "platt":
         a,b = cal_obj
         blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
     else:
-        # approximate isotonic with a sigmoid in logit-space so serving stays unchanged
-        x = np.linspace(0.01, 0.99, 199)
+        # keep serving simple: approximate isotonic in logit space
+        x = np.concatenate([
+            np.linspace(0.01, 0.10, 30),
+            np.linspace(0.10, 0.90, 120),
+            np.linspace(0.90, 0.99, 30),
+        ])
         y = np.asarray(cal_obj.predict(x), dtype=float)
         zx = _logit_vec(x); zy = _logit_vec(np.clip(y, 1e-4, 1-1e-4))
         a,b = np.polyfit(zx, zy, 1)
         blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
     return blob
+
+def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (X_std, mean, scale). Any zero-variance column is left unscaled."""
+    mean = X.mean(axis=0)
+    scale = X.std(axis=0, ddof=0)
+    scale = np.where(scale <= 1e-12, 1.0, scale)
+    Xs = (X - mean) / scale
+    return Xs, mean, scale
+
+def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray, features: List[str]) -> Tuple[float, Dict[str, float]]:
+    """Convert weights learned on standardized X back to raw feature space."""
+    # model.coef_ is for standardized features => w_std
+    w_std = model.coef_.ravel().astype(float)
+    b_std = float(model.intercept_.ravel()[0])
+    # raw weights
+    w_raw = (w_std / scale).astype(float)
+    # intercept shift: b_raw = b_std - sum_j (w_std_j * mean_j / scale_j)
+    b_raw = float(b_std - np.sum(w_std * (mean / scale)))
+    weights = {name: float(w) for name, w in zip(features, w_raw.tolist())}
+    return b_raw, weights
 
 # ─────────────────────── Thresholding ─────────────────────── #
 
@@ -380,55 +420,134 @@ def _ece(y_true: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
         ece += (np.sum(mask)/len(p)) * abs(conf-acc)
     return float(ece)
 
+def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, features: List[str]) -> np.ndarray:
+    """
+    Keep rows where the outcome isn't trivially decided at snapshot.
+    - OU_L: drop rows where goals_sum > line (Over guaranteed)
+    - BTTS: drop rows where goals_h>0 and goals_a>0 (Yes guaranteed)
+    - 1X2: keep all (never fully decided until FT)
+    """
+    fidx = {f:i for i,f in enumerate(features)}
+    keep = np.ones(len(y_all), dtype=bool)
+
+    # helpers
+    def col(name): return X_all[:, fidx[name]] if name in fidx else np.zeros(len(X_all))
+
+    goals_sum = col("goals_sum")
+    gh = col("goals_h"); ga = col("goals_a")
+
+    if market_key.startswith("OU_"):
+        try:
+            ln = float(market_key.split("_", 1)[1].replace(",", "."))
+        except Exception:
+            ln = 2.5
+        # if goals_sum > line, Over is already guaranteed; drop that snapshot
+        keep &= ~(goals_sum > ln)
+    elif market_key == "BTTS_YES":
+        # both already scored -> BTTS is locked as True; drop
+        keep &= ~((gh > 0) & (ga > 0))
+    # 1X2_* : no drop
+
+    return keep
+
 def _train_binary_head(
-    conn, X_all: np.ndarray, y_all: np.ndarray, ts_all: np.ndarray,
-    mask_tr: np.ndarray, mask_te: np.ndarray, feature_names: List[str],
-    model_key: str, threshold_label: Optional[str],
-    target_precision: float, min_preds: int,
-    min_thresh_pct: float, max_thresh_pct: float,
-    default_thr_prob: float, metrics_name: Optional[str] = None,
+    conn,
+    X_all: np.ndarray,
+    y_all: np.ndarray,
+    ts_all: np.ndarray,
+    mask_tr: np.ndarray,
+    mask_te: np.ndarray,
+    feature_names: List[str],
+    model_key: str,
+    threshold_label: Optional[str],
+    target_precision: float,
+    min_preds: int,
+    min_thresh_pct: float,
+    max_thresh_pct: float,
+    default_thr_prob: float,
+    metrics_name: Optional[str] = None,
     train_minute_cutoff: Optional[int] = None,
-) -> Tuple[bool, Dict[str,Any], Optional[np.ndarray]]:
-    if len(np.unique(y_all)) < 2: return False, {}, None
+) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
+    """
+    Train one binary head (e.g., BTTS_YES, OU_2.5, WLD_HOME).
 
+    Changes vs. original:
+      - Standardize X on train fold (mean/std), then fold scaler back into weights
+        so serving code in main.py remains unchanged.
+      - Drop trivial/decided in-play snapshots for this head (focus on uncertain states).
+      - Deterministic LogisticRegression (random_state) + tunable C via LR_C.
+    """
+    # sanity
+    if len(np.unique(y_all)) < 2:
+        return False, {}, None
+
+    # Apply minute cutoff on training rows (col 0 is 'minute'), if provided
     if train_minute_cutoff is not None:
-        mt = (X_all[:,0] <= float(train_minute_cutoff))
-        mask_tr = mask_tr & mt
-        if not np.any(mask_tr):
-            logger.info("[TRAIN] %s: cutoff removed all train rows; ignoring cutoff.", model_key)
+        try:
+            mt = (X_all[:, 0] <= float(train_minute_cutoff))
+            mask_tr = mask_tr & mt
+        except Exception:
+            pass
 
+    # Drop trivial/decided snapshots for this specific head (train only)
+    try:
+        undecided = _mask_undecided(model_key, X_all, y_all, feature_names)
+        new_mask_tr = mask_tr & undecided
+        if np.any(new_mask_tr):
+            mask_tr = new_mask_tr
+        else:
+            logger.info("[TRAIN] %s: undecided filter removed all train rows; proceeding without it.", model_key)
+    except Exception as _:
+        # be permissive; training should still proceed
+        pass
+
+    # Split to folds
     X_tr, X_te = X_all[mask_tr], X_all[mask_te]
     y_tr, y_te = y_all[mask_tr], y_all[mask_te]
     ts_tr      = ts_all[mask_tr]
 
-    sw = recency_weights(ts_tr)
-    model = fit_lr_safe(X_tr, y_tr, sample_weight=sw)
-    if model is None: return False, {}, None
+    # Standardize on train, apply to test
+    X_tr_std, mu, sd = _standardize_fit(X_tr)
+    X_te_std = (X_te - mu) / sd
 
-    p_raw_te = model.predict_proba(X_te)[:,1]
+    # Fit LR with recency weights
+    sw = recency_weights(ts_tr)
+    model = fit_lr_safe(X_tr_std, y_tr, sample_weight=sw)
+    if model is None:
+        return False, {}, None
+
+    # Validate (calibration on validation fold)
+    p_raw_te = model.predict_proba(X_te_std)[:, 1]
     cal_kind, cal_obj = _fit_calibration(y_te, p_raw_te)
     p_cal = _apply_calibration(p_raw_te, cal_kind, cal_obj)
 
+    # Metrics
     mets = {
         "brier": float(brier_score_loss(y_te, p_cal)),
         "auc": float(roc_auc_score(y_te, p_cal)) if len(np.unique(y_te)) > 1 else float("nan"),
         "ece": float(_ece(y_te, p_cal)),
-        "acc@0.5": float(accuracy_score(y_te, (p_cal>=0.5).astype(int))),
-        "logloss": float(log_loss(y_te, p_cal, labels=[0,1])),
+        "acc@0.5": float(accuracy_score(y_te, (p_cal >= 0.5).astype(int))),
+        "logloss": float(log_loss(y_te, p_cal, labels=[0, 1])),
         "n_test": int(len(y_te)),
         "prevalence": float(y_all.mean()),
         "calibration": cal_kind,
     }
-    if metrics_name: logger.info("[METRICS] %s: %s", metrics_name, mets)
+    if metrics_name:
+        logger.info("[METRICS] %s: %s", metrics_name, mets)
 
-    blob = build_model_blob(model, feature_names, cal_kind, cal_obj)
+    # Serialize model: fold scaler into raw-space weights so serving stays unchanged
+    blob = build_model_blob(model, feature_names, cal_kind, cal_obj, mean=mu, scale=sd)
     for k in (f"model_latest:{model_key}", f"model:{model_key}"):
         _set_setting(conn, k, json.dumps(blob))
 
+    # Optional: derive/update per-market threshold from validation fold
     if threshold_label:
         thr_prob = _pick_threshold_for_target_precision(
-            y_true=y_te, p_cal=p_cal, target_precision=target_precision,
-            min_preds=min_preds, default_threshold=default_thr_prob
+            y_true=y_te,
+            p_cal=p_cal,
+            target_precision=target_precision,
+            min_preds=min_preds,
+            default_threshold=default_thr_prob,
         )
         thr_pct = float(np.clip(_percent(thr_prob), min_thresh_pct, max_thresh_pct))
         _set_setting(conn, f"conf_threshold:{threshold_label}", f"{thr_pct:.2f}")
