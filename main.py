@@ -132,6 +132,13 @@ EDGE_MIN_BPS  = int(os.getenv("EDGE_MIN_BPS", "600"))      # was 300 bps
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")  # optional API-Football book id
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","0") not in ("0","false","False","no","NO")  # default hardened to 0
 
+# Aggregated odds controls (new)
+ODDS_SOURCE = os.getenv("ODDS_SOURCE", "auto").lower()            # auto|live|prematch
+ODDS_AGGREGATION = os.getenv("ODDS_AGGREGATION", "median").lower()# median|best
+ODDS_OUTLIER_MULT = float(os.getenv("ODDS_OUTLIER_MULT", "1.8"))  # drop books > x * median
+ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))# min distinct books per side
+ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))# cap vs fair (1/p)
+
 # ───────── Markets allow-list (draw suppressed) ─────────
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
 def _fmt_line(line: float) -> str: return f"{line}".rstrip("0").rstrip(".")
@@ -245,6 +252,21 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS match_results (
             match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS odds_history (
+            match_id BIGINT,
+            captured_ts BIGINT,
+            market TEXT,
+            selection TEXT,
+            odds DOUBLE PRECISION,
+            book TEXT,
+            PRIMARY KEY (match_id, market, selection, captured_ts)
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_match ON odds_history (match_id, captured_ts DESC)")
+        c.execute("""CREATE TABLE IF NOT EXISTS lineups (
+            match_id BIGINT PRIMARY KEY,
+            created_ts BIGINT,
+            payload TEXT
+        )""")
         # Evolutive columns (idempotent)
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
         except: pass
@@ -631,55 +653,116 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
     return m <= int(cutoff)
 
-def fetch_odds(fid: int) -> dict:
+def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+    if not vals:
+        return None, None
+    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
+    if not xs:
+        return None, None
+    import statistics
+    med = statistics.median(xs)
+    cleaned = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
+    if not cleaned:
+        cleaned = vals
+    xs2 = sorted([o for (o, _) in cleaned])
+    med2 = statistics.median(xs2)
+    if prob_hint is not None and prob_hint > 0:
+        fair = 1.0 / max(1e-6, float(prob_hint))
+        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
+        cleaned = [(o, b) for (o, b) in cleaned if o <= cap] or cleaned
+    if ODDS_AGGREGATION == "best":
+        best = max(cleaned, key=lambda t: t[0])
+        return float(best[0]), str(best[1])
+    target = med2
+    pick = min(cleaned, key=lambda t: abs(t[0] - target))
+    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
+
+def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     """
-    Returns a dict like:
+    Aggregated odds map:
       { "BTTS": {...}, "1X2": {...}, "OU_2.5": {...}, ... }
-    Best-effort parsing of API-Football /odds endpoint; tolerate missing data.
+    Prefers /odds/live, falls back to /odds; aggregates across books with outlier & fair checks.
     """
-    cached=_odds_cache_get(fid)
-    if cached is not None: return cached
-    params={"fixture": fid}
-    if ODDS_BOOKMAKER_ID: params["bookmaker"] = ODDS_BOOKMAKER_ID
-    js=_api_get(f"{BASE_URL}/odds", params) or {}
-    out={}
+    cached = _odds_cache_get(fid)
+    if cached is not None:
+        return cached
+
+    def _fetch(path: str) -> dict:
+        js = _api_get(f"{BASE_URL}/{path}", {"fixture": fid}) or {}
+        return js if isinstance(js, dict) else {}
+
+    js = {}
+    if ODDS_SOURCE in ("auto", "live"):
+        js = _fetch("odds/live")
+    if not (js.get("response") or []) and ODDS_SOURCE in ("auto", "prematch"):
+        js = _fetch("odds")
+
+    by_market: dict[str, dict[str, list[tuple[float, str]]]] = {}
     try:
-        for r in js.get("response",[]) if isinstance(js,dict) else []:
-            book=(r.get("bookmakers") or [])
-            if not book: continue
-            bk=book[0]; book_name=bk.get("name") or "Book"
-            for mkt in (bk.get("bets") or []):
-                mname=_market_name_normalize(mkt.get("name",""))
-                vals=mkt.get("values") or []
-                if mname=="BTTS":
-                    d={}
-                    for v in vals:
-                        lbl=(v.get("value") or "").strip().lower()
-                        if "yes" in lbl: d["Yes"]={"odds":float(v.get("odd") or 0), "book":book_name}
-                        if "no"  in lbl: d["No"] ={"odds":float(v.get("odd") or 0), "book":book_name}
-                    if d: out["BTTS"]=d
-                elif mname=="1X2":
-                    d={}
-                    for v in vals:
-                        lbl=(v.get("value") or "").strip().lower()
-                        if lbl in ("home","1"): d["Home"]={"odds":float(v.get("odd") or 0),"book":book_name}
-                        if lbl in ("away","2"): d["Away"]={"odds":float(v.get("odd") or 0),"book":book_name}
-                    if d: out["1X2"]=d
-                elif mname=="OU":
-                    by_line={}
-                    for v in vals:
-                        lbl=(v.get("value") or "").lower()
-                        if "over" in lbl or "under" in lbl:
-                            try:
-                                ln=float(lbl.split()[-1])
-                                key=f"OU_{_fmt_line(ln)}"
-                                side="Over" if "over" in lbl else "Under"
-                                by_line.setdefault(key,{}).update({side: {"odds":float(v.get("odd") or 0),"book":book_name}})
-                            except: pass
-                    for k,v in by_line.items(): out[k]=v
-        ODDS_CACHE[fid]=(time.time(), out)
+        for r in js.get("response", []) or []:
+            for bk in (r.get("bookmakers") or []):
+                book_name = bk.get("name") or "Book"
+                for mkt in (bk.get("bets") or []):
+                    mname = _market_name_normalize(mkt.get("name", ""))
+                    vals = mkt.get("values") or []
+                    if mname == "BTTS":
+                        for v in vals:
+                            lbl = (v.get("value") or "").strip().lower()
+                            if "yes" in lbl:
+                                by_market.setdefault("BTTS", {}).setdefault("Yes", []).append((float(v.get("odd") or 0), book_name))
+                            elif "no" in lbl:
+                                by_market.setdefault("BTTS", {}).setdefault("No", []).append((float(v.get("odd") or 0), book_name))
+                    elif mname == "1X2":
+                        for v in vals:
+                            lbl = (v.get("value") or "").strip().lower()
+                            if lbl in ("home","1"):
+                                by_market.setdefault("1X2", {}).setdefault("Home", []).append((float(v.get("odd") or 0), book_name))
+                            elif lbl in ("away","2"):
+                                by_market.setdefault("1X2", {}).setdefault("Away", []).append((float(v.get("odd") or 0), book_name))
+                    elif mname == "OU":
+                        for v in vals:
+                            lbl = (v.get("value") or "").lower()
+                            if ("over" in lbl) or ("under" in lbl):
+                                try:
+                                    ln = float(lbl.split()[-1])
+                                    key = f"OU_{_fmt_line(ln)}"
+                                    side = "Over" if "over" in lbl else "Under"
+                                    by_market.setdefault(key, {}).setdefault(side, []).append((float(v.get("odd") or 0), book_name))
+                                except:
+                                    pass
     except Exception:
-        out={}
+        pass
+
+    out: dict[str, dict[str, dict]] = {}
+    for mkey, side_map in by_market.items():
+        ok = True
+        for side, lst in side_map.items():
+            if len({b for (_, b) in lst}) < max(1, ODDS_REQUIRE_N_BOOKS):
+                ok = False
+                break
+        if not ok:
+            continue
+
+        out[mkey] = {}
+        for side, lst in side_map.items():
+            hint = None
+            if prob_hints:
+                if mkey == "BTTS":
+                    hint = prob_hints.get("BTTS: Yes") if side == "Yes" else (1.0 - (prob_hints.get("BTTS: Yes") or 0.0))
+                elif mkey == "1X2":
+                    hint = prob_hints.get("Home Win") if side == "Home" else (prob_hints.get("Away Win") if side == "Away" else None)
+                elif mkey.startswith("OU_"):
+                    try:
+                        ln = float(mkey.split("_", 1)[1])
+                        key = f"{_fmt_line(ln)}"
+                        hint = prob_hints.get(f"Over {key} Goals") if side == "Over" else (1.0 - (prob_hints.get(f"Over {key} Goals") or 0.0))
+                    except:
+                        pass
+            ag, label = _aggregate_price(lst, hint)
+            if ag is not None:
+                out[mkey][side] = {"odds": float(ag), "book": label}
+
+    ODDS_CACHE[fid] = (time.time(), out)
     return out
 
 def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
@@ -791,9 +874,18 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
             (fid, now, payload)
         )
         c.execute(
-            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok) "
-            "VALUES (%s,%s,%s,%s,%s,'HARVEST','HARVEST',0.0,0.0,%s,%s,%s,1)",
-            (fid, league_id, league, home, away, f"{gh}-{ga}", minute, now)
+            "INSERT INTO tips("
+            "match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok"
+            ") VALUES ("
+            "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s"
+            ")",
+            (
+                fid, league_id, league, home, away,
+                "HARVEST", "HARVEST",                # market, suggestion
+                0.0, 0.0,                            # confidence, confidence_raw
+                f"{gh}-{ga}",                        # score_at_tip
+                minute, now, 1                       # minute, created_ts, sent_ok
+            )
         )
 
 # ───────── Outcomes/backfill/digest (short) ─────────
@@ -1303,28 +1395,88 @@ def production_scan() -> Tuple[int, int]:
 
 # ───────── Prematch (snapshot + save; thresholds & EV enforced) ─────────
 def extract_prematch_features(fx: dict) -> Dict[str,float]:
-    teams=fx.get("teams") or {}; th=(teams.get("home") or {}).get("id"); ta=(teams.get("away") or {}).get("id")
-    if not th or not ta: return {}
+    teams = fx.get("teams") or {}
+    th = (teams.get("home") or {}).get("id")
+    ta = (teams.get("away") or {}).get("id")
+    if not th or not ta:
+        return {}
+
     def _rate(games):
-        ov25=ov35=btts=played=0
+        ov25 = ov35 = btts = played = 0
         for g in games:
-            st=(((g.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-            if st not in {"FT","AET","PEN"}: continue
-            gh=int((g.get("goals") or {}).get("home") or 0); ga=int((g.get("goals") or {}).get("away") or 0)
-            played+=1; 
-            if gh+ga>2: ov25+=1
-            if gh+ga>3: ov35+=1
-            if gh>0 and ga>0: btts+=1
-        if played==0: return 0,0,0
+            st = (((g.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+            if st not in {"FT","AET","PEN"}:
+                continue
+            gh = int((g.get("goals") or {}).get("home") or 0)
+            ga = int((g.get("goals") or {}).get("away") or 0)
+            played += 1
+            if gh+ga > 2: ov25 += 1
+            if gh+ga > 3: ov35 += 1
+            if gh>0 and ga>0: btts += 1
+        if played == 0:
+            return 0,0,0
         return ov25/played, ov35/played, btts/played
-    last_h=_api_last_fixtures(th,5); last_a=_api_last_fixtures(ta,5); h2h=_api_h2h(th,ta,5)
-    ov25_h,ov35_h,btts_h=_rate(last_h); ov25_a,ov35_a,btts_a=_rate(last_a); ov25_h2h,ov35_h2h,btts_h2h=_rate(h2h)
-    return {"pm_ov25_h":ov25_h,"pm_ov35_h":ov35_h,"pm_btts_h":btts_h,
-            "pm_ov25_a":ov25_a,"pm_ov35_a":ov35_a,"pm_btts_a":btts_a,
-            "pm_ov25_h2h":ov25_h2h,"pm_ov35_h2h":ov35_h2h,"pm_btts_h2h":btts_h2h,
-            "minute":0.0,"goals_h":0.0,"goals_a":0.0,"goals_sum":0.0,"goals_diff":0.0,
-            "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
-            "cor_h":0.0,"cor_a":0.0,"cor_sum":0.0,"pos_h":0.0,"pos_a":0.0,"pos_diff":0.0,"red_h":0.0,"red_a":0.0,"red_sum":0.0}
+
+    last_h = _api_last_fixtures(th,5); last_a = _api_last_fixtures(ta,5); h2h = _api_h2h(th,ta,5)
+    ov25_h,ov35_h,btts_h = _rate(last_h)
+    ov25_a,ov35_a,btts_a = _rate(last_a)
+    ov25_h2h,ov35_h2h,btts_h2h = _rate(h2h)
+
+    # rest-days (simple but useful)
+    def _rest_days(team_id: int) -> float:
+        last = _api_last_fixtures(team_id, 1)
+        if not last:
+            return 7.0
+        dt = (((last[0].get("fixture") or {}).get("date") or "") or "").replace("Z","+00:00")
+        try:
+            then = datetime.fromisoformat(dt)
+            return max(0.0, (datetime.now(tz=ZoneInfo("UTC")) - then).total_seconds()/86400.0)
+        except Exception:
+            return 7.0
+
+    rd_h = _rest_days(int(th)); rd_a = _rest_days(int(ta))
+
+    # lineup strength proxy from saved lineups (count starters)
+    def _lineup_strength(fid: int, team_idx: int) -> float:
+        try:
+            with db_conn() as c:
+                row = c.execute("SELECT payload FROM lineups WHERE match_id=%s", (fid,)).fetchone()
+            if not row:
+                return 0.0
+            arr = json.loads(row[0]) or []
+            if not arr or team_idx >= len(arr):
+                return 0.0
+            starters = [(p.get("player") or {}).get("id") for p in (arr[team_idx].get("startXI") or [])]
+            starters = [int(x) for x in starters if x]
+            return float(len(starters))
+        except Exception:
+            return 0.0
+
+    fid = int((fx.get("fixture") or {}).get("id") or 0)
+    # best effort: try to capture lineups before computing features
+    try:
+        if fid:
+            fetch_lineup_and_save(fid)
+    except Exception:
+        pass
+
+    ls_home = _lineup_strength(fid, 0)
+    ls_away = _lineup_strength(fid, 1)
+
+    base = {
+        "pm_ov25_h":ov25_h,"pm_ov35_h":ov35_h,"pm_btts_h":btts_h,
+        "pm_ov25_a":ov25_a,"pm_ov35_a":ov35_a,"pm_btts_a":btts_a,
+        "pm_ov25_h2h":ov25_h2h,"pm_ov35_h2h":ov35_h2h,"pm_btts_h2h":btts_h2h,
+        "pm_rest_days_h": rd_h, "pm_rest_days_a": rd_a, "pm_rest_days_diff": rd_h - rd_a,
+        "pm_lineup_strength_h": ls_home, "pm_lineup_strength_a": ls_away, "pm_lineup_strength_diff": ls_home - ls_away,
+        # keep live placeholders for model compatibility
+        "minute":0.0,"goals_h":0.0,"goals_a":0.0,"goals_sum":0.0,"goals_diff":0.0,
+        "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
+        "sh_total_h":0.0,"sh_total_a":0.0,"cor_h":0.0,"cor_a":0.0,"cor_sum":0.0,
+        "pos_h":0.0,"pos_a":0.0,"pos_diff":0.0,"red_h":0.0,"red_a":0.0,"red_sum":0.0,
+        "yellow_h":0.0,"yellow_a":0.0,
+    }
+    return base
 
 def _kickoff_berlin(utc_iso: str|None) -> str:
     try:
@@ -1351,6 +1503,50 @@ def save_prematch_snapshot(fx: dict, feat: Dict[str, float]) -> None:
             "ON CONFLICT (match_id) DO UPDATE SET created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload",
             (fid, now, payload)
         )
+
+def snapshot_odds_for_fixtures(fixtures: List[int]) -> int:
+    wrote = 0
+    now = int(time.time())
+    for fid in fixtures:
+        try:
+            od = fetch_odds(fid)  # already aggregated
+            rows = []
+            for mk, sides in (od or {}).items():
+                for sel, payload in (sides or {}).items():
+                    o = float((payload or {}).get("odds") or 0)
+                    b = (payload or {}).get("book") or "Book"
+                    if o <= 0: 
+                        continue
+                    rows.append((fid, now, mk, sel, o, b))
+            if not rows:
+                continue
+            with db_conn() as c:
+                c.cur.executemany(
+                    "INSERT INTO odds_history(match_id,captured_ts,market,selection,odds,book) "
+                    "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                    rows
+                )
+                wrote += len(rows)
+        except Exception:
+            continue
+    return wrote
+
+def _today_fixture_ids() -> List[int]:
+    fixtures = _collect_todays_prematch_fixtures()
+    return [int(((fx.get('fixture') or {}).get('id') or 0)) for fx in fixtures if int(((fx.get('fixture') or {}).get('id') or 0))]
+
+def fetch_lineup_and_save(fid: int) -> bool:
+    js = _api_get(f"{BASE_URL}/fixtures/lineups", {"fixture": fid}) or {}
+    arr = js.get("response") or []
+    if not arr:
+        return False
+    with db_conn() as c:
+        c.execute(
+            "INSERT INTO lineups(match_id,created_ts,payload) VALUES (%s,%s,%s) "
+            "ON CONFLICT (match_id) DO UPDATE SET created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload",
+            (int(fid), int(time.time()), json.dumps(arr, separators=(",", ":")))
+        )
+    return True
 
 def prematch_scan_save() -> int:
     fixtures = _collect_todays_prematch_fixtures()
@@ -1782,6 +1978,7 @@ def _run_with_pg_lock(lock_key: int, fn, *a, **k):
         log.exception("[LOCK %s] failed: %s", lock_key, e); return None
 
 _scheduler_started=False
+
 def _start_scheduler_once():
     global _scheduler_started
     if _scheduler_started or not RUN_SCHEDULER: return
@@ -1806,6 +2003,13 @@ def _start_scheduler_once():
                           CronTrigger(hour=4, minute=7, timezone=TZ_UTC),
                           id="auto_tune", max_instances=1, coalesce=True)
         sched.add_job(lambda:_run_with_pg_lock(1007,retry_unsent_tips,30,200),"interval",minutes=10,id="retry",max_instances=1,coalesce=True)
+
+      # periodic odds snapshots to build your own opening→closing history
+      sched.add_job(
+          lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
+          "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True
+      )
+
         sched.start(); _scheduler_started=True
         send_telegram("🚀 goalsniper AI mode (in-play + prematch) started.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
