@@ -1981,38 +1981,54 @@ _scheduler_started=False
 
 def _start_scheduler_once():
     global _scheduler_started
-    if _scheduler_started or not RUN_SCHEDULER: return
+    if _scheduler_started or not RUN_SCHEDULER:
+        return
     try:
-        sched=BackgroundScheduler(timezone=TZ_UTC)
-        sched.add_job(lambda:_run_with_pg_lock(1001,production_scan),"interval",seconds=SCAN_INTERVAL_SEC,id="scan",max_instances=1,coalesce=True)
-        sched.add_job(lambda:_run_with_pg_lock(1002,backfill_results_for_open_matches,400),"interval",minutes=BACKFILL_EVERY_MIN,id="backfill",max_instances=1,coalesce=True)
+        sched = BackgroundScheduler(timezone=TZ_UTC)
+
+        # core jobs
+        sched.add_job(lambda: _run_with_pg_lock(1001, production_scan),
+                      "interval", seconds=SCAN_INTERVAL_SEC, id="scan", max_instances=1, coalesce=True)
+        sched.add_job(lambda: _run_with_pg_lock(1002, backfill_results_for_open_matches, 400),
+                      "interval", minutes=BACKFILL_EVERY_MIN, id="backfill", max_instances=1, coalesce=True)
+
         if DAILY_ACCURACY_DIGEST_ENABLE:
-            sched.add_job(lambda:_run_with_pg_lock(1003,daily_accuracy_digest),
-                          CronTrigger(hour=int(os.getenv("DAILY_ACCURACY_HOUR","3")), minute=int(os.getenv("DAILY_ACCURACY_MINUTE","6")), timezone=BERLIN_TZ),
+            sched.add_job(lambda: _run_with_pg_lock(1003, daily_accuracy_digest),
+                          CronTrigger(hour=int(os.getenv("DAILY_ACCURACY_HOUR", "3")),
+                                      minute=int(os.getenv("DAILY_ACCURACY_MINUTE", "6")),
+                                      timezone=BERLIN_TZ),
                           id="digest", max_instances=1, coalesce=True)
-        if os.getenv("MOTD_PREDICT","1") not in ("0","false","False","no","NO"):
-            sched.add_job(lambda:_run_with_pg_lock(1004,send_match_of_the_day),
-                          CronTrigger(hour=int(os.getenv("MOTD_HOUR","19")), minute=int(os.getenv("MOTD_MINUTE","15")), timezone=BERLIN_TZ),
+
+        if os.getenv("MOTD_PREDICT", "1") not in ("0", "false", "False", "no", "NO"):
+            sched.add_job(lambda: _run_with_pg_lock(1004, send_match_of_the_day),
+                          CronTrigger(hour=int(os.getenv("MOTD_HOUR", "19")),
+                                      minute=int(os.getenv("MOTD_MINUTE", "15")),
+                                      timezone=BERLIN_TZ),
                           id="motd", max_instances=1, coalesce=True)
+
         if TRAIN_ENABLE:
-            sched.add_job(lambda:_run_with_pg_lock(1005,auto_train_job),
+            sched.add_job(lambda: _run_with_pg_lock(1005, auto_train_job),
                           CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
                           id="train", max_instances=1, coalesce=True)
+
         if AUTO_TUNE_ENABLE:
-            sched.add_job(lambda:_run_with_pg_lock(1006,auto_tune_thresholds,14),
+            sched.add_job(lambda: _run_with_pg_lock(1006, auto_tune_thresholds, 14),
                           CronTrigger(hour=4, minute=7, timezone=TZ_UTC),
                           id="auto_tune", max_instances=1, coalesce=True)
-        sched.add_job(lambda:_run_with_pg_lock(1007,retry_unsent_tips,30,200),"interval",minutes=10,id="retry",max_instances=1,coalesce=True)
 
-      # periodic odds snapshots to build your own opening→closing history
-      sched.add_job(
-          lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
-          "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True
-      )
+        # retry unsent
+        sched.add_job(lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200),
+                      "interval", minutes=10, id="retry", max_instances=1, coalesce=True)
 
-        sched.start(); _scheduler_started=True
+        # ✅ periodic odds snapshots (the new job) — INSIDE the function
+        sched.add_job(lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
+                      "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True)
+
+        sched.start()
+        _scheduler_started = True
         send_telegram("🚀 goalsniper AI mode (in-play + prematch) started.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
+
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
