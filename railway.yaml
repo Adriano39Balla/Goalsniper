@@ -1,14 +1,13 @@
 services:
   - type: web
-    name: goalsniper
-    env: docker
-    dockerfilePath: ./Dockerfile
+    name: goalsniper-web
+    env: python
+    buildCommand: python -m pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+    startCommand: gunicorn -w 2 -k gthread -t 120 -b 0.0.0.0:${PORT} main:app
     healthCheckPath: /health
     envVars:
       - key: RUN_SCHEDULER
-        value: "1"
-
-      # secrets (set in Railway → Variables, not in repo)
+        value: "0"
       - key: DATABASE_URL
         sync: false
       - key: API_KEY
@@ -19,12 +18,43 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-
-      # knobs
       - key: OU_LINES
-        value: "2.5,3.5"
+        value: "2.5"
       - key: OU_TRAIN_LINES
-        value: "2.5,3.5"
+        value: "2.5"
+      - key: TIP_MIN_MINUTE
+        value: "20"
+      - key: PREDICTIONS_PER_MATCH
+        value: "1"
+      - key: DUP_COOLDOWN_MIN
+        value: "25"
+      - key: SCAN_INTERVAL_SEC
+        value: "300"
+      - key: TRAIN_ENABLE
+        value: "1"
+
+  - type: worker
+    name: goalsniper-worker
+    env: python
+    buildCommand: python -m pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+    startCommand: python -u worker.py
+    envVars:
+      - key: RUN_SCHEDULER
+        value: "1"
+      - key: DATABASE_URL
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: ADMIN_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: OU_LINES
+        value: "2.5"
+      - key: OU_TRAIN_LINES
+        value: "2.5"
       - key: TIP_MIN_MINUTE
         value: "20"
       - key: PREDICTIONS_PER_MATCH
