@@ -2,21 +2,16 @@ services:
   - type: web
     name: goalsniper
     env: python
-    # Pin pip first to avoid incompat issues, then install deps
-    buildCommand: |
-      python -m pip install --upgrade "pip==24.2"
-      pip install --no-cache-dir -r requirements.txt
-    # Simple single-process start (scheduler runs inside main.py)
+    buildCommand: pip install --no-cache-dir -r requirements.txt
     startCommand: python -X utf8 -u main.py
     healthCheckPath: /health
     envVars:
-      # Pin Python version used by Railway’s Python environment
       - key: PYTHON_VERSION
         value: "3.11.9"
-      # run the scheduler inside this service
       - key: RUN_SCHEDULER
         value: "1"
-      # secrets are provided from Railway (leave as unsynced)
+
+      # secrets (leave unsynced; set values in Railway UI)
       - key: DATABASE_URL
         sync: false
       - key: API_KEY
@@ -27,7 +22,8 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      # your knobs
+
+      # knobs (tweak as you like)
       - key: OU_LINES
         value: "2.5,3.5"
       - key: OU_TRAIN_LINES
