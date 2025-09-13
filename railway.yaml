@@ -1,4 +1,3 @@
-# --- railway.yaml ---
 services:
   - type: web
     name: goalsniper
@@ -9,7 +8,7 @@ services:
       - key: RUN_SCHEDULER
         value: "1"
 
-      # secrets (leave unsynced; set values in Railway UI)
+      # secrets (set in Railway → Variables, not in repo)
       - key: DATABASE_URL
         sync: false
       - key: API_KEY
@@ -21,7 +20,7 @@ services:
       - key: TELEGRAM_CHAT_ID
         sync: false
 
-      # knobs (tweak as you like)
+      # knobs
       - key: OU_LINES
         value: "2.5,3.5"
       - key: OU_TRAIN_LINES
