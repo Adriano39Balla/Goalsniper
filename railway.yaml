@@ -2,22 +2,21 @@ services:
   - type: web
     name: goalsniper
     env: python
-
-    # Build
-    buildCommand: pip install --no-cache-dir -r requirements.txt
-
-    # Start (serves Flask app AND runs the in-process scheduler)
-    startCommand: gunicorn -w 2 --threads 4 -k gthread -t 120 -b 0.0.0.0:$PORT main:app
-
-    # Health endpoint from main.py
+    # Pin pip first to avoid incompat issues, then install deps
+    buildCommand: |
+      python -m pip install --upgrade "pip==24.2"
+      pip install --no-cache-dir -r requirements.txt
+    # Simple single-process start (scheduler runs inside main.py)
+    startCommand: python -X utf8 -u main.py
     healthCheckPath: /health
-
-    # Environment (secrets marked sync:false so they’re managed in Railway’s Variables)
     envVars:
+      # Pin Python version used by Railway’s Python environment
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # run the scheduler inside this service
       - key: RUN_SCHEDULER
         value: "1"
-
-      # Core secrets (set values in Railway -> Variables)
+      # secrets are provided from Railway (leave as unsynced)
       - key: DATABASE_URL
         sync: false
       - key: API_KEY
@@ -28,103 +27,18 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: TELEGRAM_WEBHOOK_SECRET
-        sync: false
-
-      # Model/scan knobs (safe defaults that match our current code)
+      # your knobs
       - key: OU_LINES
         value: "2.5,3.5"
       - key: OU_TRAIN_LINES
         value: "2.5,3.5"
       - key: TIP_MIN_MINUTE
-        value: "12"
+        value: "20"
       - key: PREDICTIONS_PER_MATCH
         value: "1"
-      - key: PER_LEAGUE_CAP
-        value: "2"
       - key: DUP_COOLDOWN_MIN
         value: "25"
       - key: SCAN_INTERVAL_SEC
         value: "300"
-      - key: SETTINGS_TTL_SEC
-        value: "60"
-      - key: MODELS_CACHE_TTL_SEC
-        value: "120"
-      - key: TOTAL_MATCH_MINUTES
-        value: "95"
-      - key: TZ
-        value: "Europe/Berlin"
-
-      # Training / auto-tune
       - key: TRAIN_ENABLE
         value: "1"
-      - key: TRAIN_HOUR_UTC
-        value: "4"
-      - key: TRAIN_MINUTE_UTC
-        value: "12"
-      - key: TRAIN_MIN_MINUTE
-        value: "15"
-      - key: AUTO_TUNE_ENABLE
-        value: "1"
-      - key: TARGET_PRECISION
-        value: "0.60"
-      - key: THRESH_MIN_PREDICTIONS
-        value: "25"
-      - key: MIN_THRESH
-        value: "55"
-      - key: MAX_THRESH
-        value: "92"
-
-      # Odds / EV guards (keeps tips sane)
-      - key: ALLOW_TIPS_WITHOUT_ODDS
-        value: "0"
-      - key: MIN_ODDS_OU
-        value: "1.50"
-      - key: MIN_ODDS_BTTS
-        value: "1.50"
-      - key: MIN_ODDS_1X2
-        value: "1.50"
-      - key: MAX_ODDS_ALL
-        value: "20"
-      - key: EDGE_MIN_BPS
-        value: "600"
-      - key: ODDS_SOURCE
-        value: "auto"
-      - key: ODDS_AGGREGATION
-        value: "median"
-      - key: ODDS_REQUIRE_N_BOOKS
-        value: "2"
-      - key: ODDS_OUTLIER_MULT
-        value: "1.8"
-      - key: ODDS_FAIR_MAX_MULT
-        value: "2.5"
-
-      # Scheduler jobs you already use
-      - key: BACKFILL_EVERY_MIN
-        value: "15"
-      - key: BACKFILL_DAYS
-        value: "14"
-      - key: DAILY_ACCURACY_DIGEST_ENABLE
-        value: "1"
-      - key: DAILY_ACCURACY_HOUR
-        value: "3"
-      - key: DAILY_ACCURACY_MINUTE
-        value: "6"
-      - key: MOTD_PREMATCH_ENABLE
-        value: "1"
-      - key: MOTD_PREDICT
-        value: "1"
-      - key: MOTD_HOUR
-        value: "19"
-      - key: MOTD_MINUTE
-        value: "15"
-      - key: MOTD_CONF_MIN
-        value: "70"
-
-      # Feed safety
-      - key: STALE_GUARD_ENABLE
-        value: "1"
-      - key: STALE_STATS_MAX_SEC
-        value: "240"
-      - key: MARKET_CUTOFFS
-        value: "BTTS=83,1X2=83,OU=90"
