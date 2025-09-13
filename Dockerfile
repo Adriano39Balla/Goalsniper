@@ -24,4 +24,4 @@ COPY . .
 ENV PORT=8080
 
 # Start the app (1 worker so the scheduler isn’t duplicated)
-CMD ["gunicorn", "-w", "1", "-k", "gthread", "-t", "120", "main:app"]
+CMD ["gunicorn","-w","1","-k","gthread","-t","120","-b","0.0.0.0:${PORT}","main:app"]
