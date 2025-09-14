@@ -1978,12 +1978,10 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
         log.info("[RETRY] resent %d", retried)
     return retried
 
-# ───────── MOTD (prematch) with stacking ─────────
-MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
-
 def send_match_of_the_day() -> bool:
-    if not os.getenv("MOTD_PREDICT","1") not in ("0","false","False","no","NO"):
+    if os.getenv("MOTD_PREDICT","1") in ("0","false","False","no","NO"):
         return send_telegram("🏅 MOTD disabled.")
+
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
         return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
@@ -1991,9 +1989,10 @@ def send_match_of_the_day() -> bool:
     if MOTD_LEAGUE_IDS:
         fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
         if not fixtures:
-            return send_telegram("🏅 Match of the Day: no fixtures in configured leagues.")
+            return send_telegram("🏅 MOTD: no fixtures in configured leagues.")
 
     best = None
+    fallback = None  # store best even if below EV/conf thresholds
 
     for fx in fixtures:
         fixture = fx.get("fixture") or {}
@@ -2007,27 +2006,27 @@ def send_match_of_the_day() -> bool:
         kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
 
         feat = extract_prematch_features(fx)
-        if not feat:
-            continue
+        if not feat: continue
 
         candidates: List[Tuple[str,str,float,Optional[Dict[str,Any]]]] = []
 
+        # Markets
         for line in OU_LINES:
             mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
             if not mdl: continue
             p = _score_prob(feat, mdl)
             mk = f"Over/Under {_fmt_line(line)}"
             thr = _get_market_threshold_pre(mk)
-            if p*100.0 >= thr:   candidates.append((mk, f"Over {_fmt_line(line)} Goals", p, mdl))
-            q = 1.0 - p
-            if q*100.0 >= thr:   candidates.append((mk, f"Under {_fmt_line(line)} Goals", q, mdl))
+            if p*100 >= thr: candidates.append((mk, f"Over {_fmt_line(line)} Goals", p, mdl))
+            q = 1-p
+            if q*100 >= thr: candidates.append((mk, f"Under {_fmt_line(line)} Goals", q, mdl))
 
         mdl = load_model_from_settings("PRE_BTTS_YES")
         if mdl:
             p = _score_prob(feat, mdl); thr = _get_market_threshold_pre("BTTS")
-            if p*100.0 >= thr: candidates.append(("BTTS","BTTS: Yes", p, mdl))
-            q = 1.0 - p
-            if q*100.0 >= thr: candidates.append(("BTTS","BTTS: No",  q, mdl))
+            if p*100 >= thr: candidates.append(("BTTS","BTTS: Yes", p, mdl))
+            q = 1-p
+            if q*100 >= thr: candidates.append(("BTTS","BTTS: No", q, mdl))
 
         mh = load_model_from_settings("PRE_WLD_HOME")
         ma = load_model_from_settings("PRE_WLD_AWAY")
@@ -2035,43 +2034,44 @@ def send_match_of_the_day() -> bool:
             ph = _score_prob(feat, mh); pa = _score_prob(feat, ma)
             s = max(EPS, ph+pa); ph, pa = ph/s, pa/s
             thr = _get_market_threshold_pre("1X2")
-            if ph*100.0 >= thr: candidates.append(("1X2","Home Win", ph, mh))
-            if pa*100.0 >= thr: candidates.append(("1X2","Away Win", pa, ma))
+            if ph*100 >= thr: candidates.append(("1X2","Home Win", ph, mh))
+            if pa*100 >= thr: candidates.append(("1X2","Away Win", pa, ma))
 
-        if not candidates:
-            continue
+        if not candidates: continue
 
-        # Choose top by stacked probability & EV
-        best_local = None
+        # Choose top by stacked prob + EV
         odds_map = fetch_odds(fid)
         for mk, sug, p_model, mdl_used in candidates:
             pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
-            if not pass_odds or odds is None:
-                continue
+            if not pass_odds or odds is None: continue
             p_book = _implied_prob_from_odds(odds)
             p_final = _apply_stack_if_available(p_model, mdl_used, p_book)
             edge = _ev(p_final, odds)
-            ev_bps = int(round(edge * 10000))
-            ev_pct = round(edge*100.0, 1)
+            ev_bps = int(round(edge*10000))
+            ev_pct = round(edge*100,1)
+
+            score = (p_final ** 1.2) * (1 + max(0, ev_pct)/100)
+            cand = (score, p_final*100, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
+
+            # Store fallback (best overall)
+            if fallback is None or cand > fallback:
+                fallback = cand
+
+            # Apply EV filter only for strict "best"
             if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
                 continue
-            score = (p_final ** 1.2) * (1 + max(0.0, ev_pct) / 100.0)
-            cand = (score, p_final*100.0, sug, odds, book, ev_pct)
-            if (best_local is None) or (cand > best_local):
-                best_local = cand
 
-        if not best_local:
-            continue
+            if best is None or cand > best:
+                best = cand
 
-        _, prob_pct, sug, odds, book, ev_pct = best_local
-        item = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
-        if best is None or prob_pct > best[0]:
-            best = item
+    chosen = best or fallback
+    if not chosen:
+        return send_telegram("🏅 MOTD: no prematch pick available.")
 
-    if not best:
-        return send_telegram("🏅 Match of the Day: no prematch pick met thresholds.")
-    prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best
-    return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
+    _, prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = chosen
+    return send_telegram(
+        _format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct)
+    )
 
 # ───────── Scheduler ─────────
 def _run_with_pg_lock(lock_key: int, fn, *a, **k):
