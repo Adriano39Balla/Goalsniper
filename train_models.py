@@ -1,4 +1,3 @@
-# file: train_models.py
 """
 Postgres-only training with robust calibration + per-market auto-thresholding.
 
@@ -13,6 +12,7 @@ Highlights
 
 import argparse, json, os, logging, math
 from typing import Any, Dict, List, Optional, Tuple
+from math import sqrt
 
 import numpy as np
 import pandas as pd
@@ -242,8 +242,6 @@ def fit_lr_safe(X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray
         solver="saga",
         penalty="l2",
         class_weight="balanced",
-        n_jobs=-1,
-        C=C,
         random_state=42,
     ).fit(X, y, sample_weight=sample_weight)
 
@@ -286,7 +284,9 @@ def _weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[s
     return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
 
 def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: str, cal_obj,
-                     mean: Optional[np.ndarray]=None, scale: Optional[np.ndarray]=None) -> Dict[str,Any]:
+                     mean: Optional[np.ndarray]=None, scale: Optional[np.ndarray]=None,
+                     cal_by_minute: Optional[List[Dict[str, float]]] = None,
+                     stack_coeffs: Optional[Dict[str, float]] = None) -> Dict[str,Any]:
     # If mean/scale provided (we trained on standardized X), fold them into raw-space weights.
     if mean is not None and scale is not None:
         intercept, weights = _fold_std_into_weights(model, mean, scale, features)
@@ -313,6 +313,10 @@ def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: s
         zx = _logit_vec(x); zy = _logit_vec(np.clip(y, 1e-4, 1-1e-4))
         a,b = np.polyfit(zx, zy, 1)
         blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
+    if cal_by_minute:
+        blob["calibration_by_minute"] = cal_by_minute
+    if stack_coeffs:
+        blob["stack"] = stack_coeffs
     return blob
 
 def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -325,12 +329,9 @@ def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]
 
 def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray, features: List[str]) -> Tuple[float, Dict[str, float]]:
     """Convert weights learned on standardized X back to raw feature space."""
-    # model.coef_ is for standardized features => w_std
     w_std = model.coef_.ravel().astype(float)
     b_std = float(model.intercept_.ravel()[0])
-    # raw weights
     w_raw = (w_std / scale).astype(float)
-    # intercept shift: b_raw = b_std - sum_j (w_std_j * mean_j / scale_j)
     b_raw = float(b_std - np.sum(w_std * (mean / scale)))
     weights = {name: float(w) for name, w in zip(features, w_raw.tolist())}
     return b_raw, weights
@@ -372,9 +373,38 @@ def _pick_threshold_for_target_precision(
 
     return float(best_t if best_t is not None else default_threshold)
 
+# (4) Wilson lower bound thresholding
+def _wilson_lb(successes:int, n:int, z:float=1.96) -> float:
+    if n <= 0: return 0.0
+    phat = successes / n
+    denom = 1 + z*z/n
+    centre = phat + z*z/(2*n)
+    adj = z*sqrt((phat*(1-phat)+z*z/(4*n))/n)
+    return (centre - adj) / denom
+
+def pick_threshold_with_wilson(y_true, p_cal, min_preds: int, target_precision: float,
+                               candidates: Optional[np.ndarray] = None, z: float = 1.96) -> float:
+    y = np.asarray(y_true, int); p = np.asarray(p_cal, float)
+    if candidates is None:
+        candidates = np.arange(0.50, 0.951, 0.005)
+    best = None  # (meet_target, lb, prec, n, thr)
+    for t in candidates:
+        sel = p >= t
+        n = int(sel.sum())
+        if n < min_preds:
+            continue
+        s = int((y[sel] == 1).sum())
+        prec = s / n if n else 0.0
+        lb = _wilson_lb(s, n, z)
+        score = (float(lb >= target_precision), lb, prec, n, float(t))
+        if (best is None) or (score > (best[0], best[1], best[2], best[3])):
+            best = score
+    return float(best[-1] if best else 0.65)
+
 # ─────────────────────── Split & weights ─────────────────────── #
 
 def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray,np.ndarray]:
+    # kept for compatibility (unused after upgrade)
     if "_ts" not in df.columns:
         n = len(df); idx = np.arange(n)
         rng = np.random.default_rng(42); rng.shuffle(idx)
@@ -382,12 +412,30 @@ def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray,np.
         tr = np.zeros(n,dtype=bool); te = np.zeros(n,dtype=bool)
         tr[idx[:cut]] = True; te[idx[cut:]] = True
         return tr, te
-
-    df_sorted = df.sort_values("_ts").reset_index(drop=True)
+    df_sorted = df.sort_values("_ts")
     n = len(df_sorted); cut = int(max(1,(1-test_size)*n))
     train_idx = df_sorted.index[:cut].to_numpy(); test_idx = df_sorted.index[cut:].to_numpy()
-    tr = np.zeros(n,dtype=bool); te = np.zeros(n,dtype=bool)
+    tr = np.zeros(len(df),dtype=bool); te = np.zeros(len(df),dtype=bool)
     tr[train_idx] = True; te[test_idx] = True
+    return tr, te
+
+# (1) Purged time split with embargo
+def time_purged_split(ts: np.ndarray, test_size: float, embargo_days: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(ts)
+    order = np.argsort(ts)
+    cut = int(max(1, (1 - float(test_size)) * n))
+    tr_idx = order[:cut]
+    te_idx = order[cut:]
+    if te_idx.size == 0:
+        te_idx = order[-max(1, int(n*test_size)):]
+        tr_idx = np.setdiff1d(order, te_idx, assume_unique=False)
+    if te_idx.size:
+        lo = float(ts[te_idx].min()) - embargo_days * 86400.0
+        hi = float(ts[te_idx].max()) + embargo_days * 86400.0
+        keep_tr = ~((ts[tr_idx] >= lo) & (ts[tr_idx] <= hi))
+        tr_idx = tr_idx[keep_tr]
+    tr = np.zeros(n, dtype=bool); te = np.zeros(n, dtype=bool)
+    tr[tr_idx] = True; te[te_idx] = True
     return tr, te
 
 def recency_weights(ts: np.ndarray) -> Optional[np.ndarray]:
@@ -398,6 +446,38 @@ def recency_weights(ts: np.ndarray) -> Optional[np.ndarray]:
     w = np.exp(-lam * np.maximum(0.0, dt_days))
     s = float(np.sum(w))
     return (w/s) if s>0 else None
+
+# ─────────────────────── Bookmaker implied probabilities (5) ─────────────────────── #
+
+def _latest_book_probs(conn, match_ids: List[int], market_key: str, selection: str) -> Dict[int, float]:
+    """
+    Returns {match_id: implied_prob} using the latest captured odds in odds_history
+    for the given (market_key, selection). Prob = 1/odds (no de-vig here for simplicity).
+    """
+    if not match_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (match_id)
+                   match_id, odds
+            FROM odds_history
+            WHERE match_id = ANY(%s)
+              AND market = %s
+              AND selection = %s
+            ORDER BY match_id, captured_ts DESC
+            """,
+            (match_ids, market_key, selection)
+        )
+        out = {}
+        for mid, odds in cur.fetchall() or []:
+            try:
+                o = float(odds or 0.0)
+                if o > 1.0:
+                    out[int(mid)] = max(0.01, min(0.99, 1.0/o))
+            except Exception:
+                pass
+        return out
 
 # ─────────────────────── Core training ─────────────────────── #
 
@@ -430,7 +510,6 @@ def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, featu
     fidx = {f:i for i,f in enumerate(features)}
     keep = np.ones(len(y_all), dtype=bool)
 
-    # helpers
     def col(name): return X_all[:, fidx[name]] if name in fidx else np.zeros(len(X_all))
 
     goals_sum = col("goals_sum")
@@ -441,12 +520,9 @@ def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, featu
             ln = float(market_key.split("_", 1)[1].replace(",", "."))
         except Exception:
             ln = 2.5
-        # if goals_sum > line, Over is already guaranteed; drop that snapshot
         keep &= ~(goals_sum > ln)
     elif market_key == "BTTS_YES":
-        # both already scored -> BTTS is locked as True; drop
         keep &= ~((gh > 0) & (ga > 0))
-    # 1X2_* : no drop
 
     return keep
 
@@ -467,46 +543,48 @@ def _train_binary_head(
     default_thr_prob: float,
     metrics_name: Optional[str] = None,
     train_minute_cutoff: Optional[int] = None,
+    # (5) bookmaker stacking input (aligned to X_all rows), optional
+    p_book_all: Optional[np.ndarray] = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
     """
     Train one binary head (e.g., BTTS_YES, OU_2.5, WLD_HOME).
 
-    Changes vs. original:
-      - Standardize X on train fold (mean/std), then fold scaler back into weights
-        so serving code in main.py remains unchanged.
-      - Drop trivial/decided in-play snapshots for this head (focus on uncertain states).
-      - Deterministic LogisticRegression (random_state) + tunable C via LR_C.
+    Upgrades in this function:
+      - (1) Minute cutoff applied on train fold only (no leakage).
+      - Drop trivial/decided snapshots for this head on train fold.
+      - Standardize, fit LR, then fold scaler into raw weights.
+      - (3) Minute-binned calibration (Platt per minute bin when possible).
+      - (5) Optional stacking with bookmaker implied prob (validation-only fit).
+      - (4) Threshold via Wilson lower bound.
     """
-    # sanity
     if len(np.unique(y_all)) < 2:
         return False, {}, None
 
-    # Apply minute cutoff on training rows (col 0 is 'minute'), if provided
+    # Train-minute cutoff
     if train_minute_cutoff is not None:
         try:
-            mt = (X_all[:, 0] <= float(train_minute_cutoff))
+            mt = (X_all[:, 0] <= float(train_minute_cutoff))  # col 0 is "minute"
             mask_tr = mask_tr & mt
         except Exception:
             pass
 
-    # Drop trivial/decided snapshots for this specific head (train only)
+    # Undecided filter (train only)
     try:
         undecided = _mask_undecided(model_key, X_all, y_all, feature_names)
         new_mask_tr = mask_tr & undecided
         if np.any(new_mask_tr):
             mask_tr = new_mask_tr
         else:
-            logger.info("[TRAIN] %s: undecided filter removed all train rows; proceeding without it.", model_key)
-    except Exception as _:
-        # be permissive; training should still proceed
+            logger.info("[TRAIN] %s: undecided filter removed all train rows; proceeding.", model_key)
+    except Exception:
         pass
 
-    # Split to folds
+    # Split arrays
     X_tr, X_te = X_all[mask_tr], X_all[mask_te]
     y_tr, y_te = y_all[mask_tr], y_all[mask_te]
     ts_tr      = ts_all[mask_tr]
 
-    # Standardize on train, apply to test
+    # Standardize on train, apply on test
     X_tr_std, mu, sd = _standardize_fit(X_tr)
     X_te_std = (X_te - mu) / sd
 
@@ -516,12 +594,47 @@ def _train_binary_head(
     if model is None:
         return False, {}, None
 
-    # Validate (calibration on validation fold)
+    # Validation raw probs
     p_raw_te = model.predict_proba(X_te_std)[:, 1]
+
+    # (3) Minute-binned calibration
+    BINS = [(0,20),(20,40),(40,60),(60,200)]
+    minute_idx = feature_names.index("minute") if "minute" in feature_names else None
+    cal_by_minute: List[Dict[str, float]] = []
+    if minute_idx is not None:
+        for lo, hi in BINS:
+            m = (X_te[:, minute_idx] >= lo) & (X_te[:, minute_idx] < hi)
+            if m.sum() >= 150 and (len(np.unique(y_te[m])) == 2):
+                kind_m, obj_m = _fit_calibration(y_te[m], p_raw_te[m])
+                if kind_m == "platt":
+                    a_m, b_m = obj_m
+                else:
+                    x = np.linspace(0.01, 0.99, 200); yhat = obj_m.predict(x)
+                    zx, zy = _logit_vec(x), _logit_vec(np.clip(yhat, 1e-4, 1-1e-4))
+                    a_m, b_m = np.polyfit(zx, zy, 1)
+                cal_by_minute.append({"lo": float(lo), "hi": float(hi), "a": float(a_m), "b": float(b_m)})
+
+    # Global calibration (fallback/base)
     cal_kind, cal_obj = _fit_calibration(y_te, p_raw_te)
     p_cal = _apply_calibration(p_raw_te, cal_kind, cal_obj)
 
-    # Metrics
+    # (5) Stacking with bookmaker implied prob (validation fold only)
+    stack_coeffs = None
+    if p_book_all is not None:
+        p_book_te = p_book_all[mask_te]
+        mask_valid = np.isfinite(p_book_te) & (p_book_te > 0) & (p_book_te < 1)
+        if mask_valid.sum() >= 200 and (len(np.unique(y_te[mask_valid])) == 2):
+            Zm = _logit_vec(np.clip(p_cal[mask_valid], 1e-6, 1-1e-6)).reshape(-1,1)
+            Zb = _logit_vec(np.clip(p_book_te[mask_valid], 1e-6, 1-1e-6)).reshape(-1,1)
+            Z = np.concatenate([Zm, Zb], axis=1)
+            meta = LogisticRegression(max_iter=2000, solver="lbfgs", class_weight="balanced", random_state=42)
+            meta.fit(Z, y_te[mask_valid].astype(int))
+            a_model = float(meta.coef_.ravel()[0]); a_book = float(meta.coef_.ravel()[1]); b_meta = float(meta.intercept_.ravel()[0])
+            p_stack = 1.0/(1.0+np.exp(-(a_model*Zm.ravel() + a_book*Zb.ravel() + b_meta)))
+            if brier_score_loss(y_te[mask_valid], p_stack) + 1e-6 < brier_score_loss(y_te[mask_valid], p_cal[mask_valid]):
+                stack_coeffs = {"a_model": a_model, "a_book": a_book, "b": b_meta}
+
+    # Metrics (on calibrated model, not stacked; stacking info is saved in blob)
     mets = {
         "brier": float(brier_score_loss(y_te, p_cal)),
         "auc": float(roc_auc_score(y_te, p_cal)) if len(np.unique(y_te)) > 1 else float("nan"),
@@ -535,19 +648,16 @@ def _train_binary_head(
     if metrics_name:
         logger.info("[METRICS] %s: %s", metrics_name, mets)
 
-    # Serialize model: fold scaler into raw-space weights so serving stays unchanged
-    blob = build_model_blob(model, feature_names, cal_kind, cal_obj, mean=mu, scale=sd)
+    # Serialize model
+    blob = build_model_blob(model, feature_names, cal_kind, cal_obj, mean=mu, scale=sd,
+                            cal_by_minute=cal_by_minute or None, stack_coeffs=stack_coeffs)
     for k in (f"model_latest:{model_key}", f"model:{model_key}"):
         _set_setting(conn, k, json.dumps(blob))
 
-    # Optional: derive/update per-market threshold from validation fold
+    # (4) Wilson-LB threshold (per-market), if requested
     if threshold_label:
-        thr_prob = _pick_threshold_for_target_precision(
-            y_true=y_te,
-            p_cal=p_cal,
-            target_precision=target_precision,
-            min_preds=min_preds,
-            default_threshold=default_thr_prob,
+        thr_prob = pick_threshold_with_wilson(
+            y_true=y_te, p_cal=p_cal, min_preds=min_preds, target_precision=target_precision
         )
         thr_pct = float(np.clip(_percent(thr_prob), min_thresh_pct, max_thresh_pct))
         _set_setting(conn, f"conf_threshold:{threshold_label}", f"{thr_pct:.2f}")
@@ -584,17 +694,35 @@ def train_models(
         # ===== In-Play =====
         df_ip = load_inplay_data(conn, min_minute=min_minute)
         if not df_ip.empty and len(df_ip) >= min_rows:
-            tr_mask, te_mask = time_order_split(df_ip, test_size=test_size)
-            df_ip = df_ip.reset_index(drop=True)
+            # (1) purged time split (no index resetting afterwards)
+            tr_mask, te_mask = time_purged_split(df_ip["_ts"].values, test_size=test_size, embargo_days=3)
             X_all  = _ensure_columns(df_ip, FEATURES).values
             ts_all = df_ip["_ts"].values
+
+            # helper to get bookmaker implied prob vectors per head (5)
+            def _book_probe_for(df, mk: str) -> Optional[np.ndarray]:
+                mid = df["_mid"].astype(int).tolist()
+                if mk == "BTTS_YES":
+                    mp = _latest_book_probs(conn, mid, "BTTS", "Yes")
+                elif mk.startswith("OU_"):
+                    line_txt = mk.split("_",1)[1]
+                    mp = _latest_book_probs(conn, mid, f"OU_{line_txt}", "Over")
+                elif mk == "WLD_HOME":
+                    mp = _latest_book_probs(conn, mid, "1X2", "Home")
+                elif mk == "WLD_AWAY":
+                    mp = _latest_book_probs(conn, mid, "1X2", "Away")
+                else:
+                    return None
+                arr = np.array([mp.get(int(m), np.nan) for m in df["_mid"]], dtype=float)
+                return arr
 
             # BTTS
             ok, mets, _ = _train_binary_head(
                 conn, X_all, df_ip["btts_yes"].values.astype(int), ts_all,
                 tr_mask, te_mask, FEATURES, "BTTS_YES", "BTTS",
                 target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                "BTTS_YES", _minute_cutoff_for_market("BTTS")
+                "BTTS_YES", _minute_cutoff_for_market("BTTS"),
+                p_book_all=_book_probe_for(df_ip, "BTTS_YES")
             )
             summary["trained"]["BTTS_YES"] = ok
             if ok: summary["metrics"]["BTTS_YES"] = mets
@@ -607,7 +735,8 @@ def train_models(
                     conn, X_all, (totals > line).astype(int), ts_all,
                     tr_mask, te_mask, FEATURES, name, f"Over/Under {_fmt_line(line)}",
                     target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                    name, _minute_cutoff_for_market("Over/Under")
+                    name, _minute_cutoff_for_market("Over/Under"),
+                    p_book_all=_book_probe_for(df_ip, name)
                 )
                 summary["trained"][name] = ok
                 if ok:
@@ -618,22 +747,25 @@ def train_models(
                             for k in ("model_latest:O25","model:O25"):
                                 _set_setting(conn, k, json.dumps(blob))
 
-            # 1X2
+            # 1X2 (draw suppressed)
             gd = df_ip["final_goals_diff"].values.astype(int)
             y_home = (gd > 0).astype(int); y_draw = (gd == 0).astype(int); y_away = (gd < 0).astype(int)
 
             ok_h, mets_h, p_h = _train_binary_head(conn, X_all, y_home, ts_all, tr_mask, te_mask, FEATURES,
                                                    "WLD_HOME", None, target_precision, min_preds,
                                                    min_thresh, max_thresh, 0.45, "WLD_HOME",
-                                                   _minute_cutoff_for_market("1X2"))
+                                                   _minute_cutoff_for_market("1X2"),
+                                                   p_book_all=_book_probe_for(df_ip, "WLD_HOME"))
             ok_d, mets_d, p_d = _train_binary_head(conn, X_all, y_draw, ts_all, tr_mask, te_mask, FEATURES,
                                                    "WLD_DRAW", None, target_precision, min_preds,
                                                    min_thresh, max_thresh, 0.45, "WLD_DRAW",
-                                                   _minute_cutoff_for_market("1X2"))
+                                                   _minute_cutoff_for_market("1X2"),
+                                                   p_book_all=None)
             ok_a, mets_a, p_a = _train_binary_head(conn, X_all, y_away, ts_all, tr_mask, te_mask, FEATURES,
                                                    "WLD_AWAY", None, target_precision, min_preds,
                                                    min_thresh, max_thresh, 0.45, "WLD_AWAY",
-                                                   _minute_cutoff_for_market("1X2"))
+                                                   _minute_cutoff_for_market("1X2"),
+                                                   p_book_all=_book_probe_for(df_ip, "WLD_AWAY"))
 
             summary["trained"]["WLD_HOME"] = ok_h; summary["trained"]["WLD_DRAW"] = ok_d; summary["trained"]["WLD_AWAY"] = ok_a
             if ok_h: summary["metrics"]["WLD_HOME"] = mets_h
@@ -650,9 +782,9 @@ def train_models(
                 y_class[gd_te==0] = 1; y_class[gd_te<0] = 2
                 correct = (np.argmax(np.stack([phn,pdn,pan],axis=1), axis=1) == y_class).astype(int)
 
-                thr_prob = _pick_threshold_for_target_precision(
+                thr_prob = pick_threshold_with_wilson(
                     y_true=correct, p_cal=p_max,
-                    target_precision=target_precision, min_preds=min_preds, default_threshold=0.45
+                    min_preds=min_preds, target_precision=target_precision
                 )
                 thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
                 _set_setting(conn, "conf_threshold:1X2", f"{thr_pct:.2f}")
@@ -664,8 +796,7 @@ def train_models(
         # ===== Prematch =====
         df_pre = load_prematch_data(conn)
         if not df_pre.empty and len(df_pre) >= min_rows:
-            tr_mask, te_mask = time_order_split(df_pre, test_size=test_size)
-            df_pre = df_pre.reset_index(drop=True)
+            tr_mask, te_mask = time_purged_split(df_pre["_ts"].values, test_size=test_size, embargo_days=3)
             Xp_all = _ensure_columns(df_pre, PRE_FEATURES).values
             ts_pre = df_pre["_ts"].values
 
@@ -674,7 +805,7 @@ def train_models(
                 conn, Xp_all, df_pre["label_btts"].values.astype(int), ts_pre,
                 tr_mask, te_mask, PRE_FEATURES, "PRE_BTTS_YES", "PRE BTTS",
                 target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                "PRE_BTTS_YES", None
+                "PRE_BTTS_YES", None, p_book_all=None
             )
             summary["trained"]["PRE_BTTS_YES"] = ok
             if ok: summary["metrics"]["PRE_BTTS_YES"] = mets
@@ -687,7 +818,7 @@ def train_models(
                     conn, Xp_all, (totals > line).astype(int), ts_pre,
                     tr_mask, te_mask, PRE_FEATURES, name, f"PRE Over/Under {_fmt_line(line)}",
                     target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                    name, None
+                    name, None, p_book_all=None
                 )
                 summary["trained"][name] = ok
                 if ok: summary["metrics"][name] = mets
@@ -698,10 +829,10 @@ def train_models(
 
             ok_h, mets_h, p_h = _train_binary_head(conn, Xp_all, y_home, ts_pre, tr_mask, te_mask, PRE_FEATURES,
                                                    "PRE_WLD_HOME", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_HOME", None)
+                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_HOME", None, p_book_all=None)
             ok_a, mets_a, p_a = _train_binary_head(conn, Xp_all, y_away, ts_pre, tr_mask, te_mask, PRE_FEATURES,
                                                    "PRE_WLD_AWAY", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_AWAY", None)
+                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_AWAY", None, p_book_all=None)
             summary["trained"]["PRE_WLD_HOME"] = ok_h; summary["trained"]["PRE_WLD_AWAY"] = ok_a
             if ok_h: summary["metrics"]["PRE_WLD_HOME"] = mets_h
             if ok_a: summary["metrics"]["PRE_WLD_AWAY"] = mets_a
@@ -715,9 +846,9 @@ def train_models(
                 mask = (y_class != -1)
                 if mask.any():
                     correct = (np.argmax(np.stack([phn,pan],axis=1), axis=1)[mask] == y_class[mask]).astype(int)
-                    thr_prob = _pick_threshold_for_target_precision(
+                    thr_prob = pick_threshold_with_wilson(
                         y_true=correct, p_cal=p_max[mask],
-                        target_precision=target_precision, min_preds=min_preds, default_threshold=0.45
+                        min_preds=min_preds, target_precision=target_precision
                     )
                     thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
                     _set_setting(conn, "conf_threshold:PRE 1X2", f"{thr_pct:.2f}")
@@ -754,7 +885,7 @@ def train_models(
 
 def _cli_main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-url", help="Postgres DSN (or use env DATABASE_URL)")
+    ap.add_argument("--db-url", help="Postgres DSN (or use env DATABASE_URL")
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=int(os.getenv("TRAIN_MIN_MINUTE", 15)))
     ap.add_argument("--test-size", type=float, default=float(os.getenv("TRAIN_TEST_SIZE", 0.25)))
     ap.add_argument("--min-rows", type=int, default=int(os.getenv("MIN_ROWS", 150)))
