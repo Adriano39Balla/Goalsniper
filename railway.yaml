@@ -1,37 +1,8 @@
+# railway.yaml
 services:
-  - type: web
-    name: goalsniper
-    env: python
-    buildCommand: >
-      python -m pip install --upgrade pip &&
-      pip install --no-cache-dir -r requirements.txt &&
-      chmod +x start.sh
-    startCommand: bash start.sh
-    healthCheckPath: /health
-    envVars:
-      - key: RUN_SCHEDULER
-        value: "1"
-      - key: DATABASE_URL
-        sync: false
-      - key: API_KEY
-        sync: false
-      - key: ADMIN_API_KEY
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-      - key: OU_LINES
-        value: "2.5"
-      - key: OU_TRAIN_LINES
-        value: "2.5"
-      - key: TIP_MIN_MINUTE
-        value: "20"
-      - key: PREDICTIONS_PER_MATCH
-        value: "1"
-      - key: DUP_COOLDOWN_MIN
-        value: "25"
-      - key: SCAN_INTERVAL_SEC
-        value: "300"
-      - key: TRAIN_ENABLE
-        value: "1"
+  api:
+    build:
+      builder: python:3.11
+      buildCommand: pip install -r requirements.txt
+      startCommand: python main.py
+    
