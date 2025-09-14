@@ -1011,60 +1011,130 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     return updated
 
 def daily_accuracy_digest(window_days: Optional[int] = None) -> Optional[str]:
-    if window_days is None:
-        window_days = int(os.getenv("DAILY_DIGEST_WINDOW_DAYS"))
     """
-    Rolling accuracy digest over N days.
-    Includes ROI (1u flat staking) per market.
+    Accuracy/ROI digest over a configurable rolling window (default 1 day).
+    - Uses Berlin local time for the window and display.
+    - Backfills results first so grading is up to date.
+    - Computes overall accuracy and per-market ROI (1u flat staking).
     """
-    if not DAILY_ACCURACY_DIGEST_ENABLE: return None
-    backfill_results_for_open_matches(400)
+    try:
+        # Resolve window (days)
+        if window_days is None:
+            try:
+                window_days = int(os.getenv("DAILY_DIGEST_WINDOW_DAYS", str(DAILY_DIGEST_WINDOW_DAYS)))
+            except Exception:
+                window_days = 1
+        window_days = max(1, int(window_days))
 
-    cutoff=int((datetime.now(BERLIN_TZ)-timedelta(days=window_days)).timestamp())
-    with db_conn() as c:
-        rows=c.execute("""
-            SELECT t.market, t.suggestion, t.confidence, t.confidence_raw, t.created_ts,
-                   t.odds, r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM tips t LEFT JOIN match_results r ON r.match_id=t.match_id
-            WHERE t.created_ts >= %s AND t.suggestion<>'HARVEST' AND t.sent_ok=1
-        """,(cutoff,)).fetchall()
+        # Keep results fresh
+        backfill_results_for_open_matches(400)
 
-    total=graded=wins=0
-    roi_by_market, by_market = {}, {}
+        # Window cutoff (Berlin-local → UTC timestamp)
+        now_local = datetime.now(BERLIN_TZ)
+        cutoff_ts = int((now_local - timedelta(days=window_days)).timestamp())
 
-    for (mkt, sugg, conf, conf_raw, cts, odds, gh, ga, btts) in rows:
-        res={"final_goals_h":gh,"final_goals_a":ga,"btts_yes":btts}
-        out=_tip_outcome_for_result(sugg,res)
-        if out is None: continue
+        # Pull tips inside window, joined to results if present
+        with db_conn() as c:
+            rows = c.execute(
+                """
+                SELECT
+                    t.market,
+                    t.suggestion,
+                    COALESCE(t.confidence_raw, t.confidence/100.0) AS prob,
+                    t.odds,
+                    t.created_ts,
+                    r.final_goals_h, r.final_goals_a, r.btts_yes
+                FROM tips t
+                LEFT JOIN match_results r ON r.match_id = t.match_id
+                WHERE t.created_ts >= %s
+                  AND t.suggestion <> 'HARVEST'
+                  AND t.sent_ok = 1
+                ORDER BY t.created_ts ASC
+                """,
+                (cutoff_ts,),
+            ).fetchall()
 
-        total+=1; graded+=1; wins+=1 if out==1 else 0
-        d=by_market.setdefault(mkt or "?",{"graded":0,"wins":0}); d["graded"]+=1; d["wins"]+=1 if out==1 else 0
+        if not rows:
+            msg = f"📊 Accuracy Digest\nNo tips in the last {window_days}d."
+            send_telegram(msg)
+            return msg
 
-        if odds:
-            roi_by_market.setdefault(mkt, {"stake":0,"pnl":0})
-            roi_by_market[mkt]["stake"]+=1
-            if out==1: roi_by_market[mkt]["pnl"]+=float(odds)-1
-            else: roi_by_market[mkt]["pnl"]-=1
+        # Helpers
+        def _grade(suggestion: str, gh: Optional[int], ga: Optional[int], btts: Optional[int]) -> Optional[int]:
+            if gh is None or ga is None or btts is None:
+                return None
+            return _tip_outcome_for_result(suggestion, {
+                "final_goals_h": int(gh or 0),
+                "final_goals_a": int(ga or 0),
+                "btts_yes": int(btts or 0)
+            })
 
-    if graded==0:
-        msg="📊 Accuracy Digest\nNo graded tips in window."
-    else:
-        acc=100.0*wins/max(1,graded)
-        lines=[f"📊 <b>Accuracy Digest</b> (last {window_days}d)",
-               f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"]
+        total_sent = len(rows)
+        graded = wins = 0
 
-        for mk,st in sorted(by_market.items()):
-            if st["graded"]==0: continue
-            a=100.0*st["wins"]/st["graded"]
-            roi=""; 
-            if mk in roi_by_market and roi_by_market[mk]["stake"]>0:
-                roi_val=100.0*roi_by_market[mk]["pnl"]/roi_by_market[mk]["stake"]
-                roi=f" • ROI {roi_val:+.1f}%"
-            lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} ({a:.1f}%){roi}")
+        by_market: Dict[str, Dict[str, float]] = {}  # graded, wins, stake, pnl
+        for (mkt, sugg, prob, odds, cts, gh, ga, btts) in rows:
+            # Grade if we have a result
+            outcome = _grade(sugg, gh, ga, btts)
+            if outcome is None:
+                continue
+            graded += 1
+            if int(outcome) == 1:
+                wins += 1
 
-        msg="\n".join(lines)
+            # Per-market tallies
+            m = by_market.setdefault(mkt or "?", {"graded": 0, "wins": 0, "stake": 0.0, "pnl": 0.0})
+            m["graded"] += 1
+            if int(outcome) == 1:
+                m["wins"] += 1
 
-    send_telegram(msg); return msg
+            # ROI only if odds available and sane
+            try:
+                o = float(odds) if odds is not None else None
+                if o is not None and 1.01 <= o <= MAX_ODDS_ALL:
+                    m["stake"] += 1.0
+                    m["pnl"] += (o - 1.0) if int(outcome) == 1 else -1.0
+            except Exception:
+                pass
+
+        if graded == 0:
+            msg = f"📊 Accuracy Digest\nNo graded tips in the last {window_days}d."
+            send_telegram(msg)
+            return msg
+
+        acc = 100.0 * wins / max(1, graded)
+
+        # Header
+        header = [
+            f"📊 <b>Accuracy Digest</b> (last {window_days}d)",
+            f"Tips sent: {total_sent}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"
+        ]
+
+        # Per-market lines (sorted for stable output)
+        body: List[str] = []
+        for mk in sorted(by_market.keys()):
+            st = by_market[mk]
+            if st["graded"] <= 0:
+                continue
+            a = 100.0 * st["wins"] / max(1, st["graded"])
+            roi_txt = ""
+            if st["stake"] > 0:
+                roi_val = 100.0 * st["pnl"] / st["stake"]
+                roi_txt = f" • ROI {roi_val:+.1f}%"
+            body.append(f"• {escape(mk)} — {int(st['wins'])}/{int(st['graded'])} ({a:.1f}%){roi_txt}")
+
+        msg = "\n".join(header + body)
+        send_telegram(msg)
+        return msg
+
+    except Exception as e:
+        log.exception("[DIGEST] failed: %s", e)
+        # Don’t raise; just report failure once
+        try:
+            send_telegram(f"📊 Accuracy Digest failed: {escape(str(e))}")
+        except Exception:
+            pass
+        return None
 
 # ───────── Thresholds & formatting ─────────
 def _get_market_threshold_key(m: str) -> str: return f"conf_threshold:{m}"
@@ -2109,8 +2179,19 @@ def http_train():
 @app.route("/admin/train-notify", methods=["POST","GET"])
 def http_train_notify(): _require_admin(); auto_train_job(); return jsonify({"ok": True})
 
-@app.route("/admin/digest", methods=["POST","GET"])
-def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
+@app.route("/admin/digest", methods=["POST", "GET"])
+def http_digest():
+    _require_admin()
+    # Optional override: /admin/digest?days=1
+    days_q = request.args.get("days", "").strip()
+    days = None
+    try:
+        if days_q:
+            days = max(1, int(float(days_q)))
+    except Exception:
+        days = None
+    msg = daily_accuracy_digest(window_days=days)
+    return jsonify({"ok": bool(msg), "window_days": (days if days is not None else DAILY_DIGEST_WINDOW_DAYS)})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
 def http_auto_tune(): _require_admin(); tuned=auto_tune_thresholds(14); return jsonify({"ok": True, "tuned": tuned})
