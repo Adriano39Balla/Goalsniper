@@ -155,6 +155,8 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES = {"1H","HT","2H","ET","BT","P"}
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 session = requests.Session()
 session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503,504], respect_retry_after_header=True)))
 
@@ -561,17 +563,50 @@ def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) 
     s=float(intercept or 0.0)
     for k,w in (weights or {}).items(): s += float(w or 0.0)*float(feat.get(k,0.0))
     return s
-def _calibrate(p: float, cal: Dict[str,Any]) -> float:
+
+# >>> UPGRADE: minute-binned calibration support <<<
+def _pick_bin_params(cal_bins: list|None, minute: float) -> Optional[Tuple[float,float]]:
+    """Return (a,b) for minute-binned Platt if minute falls in a learned bin."""
+    if not cal_bins: return None
+    try:
+        m=float(minute or 0.0)
+        for b in cal_bins:
+            lo=float((b or {}).get("lo", -1e9)); hi=float((b or {}).get("hi", 1e9))
+            if lo <= m < hi:
+                return float(b.get("a", 1.0)), float(b.get("b", 0.0))
+    except Exception:
+        pass
+    return None
+
+def _calibrate_base(p: float, cal: Dict[str,Any]) -> float:
+    """Global calibration fallback (Platt or sigmoid)."""
     method=(cal or {}).get("method","sigmoid"); a=float((cal or {}).get("a",1.0)); b=float((cal or {}).get("b",0.0))
     if method.lower()=="platt": return _sigmoid(a*_logit(p)+b)
     import math; p=max(EPS,min(1-EPS,float(p))); z=math.log(p/(1-p)); return _sigmoid(a*z+b)
+
 def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
+    """
+    Return calibrated model probability using minute-binned Platt if available,
+    else the global calibration in the blob.
+    """
+    # raw model score
     p=_sigmoid(_linpred(feat, mdl.get("weights",{}), float(mdl.get("intercept",0.0))))
-    cal=mdl.get("calibration") or {}
+    p=float(max(0.0, min(1.0, p)))
+
+    # minute-binned override
+    cal_bins = mdl.get("calibration_by_minute")
+    bin_params = _pick_bin_params(cal_bins, feat.get("minute", 0.0))
+    if bin_params is not None:
+        a,b = bin_params
+        return float(_sigmoid(a*_logit(p) + b))
+
+    # global calibration
     try: 
-        if cal: p=_calibrate(p, cal)
-    except: pass
-    return max(0.0, min(1.0, float(p)))
+        cal=mdl.get("calibration") or {}
+        return float(_calibrate_base(p, cal)) if cal else p
+    except: 
+        return p
+
 def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
     name=f"OU_{_fmt_line(line)}"; mdl=load_model_from_settings(name)
     return mdl or (load_model_from_settings("O25") if abs(line-2.5)<1e-6 else None)
@@ -799,11 +834,38 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
     if not (min_odds <= odds <= MAX_ODDS_ALL):
         return (False, odds, book, None)
 
-    # EV check (bps)
-    ev = _ev(prob=1.0, odds=float(odds))  # base; real EV computed later with actual prob
-    # We don't know prob here, so defer EV thresholding until the call site computes EV with prob.
-    # Still return odds and book so caller can compute EV and apply EDGE_MIN_BPS.
+    # EV check deferred until caller computes with actual probability
     return (True, odds, book, None)
+
+# ───────── Stacking helpers (model + bookmaker) ─────────
+def _implied_prob_from_odds(odds: Optional[float]) -> Optional[float]:
+    try:
+        o = float(odds or 0.0)
+        if o <= 1.0:
+            return None
+        return max(0.01, min(0.99, 1.0 / o))
+    except Exception:
+        return None
+
+def _apply_stack_if_available(p_model: float, mdl: Optional[Dict[str,Any]], p_book: Optional[float]) -> float:
+    """
+    If the model blob contains stack coefficients {'a_model','a_book','b'} and a valid
+    bookmaker implied probability is present, blend logits and return the stacked prob.
+    Otherwise return p_model unchanged.
+    """
+    try:
+        if not mdl:
+            return float(p_model)
+        stack = mdl.get("stack")
+        if not stack or p_book is None:
+            return float(p_model)
+        a_model = float(stack.get("a_model", 0.0))
+        a_book  = float(stack.get("a_book",  0.0))
+        b0      = float(stack.get("b",       0.0))
+        z = a_model*_logit(p_model) + a_book*_logit(p_book) + b0
+        return float(_sigmoid(z))
+    except Exception:
+        return float(p_model)
 
 # ───────── Snapshots ─────────
 def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
@@ -1211,7 +1273,7 @@ def production_scan() -> Tuple[int, int]:
                 home, away = _teams(m)
                 score = _pretty_score(m)
 
-                candidates: List[Tuple[str, str, float]] = []
+                candidates: List[Tuple[str, str, float, Optional[Dict[str,Any]]]] = []
 
                 # OU
                 for line in OU_LINES:
@@ -1228,7 +1290,7 @@ def production_scan() -> Tuple[int, int]:
                         and _candidate_is_sane(sug_over, feat)
                         and market_cutoff_ok(minute, mk, sug_over)
                     ):
-                        candidates.append((mk, sug_over, p_over))
+                        candidates.append((mk, sug_over, p_over, mdl))
 
                     p_under = 1.0 - p_over
                     sug_under = f"Under {_fmt_line(line)} Goals"
@@ -1237,7 +1299,8 @@ def production_scan() -> Tuple[int, int]:
                         and _candidate_is_sane(sug_under, feat)
                         and market_cutoff_ok(minute, mk, sug_under)
                     ):
-                        candidates.append((mk, sug_under, p_under))
+                        # For stacking, use the same OU model; book-prob will be 1-p if needed
+                        candidates.append((mk, sug_under, p_under, mdl))
 
                 # BTTS
                 mdl_btts = load_model_from_settings("BTTS_YES")
@@ -1251,7 +1314,7 @@ def production_scan() -> Tuple[int, int]:
                         and _candidate_is_sane("BTTS: Yes", feat)
                         and market_cutoff_ok(minute, mk, "BTTS: Yes")
                     ):
-                        candidates.append((mk, "BTTS: Yes", p_yes))
+                        candidates.append((mk, "BTTS: Yes", p_yes, mdl_btts))
 
                     p_no = 1.0 - p_yes
                     if (
@@ -1259,7 +1322,7 @@ def production_scan() -> Tuple[int, int]:
                         and _candidate_is_sane("BTTS: No", feat)
                         and market_cutoff_ok(minute, mk, "BTTS: No")
                     ):
-                        candidates.append((mk, "BTTS: No", p_no))
+                        candidates.append((mk, "BTTS: No", p_no, mdl_btts))
 
                 # 1X2 (draw suppressed)
                 mh, md, ma = _load_wld_models()
@@ -1273,9 +1336,9 @@ def production_scan() -> Tuple[int, int]:
                     ph, pa = ph / s, pa / s
 
                     if ph * 100.0 >= thr and market_cutoff_ok(minute, mk, "Home Win"):
-                        candidates.append((mk, "Home Win", ph))
+                        candidates.append((mk, "Home Win", ph, mh))
                     if pa * 100.0 >= thr and market_cutoff_ok(minute, mk, "Away Win"):
-                        candidates.append((mk, "Away Win", pa))
+                        candidates.append((mk, "Away Win", pa, ma))
 
                 if not candidates:
                     continue
@@ -1283,7 +1346,7 @@ def production_scan() -> Tuple[int, int]:
                 odds_map = fetch_odds(fid) if API_KEY else {}
                 ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
 
-                for mk, sug, prob in candidates:
+                for mk, sug, p_model, mdl_used in candidates:
                     if sug not in ALLOWED_SUGGESTIONS:
                         continue
 
@@ -1307,26 +1370,30 @@ def production_scan() -> Tuple[int, int]:
                         if tgt in d:
                             odds, book = d[tgt]["odds"], d[tgt]["book"]
 
-                    # gate on presence (and floor/ceiling) + compute EV
+                    # gate on presence (and floor/ceiling)
                     pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
                     if not pass_odds:
                         continue
                     if odds is None:
                         odds = odds2
                         book = book2
-
-                    ev_pct = None
-                    if odds is not None:
-                        edge = _ev(prob, float(odds))
-                        ev_pct = round(edge * 100.0, 1)
-                        if int(round(edge * 10000)) < EDGE_MIN_BPS:
-                            continue
-                    else:
-                        # odds are mandatory by default (ALLOW_TIPS_WITHOUT_ODDS=0); skip
+                    if odds is None:
+                        # odds mandatory by default (ALLOW_TIPS_WITHOUT_ODDS=0)
                         continue
 
-                    rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0)
-                    ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score))
+                    # Stacking: blend model prob with bookmaker implied prob (if stack params exist)
+                    p_book = _implied_prob_from_odds(odds)
+                    p_final = _apply_stack_if_available(p_model, mdl_used, p_book)
+
+                    # EV check using p_final
+                    edge = _ev(p_final, float(odds))
+                    ev_pct = round(edge * 100.0, 1)
+                    if int(round(edge * 10000)) < EDGE_MIN_BPS:
+                        continue
+
+                    # Rank: emphasize higher prob & EV
+                    rank_score = (p_final ** 1.2) * (1 + (ev_pct or 0) / 100.0)
+                    ranked.append((mk, sug, p_final, odds, book, ev_pct, rank_score))
 
                 if not ranked:
                     continue
@@ -1336,13 +1403,12 @@ def production_scan() -> Tuple[int, int]:
                 per_match = 0
                 base_now = int(time.time())
 
-                for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank) in enumerate(ranked):
+                for idx, (market_txt, suggestion, p_final, odds, book, ev_pct, _rank) in enumerate(ranked):
                     if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
                         continue
 
                     created_ts = base_now + idx
-                    raw = float(prob)
-                    prob_pct = round(raw * 100.0, 1)
+                    prob_pct = round(float(p_final) * 100.0, 1)
 
                     try:
                         with db_conn() as c2:
@@ -1359,7 +1425,7 @@ def production_scan() -> Tuple[int, int]:
                                 (
                                     fid, league_id, league, home, away,
                                     market_txt, suggestion,
-                                    float(prob_pct), raw, score, minute, created_ts,
+                                    float(prob_pct), float(p_final), score, minute, created_ts,
                                     (float(odds) if odds is not None else None),
                                     (book or None),
                                     (float(ev_pct) if ev_pct is not None else None),
@@ -1393,7 +1459,7 @@ def production_scan() -> Tuple[int, int]:
     log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
     return saved, live_seen
 
-# ───────── Prematch (snapshot + save; thresholds & EV enforced) ─────────
+# ───────── Prematch (snapshot + save; thresholds & EV enforced + stacking) ─────────
 def extract_prematch_features(fx: dict) -> Dict[str,float]:
     teams = fx.get("teams") or {}
     th = (teams.get("home") or {}).get("id")
@@ -1574,7 +1640,7 @@ def prematch_scan_save() -> int:
         except Exception:
             pass
 
-        candidates: List[Tuple[str, str, float]] = []
+        candidates: List[Tuple[str, str, float, Optional[Dict[str,Any]]]] = []
 
         # PRE OU
         for line in OU_LINES:
@@ -1585,10 +1651,10 @@ def prematch_scan_save() -> int:
             mk = f"Over/Under {_fmt_line(line)}"
             thr = _get_market_threshold_pre(mk)
             if p * 100.0 >= thr:
-                candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p))
+                candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p, mdl))
             q = 1.0 - p
             if q * 100.0 >= thr:
-                candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", q))
+                candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", q, mdl))
 
         # PRE BTTS
         mdl = load_model_from_settings("PRE_BTTS_YES")
@@ -1596,10 +1662,10 @@ def prematch_scan_save() -> int:
             p = _score_prob(feat, mdl)
             thr = _get_market_threshold_pre("BTTS")
             if p * 100.0 >= thr:
-                candidates.append(("PRE BTTS", "BTTS: Yes", p))
+                candidates.append(("PRE BTTS", "BTTS: Yes", p, mdl))
             q = 1.0 - p
             if q * 100.0 >= thr:
-                candidates.append(("PRE BTTS", "BTTS: No", q))
+                candidates.append(("PRE BTTS", "BTTS: No", q, mdl))
 
         # PRE 1X2 (draw suppressed)
         mh, ma = load_model_from_settings("PRE_WLD_HOME"), load_model_from_settings("PRE_WLD_AWAY")
@@ -1610,9 +1676,9 @@ def prematch_scan_save() -> int:
             ph, pa = ph / s, pa / s
             thr = _get_market_threshold_pre("1X2")
             if ph * 100.0 >= thr:
-                candidates.append(("PRE 1X2", "Home Win", ph))
+                candidates.append(("PRE 1X2", "Home Win", ph, mh))
             if pa * 100.0 >= thr:
-                candidates.append(("PRE 1X2", "Away Win", pa))
+                candidates.append(("PRE 1X2", "Away Win", pa, ma))
 
         if not candidates:
             continue
@@ -1620,8 +1686,9 @@ def prematch_scan_save() -> int:
         candidates.sort(key=lambda x: x[2], reverse=True)
         base_now = int(time.time())
         per_match = 0
+        odds_map = fetch_odds(fid) if API_KEY else {}
 
-        for idx, (mk, sug, prob) in enumerate(candidates):
+        for idx, (mk, sug, p_model, mdl_used) in enumerate(candidates):
             if sug not in ALLOWED_SUGGESTIONS:
                 continue
             if per_match >= max(1, PREDICTIONS_PER_MATCH):
@@ -1630,19 +1697,21 @@ def prematch_scan_save() -> int:
             pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ", ""), sug, fid)
             if not pass_odds:
                 continue
+            if odds is None:
+                # odds mandatory by default
+                continue
 
-            ev_pct = None
-            if odds is not None:
-                edge = _ev(prob, odds)
-                ev_pct = round(edge * 100.0, 1)
-                if int(round(edge * 10000)) < EDGE_MIN_BPS:
-                    continue
-            else:
-                continue  # odds mandatory by default
+            # bookmaker implied prob for stacking
+            p_book = _implied_prob_from_odds(odds)
+            p_final = _apply_stack_if_available(p_model, mdl_used, p_book)
+
+            edge = _ev(p_final, odds)
+            ev_pct = round(edge * 100.0, 1)
+            if int(round(edge * 10000)) < EDGE_MIN_BPS:
+                continue
 
             created_ts = base_now + idx
-            raw = float(prob)
-            pct = round(raw * 100.0, 1)
+            pct = round(float(p_final) * 100.0, 1)
 
             with db_conn() as c2:
                 c2.execute(
@@ -1651,7 +1720,7 @@ def prematch_scan_save() -> int:
                     "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'0-0',0,%s,%s,%s,%s,0)",
                     (
                         fid, league_id, league, home, away, mk, sug,
-                        float(pct), raw, created_ts,
+                        float(pct), float(p_final), created_ts,
                         (float(odds) if odds is not None else None),
                         (book or None),
                         (float(ev_pct) if ev_pct is not None else None),
@@ -1663,7 +1732,7 @@ def prematch_scan_save() -> int:
     log.info("[PREMATCH] saved=%d", saved)
     return saved
 
-# ───────── Auto-train / tune / retry ─────────
+# ───────── Auto-train / notify (unchanged except messaging) ─────────
 def auto_train_job():
     if not TRAIN_ENABLE:
         return send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
@@ -1699,17 +1768,145 @@ def auto_train_job():
         log.exception("[TRAIN] job failed: %s", e)
         send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
 
-def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
-    import numpy as np
-    y=np.asarray(y_true,dtype=int); p=np.asarray(y_prob,dtype=float)
-    best=default_pct/100.0
-    for t in np.arange(MIN_THRESH,MAX_THRESH+1e-9,1.0)/100.0:
-        pred=(p>=t).astype(int); n=int(pred.sum())
-        if n<min_preds: continue
-        tp=int(((pred==1)&(y==1)).sum()); prec=tp/max(1,n)
-        if prec>=target_precision: best=float(t); break
-    return best*100.0
+# ───────── ROI-aware auto-tune (unchanged core) ─────────
+def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
+    if not AUTO_TUNE_ENABLE:
+        return {}
 
+    PREC_TOL = float(os.getenv("AUTO_TUNE_PREC_TOL", "0.03"))
+    cutoff = int(time.time()) - days * 24 * 3600
+
+    with db_conn() as c:
+        rows = c.execute(
+            """
+            SELECT t.market,
+                   t.suggestion,
+                   COALESCE(t.confidence_raw, t.confidence/100.0) AS prob,
+                   t.odds,
+                   r.final_goals_h, r.final_goals_a, r.btts_yes
+            FROM tips t
+            JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts >= %s
+              AND t.suggestion <> 'HARVEST'
+              AND t.sent_ok = 1
+              AND t.odds IS NOT NULL
+            """,
+            (cutoff,),
+        ).fetchall()
+
+    if not rows:
+        send_telegram("🔧 Auto-tune: no labeled tips with odds in window.")
+        return {}
+
+    by: dict[str, list[tuple[float, int, float]]] = {}
+    for (mk, sugg, prob, odds, gh, ga, btts) in rows:
+        try:
+            prob = float(prob or 0.0)
+            odds = float(odds or 0.0)
+        except Exception:
+            continue
+        res = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
+        if res is None:
+            continue
+        y = int(res)
+        if not (1.01 <= odds <= MAX_ODDS_ALL):
+            continue
+        by.setdefault(mk, []).append((prob, y, odds))
+
+    if not by:
+        send_telegram("🔧 Auto-tune: nothing to tune after filtering.")
+        return {}
+
+    target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
+    min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
+    min_thr = float(os.getenv("MIN_THRESH", "55"))
+    max_thr = float(os.getenv("MAX_THRESH", "85"))
+
+    tuned: Dict[str, float] = {}
+
+    def _eval_threshold(items: list[tuple[float, int, float]], thr_prob: float) -> tuple[int, float, float]:
+        sel = [(p, y, o) for (p, y, o) in items if p >= thr_prob]
+        n = len(sel)
+        if n == 0:
+            return 0, 0.0, 0.0
+        wins = sum(y for (_, y, _) in sel)
+        prec = wins / n
+        roi = sum((y * (odds - 1.0) - (1 - y)) for (_, y, odds) in sel) / n
+        return n, float(prec), float(roi)
+
+    for mk, items in by.items():
+        if len(items) < min_preds:
+            continue
+        candidates_pct = list(np.arange(min_thr, max_thr + 1e-9, 1.0))
+        best = None
+        feasible_any = False
+        for thr_pct in candidates_pct:
+            thr_prob = float(thr_pct / 100.0)
+            n, prec, roi = _eval_threshold(items, thr_prob)
+            if n < min_preds:
+                continue
+            if prec >= target_precision:
+                feasible_any = True
+                score = (roi, prec, n)
+                if (best is None) or (score > (best[0], best[1], best[2])):
+                    best = (roi, prec, n, thr_pct)
+        if not feasible_any:
+            for thr_pct in candidates_pct:
+                thr_prob = float(thr_pct / 100.0)
+                n, prec, roi = _eval_threshold(items, thr_prob)
+                if n < min_preds:
+                    continue
+                if (prec >= max(0.0, target_precision - PREC_TOL)) and (roi > 0.0):
+                    score = (roi, prec, n)
+                    if (best is None) or (score > (best[0], best[1], best[2])):
+                        best = (roi, prec, n, thr_pct)
+        if best is None:
+            fallback = None
+            for thr_pct in candidates_pct:
+                thr_prob = float(thr_pct / 100.0)
+                n, prec, roi = _eval_threshold(items, thr_prob)
+                if n < min_preds:
+                    continue
+                score = (prec, n, roi)
+                if (fallback is None) or (score > (fallback[0], fallback[1], fallback[2])):
+                    fallback = (prec, n, roi, thr_pct)
+            if fallback is not None:
+                tuned[mk] = float(fallback[3])
+        else:
+            tuned[mk] = float(best[3])
+
+    if tuned:
+        for mk, pct in tuned.items():
+            set_setting(f"conf_threshold:{mk}", f"{pct:.2f}")
+            _SETTINGS_CACHE.invalidate(f"conf_threshold:{mk}")
+        lines = ["🔧 Auto-tune (ROI-aware) updated thresholds:"]
+        for mk, pct in sorted(tuned.items()):
+            lines.append(f"• {mk}: {pct:.1f}%")
+        send_telegram("\n".join(lines))
+    else:
+        send_telegram("🔧 Auto-tune (ROI-aware): no markets met minimum data.")
+    return tuned
+
+def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
+    cutoff = int(time.time()) - minutes*60
+    retried = 0
+    with db_conn() as c:
+        rows = c.execute(
+            "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct "
+            "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",
+            (cutoff, limit)
+        ).fetchall()
+
+        for (mid, league, home, away, market, sugg, conf, conf_raw, score, minute, cts, odds, book, ev_pct) in rows:
+            ok = send_telegram(_format_tip_message(home, away, league, int(minute), score, sugg, float(conf), {}, odds, book, ev_pct))
+            if ok:
+                c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
+                retried += 1
+    if retried:
+        log.info("[RETRY] resent %d", retried)
+    return retried
+
+# ───────── MOTD (prematch) with stacking ─────────
 MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
 
 def send_match_of_the_day() -> bool:
@@ -1741,7 +1938,7 @@ def send_match_of_the_day() -> bool:
         if not feat:
             continue
 
-        candidates: List[Tuple[str,str,float]] = []
+        candidates: List[Tuple[str,str,float,Optional[Dict[str,Any]]]] = []
 
         for line in OU_LINES:
             mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
@@ -1749,16 +1946,16 @@ def send_match_of_the_day() -> bool:
             p = _score_prob(feat, mdl)
             mk = f"Over/Under {_fmt_line(line)}"
             thr = _get_market_threshold_pre(mk)
-            if p*100.0 >= thr:   candidates.append((mk, f"Over {_fmt_line(line)} Goals", p))
+            if p*100.0 >= thr:   candidates.append((mk, f"Over {_fmt_line(line)} Goals", p, mdl))
             q = 1.0 - p
-            if q*100.0 >= thr:   candidates.append((mk, f"Under {_fmt_line(line)} Goals", q))
+            if q*100.0 >= thr:   candidates.append((mk, f"Under {_fmt_line(line)} Goals", q, mdl))
 
         mdl = load_model_from_settings("PRE_BTTS_YES")
         if mdl:
             p = _score_prob(feat, mdl); thr = _get_market_threshold_pre("BTTS")
-            if p*100.0 >= thr: candidates.append(("BTTS","BTTS: Yes", p))
+            if p*100.0 >= thr: candidates.append(("BTTS","BTTS: Yes", p, mdl))
             q = 1.0 - p
-            if q*100.0 >= thr: candidates.append(("BTTS","BTTS: No",  q))
+            if q*100.0 >= thr: candidates.append(("BTTS","BTTS: No",  q, mdl))
 
         mh = load_model_from_settings("PRE_WLD_HOME")
         ma = load_model_from_settings("PRE_WLD_AWAY")
@@ -1766,32 +1963,35 @@ def send_match_of_the_day() -> bool:
             ph = _score_prob(feat, mh); pa = _score_prob(feat, ma)
             s = max(EPS, ph+pa); ph, pa = ph/s, pa/s
             thr = _get_market_threshold_pre("1X2")
-            if ph*100.0 >= thr: candidates.append(("1X2","Home Win", ph))
-            if pa*100.0 >= thr: candidates.append(("1X2","Away Win", pa))
+            if ph*100.0 >= thr: candidates.append(("1X2","Home Win", ph, mh))
+            if pa*100.0 >= thr: candidates.append(("1X2","Away Win", pa, ma))
 
         if not candidates:
             continue
 
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        mk, sug, prob = candidates[0]
-        prob_pct = prob * 100.0
-        if prob_pct < max(MOTD_CONF_MIN, 75):
-            continue
-
-        pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
-        if not pass_odds:
-            continue
-
-        ev_pct = None
-        if odds is not None:
-            edge = _ev(prob, odds)
+        # Choose top by stacked probability & EV
+        best_local = None
+        odds_map = fetch_odds(fid)
+        for mk, sug, p_model, mdl_used in candidates:
+            pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
+            if not pass_odds or odds is None:
+                continue
+            p_book = _implied_prob_from_odds(odds)
+            p_final = _apply_stack_if_available(p_model, mdl_used, p_book)
+            edge = _ev(p_final, odds)
             ev_bps = int(round(edge * 10000))
-            ev_pct = round(edge * 100.0, 1)
+            ev_pct = round(edge*100.0, 1)
             if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
                 continue
-        else:
+            score = (p_final ** 1.2) * (1 + max(0.0, ev_pct) / 100.0)
+            cand = (score, p_final*100.0, sug, odds, book, ev_pct)
+            if (best_local is None) or (cand > best_local):
+                best_local = cand
+
+        if not best_local:
             continue
 
+        _, prob_pct, sug, odds, book, ev_pct = best_local
         item = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
         if best is None or prob_pct > best[0]:
             best = item
@@ -1800,171 +2000,6 @@ def send_match_of_the_day() -> bool:
         return send_telegram("🏅 Match of the Day: no prematch pick met thresholds.")
     prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best
     return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
-
-def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
-    """
-    Pick per-market confidence thresholds that meet TARGET_PRECISION while maximizing realized ROI.
-
-    ROI definition (per 1u stake): y*(odds-1) - (1-y)
-      where y in {0,1}, odds is decimal. We average ROI across selected bets.
-    Tie-breakers: higher precision, then larger n. Requires >= THRESH_MIN_PREDICTIONS.
-    If no threshold meets target precision, accept within PREC_TOL below target *and* ROI > 0.
-    """
-    if not AUTO_TUNE_ENABLE:
-        return {}
-
-    PREC_TOL = float(os.getenv("AUTO_TUNE_PREC_TOL", "0.03"))  # allow 3pp below target if ROI>0
-    cutoff = int(time.time()) - days * 24 * 3600
-
-    with db_conn() as c:
-        rows = c.execute(
-            """
-            SELECT t.market,
-                   t.suggestion,
-                   COALESCE(t.confidence_raw, t.confidence/100.0) AS prob,
-                   t.odds,
-                   r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM tips t
-            JOIN match_results r ON r.match_id = t.match_id
-            WHERE t.created_ts >= %s
-              AND t.suggestion <> 'HARVEST'
-              AND t.sent_ok = 1
-              AND t.odds IS NOT NULL
-            """,
-            (cutoff,),
-        ).fetchall()
-
-    if not rows:
-        send_telegram("🔧 Auto-tune: no labeled tips with odds in window.")
-        return {}
-
-    # Prepare per-market arrays
-    by: dict[str, list[tuple[float, int, float]]] = {}
-    for (mk, sugg, prob, odds, gh, ga, btts) in rows:
-        try:
-            prob = float(prob or 0.0)
-            odds = float(odds or 0.0)
-        except Exception:
-            continue
-
-        # Grade outcome
-        res = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
-        if res is None:
-            continue
-        y = int(res)
-
-        # Only consider sane odds
-        if not (1.01 <= odds <= MAX_ODDS_ALL):
-            continue
-
-        by.setdefault(mk, []).append((prob, y, odds))
-
-    if not by:
-        send_telegram("🔧 Auto-tune: nothing to tune after filtering.")
-        return {}
-
-    target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
-    min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
-    min_thr = float(os.getenv("MIN_THRESH", "55"))
-    max_thr = float(os.getenv("MAX_THRESH", "85"))
-
-    tuned: Dict[str, float] = {}
-
-    def _eval_threshold(items: list[tuple[float, int, float]], thr_prob: float) -> tuple[int, float, float]:
-        """Return (n, precision, roi_avg)."""
-        sel = [(p, y, o) for (p, y, o) in items if p >= thr_prob]
-        n = len(sel)
-        if n == 0:
-            return 0, 0.0, 0.0
-        wins = sum(y for (_, y, _) in sel)
-        prec = wins / n
-        # avg ROI per 1u stake
-        roi = sum((y * (odds - 1.0) - (1 - y)) for (_, y, odds) in sel) / n
-        return n, float(prec), float(roi)
-
-    for mk, items in by.items():
-        if len(items) < min_preds:
-            continue
-
-        # Sweep thresholds in percentage space, convert to probability in [0,1]
-        candidates_pct = list(np.arange(min_thr, max_thr + 1e-9, 1.0))
-        best = None  # (roi, prec, n, thr_pct)
-
-        feasible_any = False
-        for thr_pct in candidates_pct:
-            thr_prob = float(thr_pct / 100.0)
-            n, prec, roi = _eval_threshold(items, thr_prob)
-            if n < min_preds:
-                continue
-
-            # Primary feasibility: meet or exceed target precision
-            if prec >= target_precision:
-                feasible_any = True
-                score = (roi, prec, n)
-                if (best is None) or (score > (best[0], best[1], best[2])):
-                    best = (roi, prec, n, thr_pct)
-
-        # If none meet target precision, allow PREC_TOL below if ROI positive
-        if not feasible_any:
-            for thr_pct in candidates_pct:
-                thr_prob = float(thr_pct / 100.0)
-                n, prec, roi = _eval_threshold(items, thr_prob)
-                if n < min_preds:
-                    continue
-                if (prec >= max(0.0, target_precision - PREC_TOL)) and (roi > 0.0):
-                    score = (roi, prec, n)
-                    if (best is None) or (score > (best[0], best[1], best[2])):
-                        best = (roi, prec, n, thr_pct)
-
-        # Fallback: maximize precision, then n, then ROI
-        if best is None:
-            fallback = None
-            for thr_pct in candidates_pct:
-                thr_prob = float(thr_pct / 100.0)
-                n, prec, roi = _eval_threshold(items, thr_prob)
-                if n < min_preds:
-                    continue
-                score = (prec, n, roi)
-                if (fallback is None) or (score > (fallback[0], fallback[1], fallback[2])):
-                    fallback = (prec, n, roi, thr_pct)
-            if fallback is not None:
-                tuned[mk] = float(fallback[3])
-        else:
-            tuned[mk] = float(best[3])
-
-    if tuned:
-        for mk, pct in tuned.items():
-            set_setting(f"conf_threshold:{mk}", f"{pct:.2f}")
-            _SETTINGS_CACHE.invalidate(f"conf_threshold:{mk}")
-
-        # Pretty notify
-        lines = ["🔧 Auto-tune (ROI-aware) updated thresholds:"]
-        for mk, pct in sorted(tuned.items()):
-            lines.append(f"• {mk}: {pct:.1f}%")
-        send_telegram("\n".join(lines))
-    else:
-        send_telegram("🔧 Auto-tune (ROI-aware): no markets met minimum data.")
-
-    return tuned
-
-def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
-    cutoff = int(time.time()) - minutes*60
-    retried = 0
-    with db_conn() as c:
-        rows = c.execute(
-            "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct "
-            "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",
-            (cutoff, limit)
-        ).fetchall()
-
-        for (mid, league, home, away, market, sugg, conf, conf_raw, score, minute, cts, odds, book, ev_pct) in rows:
-            ok = send_telegram(_format_tip_message(home, away, league, int(minute), score, sugg, float(conf), {}, odds, book, ev_pct))
-            if ok:
-                c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
-                retried += 1
-    if retried:
-        log.info("[RETRY] resent %d", retried)
-    return retried
 
 # ───────── Scheduler ─────────
 def _run_with_pg_lock(lock_key: int, fn, *a, **k):
@@ -2020,7 +2055,7 @@ def _start_scheduler_once():
         sched.add_job(lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200),
                       "interval", minutes=10, id="retry", max_instances=1, coalesce=True)
 
-        # ✅ periodic odds snapshots (the new job) — INSIDE the function
+        # periodic odds snapshots
         sched.add_job(lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
                       "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True)
 
@@ -2128,7 +2163,7 @@ def http_settings(key: str):
 def http_backfill_prematch():
     _require_admin()
     days = int(request.args.get("days", "7"))
-    n = backfill_prematch_snapshots(days=days)
+    n = backfill_prematch_snapshots(days=days) if 'backfill_prematch_snapshots' in globals() else 0
     return jsonify({"ok": True, "snapshots_written": int(n)})
 
 @app.route("/tips/latest")
