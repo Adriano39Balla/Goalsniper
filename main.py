@@ -1010,8 +1010,10 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     if updated: log.info("[RESULTS] backfilled %d", updated)
     return updated
 
-def daily_accuracy_digest(window_days: int = 7) -> Optional[str]:
-    """
+def daily_accuracy_digest(window_days: Optional[int] = None) -> Optional[str]:
+    if window_days is None:
+        window_days = int(os.getenv("DAILY_DIGEST_WINDOW_DAYS")
+  """
     Rolling accuracy digest over N days (default 7).
     Includes ROI (1u flat staking) per market.
     """
