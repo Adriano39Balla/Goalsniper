@@ -24,7 +24,9 @@ Changes in this version:
 
 import os, json, time, logging, requests, psycopg2
 import numpy as np
+import psycopg2
 from psycopg2.pool import SimpleConnectionPool
+from psycopg2 import OperationalError
 from html import escape
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
@@ -199,6 +201,20 @@ def _init_pool():
     global POOL
     dsn = DATABASE_URL + (("&" if "?" in DATABASE_URL else "?") + "sslmode=require" if "sslmode=" not in DATABASE_URL else "")
     POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
+
+def _with_pg_conn(fn, *a, **kw):
+    try:
+        conn = _connect(os.getenv("DATABASE_URL"))
+        return fn(conn, *a, **kw)
+    except OperationalError as e:
+        logger.warning("DB connection dropped, retrying once: %s", e)
+        conn = _connect(os.getenv("DATABASE_URL"))
+        return fn(conn, *a, **kw)
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
 
 def db_conn(): 
     if not POOL: _init_pool()
