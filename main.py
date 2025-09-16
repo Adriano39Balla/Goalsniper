@@ -83,6 +83,12 @@ DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") no
 DAILY_ACCURACY_HOUR   = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
 DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
+DB_URL = os.getenv("DATABASE_URL")
+POOL_MINCONN = int(os.getenv("POOL_MINCONN", "1"))
+POOL_MAXCONN = int(os.getenv("POOL_MAXCONN", "5"))
+PG_LOCK_RETRY_SLEEP = float(os.getenv("PG_LOCK_RETRY_SLEEP", "0.5"))
+PG_LOCK_MAX_RETRIES = int(os.getenv("PG_LOCK_MAX_RETRIES", "1"))
+
 AUTO_TUNE_ENABLE        = os.getenv("AUTO_TUNE_ENABLE", "0") not in ("0","false","False","no","NO")
 TARGET_PRECISION        = float(os.getenv("TARGET_PRECISION", "0.60"))
 THRESH_MIN_PREDICTIONS  = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
