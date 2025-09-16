@@ -95,6 +95,33 @@ def _parse_ou_lines(raw: str) -> List[float]:
         except: pass
     return vals or [2.5, 3.5]
 
+# ===== PATCH: data sufficiency & safe scaling =====
+TRAIN_MIN_ROWS = int(os.getenv("TRAIN_MIN_ROWS", "300"))
+TRAIN_MIN_POS  = int(os.getenv("TRAIN_MIN_POS",  "80"))
+TRAIN_MIN_NEG  = int(os.getenv("TRAIN_MIN_NEG",  "80"))
+
+def _has_enough_rows(y: np.ndarray) -> bool:
+    n = int(y.size)
+    if n < TRAIN_MIN_ROWS:
+        return False
+    pos = int((y == 1).sum())
+    neg = n - pos
+    return (pos >= TRAIN_MIN_POS) and (neg >= TRAIN_MIN_NEG)
+
+def _safe_standardize(X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Nan/empty-safe standardization; constant columns get scale=1.0 and become zeros.
+    """
+    if X.size == 0:
+        # shape-safe defaults if called with empty array
+        return X, np.zeros((X.shape[1],), dtype=float), np.ones((X.shape[1],), dtype=float)
+    mu  = np.nanmean(X, axis=0)
+    var = np.nanvar(X, axis=0)
+    sd  = np.sqrt(np.clip(var, 1e-12, None))
+    Z   = (X - mu) / sd
+    Z   = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+    return Z, mu, sd
+
 # ─────────────────────── DB utils ─────────────────────── #
 
 def _connect(db_url: str):
@@ -320,12 +347,8 @@ def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: s
     return blob
 
 def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (X_std, mean, scale). Any zero-variance column is left unscaled."""
-    mean = X.mean(axis=0)
-    scale = X.std(axis=0, ddof=0)
-    scale = np.where(scale <= 1e-12, 1.0, scale)
-    Xs = (X - mean) / scale
-    return Xs, mean, scale
+    """Return (X_std, mean, scale) with nan/empty/constant guards."""
+    return _safe_standardize(X)
 
 def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray, features: List[str]) -> Tuple[float, Dict[str, float]]:
     """Convert weights learned on standardized X back to raw feature space."""
@@ -584,9 +607,21 @@ def _train_binary_head(
     y_tr, y_te = y_all[mask_tr], y_all[mask_te]
     ts_tr      = ts_all[mask_tr]
 
+    # ===== PATCH: train-fold sufficiency guard =====
+    if (X_tr.shape[0] == 0) or (np.unique(y_tr).size < 2) or (not _has_enough_rows(y_tr)):
+        logger.info("[TRAIN] %s: skipped (insufficient train data) — n=%d, classes=%s",
+                    model_key, int(X_tr.shape[0]), np.unique(y_tr).tolist())
+        return False, {}, None
+
     # Standardize on train, apply on test
     X_tr_std, mu, sd = _standardize_fit(X_tr)
     X_te_std = (X_te - mu) / sd
+    X_te_std = np.nan_to_num(X_te_std, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # ===== PATCH: validation sufficiency guard =====
+    if X_te.shape[0] == 0 or np.unique(y_te).size < 2:
+        logger.info("[TRAIN] %s: skipped (insufficient validation data).", model_key)
+        return False, {}, None
 
     # Fit LR with recency weights
     sw = recency_weights(ts_tr)
