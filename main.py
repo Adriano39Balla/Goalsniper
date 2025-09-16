@@ -2129,7 +2129,7 @@ def _start_scheduler_once():
 
         # periodic odds snapshots
         sched.add_job(lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
-                      "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True)
+                      "interval", seconds=600, id="odds_snap", max_instances=1, coalesce=True)
 
         sched.start()
         _scheduler_started = True
