@@ -1264,11 +1264,8 @@ def _match_fingerprint(m: dict) -> Tuple:
     sot_h = g(sh, ("shots on target", "shots on goal"))
     sot_a = g(sa, ("shots on target", "shots on goal"))
     sh_tot_h = g(sh, ("total shots", "shots total"))
-    sh_tot_a = g(sa, ("total shots", "shots_clipboard
+    sh_tot_a = g(sa, ("total shots", "shots_clipboard"))
 
-Here’s **`main.py` (chunk 2/2)** — continuation and completion with the new `_run_with_pg_lock` and hardened boot. This picks up exactly where the previous chunk ended.
-
-```python
 # ───────── Prematch helpers (short) ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
     js=_api_get(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
