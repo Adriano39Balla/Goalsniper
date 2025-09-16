@@ -2091,14 +2091,49 @@ def send_match_of_the_day() -> bool:
 
 # ───────── Scheduler ─────────
 def _run_with_pg_lock(lock_key: int, fn, *a, **k):
+    """
+    Run `fn` under a PG advisory lock.
+    - Retries once (configurable) if the connection drops (OperationalError).
+    - Always attempts to unlock; failures are logged but not fatal.
+    """
+    tries = max(1, PG_LOCK_MAX_RETRIES) + 1  # e.g. 1 retry => 2 total attempts
+    for attempt in range(tries):
+        try:
+            with db_conn() as c:
+                got = c.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
+                if not got:
+                    log.info("[LOCK %s] busy; skipped.", lock_key)
+                    return None
+                try:
+                    return fn(*a, **k)
+                finally:
+                    try:
+                        c.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                    except Exception as e:
+                        log.warning("[LOCK %s] unlock failed (ignored): %s", lock_key, e)
+        except psycopg2.OperationalError as e:
+            # connection was dropped by the server; reset pool and retry once
+            log.warning("[LOCK %s] DB connection dropped (attempt %d/%d): %s",
+                        lock_key, attempt + 1, tries, e)
+            _reset_pool()
+            if attempt < tries - 1:
+                time.sleep(PG_LOCK_RETRY_SLEEP)
+                continue
+            log.exception("[LOCK %s] giving up after retries", lock_key)
+            return None
+        except Exception as e:
+            log.exception("[LOCK %s] failed: %s", lock_key, e)
+            return None
+
+def _reset_pool():
+    """Close and null the pool so the next db_conn() recreates it cleanly."""
+    global POOL
     try:
-        with db_conn() as c:
-            got=c.execute("SELECT pg_try_advisory_lock(%s)",(lock_key,)).fetchone()[0]
-            if not got: log.info("[LOCK %s] busy; skipped.", lock_key); return None
-            try: return fn(*a,**k)
-            finally: c.execute("SELECT pg_advisory_unlock(%s)",(lock_key,))
-    except Exception as e:
-        log.exception("[LOCK %s] failed: %s", lock_key, e); return None
+        if POOL:
+            POOL.closeall()
+    except Exception:
+        pass
+    POOL = None  # will be recreated on next db_conn() call
 
 _scheduler_started=False
 
