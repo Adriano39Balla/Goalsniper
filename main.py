@@ -65,14 +65,17 @@ POOL: Optional[SimpleConnectionPool] = None
 
 def _init_pool() -> None:
     global POOL
-    if POOL: return
+    if POOL:
+        return
     dsn = DATABASE_URL
     if "sslmode=" not in dsn:
         dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
     POOL = SimpleConnectionPool(
-        minconn=POOL_MINCONN, maxconn=POOL_MAXCONN, dsn=dsn
+        minconn=int(os.getenv("POOL_MINCONN","1")),
+        maxconn=int(os.getenv("POOL_MAXCONN","2")),
+        dsn=dsn
     )
-    log.info("[DB] Pool initialized (%d–%d)", POOL_MINCONN, POOL_MAXCONN)
+    log.info("[DB] Pool initialized (%d–%d)", POOL.minconn, POOL.maxconn)
 
 def _reset_pool() -> None:
     global POOL
