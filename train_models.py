@@ -1,31 +1,18 @@
-"""
-Postgres-only training with robust calibration + per-market auto-thresholding.
-
-Highlights
-- Recency weighting (RECENCY_HALF_LIFE_DAYS) + purged time split with embargo
-- Training minute cutoffs aligned with serving (MARKET_CUTOFFS / TIP_MAX_MINUTE)
-- Calibration model selection: Platt vs Isotonic (lower Brier on validation)
-- Configurable OU lines (OU_TRAIN_LINES, e.g. "1.5,2.5,3.5")
-- Optional bookmaker stacking (validation-learned logit blend)
-- Metrics: AUC, Brier, ECE, acc@0.5, logloss
-- Writes: model blobs into `settings`, per-market thresholds via Wilson LB
-"""
+# file: train_models.py
 
 from __future__ import annotations
-import argparse, json, os, logging, math, re
+import argparse, json, os, logging, math
 from typing import Any, Dict, List, Optional, Tuple
 from math import sqrt
 
 import numpy as np
 import pandas as pd
 import psycopg2
-from psycopg2.extras import execute_values
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
-    brier_score_loss, accuracy_score, log_loss, precision_score,
-    roc_auc_score, precision_recall_curve
+    brier_score_loss, accuracy_score, log_loss, roc_auc_score
 )
 
 # .env (optional)
@@ -38,7 +25,7 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger("trainer")
 
-# ───────────────────────── Feature sets (match main.py) ───────────────────────── #
+# ───────────────────────── Feature sets (aligns with main.py) ───────────────────────── #
 
 FEATURES: List[str] = [
     "minute",
@@ -52,6 +39,7 @@ FEATURES: List[str] = [
     "yellow_h","yellow_a",
 ]
 
+# Prematch snapshots (as saved by main.save_prematch_snapshot via extract_prematch_features)
 PRE_FEATURES: List[str] = [
     "pm_ov25_h","pm_ov35_h","pm_btts_h",
     "pm_ov25_a","pm_ov35_a","pm_btts_a",
@@ -66,7 +54,7 @@ PRE_FEATURES: List[str] = [
 
 EPS = 1e-6
 
-# ───────────────────────── Env knobs ───────────────────────── #
+# ─────────────────────── Env knobs ─────────────────────── #
 
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "120"))  # 0 disables
 RECENCY_MONTHS         = int(os.getenv("RECENCY_MONTHS", "36"))             # training window cap
@@ -83,8 +71,6 @@ MAX_THRESH             = float(os.getenv("MAX_THRESH","85"))
 TRAIN_MIN_ROWS         = int(os.getenv("TRAIN_MIN_ROWS", "300"))
 TRAIN_MIN_POS          = int(os.getenv("TRAIN_MIN_POS",  "80"))
 TRAIN_MIN_NEG          = int(os.getenv("TRAIN_MIN_NEG",  "80"))
-
-# ───────────────────────── Parsing helpers ───────────────────────── #
 
 def _parse_market_cutoffs(s: str) -> Dict[str,int]:
     out: Dict[str,int] = {}
@@ -113,7 +99,7 @@ def _parse_ou_lines(raw: str) -> List[float]:
 
 def _fmt_line(line: float) -> str: return f"{line}".rstrip("0").rstrip(".")
 
-# ───────────────────────── DB utils ───────────────────────── #
+# ─────────────────────── DB utils ─────────────────────── #
 
 def _connect(db_url: Optional[str]):
     db_url = db_url or os.getenv("DATABASE_URL")
@@ -154,33 +140,7 @@ def _get_setting_json(conn, key: str) -> Optional[dict]:
     except Exception:
         return None
 
-# ───────────────────────── Safe scaling / sufficiency checks ───────────────────────── #
-
-def _has_enough_rows(y: np.ndarray) -> bool:
-    n = int(y.size)
-    if n < TRAIN_MIN_ROWS: return False
-    pos = int((y == 1).sum()); neg = n - pos
-    return (pos >= TRAIN_MIN_POS) and (neg >= TRAIN_MIN_NEG)
-
-def _safe_standardize(X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if X.size == 0:
-        return X, np.zeros((X.shape[1],), dtype=float), np.ones((X.shape[1],), dtype=float)
-    mu  = np.nanmean(X, axis=0)
-    var = np.nanvar(X, axis=0)
-    sd  = np.sqrt(np.clip(var, 1e-12, None))
-    Z   = (X - mu) / sd
-    Z   = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
-    return Z, mu, sd
-
-def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray, features: List[str]) -> Tuple[float, Dict[str, float]]:
-    w_std = model.coef_.ravel().astype(float)
-    b_std = float(model.intercept_.ravel()[0])
-    w_raw = (w_std / scale).astype(float)
-    b_raw = float(b_std - np.sum(w_std * (mean / scale)))
-    weights = {name: float(w) for name, w in zip(features, w_raw.tolist())}
-    return b_raw, weights
-
-# ───────────────────────── Data loaders ───────────────────────── #
+# ─────────────────────── Data loaders ─────────────────────── #
 
 def _ensure_columns(df: "pd.DataFrame", cols: List[str]) -> "pd.DataFrame":
     for c in cols:
@@ -276,9 +236,12 @@ def load_prematch_data(conn) -> pd.DataFrame:
     if not feats: return pd.DataFrame()
     return pd.DataFrame(feats).replace([np.inf,-np.inf], np.nan).fillna(0.0)
 
-# ───────────────────────── Splits & weights ───────────────────────── #
+# ─────────────────────── Split & weights ─────────────────────── #
 
 def time_purged_split(ts: np.ndarray, test_size: float, embargo_days: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Chronological split; removes training examples within an embargo window of the test range.
+    """
     n = len(ts)
     order = np.argsort(ts)
     cut = int(max(1, (1 - float(test_size)) * n))
@@ -305,14 +268,37 @@ def recency_weights(ts: np.ndarray) -> Optional[np.ndarray]:
     s = float(np.sum(w))
     return (w/s) if s>0 else None
 
-# ───────────────────────── Calibration & thresholding ───────────────────────── #
+# ─────────────────────── Modeling helpers ─────────────────────── #
+
+def fit_lr_safe(X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray]=None) -> Optional[LogisticRegression]:
+    if len(np.unique(y)) < 2:
+        return None
+    C = float(os.getenv("LR_C", "1.0"))  # tunable
+    return LogisticRegression(
+        max_iter=5000,
+        solver="saga",
+        penalty="l2",
+        class_weight="balanced",
+        random_state=42,
+        C=C,
+    ).fit(X, y, sample_weight=sample_weight)
+
+def _safe_standardize(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if X.size == 0:
+        return X, np.zeros((X.shape[1],), dtype=float), np.ones((X.shape[1],), dtype=float)
+    mu  = np.nanmean(X, axis=0)
+    var = np.nanvar(X, axis=0)
+    sd  = np.sqrt(np.clip(var, 1e-12, None))
+    Z   = (X - mu) / sd
+    Z   = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+    return Z, mu, sd
 
 def _logit_vec(p: np.ndarray) -> np.ndarray:
     p = np.clip(p.astype(float), 1e-6, 1-1e-6)
     return np.log(p/(1.0-p))
 
 def _fit_calibration(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[str, Any]:
-    """Return ('platt',(a,b)) or ('isotonic', IsotonicRegression)."""
+    """Return ('platt',(a,b)) or ('isotonic', IsotonicRegression) based on lower Brier."""
     y = y_true.astype(int)
     z = _logit_vec(p_raw).reshape(-1,1)
 
@@ -340,18 +326,48 @@ def _apply_calibration(p_raw: np.ndarray, cal_kind: str, cal_obj) -> np.ndarray:
         return 1.0/(1.0+np.exp(-(a*z + b)))
     return np.asarray(cal_obj.predict(p_raw), dtype=float)
 
-def _ece(y_true: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
-    y = y_true.astype(int); p = np.clip(p.astype(float), 0, 1)
-    edges = np.linspace(0.0, 1.0, bins+1); ece = 0.0
-    for i in range(bins):
-        lo,hi = edges[i], edges[i+1]
-        mask = (p>=lo)&(p<hi) if i<bins-1 else (p>=lo)&(p<=hi)
-        if not np.any(mask): continue
-        conf = float(np.mean(p[mask])); acc = float(np.mean(y[mask]))
-        ece += (np.sum(mask)/len(p)) * abs(conf-acc)
-    return float(ece)
+def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray, features: List[str]) -> Tuple[float, Dict[str, float]]:
+    """Convert weights learned on standardized X back to raw feature space."""
+    w_std = model.coef_.ravel().astype(float)
+    b_std = float(model.intercept_.ravel()[0])
+    w_raw = (w_std / scale).astype(float)
+    b_raw = float(b_std - np.sum(w_std * (mean / scale)))
+    weights = {name: float(w) for name, w in zip(features, w_raw.tolist())}
+    return b_raw, weights
 
-# Wilson lower bound
+def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: str, cal_obj,
+                     mean: Optional[np.ndarray]=None, scale: Optional[np.ndarray]=None,
+                     cal_by_minute: Optional[List[Dict[str, float]]] = None,
+                     stack_coeffs: Optional[Dict[str, float]] = None) -> Dict[str,Any]:
+    if mean is not None and scale is not None:
+        intercept, weights = _fold_std_into_weights(model, mean, scale, features)
+    else:
+        intercept = float(model.intercept_.ravel()[0])
+        weights = {name: float(w) for name, w in zip(features, model.coef_.ravel().tolist())}
+
+    blob = {
+        "intercept": float(intercept),
+        "weights": weights,
+        "calibration": {"method":"sigmoid","a":1.0,"b":0.0},
+    }
+    if cal_kind == "platt":
+        a,b = cal_obj
+        blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
+    else:
+        # Keep serving simple: approximate isotonic with a line in logit space.
+        x = np.concatenate([np.linspace(0.01,0.10,30), np.linspace(0.10,0.90,120), np.linspace(0.90,0.99,30)])
+        y = np.asarray(cal_obj.predict(x), dtype=float)
+        zx = _logit_vec(x); zy = _logit_vec(np.clip(y, 1e-4, 1-1e-4))
+        a,b = np.polyfit(zx, zy, 1)
+        blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
+    if cal_by_minute:
+        blob["calibration_by_minute"] = cal_by_minute
+    if stack_coeffs:
+        blob["stack"] = stack_coeffs
+    return blob
+
+# ─────────────────────── Thresholding (Wilson lower bound) ─────────────────────── #
+
 def _wilson_lb(successes:int, n:int, z:float=1.96) -> float:
     if n <= 0: return 0.0
     phat = successes / n
@@ -383,8 +399,8 @@ def pick_threshold_with_wilson(y_true, p_cal, min_preds: int, target_precision: 
 
 def _latest_book_probs(conn, match_ids: List[int], market_key: str, selection: str) -> Dict[int, float]:
     """
-    Returns {match_id: implied_prob} using the latest captured odds in odds_history
-    for the given (market_key, selection). Prob = 1/odds (de-vig omitted intentionally).
+    Returns {match_id: implied_prob} using latest captured odds in odds_history
+    for the given (market_key, selection). Prob = 1/odds (no de-vig).
     """
     if not match_ids:
         return {}
@@ -410,51 +426,7 @@ def _latest_book_probs(conn, match_ids: List[int], market_key: str, selection: s
                 pass
         return out
 
-# ───────────────────────── Modeling helpers ───────────────────────── #
-
-def fit_lr_safe(X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray]=None) -> Optional[LogisticRegression]:
-    if len(np.unique(y)) < 2:
-        return None
-    C = float(os.getenv("LR_C", "1.0"))
-    return LogisticRegression(
-        max_iter=5000,
-        solver="saga",
-        penalty="l2",
-        class_weight="balanced",
-        random_state=42,
-        C=C,
-    ).fit(X, y, sample_weight=sample_weight)
-
-def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: str, cal_obj,
-                     mean: Optional[np.ndarray]=None, scale: Optional[np.ndarray]=None,
-                     cal_by_minute: Optional[List[Dict[str, float]]] = None,
-                     stack_coeffs: Optional[Dict[str, float]] = None) -> Dict[str,Any]:
-    if mean is not None and scale is not None:
-        intercept, weights = _fold_std_into_weights(model, mean, scale, features)
-    else:
-        intercept = float(model.intercept_.ravel()[0])
-        weights = {name: float(w) for name, w in zip(features, model.coef_.ravel().tolist())}
-
-    blob = {
-        "intercept": float(intercept),
-        "weights": weights,
-        "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0},
-    }
-    if cal_kind == "platt":
-        a,b = cal_obj
-        blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
-    else:
-        # approximate isotonic by a logit-line to keep serving simple
-        x = np.concatenate([np.linspace(0.01,0.10,30), np.linspace(0.10,0.90,120), np.linspace(0.90,0.99,30)])
-        y = np.asarray(cal_obj.predict(x), dtype=float)
-        zx = _logit_vec(x); zy = _logit_vec(np.clip(y, 1e-4, 1-1e-4))
-        a,b = np.polyfit(zx, zy, 1)
-        blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
-    if cal_by_minute:
-        blob["calibration_by_minute"] = cal_by_minute
-    if stack_coeffs:
-        blob["stack"] = stack_coeffs
-    return blob
+# ─────────────────────── Core helpers ─────────────────────── #
 
 def _minute_cutoff_for_market(market: str) -> Optional[int]:
     m = (market or "").upper()
@@ -464,12 +436,23 @@ def _minute_cutoff_for_market(market: str) -> Optional[int]:
     if m == "1X2":  return MARKET_CUTOFFS.get("1X2", TIP_MAX_MINUTE)
     return TIP_MAX_MINUTE
 
+def _ece(y_true: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
+    y = y_true.astype(int); p = np.clip(p.astype(float), 0, 1)
+    edges = np.linspace(0.0, 1.0, bins+1); ece = 0.0
+    for i in range(bins):
+        lo,hi = edges[i], edges[i+1]
+        mask = (p>=lo)&(p<hi) if i<bins-1 else (p>=lo)&(p<=hi)
+        if not np.any(mask): continue
+        conf = float(np.mean(p[mask])); acc = float(np.mean(y[mask]))
+        ece += (np.sum(mask)/len(p)) * abs(conf-acc)
+    return float(ece)
+
 def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, features: List[str]) -> np.ndarray:
     """
     Keep rows where the outcome isn't trivially decided at snapshot.
     - OU_L: drop rows where goals_sum > line (Over guaranteed)
     - BTTS: drop rows where goals_h>0 and goals_a>0 (Yes guaranteed)
-    - 1X2: keep all
+    - 1X2: keep all (never fully decided until FT)
     """
     fidx = {f:i for i,f in enumerate(features)}
     keep = np.ones(len(y_all), dtype=bool)
@@ -490,7 +473,7 @@ def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, featu
 
     return keep
 
-# ───────────────────────── Core head trainer ───────────────────────── #
+# ─────────────────────── Head trainer ─────────────────────── #
 
 def _train_binary_head(
     conn,
@@ -512,27 +495,18 @@ def _train_binary_head(
     # optional bookmaker implied prob (aligned to X_all rows)
     p_book_all: Optional[np.ndarray] = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
-    """
-    Train one binary head (e.g., BTTS_YES, OU_2.5, WLD_HOME).
-    - Minute cutoff applied on train fold only (no leakage)
-    - Drop trivial/decided snapshots on train fold for this head
-    - Standardize on train; fold scaler into raw-space weights
-    - Minute-binned calibration if enough mass, else global calibration (Platt/Isotonic)
-    - Optional stacking with bookmaker implied prob (validation-only fit)
-    - Threshold via Wilson lower bound
-    """
     if len(np.unique(y_all)) < 2:
         return False, {}, None
 
-    # Train-minute cutoff
+    # Train-minute cutoff (col 0 is 'minute')
     if train_minute_cutoff is not None:
         try:
-            mt = (X_all[:, 0] <= float(train_minute_cutoff))  # feature 0 is "minute"
+            mt = (X_all[:, 0] <= float(train_minute_cutoff))
             mask_tr = mask_tr & mt
         except Exception:
             pass
 
-    # Undecided filter (train only)
+    # Drop trivial/decided snapshots (train only)
     try:
         undecided = _mask_undecided(model_key, X_all, y_all, feature_names)
         new_mask_tr = mask_tr & undecided
@@ -548,13 +522,17 @@ def _train_binary_head(
     y_tr, y_te = y_all[mask_tr], y_all[mask_te]
     ts_tr      = ts_all[mask_tr]
 
-    # Train/validation sufficiency
-    if (X_tr.shape[0] == 0) or (np.unique(y_tr).size < 2) or (not _has_enough_rows(y_tr)):
-        logger.info("[TRAIN] %s: skipped (insufficient train data) — n=%d, classes=%s",
-                    model_key, int(X_tr.shape[0]), np.unique(y_tr).tolist())
+    # Minimum sufficiency checks
+    n_tr = int(len(y_tr))
+    if n_tr < TRAIN_MIN_ROWS:
+        logger.info("[TRAIN] %s: skipped (rows=%d < %d).", model_key, n_tr, TRAIN_MIN_ROWS)
+        return False, {}, None
+    pos = int((y_tr == 1).sum()); neg = n_tr - pos
+    if pos < TRAIN_MIN_POS or neg < TRAIN_MIN_NEG:
+        logger.info("[TRAIN] %s: skipped (pos=%d, neg=%d).", model_key, pos, neg)
         return False, {}, None
     if X_te.shape[0] == 0 or np.unique(y_te).size < 2:
-        logger.info("[TRAIN] %s: skipped (insufficient validation data).", model_key)
+        logger.info("[TRAIN] %s: skipped (insufficient validation).", model_key)
         return False, {}, None
 
     # Standardize
@@ -571,7 +549,7 @@ def _train_binary_head(
     # Validation raw probs
     p_raw_te = model.predict_proba(X_te_std)[:, 1]
 
-    # Minute-binned calibration (validation only)
+    # Minute-binned calibration (validation only; optional)
     BINS = [(0,20),(20,40),(40,60),(60,200)]
     minute_idx = feature_names.index("minute") if "minute" in feature_names else None
     cal_by_minute: List[Dict[str, float]] = []
@@ -592,7 +570,7 @@ def _train_binary_head(
     cal_kind, cal_obj = _fit_calibration(y_te, p_raw_te)
     p_cal = _apply_calibration(p_raw_te, cal_kind, cal_obj)
 
-    # Stacking with bookmaker implied prob (validation fold only)
+    # Optional stacking: blend model vs bookmaker implied p (validation-only fit)
     stack_coeffs = None
     if p_book_all is not None:
         p_book_te = p_book_all[mask_te]
@@ -608,7 +586,7 @@ def _train_binary_head(
             if brier_score_loss(y_te[mask_valid], p_stack) + 1e-6 < brier_score_loss(y_te[mask_valid], p_cal[mask_valid]):
                 stack_coeffs = {"a_model": a_model, "a_book": a_book, "b": b_meta}
 
-    # Metrics (on calibrated model; stacking info is stored in blob)
+    # Metrics (on calibrated model; stacking stored in blob)
     mets = {
         "brier": float(brier_score_loss(y_te, p_cal)),
         "auc": float(roc_auc_score(y_te, p_cal)) if len(np.unique(y_te)) > 1 else float("nan"),
@@ -638,7 +616,7 @@ def _train_binary_head(
 
     return True, mets, p_cal
 
-# ───────────────────────── End-to-end training ───────────────────────── #
+# ─────────────────────── Orchestration ─────────────────────── #
 
 def train_models(
     db_url: Optional[str] = None,
@@ -646,13 +624,6 @@ def train_models(
     test_size: Optional[float] = None,
     min_rows: Optional[int] = None,
 ) -> Dict[str,Any]:
-    """
-    Trains/calibrates in-play and prematch heads, writes:
-      - model blobs → settings (model_latest:*, model:*)
-      - per-market thresholds → settings (conf_threshold:*)
-      - metrics bundle → settings (model_metrics_latest)
-    Returns summary dict.
-    """
     conn = _connect(db_url or os.getenv("DATABASE_URL"))
     _ensure_training_tables(conn)
 
@@ -678,7 +649,7 @@ def train_models(
             X_all  = _ensure_columns(df_ip, FEATURES).values
             ts_all = df_ip["_ts"].values
 
-            # Helper: book implied probs per head (validation stacking)
+            # Bookmaker implied prob helper (for stacking)
             def _book_probe_for(df, mk: str) -> Optional[np.ndarray]:
                 mid = df["_mid"].astype(int).tolist()
                 if mk == "BTTS_YES":
@@ -705,7 +676,7 @@ def train_models(
             summary["trained"]["BTTS_YES"] = ok
             if ok: summary["metrics"]["BTTS_YES"] = mets
 
-            # OU lines (Over target; Under is derived at serve-time)
+            # OU lines (Over target)
             totals = df_ip["final_goals_sum"].values.astype(int)
             for line in ou_lines:
                 name = f"OU_{_fmt_line(line)}"
@@ -719,7 +690,7 @@ def train_models(
                 summary["trained"][name] = ok_l
                 if ok_l:
                     summary["metrics"][name] = mets_l
-                    # Alias O25 for convenience if we trained 2.5
+                    # Alias O25 → mirrors main.py usage
                     if abs(line-2.5) < 1e-6:
                         blob = _get_setting_json(conn, f"model_latest:{name}")
                         if blob is not None:
@@ -774,7 +745,6 @@ def train_models(
                 summary["thresholds"]["1X2"] = thr_pct
         else:
             logger.info("In-Play: not enough labeled data (have %d, need >= %d).", len(df_ip), min_rows)
-            # still mark heads as not trained to keep summary explicit
             summary["trained"]["BTTS_YES"] = False
 
         # ===== Prematch =====
@@ -794,7 +764,7 @@ def train_models(
             summary["trained"]["PRE_BTTS_YES"] = ok
             if ok: summary["metrics"]["PRE_BTTS_YES"] = mets
 
-            # PRE OU (Over > line)
+            # PRE OU (Over target)
             totals = df_pre["final_goals_sum"].values.astype(int)
             for line in ou_lines:
                 name = f"PRE_OU_{_fmt_line(line)}"
@@ -870,7 +840,7 @@ def train_models(
         try: conn.close()
         except Exception: pass
 
-# ───────────────────────── CLI ───────────────────────── #
+# ─────────────────────── CLI ─────────────────────── #
 
 def _cli_main() -> None:
     ap = argparse.ArgumentParser()
