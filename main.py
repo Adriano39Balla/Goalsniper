@@ -64,6 +64,7 @@ TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 
 BACKFILL_EVERY_MIN = int(os.getenv("BACKFILL_EVERY_MIN", "15"))
 BACKFILL_DAYS      = int(os.getenv("BACKFILL_DAYS", "14"))
+DAILY_DIGEST_WINDOW_DAYS = int(os.getenv("DAILY_DIGEST_WINDOW_DAYS", "1"))
 DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
 DAILY_ACCURACY_HOUR   = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
 DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
@@ -1746,56 +1747,75 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
 DAILY_ACCURACY_DIGEST_ENABLE = str(os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1")).strip() not in ("0","false","False","no","NO")
 MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
 
-def daily_accuracy_digest(window_days: int = 7) -> Optional[str]:
-    if not DAILY_ACCURACY_DIGEST_ENABLE: return None
+def daily_accuracy_digest(window_days: Optional[int] = None) -> Optional[str]:
+    """
+    Accuracy digest over the last N days (defaults from DAILY_DIGEST_WINDOW_DAYS).
+    Includes ROI (1u flat staking) per market.
+    """
+    if not DAILY_ACCURACY_DIGEST_ENABLE:
+        return None
+
+    # default window from env if not provided
+    if window_days is None:
+        try:
+            window_days = int(os.getenv("DAILY_DIGEST_WINDOW_DAYS", "1"))
+        except Exception:
+            window_days = 1
+
     backfill_results_for_open_matches(400)
 
-    cutoff=int((datetime.now(BERLIN_TZ)-timedelta(days=window_days)).timestamp())
+    cutoff = int((datetime.now(BERLIN_TZ) - timedelta(days=int(window_days))).timestamp())
     with db_conn() as c:
-        rows=c.execute("""
+        rows = c.execute("""
             SELECT t.market, t.suggestion, t.confidence, t.confidence_raw, t.created_ts,
                    t.odds, r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM tips t LEFT JOIN match_results r ON r.match_id=t.match_id
-            WHERE t.created_ts >= %s AND t.suggestion<>'HARVEST' AND t.sent_ok=1
-        """,(cutoff,)).fetchall()
+            FROM tips t
+            LEFT JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts >= %s
+              AND t.suggestion <> 'HARVEST'
+              AND t.sent_ok = 1
+        """, (cutoff,)).fetchall()
 
-    total=graded=wins=0
+    total = graded = wins = 0
     roi_by_market, by_market = {}, {}
 
     for (mkt, sugg, conf, conf_raw, cts, odds, gh, ga, btts) in rows:
-        res={"final_goals_h":gh,"final_goals_a":ga,"btts_yes":btts}
-        out=_tip_outcome_for_result(sugg,res)
-        if out is None: continue
+        res = {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts}
+        out = _tip_outcome_for_result(sugg, res)
+        if out is None:
+            continue
 
-        total+=1; graded+=1; wins+=1 if out==1 else 0
-        d=by_market.setdefault(mkt or "?",{"graded":0,"wins":0}); d["graded"]+=1; d["wins"]+=1 if out==1 else 0
+        total += 1; graded += 1; wins += 1 if out == 1 else 0
+        d = by_market.setdefault(mkt or "?", {"graded": 0, "wins": 0})
+        d["graded"] += 1; d["wins"] += 1 if out == 1 else 0
 
         if odds:
-            roi_by_market.setdefault(mkt, {"stake":0,"pnl":0})
-            roi_by_market[mkt]["stake"]+=1
-            if out==1: roi_by_market[mkt]["pnl"]+=float(odds)-1
-            else: roi_by_market[mkt]["pnl"]-=1
+            roi_by_market.setdefault(mkt, {"stake": 0, "pnl": 0})
+            roi_by_market[mkt]["stake"] += 1
+            roi_by_market[mkt]["pnl"] += (float(odds) - 1) if out == 1 else -1
 
-    if graded==0:
-        msg="📊 Accuracy Digest\nNo graded tips in window."
+    if graded == 0:
+        msg = f"📊 Accuracy Digest (last {window_days}d)\nNo graded tips in window."
     else:
-        acc=100.0*wins/max(1,graded)
-        lines=[f"📊 <b>Accuracy Digest</b> (last {window_days}d)",
-               f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"]
+        acc = 100.0 * wins / max(1, graded)
+        lines = [
+            f"📊 <b>Accuracy Digest</b> (last {window_days}d)",
+            f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"
+        ]
+        for mk, st in sorted(by_market.items()):
+            if st["graded"] == 0:
+                continue
+            a = 100.0 * st["wins"] / st["graded"]
+            roi_txt = ""
+            if mk in roi_by_market and roi_by_market[mk]["stake"] > 0:
+                roi_val = 100.0 * roi_by_market[mk]["pnl"] / roi_by_market[mk]["stake"]
+                roi_txt = f" • ROI {roi_val:+.1f}%"
+            lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} ({a:.1f}%){roi_txt}")
+        msg = "\n".join(lines)
 
-        for mk,st in sorted(by_market.items()):
-            if st["graded"]==0: continue
-            a=100.0*st["wins"]/st["graded"]
-            roi=""; 
-            if mk in roi_by_market and roi_by_market[mk]["stake"]>0:
-                roi_val=100.0*roi_by_market[mk]["pnl"]/roi_by_market[mk]["stake"]
-                roi=f" • ROI {roi_val:+.1f}%"
-            lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} ({a:.1f}%){roi}")
-
-        msg="\n".join(lines)
-
-    send_telegram(msg); return msg
-
+    send_telegram(msg)
+    return msg
+    
 # ───────── MOTD (uses thresholds, EV, odds) ─────────
 def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, odds=None, book=None, ev_pct=None):
     money = ""
@@ -1814,8 +1834,10 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, 
     )
 
 def send_match_of_the_day() -> bool:
-    if not str(os.getenv("MOTD_PREDICT","1")).strip() not in ("0","false","False","no","NO"):
+    # explicit boolean check (less confusing)
+    if os.getenv("MOTD_PREDICT", "1") in ("0", "false", "False", "no", "NO"):
         return send_telegram("🏅 MOTD disabled.")
+
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
         return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
@@ -1826,13 +1848,13 @@ def send_match_of_the_day() -> bool:
             return send_telegram("🏅 Match of the Day: no fixtures in configured leagues.")
 
     best = None
+    skipped = {"threshold": 0, "odds": 0, "ev": 0, "models": 0}
 
     for fx in fixtures:
         fixture = fx.get("fixture") or {}
         lg      = fx.get("league") or {}
         teams   = fx.get("teams") or {}
         fid     = int((fixture.get("id") or 0))
-
         home = (teams.get("home") or {}).get("name","")
         away = (teams.get("away") or {}).get("name","")
         league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
@@ -1840,79 +1862,17 @@ def send_match_of_the_day() -> bool:
 
         feat = extract_prematch_features(fx)
         if not feat:
+            skipped["models"] += 1
             continue
 
-        candidates: List[Tuple[str,str,float]] = []
+        candidates: list[tuple[str,str,float]] = []
 
+        # PRE OU
         for line in OU_LINES:
             mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-            if not mdl: continue
-            p = _score_prob(feat, mdl)
-            mk = f"Over/Under {_fmt_line(line)}"
-            thr = _get_market_threshold_pre(mk)
-            if p*100.0 >= thr:   candidates.append((mk, f"Over {_fmt_line(line)} Goals", p))
-            q = 1.0 - p
-            if q*100.0 >= thr:   candidates.append((mk, f"Under {_fmt_line(line)} Goals", q))
-
-        mdl = load_model_from_settings("PRE_BTTS_YES")
-        if mdl:
-            p = _score_prob(feat, mdl); thr = _get_market_threshold_pre("BTTS")
-            if p*100.0 >= thr: candidates.append(("BTTS","BTTS: Yes", p))
-            q = 1.0 - p
-            if q*100.0 >= thr: candidates.append(("BTTS","BTTS: No",  q))
-
-        mh = load_model_from_settings("PRE_WLD_HOME")
-        ma = load_model_from_settings("PRE_WLD_AWAY")
-        if mh and ma:
-            ph = _score_prob(feat, mh); pa = _score_prob(feat, ma)
-            s = max(EPS, ph+pa); ph, pa = ph/s, pa/s
-            thr = _get_market_threshold_pre("1X2")
-            if ph*100.0 >= thr: candidates.append(("1X2","Home Win", ph))
-            if pa*100.0 >= thr: candidates.append(("1X2","Away Win", pa))
-
-        if not candidates:
-            continue
-
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        mk, sug, prob = candidates[0]
-        prob_pct = prob * 100.0
-        if prob_pct < max(MOTD_CONF_MIN, 75):
-            continue
-
-        odds_map = fetch_odds(fid, prob_hints={sug: prob} if sug.startswith("Over") or sug == "BTTS: Yes" else None) if API_KEY else {}
-        # map odds
-        odds = None; book = None
-        if mk == "BTTS":
-            d = odds_map.get("BTTS", {})
-            tgt = "Yes" if sug.endswith("Yes") else "No"
-            if tgt in d: odds, book = d[tgt].get("odds"), d[tgt].get("book")
-        elif mk == "1X2":
-            d = odds_map.get("1X2", {})
-            tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
-            if tgt and tgt in d: odds, book = d[tgt].get("odds"), d[tgt].get("book")
-        elif mk.startswith("Over/Under"):
-            ln = _parse_ou_line_from_suggestion(sug)
-            d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
-            tgt = "Over" if sug.startswith("Over") else "Under"
-            if tgt in d: odds, book = d[tgt].get("odds"), d[tgt].get("book")
-
-        if odds is None:
-            continue
-
-        edge = _ev(prob, odds)
-        ev_bps = int(round(edge * 10000))
-        ev_pct = round(edge * 100.0, 1)
-        if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
-            continue
-
-        item = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
-        if best is None or prob_pct > best[0]:
-            best = item
-
-    if not best:
-        return send_telegram("🏅 Match of the Day: no prematch pick met thresholds.")
-    prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best
-    return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
+            if not mdl:
+                continue
+            p = _
 
 # ───────── Auto-tune thresholds (ROI-aware) ─────────
 def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
@@ -2199,7 +2159,15 @@ def http_train():
 def http_train_notify(): _require_admin(); auto_train_job(); return jsonify({"ok": True})
 
 @app.route("/admin/digest", methods=["POST","GET"])
-def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
+def http_digest():
+    _require_admin()
+    try:
+        days_param = request.args.get("days")
+        days = int(days_param) if days_param and days_param.isdigit() else None
+    except Exception:
+        days = None
+    msg = daily_accuracy_digest(days)
+    return jsonify({"ok": True, "sent": bool(msg), "window_days": int(days if days is not None else os.getenv("DAILY_DIGEST_WINDOW_DAYS", "1"))})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
 def http_auto_tune(): _require_admin(); tuned=auto_tune_thresholds(14); return jsonify({"ok": True, "tuned": tuned})
