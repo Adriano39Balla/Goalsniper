@@ -1,141 +1,34 @@
 services:
-  api:
-    build:
-      builder: nixpacks
-      buildCommand: |
-        pip install --upgrade pip
-        pip install -r requirements.txt
-      nixpacksPlan:
-        providers: ["python"]
-        phases:
-          setup:
-            nixPkgs:
-              - python311
-          install:
-            commands:
-              - pip install -r requirements.txt
+  - name: predictor
+    start: "python main.py"
+    cron: "*/10 * * * *"
+    envs:
+      - key: TZ
+        value: Europe/Berlin
+      - key: TASK
+        value: predict
 
-    start:
-      cmd: gunicorn -w 2 -k gthread -t 120 -b 0.0.0.0:$PORT main:app
+  - name: motd
+    start: "python main.py"
+    cron: "*/5 * * * *"
+    envs:
+      - key: TZ
+        value: Europe/Berlin
+      - key: TASK
+        value: motd
 
-    env:
-      HOST: 0.0.0.0
-      PORT: "8080"
-      RUN_SCHEDULER: "0"                # API only, no jobs here
+  - name: digest
+    start: "python main.py"
+    cron: "*/5 * * * *"
+    envs:
+      - key: TZ
+        value: Europe/Berlin
+      - key: TASK
+        value: digest
 
-      # Odds / EV gating (aligned with main.py defaults you have)
-      MIN_ODDS_OU: "1.50"
-      MIN_ODDS_BTTS: "1.50"
-      MIN_ODDS_1X2: "1.50"
-      MAX_ODDS_ALL: "20.0"
-      EDGE_MIN_BPS: "600"
-
-      # In-play gating
-      MARKET_CUTOFFS: "BTTS=75,1X2=80,OU=88"
-      TIP_MAX_MINUTE: "90"
-      TIP_MIN_MINUTE: "12"
-      PER_LEAGUE_CAP: "2"
-      PREDICTIONS_PER_MATCH: "1"
-      DUP_COOLDOWN_MIN: "20"
-      SCAN_INTERVAL_SEC: "300"
-
-      # Odds aggregation
-      ODDS_SOURCE: "auto"
-      ODDS_AGGREGATION: "median"
-      ODDS_OUTLIER_MULT: "1.8"
-      ODDS_REQUIRE_N_BOOKS: "2"
-      ODDS_FAIR_MAX_MULT: "2.5"
-
-      # Caches / stale guard
-      SETTINGS_TTL_SEC: "60"
-      MODELS_CACHE_TTL_SEC: "120"
-      STALE_GUARD_ENABLE: "1"
-      STALE_STATS_MAX_SEC: "240"
-
-      # Optional perf
-      PYARROW_IGNORE_TIMEZONE: "1"
-
-    healthcheck:
-      path: /health
-      interval: 15s
-      timeout: 5s
-      retries: 10
-
-    autoDeploy: true
-    domains: []  # set in Railway if you want a custom domain
-
-  worker:
-    build:
-      builder: nixpacks
-      buildCommand: |
-        pip install --upgrade pip
-        pip install -r requirements.txt
-      nixpacksPlan:
-        providers: ["python"]
-        phases:
-          setup:
-            nixPkgs:
-              - python311
-          install:
-            commands:
-              - pip install -r requirements.txt
-
-    # Import main.py (which starts the scheduler) and keep the process alive.
-    # This avoids running the Flask web server while still using your existing code.
-    start:
-      cmd: python -u -c "import main; import time; time.sleep(315360000)"
-
-    env:
-      RUN_SCHEDULER: "1"                # scheduler enabled here
-
-      # Training / auto-tune
-      TRAIN_ENABLE: "1"
-      TRAIN_HOUR_UTC: "2"
-      TRAIN_MINUTE_UTC: "12"
-      AUTO_TUNE_ENABLE: "0"             # set "1" to enable ROI-aware auto-tune nightly
-      TARGET_PRECISION: "0.80"
-      THRESH_MIN_PREDICTIONS: "40"
-      MIN_THRESH: "70"
-      MAX_THRESH: "92"
-      RECENCY_MONTHS: "24"
-      RECENCY_HALF_LIFE_DAYS: "120"
-      TRAIN_MIN_MINUTE: "15"
-      TRAIN_TEST_SIZE: "0.25"
-      TRAIN_MIN_ROWS: "500"
-      TRAIN_MIN_POS: "120"
-      TRAIN_MIN_NEG: "120"
-      OU_TRAIN_LINES: "2.5,3.5"
-
-      # In-play scanning cadence / tip rules
-      MARKET_CUTOFFS: "BTTS=75,1X2=80,OU=88"
-      TIP_MAX_MINUTE: "90"
-      TIP_MIN_MINUTE: "12"
-      PER_LEAGUE_CAP: "2"
-      PREDICTIONS_PER_MATCH: "1"
-      DUP_COOLDOWN_MIN: "20"
-      SCAN_INTERVAL_SEC: "300"
-
-      # Odds aggregation
-      ODDS_SOURCE: "auto"
-      ODDS_AGGREGATION: "median"
-      ODDS_OUTLIER_MULT: "1.8"
-      ODDS_REQUIRE_N_BOOKS: "2"
-      ODDS_FAIR_MAX_MULT: "2.5"
-
-      # Digest + MOTD
-      DAILY_ACCURACY_DIGEST_ENABLE: "1"
-      DAILY_ACCURACY_HOUR: "3"
-      DAILY_ACCURACY_MINUTE: "6"
-      MOTD_PREDICT: "1"
-      MOTD_HOUR: "19"
-      MOTD_MINUTE: "15"
-      MOTD_CONF_MIN: "70"
-      MOTD_MIN_EV_BPS: "0"
-
-      # Caches / stale guard
-      SETTINGS_TTL_SEC: "60"
-      MODELS_CACHE_TTL_SEC: "120"
-      STALE_GUARD_ENABLE: "1"
-      STALE_STATS_MAX_SEC: "240"
-
-    autoDeploy: true
+  - name: train
+    start: "python train_models.py"
+    cron: "*/15 * * * *"
+    envs:
+      - key: TZ
+        value: Europe/Berlin
