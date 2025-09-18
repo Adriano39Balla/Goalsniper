@@ -1,43 +1,9 @@
 services:
-  - name: predictor
+  - name: goalsniper
     start: "python main.py"
-    cron: "*/10 * * * *"
+    # No cron needed; APScheduler runs inside the process
     envs:
       - key: TZ
         value: Europe/Berlin
-      - key: TASK
-        value: predict
-
-  - name: heartbeat
-    start: "python main.py"
-    cron: "*/5 * * * *"
-    envs:
-      - key: TZ
-        value: Europe/Berlin
-      - key: TASK
-        value: heartbeat
-
-  - name: motd
-    start: "python main.py"
-    cron: "*/5 * * * *"
-    envs:
-      - key: TZ
-        value: Europe/Berlin
-      - key: TASK
-        value: motd
-
-  - name: digest
-    start: "python main.py"
-    cron: "*/5 * * * *"
-    envs:
-      - key: TZ
-        value: Europe/Berlin
-      - key: TASK
-        value: digest
-
-  - name: train
-    start: "python train_models.py"
-    cron: "*/15 * * * *"
-    envs:
-      - key: TZ
-        value: Europe/Berlin
+      - key: APIFOOTBALL_BUDGET_DAILY
+        value: "2200"
