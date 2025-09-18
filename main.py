@@ -28,7 +28,7 @@ BACKFILL_EVERY_MIN = int(os.getenv("BACKFILL_EVERY_MIN", "15"))
 TRAIN_ENABLE = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_HOUR_UTC = int(os.getenv("TRAIN_HOUR_UTC", "2"))
 TRAIN_MINUTE_UTC = int(os.getenv("TRAIN_MINUTE_UTC", "12"))
-AUTO_TUNE_ENABLE = os.getenv("AUTO_TUNE_ENABLE", "0") not in ("0","false","False","no","NO")
+AUTO_TUNE_ENABLE = os.getenv("AUTO_TUNE_ENABLE", "0") not in ("0","false","False","no","NO"))
 DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
 DAILY_ACCURACY_HOUR = int(os.getenv("DAILY_ACCURACY_HOUR", "8"))
 DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "0"))
@@ -38,6 +38,19 @@ MOTD_MINUTE = int(os.getenv("MOTD_MINUTE", "0"))
 
 TZ_UTC = ZoneInfo("UTC")
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
+
+# Nightly cooldown (Berlin) — default 23:00–07:00
+REST_START_HOUR_BERLIN = int(os.getenv("REST_START_HOUR_BERLIN", "23"))  # inclusive
+REST_END_HOUR_BERLIN   = int(os.getenv("REST_END_HOUR_BERLIN", "7"))     # exclusive
+
+def is_rest_window_now() -> bool:
+    """Return True if current Berlin local time is within the nightly rest window."""
+    now = time.localtime()  # not TZ aware; we'll use ZoneInfo for Berlin hour
+    h = int(__import__("datetime").datetime.now(BERLIN_TZ).hour)
+    if REST_START_HOUR_BERLIN <= REST_END_HOUR_BERLIN:
+        return REST_START_HOUR_BERLIN <= h < REST_END_HOUR_BERLIN
+    # wrap across midnight (e.g., 23..24 & 0..6)
+    return (h >= REST_START_HOUR_BERLIN) or (h < REST_END_HOUR_BERLIN)
 
 # ───────── Admin auth ─────────
 def _require_admin():
@@ -65,6 +78,14 @@ def _run_with_pg_lock(lock_key: int, fn, *a, **k):
         log.exception("[LOCK %s] failed: %s", lock_key, e)
         return None
 
+def _maybe_skip_rest(fn_name: str):
+    """Guard that turns scan jobs into no-ops in the Berlin nightly rest window."""
+    if is_rest_window_now():
+        log.info("[%s] rest window active (%02d:00–%02d:00 Berlin) — skipped.",
+                 fn_name, REST_START_HOUR_BERLIN, REST_END_HOUR_BERLIN)
+        return True
+    return False
+
 def _start_scheduler_once():
     global _scheduler_started
     if _scheduler_started or not RUN_SCHEDULER:
@@ -72,11 +93,15 @@ def _start_scheduler_once():
     try:
         sched = BackgroundScheduler(timezone=TZ_UTC)
 
-        # live in-play scanning
-        sched.add_job(lambda: _run_with_pg_lock(1001, production_scan),
-                      "interval", seconds=SCAN_INTERVAL_SEC, id="scan", max_instances=1, coalesce=True)
+        # live in-play scanning (no-op during rest window)
+        def _scan_job():
+            if _maybe_skip_rest("scan"):
+                return
+            return _run_with_pg_lock(1001, production_scan)
+        sched.add_job(_scan_job, "interval",
+                      seconds=SCAN_INTERVAL_SEC, id="scan", max_instances=1, coalesce=True)
 
-        # backfill results
+        # backfill results (can run at night — cheap and non-live)
         sched.add_job(lambda: _run_with_pg_lock(1002, backfill_results_for_open_matches, 400),
                       "interval", minutes=BACKFILL_EVERY_MIN, id="backfill", max_instances=1, coalesce=True)
 
@@ -86,31 +111,31 @@ def _start_scheduler_once():
                           CronTrigger(hour=DAILY_ACCURACY_HOUR, minute=DAILY_ACCURACY_MINUTE, timezone=BERLIN_TZ),
                           id="digest", max_instances=1, coalesce=True)
 
-        # match of the day
+        # match of the day (prematch; allowed any time, but usually morning)
         if MOTD_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1004, send_match_of_the_day),
                           CronTrigger(hour=MOTD_HOUR, minute=MOTD_MINUTE, timezone=BERLIN_TZ),
                           id="motd", max_instances=1, coalesce=True)
 
-        # training
+        # training (runs at fixed UTC time)
         if TRAIN_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1005, train_models),
                           CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
                           id="train", max_instances=1, coalesce=True)
 
-        # auto-tune thresholds
+        # auto-tune thresholds (UTC; cheap)
         if AUTO_TUNE_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1006, auto_tune_thresholds, 14),
                           CronTrigger(hour=4, minute=7, timezone=TZ_UTC),
                           id="auto_tune", max_instances=1, coalesce=True)
 
-        # retry unsent
+        # retry unsent (also cheap; allowed at night)
         sched.add_job(lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200),
                       "interval", minutes=10, id="retry", max_instances=1, coalesce=True)
 
         sched.start()
         _scheduler_started = True
-        send_telegram("🚀 goalsniper AI live and scanning")
+        send_telegram("🚀 goalsniper AI live and scanning (night rest 23:00–07:00 Berlin)")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
 
     except Exception as e:
@@ -220,6 +245,8 @@ def stats():
 @app.route("/admin/scan", methods=["POST","GET"])
 def http_scan():
     _require_admin()
+    if is_rest_window_now():
+        return jsonify({"ok": True, "saved": 0, "live_seen": 0, "skipped": "rest-window"}), 200
     s, l = production_scan()
     return jsonify({"ok": True, "saved": s, "live_seen": l})
 
@@ -265,6 +292,8 @@ def http_backfill_results():
 @app.route("/admin/prematch-scan", methods=["GET"])
 def http_prematch_scan():
     _require_admin()
+    if is_rest_window_now():
+        return jsonify({"ok": True, "saved": 0, "skipped": "rest-window"}), 200
     saved = prematch_scan_save()
     return jsonify({"ok": True, "saved": int(saved)})
 
@@ -286,6 +315,8 @@ def http_retry_unsent():
 @app.route("/admin/live-scan", methods=["GET"])
 def http_live_scan_once():
     _require_admin()
+    if is_rest_window_now():
+        return jsonify({"ok": True, "saved": 0, "live_seen": 0, "skipped": "rest-window"}), 200
     saved, live_seen = production_scan()
     return jsonify({"ok": True, "saved": int(saved), "live_seen": int(live_seen)})
 
@@ -314,6 +345,29 @@ def http_motd_get():
     _require_admin()
     ok = send_match_of_the_day()
     return jsonify({"ok": bool(ok)})
+
+# Optional: REST window config endpoint (admin)
+@app.route("/admin/rest-window", methods=["GET","POST"])
+def http_rest_window():
+    _require_admin()
+    global REST_START_HOUR_BERLIN, REST_END_HOUR_BERLIN
+    if request.method == "GET":
+        return jsonify({
+            "ok": True,
+            "start_hour": REST_START_HOUR_BERLIN,
+            "end_hour": REST_END_HOUR_BERLIN,
+            "active_now": bool(is_rest_window_now()),
+            "tz": "Europe/Berlin"
+        })
+    body = request.get_json(silent=True) or {}
+    try:
+        if "start_hour" in body:
+            REST_START_HOUR_BERLIN = int(body["start_hour"])
+        if "end_hour" in body:
+            REST_END_HOUR_BERLIN = int(body["end_hour"])
+        return jsonify({"ok": True, "start_hour": REST_START_HOUR_BERLIN, "end_hour": REST_END_HOUR_BERLIN})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 # ───────── Boot ─────────
 def _on_boot():
