@@ -1,3 +1,4 @@
+# file: db.py
 # Robust Postgres pool + schema bootstrap for goalsniper
 
 import os
@@ -25,7 +26,6 @@ if "sslmode=" not in DB_URL:
 POOL: SimpleConnectionPool | None = None
 
 def _new_conn():
-    # Keepalives help prevent idle disconnects
     return psycopg2.connect(
         DB_URL,
         keepalives=1,
@@ -44,12 +44,6 @@ def _init_pool():
 # --- Context manager with auto-retry -----------------------------------------
 
 class _PooledCursor:
-    """
-    Usage:
-        with db_conn() as c:
-            cur = c.execute("SELECT 1")
-            n = cur.fetchone()[0]
-    """
     def __init__(self, pool: SimpleConnectionPool):
         self.pool = pool
         self.conn = None
@@ -60,19 +54,14 @@ class _PooledCursor:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        # Close cursor then return conn to pool
         try:
             if self.cur is not None:
-                try:
-                    self.cur.close()
-                except Exception:
-                    pass
+                try: self.cur.close()
+                except Exception: pass
         finally:
             if self.conn is not None:
-                try:
-                    self.pool.putconn(self.conn)
-                except Exception:
-                    pass
+                try: self.pool.putconn(self.conn)
+                except Exception: pass
             self.conn = None
             self.cur = None
 
@@ -83,19 +72,15 @@ class _PooledCursor:
         self.cur = self.conn.cursor()
 
     def _reset(self):
-        # Drop broken connection, grab a fresh one
         try:
             if self.cur:
-                try:
-                    self.cur.close()
-                except Exception:
-                    pass
+                try: self.cur.close()
+                except Exception: pass
         finally:
             try:
                 if self.conn:
                     self.pool.putconn(self.conn, close=True)
-            except Exception:
-                pass
+            except Exception: pass
         self.conn = None
         self.cur = None
         self._acquire()
@@ -121,14 +106,12 @@ class _PooledCursor:
             return self.cur
 
 def db_conn() -> _PooledCursor:
-    """Get a pooled cursor context manager."""
     _init_pool()
     return _PooledCursor(POOL)  # type: ignore
 
 # --- Schema & migrations ------------------------------------------------------
 
 SCHEMA_SQL = [
-    # core tips storage (no id column by design; identity = match_id + created_ts)
     """
     CREATE TABLE IF NOT EXISTS tips (
         match_id        BIGINT,
@@ -206,7 +189,7 @@ SCHEMA_SQL = [
         payload    TEXT
     )
     """,
-    # NEW: fixtures table (used by scan stubs)
+    # ✅ Fixtures table for scan.py
     """
     CREATE TABLE IF NOT EXISTS fixtures (
         fixture_id   BIGINT PRIMARY KEY,
@@ -225,11 +208,11 @@ SCHEMA_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_snap_by_match       ON tip_snapshots(match_id, created_ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_results_updated     ON match_results(updated_ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_odds_hist_match     ON odds_history(match_id, captured_ts DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_fixtures_status     ON fixtures(status)"
+    # ✅ New index for fast scan queries
+    "CREATE INDEX IF NOT EXISTS idx_fixtures_status_update ON fixtures(status, last_update DESC)"
 ]
 
 MIGRATIONS_SQL = [
-    # idempotent add-columns in case older tables exist
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds           DOUBLE PRECISION",
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS book           TEXT",
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS ev_pct         DOUBLE PRECISION",
@@ -238,20 +221,17 @@ MIGRATIONS_SQL = [
 ]
 
 def init_db() -> None:
-    """Create tables and run safe migrations."""
     _init_pool()
     with db_conn() as c:
         for sql in SCHEMA_SQL:
             c.execute(sql)
         for sql in MIGRATIONS_SQL:
-            try:
-                c.execute(sql)
+            try: c.execute(sql)
             except Exception as e:
-                # harmless if not applicable
                 log.debug("[DB] migration skipped: %s -> %s", sql, e)
     log.info("[DB] schema ready")
 
-# --- Settings helpers (used by app) ------------------------------------------
+# --- Settings helpers --------------------------------------------------------
 
 def get_setting(key: str) -> str | None:
     with db_conn() as c:
