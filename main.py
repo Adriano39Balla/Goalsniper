@@ -1,8 +1,9 @@
-import os, asyncio, httpx, math, json, re, contextlib
+import os, asyncio, httpx, math, json, re, contextlib, pickle
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dtime, date
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import psycopg
 from psycopg.rows import dict_row
 
@@ -12,7 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from aiohttp import web
 
-# ---- ENV / CONFIG ----
+# ========= ENV / CONFIG =========
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Berlin"))
 API_KEY = os.getenv("APIFOOTBALL_KEY", "")
 BOT = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -21,16 +22,14 @@ DB_URL = os.getenv("DATABASE_URL", "")
 
 COOLDOWN_START = os.getenv("COOLDOWN_START", "23:00")
 COOLDOWN_END   = os.getenv("COOLDOWN_END", "07:00")
+SEND_MESSAGES  = os.getenv("SEND_MESSAGES", "true").lower() == "true"
 
-SEND_MESSAGES = os.getenv("SEND_MESSAGES", "true").lower() == "true"  # can disable globally
-MAX_LOOKBACK = int(os.getenv("LOOKBACK_MATCHES", "10"))               # recent matches for Poisson
-
+LOOKBACK_MATCHES = int(os.getenv("LOOKBACK_MATCHES", "10"))
 API_BASE = "https://v3.football.api-sports.io"
-HEADERS = {"x-apisports-key": API_KEY}
-
+HEADERS  = {"x-apisports-key": API_KEY}
 HTTP_PORT = int(os.getenv("PORT", "8000"))
 
-# ---- UTILITIES ----
+# ========= UTILITIES =========
 def now_local() -> datetime:
     return datetime.now(TZ)
 
@@ -47,45 +46,61 @@ def is_exact_local_time(hhmm: str) -> bool:
     return n.hour == t.hour and n.minute == t.minute
 
 def league_excluded(name: str, type_: str) -> bool:
-    if type_ not in ("League", "Cup"): return True
+    if type_ not in ("League","Cup"): return True
     return re.search(r"(U-?\d{2}|U\d{2}|Youth|Reserves?|Academy|U19|U21|U23|B$|II$)", name, re.I) is not None
 
 async def send_telegram(text: str):
-    if not (BOT and CHAT and SEND_MESSAGES):
-        return
+    if not (BOT and CHAT and SEND_MESSAGES): return
     url = f"https://api.telegram.org/bot{BOT}/sendMessage"
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.post(url, json={"chat_id": CHAT, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
         r.raise_for_status()
 
-def implied_prob(decimal_odds: float) -> float:
-    if not decimal_odds or decimal_odds <= 1.0: return 0.0
-    return 1.0 / decimal_odds
+def implied_prob(odds: float) -> float:
+    return 0.0 if not odds or odds <= 1 else 1.0 / odds
 
 def normalize_overround(p_over: float, p_under: float):
     s = max(p_over + p_under, 1e-6)
     return p_over / s, p_under / s
 
-def expected_value(prob: float, dec_odds: float):
-    return prob * (dec_odds - 1.0) - (1.0 - prob)
+def expected_value(p: float, dec: float):
+    return p * (dec - 1.0) - (1.0 - p)
 
-def poisson_p_total_ge_k(lambda_total: float, k: int) -> float:
-    # P(X >= k) for Poisson; 1 - CDF(k-1)
-    cdf = 0.0
-    for i in range(0, k):
-        cdf += math.exp(-lambda_total) * lambda_total**i / math.factorial(i)
-    return max(0.0, min(1.0, 1.0 - cdf))
-
-# ---- DB ----
+# ========= DB SCHEMA =========
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS fixtures (
   fixture_id INT PRIMARY KEY,
   date DATE,
+  league_id INT,
   league_name TEXT,
+  season INT,
+  home_id INT,
+  away_id INT,
   home TEXT,
   away TEXT,
   kickoff TIMESTAMPTZ,
-  status TEXT
+  status TEXT,
+  goals_home SMALLINT,
+  goals_away SMALLINT
+);
+
+CREATE TABLE IF NOT EXISTS odds_snapshots (
+  fixture_id INT,
+  ts TIMESTAMPTZ DEFAULT now(),
+  over25 REAL,
+  under25 REAL,
+  PRIMARY KEY (fixture_id, ts)
+);
+
+CREATE TABLE IF NOT EXISTS features (
+  fixture_id INT PRIMARY KEY,
+  computed_at TIMESTAMPTZ DEFAULT now(),
+  home_form_gf5 REAL, home_form_ga5 REAL,
+  away_form_gf5 REAL, away_form_ga5 REAL,
+  home_rest_days REAL, away_rest_days REAL,
+  league_goal_env REAL,
+  odds_over_implied REAL, odds_under_implied REAL,
+  odds_overround REAL, odds_over_drift REAL, odds_under_drift REAL
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
@@ -96,26 +111,37 @@ CREATE TABLE IF NOT EXISTS predictions (
   kickoff TIMESTAMPTZ,
   market TEXT,
   pick TEXT,
-  p_over REAL,
-  p_under REAL,
-  odds_over REAL,
-  odds_under REAL,
-  confidence REAL,
-  ev REAL,
+  p_over REAL, p_under REAL,
+  odds_over REAL, odds_under REAL,
+  confidence REAL, ev REAL,
+  policy_id TEXT DEFAULT 'global',
+  explain JSONB,
   sent_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS results (
   fixture_id INT PRIMARY KEY,
-  goals_home SMALLINT,
-  goals_away SMALLINT,
+  goals_home SMALLINT, goals_away SMALLINT,
   settled_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS model_registry (
+  model_id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  label TEXT,
+  version TEXT,
+  lib TEXT,
+  blob BYTEA,
+  meta JSONB
 );
 
 CREATE TABLE IF NOT EXISTS model_cfg (
   key TEXT PRIMARY KEY,
   value JSONB
 );
+
+-- Extensions
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 """
 
 async def ensure_schema():
@@ -123,6 +149,7 @@ async def ensure_schema():
         await con.execute(SCHEMA_SQL)
         await con.commit()
 
+# ========= CFG HELPERS =========
 async def get_cfg(key: str):
     async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
         row = await con.execute("SELECT value FROM model_cfg WHERE key=%s", (key,))
@@ -132,23 +159,23 @@ async def get_cfg(key: str):
 async def set_cfg(key: str, value):
     async with await psycopg.AsyncConnection.connect(DB_URL) as con:
         await con.execute(
-            "INSERT INTO model_cfg(key,value) VALUES (%s,%s) "
-            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            "INSERT INTO model_cfg(key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
             (key, json.dumps(value)),
-        )
-        await con.commit()
+        ); await con.commit()
 
-async def get_policy():
-    # Reads {'theta': float, 'ev_min': float} from model_cfg.policy; falls back to env defaults
-    theta = float(os.getenv("THRESHOLD", "0.75"))
-    ev_min = float(os.getenv("EV_MIN", "0.05"))
-    pol = await get_cfg("policy")
-    if isinstance(pol, dict):
-        theta = float(pol.get("theta", theta))
-        ev_min = float(pol.get("ev_min", ev_min))
-    return theta, ev_min
+async def get_policy_for_league(league_name: str):
+    # Supports {"global":{"theta":..,"ev_min":..}, "bundesliga":{"theta":..,"ev_min":..}, ...}
+    pol = await get_cfg("policy") or {}
+    g = pol.get("global", {"theta":0.78,"ev_min":0.04})
+    theta_g, ev_g = float(g.get("theta",0.78)), float(g.get("ev_min",0.04))
+    ln = (league_name or "").lower()
+    for k, v in pol.items():
+        if k == "global": continue
+        if k in ln:
+            return float(v.get("theta", theta_g)), float(v.get("ev_min", ev_g))
+    return theta_g, ev_g
 
-# ---- API-FOOTBALL CALLS ----
+# ========= API-FOOTBALL =========
 async def api_get(path: str, params: dict):
     async with httpx.AsyncClient(headers=HEADERS, timeout=30) as c:
         r = await c.get(f"{API_BASE}/{path}", params=params); r.raise_for_status()
@@ -156,17 +183,14 @@ async def api_get(path: str, params: dict):
 
 async def get_fixtures_by_date(date_iso: str):
     data = await api_get("fixtures", {"date": date_iso})
-    out = []
+    out=[]
     for r in data.get("response", []):
         lg = r.get("league", {}) or {}
-        lgname = lg.get("name", "")
-        lgtype = lg.get("type", "League")
-        if league_excluded(lgname, lgtype): 
-            continue
+        if league_excluded(lg.get("name",""), lg.get("type","League")): continue
         out.append(r)
     return out
 
-async def get_team_last_matches(team_id: int, n: int = MAX_LOOKBACK):
+async def get_team_last_matches(team_id: int, n: int = LOOKBACK_MATCHES):
     data = await api_get("fixtures", {"team": team_id, "last": n})
     return data.get("response", [])
 
@@ -176,178 +200,322 @@ async def get_odds_for_fixture(fixture_id: int):
     for resp in data.get("response", []):
         for bk in resp.get("bookmakers", []):
             for market in bk.get("bets", []):
-                if str(market.get("name", "")).lower() in ("over/under", "goals over/under"):
+                if str(market.get("name","")).lower() in ("over/under","goals over/under"):
                     for v in market.get("values", []):
                         label = (v.get("value") or "").strip()
-                        odd = v.get("odd", None)
-                        if not odd: 
-                            continue
-                        if label in ("Over 2.5", "Over 2,5"):
-                            best["over"] = max(best["over"] or 0.0, float(odd))
-                        elif label in ("Under 2.5", "Under 2,5"):
-                            best["under"] = max(best["under"] or 0.0, float(odd))
+                        odd = v.get("odd")
+                        if not odd: continue
+                        odd = float(odd)
+                        if label in ("Over 2.5","Over 2,5"):   best["over"]  = max(best["over"] or 0.0, odd)
+                        elif label in ("Under 2.5","Under 2,5"): best["under"] = max(best["under"] or 0.0, odd)
     return best
 
-# ---- FEATURES via SIMPLE POISSON ----
+# ========= UPSERTS =========
+async def upsert_fixture_row(f):
+    fix=f["fixture"]; teams=f["teams"]; league=f["league"]; goals=f["goals"]
+    async with await psycopg.AsyncConnection.connect(DB_URL) as con:
+        await con.execute("""
+            INSERT INTO fixtures(fixture_id,date,league_id,league_name,season,home_id,away_id,home,away,kickoff,status,goals_home,goals_away)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (fixture_id) DO UPDATE SET
+              date=EXCLUDED.date, league_id=EXCLUDED.league_id, league_name=EXCLUDED.league_name, season=EXCLUDED.season,
+              home_id=EXCLUDED.home_id, away_id=EXCLUDED.away_id, home=EXCLUDED.home, away=EXCLUDED.away,
+              kickoff=EXCLUDED.kickoff, status=EXCLUDED.status, goals_home=EXCLUDED.goals_home, goals_away=EXCLUDED.goals_away
+        """, (
+            fix["id"],
+            datetime.fromtimestamp(fix["timestamp"], tz=TZ).date(),
+            league.get("id"), league.get("name"), league.get("season"),
+            teams["home"]["id"], teams["away"]["id"],
+            teams["home"]["name"], teams["away"]["name"],
+            datetime.fromtimestamp(fix["timestamp"], tz=TZ),
+            fix["status"]["short"],
+            (goals["home"] or None), (goals["away"] or None)
+        ))
+        await con.commit()
+
+async def insert_odds_snapshot(fid:int, over:float, under:float):
+    async with await psycopg.AsyncConnection.connect(DB_URL) as con:
+        await con.execute("INSERT INTO odds_snapshots(fixture_id,over25,under25) VALUES (%s,%s,%s)", (fid, over, under))
+        await con.commit()
+
+# ========= FEATURES (DB-first; API fallback) =========
+async def team_recent_stats(team_id:int, limit:int=LOOKBACK_MATCHES):
+    # Prefer DB (finished fixtures)
+    async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
+        rows = await con.execute("""
+            SELECT goals_home, goals_away, home_id, away_id, kickoff
+            FROM fixtures
+            WHERE (home_id=%s OR away_id=%s) AND status='FT'
+            ORDER BY kickoff DESC LIMIT %s
+        """, (team_id, team_id, limit))
+        data = await rows.fetchall()
+
+    if data:
+        gf=ga=0; last_dt=None
+        for r in data:
+            if r["home_id"]==team_id: gf+=(r["goals_home"] or 0); ga+=(r["goals_away"] or 0); last_dt=r["kickoff"]
+            else: gf+=(r["goals_away"] or 0); ga+=(r["goals_home"] or 0); last_dt=r["kickoff"]
+        cnt=len(data); rest_days=(now_local()-last_dt).days if last_dt else 7.0
+        return (gf/cnt if cnt else 1.2, ga/cnt if cnt else 1.1, rest_days)
+
+    # fallback to API
+    last = await get_team_last_matches(team_id, limit)
+    gf=ga=cnt=0; last_ts=None
+    for m in last:
+        t_home=m["teams"]["home"]["id"]; gh=m["goals"]["home"] or 0; ga_ = m["goals"]["away"] or 0
+        ts=datetime.fromtimestamp(m["fixture"]["timestamp"], tz=TZ)
+        if t_home==team_id: gf+=gh; ga+=ga_; cnt+=1
+        else: gf+=ga_; ga+=gh; cnt+=1
+        last_ts = last_ts or ts
+    rest_days=(now_local()-last_ts).days if last_ts else 7.0
+    return (gf/cnt if cnt else 1.2, ga/cnt if cnt else 1.1, rest_days)
+
+async def compute_and_upsert_features(fixture):
+    fix=fixture["fixture"]; league=fixture["league"]; teams=fixture["teams"]
+    fid=fix["id"]; home_id=teams["home"]["id"]; away_id=teams["away"]["id"]
+
+    # odds snapshot + drift
+    odds = await get_odds_for_fixture(fid)
+    over,under = odds.get("over"), odds.get("under")
+    if over and under: await insert_odds_snapshot(fid, over, under)
+
+    async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
+        rows = await con.execute("SELECT * FROM odds_snapshots WHERE fixture_id=%s ORDER BY ts ASC", (fid,))
+        snaps = await rows.fetchall()
+    drift_over = drift_under = None
+    if len(snaps) >= 2:
+        drift_over  = (snaps[-1]["over25"] or 0) - (snaps[0]["over25"] or 0)
+        drift_under = (snaps[-1]["under25"] or 0) - (snaps[0]["under25"] or 0)
+
+    # rolling form + rest
+    h_gf5,h_ga5,h_rest = await team_recent_stats(home_id, LOOKBACK_MATCHES)
+    a_gf5,a_ga5,a_rest = await team_recent_stats(away_id, LOOKBACK_MATCHES)
+
+    # league goal environment
+    async with await psycopg.AsyncConnection.connect(DB_URL) as con:
+        r = await con.execute("""
+            SELECT AVG((goals_home+goals_away)::float) FROM fixtures
+            WHERE league_id=%s AND status='FT' AND (goals_home IS NOT NULL AND goals_away IS NOT NULL)
+        """, (league.get("id"),))
+        env = (await r.fetchone())[0] or 2.6
+
+    p_over_bk = implied_prob(over) if over else None
+    p_under_bk = implied_prob(under) if under else None
+    overround = (p_over_bk or 0) + (p_under_bk or 0)
+
+    async with await psycopg.AsyncConnection.connect(DB_URL) as con:
+        await con.execute("""
+            INSERT INTO features(fixture_id,home_form_gf5,home_form_ga5,away_form_gf5,away_form_ga5,
+                                 home_rest_days,away_rest_days,league_goal_env,
+                                 odds_over_implied,odds_under_implied,odds_overround,odds_over_drift,odds_under_drift)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (fixture_id) DO UPDATE SET
+              computed_at=now(),
+              home_form_gf5=EXCLUDED.home_form_gf5, home_form_ga5=EXCLUDED.home_form_ga5,
+              away_form_gf5=EXCLUDED.away_form_gf5, away_form_ga5=EXCLUDED.away_form_ga5,
+              home_rest_days=EXCLUDED.home_rest_days, away_rest_days=EXCLUDED.away_rest_days,
+              league_goal_env=EXCLUDED.league_goal_env,
+              odds_over_implied=EXCLUDED.odds_over_implied, odds_under_implied=EXCLUDED.odds_under_implied,
+              odds_overround=EXCLUDED.odds_overround, odds_over_drift=EXCLUDED.odds_over_drift, odds_under_drift=EXCLUDED.odds_under_drift
+        """, (fid,h_gf5,h_ga5,a_gf5,a_ga5,h_rest,a_rest,env,p_over_bk,p_under_bk,overround,drift_over,drift_under))
+        await con.commit()
+
+    return odds
+
+# ========= MODEL LOADING =========
+FEATURES_ORDER = [
+    "home_form_gf5","home_form_ga5","away_form_gf5","away_form_ga5",
+    "home_rest_days","away_rest_days","league_goal_env",
+    "odds_over_implied","odds_under_implied","odds_overround",
+    "odds_over_drift","odds_under_drift"
+]
+
+class CalibratedModel:
+    # Stored by train_models.py: catboost + platt LR. Here we just load and call predict_proba(X)->P(over)
+    def __init__(self, cat, lr):
+        self.cat = cat
+        self.lr  = lr
+    def predict_over(self, X: np.ndarray) -> np.ndarray:
+        raw = self.cat.predict_proba(X)[:,1]
+        raw = np.clip(raw, 1e-6, 1-1e-6)
+        logits = np.log(raw/(1-raw))
+        # LR is trained on logits; use its sigmoid
+        coef = float(self.lr.coef_.ravel()[0]); intercept = float(self.lr.intercept_.ravel()[0])
+        z = coef*logits + intercept
+        return 1/(1+np.exp(-z))
+
+async def load_latest_model():
+    async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
+        row = await con.execute("""
+            SELECT blob, meta FROM model_registry
+            WHERE label='ou25_global' ORDER BY created_at DESC LIMIT 1
+        """)
+        r = await row.fetchone()
+        if not r: return None, None
+        model = pickle.loads(bytes(r["blob"]))
+        meta  = r["meta"] or {}
+        return model, meta
+
+# ========= POLICY-AWARE PICK =========
 @dataclass
 class FixtureInfo:
-    fixture_id: int
-    league: str
-    kickoff: datetime
-    home_id: int
-    away_id: int
-    home: str
-    away: str
+    fixture_id:int; league:str; kickoff:datetime; home_id:int; away_id:int; home:str; away:str
 
-async def compute_poisson_over25(home_id: int, away_id: int):
-    last_home = await get_team_last_matches(home_id, MAX_LOOKBACK)
-    last_away = await get_team_last_matches(away_id, MAX_LOOKBACK)
-
-    def avg_goals(matches, as_team_id):
-        gf = ga = cnt = 0
-        for m in matches:
-            t_home = m["teams"]["home"]["id"]; t_away = m["teams"]["away"]["id"]
-            gh = m["goals"]["home"] or 0; ga_ = m["goals"]["away"] or 0
-            if as_team_id == t_home:
-                gf += gh; ga += ga_; cnt += 1
-            elif as_team_id == t_away:
-                gf += ga_; ga += gh; cnt += 1
-        return (gf / cnt if cnt else 1.2), (ga / cnt if cnt else 1.2)
-
-    gf_h, _ = avg_goals(last_home, home_id)
-    gf_a, _ = avg_goals(last_away, away_id)
-    lam_total = max(0.2, gf_h + gf_a)
-    p_over = poisson_p_total_ge_k(lam_total, 3)
-    p_under = 1.0 - p_over
-    return p_over, p_under, lam_total
-
-# ---- SELECTION POLICY ----
-def choose_pick(p_over, odds_over, p_under, odds_under, threshold, ev_min):
-    if not odds_over or not odds_under: return None
-    p_over_adj, p_under_adj = normalize_overround(implied_prob(odds_over), implied_prob(odds_under))
+def choose_pick(p_model, odds_over, odds_under, theta, ev_min):
+    if not (odds_over and odds_under): return None
+    p_over = float(p_model); p_under = 1.0 - p_over
     # conservative blend with market priors
-    p_over_blend = 0.6 * p_over + 0.4 * p_over_adj
+    p_over_bk, p_under_bk = normalize_overround(implied_prob(odds_over), implied_prob(odds_under))
+    p_over_blend = 0.7*p_over + 0.3*p_over_bk
     p_under_blend = 1.0 - p_over_blend
     ev_over = expected_value(p_over_blend, odds_over)
     ev_under = expected_value(p_under_blend, odds_under)
-    if p_over_blend >= threshold and ev_over >= ev_min and ev_over >= ev_under:
+    if p_over_blend>=theta and ev_over>=ev_min and ev_over>=ev_under:
         return ("over", p_over_blend, ev_over)
-    if p_under_blend >= threshold and ev_under >= ev_min and ev_under > ev_over:
+    if p_under_blend>=theta and ev_under>=ev_min and ev_under>ev_over:
         return ("under", p_under_blend, ev_under)
     return None
 
-# ---- FIXTURE UPSERT (for harvesting) ----
-async def upsert_fixture_row(fix_row):
-    fix = fix_row["fixture"]; teams = fix_row["teams"]; league = fix_row["league"]
-    async with await psycopg.AsyncConnection.connect(DB_URL) as con:
-        await con.execute(
-            """INSERT INTO fixtures(fixture_id, date, league_name, home, away, kickoff, status)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)
-               ON CONFLICT (fixture_id) DO UPDATE SET
-                 date=EXCLUDED.date, league_name=EXCLUDED.league_name, home=EXCLUDED.home,
-                 away=EXCLUDED.away, kickoff=EXCLUDED.kickoff, status=EXCLUDED.status""",
-            (
-                fix["id"],
-                datetime.fromtimestamp(fix["timestamp"], tz=TZ).date(),
-                league["name"],
-                teams["home"]["name"],
-                teams["away"]["name"],
-                datetime.fromtimestamp(fix["timestamp"], tz=TZ),
-                fix["status"]["short"],
-            )
-        )
-        await con.commit()
-
-# ---- HEARTBEAT ----
+# ========= HEARTBEAT =========
 async def maybe_send_daily_heartbeat():
-    """Send 'Goalsniper AI live and scanning ✅' once per calendar day at 08:00 Europe/Berlin."""
-    if not is_exact_local_time("08:00"):
-        return
+    if not is_exact_local_time("08:00"): return
     day_key = f"heartbeat:{now_local().strftime('%Y-%m-%d')}"
-    already = await get_cfg(day_key)
-    if not already:
+    if not await get_cfg(day_key):
         await send_telegram("Goalsniper AI live and scanning ✅")
         await set_cfg(day_key, {"sent_at": now_local().isoformat()})
 
-# ---- CORE TASKS (LIVE) ----
+# ========= CORE: PREDICT =========
 async def predict_and_send_for_today():
     if within_cooldown():
-        print("[INFO] Cooldown active; no outbound predictions.")
-        return
+        print("[INFO] Cooldown active; no outbound predictions."); return
 
-    theta, ev_min = await get_policy()
+    model, meta = await load_latest_model()
     today = now_local().date().isoformat()
     fixtures = await get_fixtures_by_date(today)
-    results = []
+
     for f in fixtures:
         await upsert_fixture_row(f)
-        fix = f["fixture"]; teams = f["teams"]; league = f["league"]
-        status = fix["status"]["short"]
-        if status not in ("NS","TBD"):  # only not started
-            continue
+        fix=f["fixture"]; teams=f["teams"]; league=f["league"]
+        if fix["status"]["short"] not in ("NS","TBD"): continue
+
         info = FixtureInfo(
-            fixture_id=fix["id"],
-            league=league["name"],
+            fixture_id=fix["id"], league=league["name"],
             kickoff=datetime.fromtimestamp(fix["timestamp"], tz=TZ),
             home_id=teams["home"]["id"], away_id=teams["away"]["id"],
             home=teams["home"]["name"], away=teams["away"]["name"]
         )
-        odds = await get_odds_for_fixture(info.fixture_id)
-        if not odds or (not odds["over"] or not odds["under"]): continue
 
-        p_over, p_under, lam = await compute_poisson_over25(info.home_id, info.away_id)
-        pick = choose_pick(p_over, odds["over"], p_under, odds["under"], theta, ev_min)
+        odds = await compute_and_upsert_features(f)
+        if not odds or not odds.get("over") or not odds.get("under"): continue
+
+        # Pull features row
+        async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
+            r=await con.execute("SELECT * FROM features WHERE fixture_id=%s",(info.fixture_id,))
+            feat=await r.fetchone()
+        if not feat: continue
+
+        X = np.array([[
+            float(feat.get(k) or 0.0) for k in (meta.get("feature_order") or FEATURES_ORDER)
+        ]])
+
+        # If no model yet, fallback to odds prior (conservative)
+        if model:
+            try:
+                p_over = float(model.predict_over(X).reshape(-1)[0])
+            except Exception:
+                p_over = normalize_overround(implied_prob(odds["over"]), implied_prob(odds["under"]))[0]
+        else:
+            p_over = normalize_overround(implied_prob(odds["over"]), implied_prob(odds["under"]))[0]
+
+        theta, ev_min = await get_policy_for_league(info.league)
+        pick = choose_pick(p_over, odds["over"], odds["under"], theta, ev_min)
         if not pick: continue
 
         sel, conf, ev = pick
+        rationale = {
+            "env": feat.get("league_goal_env"),
+            "drift_over": feat.get("odds_over_drift"),
+            "drift_under": feat.get("odds_under_drift")
+        }
         msg = (f"*{info.league}* {info.kickoff.strftime('%Y-%m-%d %H:%M')}\n"
                f"{info.home} vs {info.away}\n"
                f"Pick: *{sel.upper()} 2.5* | P={conf:.2f} | Odds(O/U)={odds['over']:.2f}/{odds['under']:.2f} | EV={ev:+.2f}\n"
-               f"λ≈{lam:.2f}")
+               f"env={rationale['env']:.2f if rationale['env'] is not None else float('nan'):.2f} "
+               f"drift(O/U)={rationale['drift_over']}/{rationale['drift_under']}")
         await send_telegram(msg)
+
         async with await psycopg.AsyncConnection.connect(DB_URL) as con:
-            await con.execute(
-                """INSERT INTO predictions(fixture_id, league_name, home, away, kickoff, market, pick, p_over, p_under, odds_over, odds_under, confidence, ev)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (info.fixture_id, info.league, info.home, info.away, info.kickoff, "ou_2_5", sel, p_over, p_under, odds["over"], odds["under"], conf, ev)
-            ); await con.commit()
-        results.append((info.fixture_id, sel, conf, ev))
+            await con.execute("""
+                INSERT INTO predictions(fixture_id,league_name,home,away,kickoff,market,pick,p_over,p_under,odds_over,odds_under,confidence,ev,explain)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (info.fixture_id, info.league, info.home, info.away, info.kickoff, "ou_2_5", sel,
+                  p_over, 1-p_over, odds["over"], odds["under"], conf, ev, json.dumps(rationale)))
+            await con.commit()
 
-    if not results:
-        print("[INFO] No qualifying picks found (threshold/EV too strict or no odds).")
-
-# ---- DIGEST / SETTLEMENT ----
-async def settle_for_date(d: date, send_digest: bool):
-    fixtures = await get_fixtures_by_date(d.isoformat())
-    results_map = {}
+# ========= MOTD =========
+async def motd_at_10():
+    if not is_exact_local_time("10:00"): return
+    model, meta = await load_latest_model()
+    today = now_local().date().isoformat()
+    fixtures = await get_fixtures_by_date(today)
+    cands=[]
     for f in fixtures:
         await upsert_fixture_row(f)
-        fix = f["fixture"]; goals = f["goals"]
-        if fix["status"]["short"] == "FT":
-            results_map[fix["id"]] = (goals["home"] or 0, goals["away"] or 0)
+        if f["fixture"]["status"]["short"] not in ("NS","TBD"): continue
+        odds = await compute_and_upsert_features(f)
+        if not odds or not odds.get("over") or not odds.get("under"): continue
+        fid=f["fixture"]["id"]
+        async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
+            r=await con.execute("SELECT * FROM features WHERE fixture_id=%s",(fid,))
+            feat=await r.fetchone()
+        if not feat: continue
+        X = np.array([[float(feat.get(k) or 0.0) for k in (meta.get("feature_order") or FEATURES_ORDER)]])
+        p_over = (float(model.predict_over(X).reshape(-1)[0]) if model else
+                  normalize_overround(implied_prob(odds["over"]), implied_prob(odds["under"]))[0])
+        theta, ev_min = await get_policy_for_league(f["league"]["name"])
+        pick = choose_pick(p_over, odds["over"], odds["under"], theta, ev_min)
+        if not pick: continue
+        sel, conf, ev = pick
+        score = 2.0*ev + 0.5*conf
+        cands.append((score, f, sel, conf, ev))
+    if not cands:
+        await send_telegram("MOTD — no high-confidence O/U 2.5 pick today."); return
+    cands.sort(key=lambda x: x[0], reverse=True)
+    _, f, sel, conf, ev = cands[0]
+    fix=f["fixture"]; teams=f["teams"]; league=f["league"]
+    text=(f"*MOTD — Best O/U 2.5*\n{league['name']} {datetime.fromtimestamp(fix['timestamp'], tz=TZ).strftime('%Y-%m-%d %H:%M')}\n"
+          f"{teams['home']['name']} vs {teams['away']['name']}\n"
+          f"Pick: *{sel.upper()} 2.5* | P={conf:.2f} | EV={ev:+.2f}")
+    await send_telegram(text)
+
+# ========= DIGEST / SETTLEMENT =========
+async def settle_for_date(d: date, send_digest: bool):
+    fixtures = await get_fixtures_by_date(d.isoformat())
+    results_map={}
+    for f in fixtures:
+        await upsert_fixture_row(f)
+        if f["fixture"]["status"]["short"]=="FT":
+            gh=f["goals"]["home"] or 0; ga=f["goals"]["away"] or 0
+            results_map[f["fixture"]["id"]] = (gh,ga)
+
     wins=loss=push=0; bets=0; roi=0.0; avg_odds=0.0
     async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
         rows = await con.execute(
-            "SELECT * FROM predictions WHERE (sent_at AT TIME ZONE 'Europe/Berlin')::date = %s::date",
-            (d.isoformat(),)
+            "SELECT * FROM predictions WHERE (sent_at AT TIME ZONE 'Europe/Berlin')::date = %s::date", (d.isoformat(),)
         ); preds = await rows.fetchall()
         for p in preds:
             if p["fixture_id"] not in results_map: continue
-            gh, ga = results_map[p["fixture_id"]]
-            over25 = (gh + ga) >= 3
-            won = (p["pick"] == "over" and over25) or (p["pick"] == "under" and not over25)
+            gh,ga = results_map[p["fixture_id"]]
+            over25=(gh+ga)>=3
+            won = (p["pick"]=="over" and over25) or (p["pick"]=="under" and not over25)
             odds = p["odds_over"] if p["pick"]=="over" else p["odds_under"]
-            if won:
-                wins += 1; roi += (odds - 1.0)
-            else:
-                loss += 1; roi -= 1.0
-            avg_odds += odds; bets += 1
-        if bets:
-            avg_odds /= bets
+            if won: wins+=1; roi+=(odds-1.0)
+            else:   loss+=1; roi-=1.0
+            avg_odds+=odds; bets+=1
+        if bets: avg_odds/=bets
         if send_digest:
-            msg = f"{d.isoformat()} — Bets: {bets} | W-L-P: {wins}-{loss}-{push} | Hit: {(wins/bets*100 if bets else 0):.1f}% | ROI: {roi:+.2f}u | Avg Odds: {avg_odds:.2f}"
+            msg=f"{d.isoformat()} — Bets: {bets} | W-L-P: {wins}-{loss}-{push} | Hit: {(wins/bets*100 if bets else 0):.1f}% | ROI: {roi:+.2f}u | Avg Odds: {avg_odds:.2f}"
             await send_telegram(msg)
-        # persist results
         for fid,(gh,ga) in results_map.items():
             await con.execute(
                 "INSERT INTO results(fixture_id,goals_home,goals_away,settled_at) VALUES (%s,%s,%s,now()) ON CONFLICT (fixture_id) DO NOTHING",
@@ -355,11 +523,10 @@ async def settle_for_date(d: date, send_digest: bool):
             ); await con.commit()
 
 async def settle_yesterday_and_digest_at_0830():
-    if not is_exact_local_time("08:30"): 
-        return
-    await settle_for_date(now_local().date() - timedelta(days=1), send_digest=True)
+    if not is_exact_local_time("08:30"): return
+    await settle_for_date(now_local().date()-timedelta(days=1), send_digest=True)
 
-# ---- HARVESTING / BACKFILL (optional/manual) ----
+# ========= HARVEST / BACKFILL (optional) =========
 @contextlib.asynccontextmanager
 async def advisory_lock(lock_id: int):
     async with await psycopg.AsyncConnection.connect(DB_URL) as con:
@@ -370,102 +537,80 @@ async def advisory_lock(lock_id: int):
             await con.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
 
 def daterange(d1: date, d2: date):
-    cur = d1
-    while cur <= d2:
+    cur=d1
+    while cur<=d2:
         yield cur
-        cur += timedelta(days=1)
+        cur+=timedelta(days=1)
 
 async def harvest_range(start: str, end: str):
-    """Harvest fixtures (and FT results) for [start, end] inclusive. No Telegram."""
-    global SEND_MESSAGES
-    prev = SEND_MESSAGES
-    SEND_MESSAGES = False
-    d1 = datetime.fromisoformat(start).date()
-    d2 = datetime.fromisoformat(end).date()
-    count_fixtures = count_results = 0
-    for d in daterange(d1, d2):
+    d1=datetime.fromisoformat(start).date(); d2=datetime.fromisoformat(end).date()
+    for d in daterange(d1,d2):
         fixtures = await get_fixtures_by_date(d.isoformat())
-        for f in fixtures:
-            await upsert_fixture_row(f); count_fixtures += 1
-            fix = f["fixture"]; goals = f["goals"]
-            if fix["status"]["short"] == "FT":
-                async with await psycopg.AsyncConnection.connect(DB_URL) as con:
-                    await con.execute(
-                        "INSERT INTO results(fixture_id,goals_home,goals_away,settled_at) VALUES (%s,%s,%s,now()) ON CONFLICT (fixture_id) DO NOTHING",
-                        (fix["id"], goals["home"] or 0, goals["away"] or 0)
-                    ); await con.commit()
-                count_results += 1
-        print(f"[HARVEST] {d} fixtures={len(fixtures)} (cum {count_fixtures}), results added {count_results}")
-    SEND_MESSAGES = prev
+        for f in fixtures: await upsert_fixture_row(f)
+        print(f"[HARVEST] {d} fixtures={len(fixtures)}")
 
-async def backfill_days(days: int, send_digest: bool):
-    """Backfill results for the last N days ending yesterday. Optionally send digests for each day."""
-    y = now_local().date() - timedelta(days=1)
-    start = y - timedelta(days=days-1)
-    for d in daterange(start, y):
-        await settle_for_date(d, send_digest=send_digest)
-        print(f"[BACKFILL] settled {d}")
+async def backfill_days(days:int, send_digest:bool):
+    y=now_local().date()-timedelta(days=1); start=y-timedelta(days=days-1)
+    for d in daterange(start,y):
+        await settle_for_date(d, send_digest); print(f"[BACKFILL] settled {d}")
 
-# ---- HTTP SERVER (/health, /stats) ----
+# ========= HTTP SERVER (/health, /stats) =========
 async def http_health(request):
     return web.json_response({"ok": True, "time": now_local().isoformat(), "cooldown": within_cooldown()})
 
 async def http_stats(request):
-    # last 24h and last 7d summary
-    out = {"now": now_local().isoformat()}
+    out={"now": now_local().isoformat()}
     async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
-        # 24h
         rows = await con.execute("""
             SELECT p.fixture_id, p.pick, p.odds_over, p.odds_under, p.sent_at, r.goals_home, r.goals_away
             FROM predictions p
-            LEFT JOIN results r ON r.fixture_id = p.fixture_id
+            LEFT JOIN results r ON r.fixture_id=p.fixture_id
             WHERE p.sent_at >= now() - interval '24 hours'
         """); d24 = await rows.fetchall()
-        bets24 = len(d24)
-        wins24 = 0
+        bets24=len(d24); wins24=0
         for r in d24:
             if r["goals_home"] is None or r["goals_away"] is None: continue
-            over25 = (r["goals_home"] + r["goals_away"]) >= 3
-            won = (r["pick"] == "over" and over25) or (r["pick"] == "under" and not over25)
-            wins24 += 1 if won else 0
-        out["last_24h"] = {"bets": bets24, "wins": wins24, "hit_rate": (wins24 / bets24) if bets24 else None}
+            over25=(r["goals_home"]+r["goals_away"])>=3
+            won=(r["pick"]=="over" and over25) or (r["pick"]=="under" and not over25)
+            wins24+=1 if won else 0
+        out["last_24h"]={"bets":bets24,"wins":wins24,"hit_rate":(wins24/bets24) if bets24 else None}
 
-        # 7d
         rows = await con.execute("""
             SELECT p.fixture_id, p.pick, p.odds_over, p.odds_under, p.sent_at, r.goals_home, r.goals_away
             FROM predictions p
-            LEFT JOIN results r ON r.fixture_id = p.fixture_id
+            LEFT JOIN results r ON r.fixture_id=p.fixture_id
             WHERE p.sent_at >= now() - interval '7 days'
-        """); d7 = await rows.fetchall()
-        bets7 = len(d7); wins7 = 0
+        """); d7=await rows.fetchall()
+        bets7=len(d7); wins7=0
         for r in d7:
             if r["goals_home"] is None or r["goals_away"] is None: continue
-            over25 = (r["goals_home"] + r["goals_away"]) >= 3
-            won = (r["pick"] == "over" and over25) or (r["pick"] == "under" and not over25)
-            wins7 += 1 if won else 0
-        out["last_7d"] = {"bets": bets7, "wins": wins7, "hit_rate": (wins7 / bets7) if bets7 else None}
+            over25=(r["goals_home"]+r["goals_away"])>=3
+            won=(r["pick"]=="over" and over25) or (r["pick"]=="under" and not over25)
+            wins7+=1 if won else 0
+        out["last_7d"]={"bets":bets7,"wins":wins7,"hit_rate":(wins7/bets7) if bets7 else None}
 
         pol = await con.execute("SELECT value FROM model_cfg WHERE key='policy'")
         pol_row = await pol.fetchone()
         out["policy"] = pol_row["value"] if pol_row else None
+
+        mdl = await con.execute("SELECT label, version, created_at FROM model_registry ORDER BY created_at DESC LIMIT 1")
+        mdl_row = await mdl.fetchone()
+        out["model"] = dict(mdl_row) if mdl_row else None
 
     return web.json_response(out)
 
 async def start_http_server():
     app = web.Application()
     app.router.add_get("/health", http_health)
-    app.router.add_get("/stats", http_stats)
-    # simple root
+    app.router.add_get("/stats",  http_stats)
     async def root(_): return web.json_response({"name":"goalsniper", "status":"running"})
     app.router.add_get("/", root)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
+    runner = web.AppRunner(app); await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
     await site.start()
     print(f"[HTTP] listening on 0.0.0.0:{HTTP_PORT}")
 
-# ---- SCHEDULER ----
+# ========= SCHEDULER =========
 async def scheduler_main():
     if not (API_KEY and BOT and CHAT and DB_URL):
         raise SystemExit("Missing required env (APIFOOTBALL_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL).")
@@ -474,84 +619,43 @@ async def scheduler_main():
 
     sched = AsyncIOScheduler(timezone=str(TZ))
 
-    # Predictor every 15 minutes (internal code respects cooldown)
     async def job_predict():
         async with advisory_lock(1001):
             await predict_and_send_for_today()
     sched.add_job(job_predict, IntervalTrigger(minutes=15), id="predict-interval", coalesce=True, max_instances=1)
 
-    # MOTD at 10:00 local
     async def job_motd():
         async with advisory_lock(1002):
             await motd_at_10()
     sched.add_job(job_motd, CronTrigger(hour=10, minute=0), id="motd-10", coalesce=True, max_instances=1)
 
-    # Digest at 08:30 local
     async def job_digest():
         async with advisory_lock(1003):
             await settle_yesterday_and_digest_at_0830()
     sched.add_job(job_digest, CronTrigger(hour=8, minute=30), id="digest-0830", coalesce=True, max_instances=1)
 
-    # Heartbeat at 08:00 local
     async def job_heartbeat():
         async with advisory_lock(1004):
             await maybe_send_daily_heartbeat()
     sched.add_job(job_heartbeat, CronTrigger(hour=8, minute=0), id="heartbeat-0800", coalesce=True, max_instances=1)
 
-    # (Optional) Nightly training hook can be added here when you wire CatBoost training into this version.
-    # Example:
-    # async def job_train():
-    #     from train_models import main as train_main
-    #     async with advisory_lock(1005):
-    #         await train_main()
-    # sched.add_job(job_train, CronTrigger(hour=23, minute=30), id="train-2330", coalesce=True, max_instances=1)
+    # Nightly trainer hook (optional; if you have train_models.py wired)
+    try:
+        from train_models import main as train_main
+        async def job_train():
+            async with advisory_lock(1005):
+                await train_main()
+        sched.add_job(job_train, CronTrigger(hour=23, minute=30), id="train-2330", coalesce=True, max_instances=1)
+    except Exception:
+        print("[WARN] train_models.py not available; skipping nightly training job.")
 
     sched.start()
-
-    # Keep process alive
     try:
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:
         pass
 
-# ---- MOTD (kept at end) ----
-async def motd_at_10():
-    if not is_exact_local_time("10:00"): 
-        return
-    theta, ev_min = await get_policy()
-    today = now_local().date().isoformat()
-    fixtures = await get_fixtures_by_date(today)
-    candidates = []
-    for f in fixtures:
-        await upsert_fixture_row(f)
-        fix = f["fixture"]; teams = f["teams"]; league = f["league"]
-        if fix["status"]["short"] not in ("NS","TBD"): continue
-        info = FixtureInfo(
-            fixture_id=fix["id"], league=league["name"],
-            kickoff=datetime.fromtimestamp(fix["timestamp"], tz=TZ),
-            home_id=teams["home"]["id"], away_id=teams["away"]["id"],
-            home=teams["home"]["name"], away=teams["away"]["name"]
-        )
-        odds = await get_odds_for_fixture(info.fixture_id)
-        if not odds or (not odds["over"] or not odds["under"]): continue
-        p_over, p_under, lam = await compute_poisson_over25(info.home_id, info.away_id)
-        pick = choose_pick(p_over, odds["over"], p_under, odds["under"], theta, ev_min)
-        if pick:
-            sel, conf, ev = pick
-            weight = 1.0 + (0.1 if any(x in info.league.lower() for x in ["premier","bundesliga","laliga","serie a","ligue 1","uefa"]) else 0)
-            score = ev * 2.0 + conf * 0.5
-            candidates.append((score*weight, info, sel, conf, ev, lam, odds))
-    if not candidates:
-        await send_telegram("MOTD — no high-confidence O/U 2.5 pick today.")
-        return
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    _, info, sel, conf, ev, lam, odds = candidates[0]
-    text = (f"*MOTD — Best O/U 2.5*\n{info.league} {info.kickoff.strftime('%Y-%m-%d %H:%M')}\n"
-            f"{info.home} vs {info.away}\n"
-            f"Pick: *{sel.upper()} 2.5* | P={conf:.2f} | Odds={odds['over']:.2f}/{odds['under']:.2f} | EV={ev:+.2f} | λ≈{lam:.2f}")
-    await send_telegram(text)
-
-# ---- BOOT ----
+# ========= BOOT =========
 if __name__ == "__main__":
     asyncio.run(scheduler_main())
