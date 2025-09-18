@@ -6,10 +6,10 @@ import time
 import uuid
 import hmac
 import logging
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional
 from datetime import datetime
 
-from flask import Flask, jsonify, request, abort, g
+from flask import Flask, jsonify, request, abort, g, has_request_context
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from zoneinfo import ZoneInfo
@@ -28,10 +28,14 @@ _base_log = logging.getLogger("goalsniper")
 app = Flask(__name__)
 
 def get_logger():
-    # include request_id if available
-    rid = getattr(g, "request_id", None)
-    if rid:
-        return logging.LoggerAdapter(_base_log, extra={"request_id": rid})
+    """Return a logger that includes request_id when there is a request context."""
+    try:
+        if has_request_context():
+            rid = getattr(g, "request_id", None)
+            if rid:
+                return logging.LoggerAdapter(_base_log, extra={"request_id": rid})
+    except Exception:
+        pass
     return _base_log
 
 # ───────── Env helpers ─────────
@@ -99,7 +103,6 @@ def _constant_time_eq(a: str, b: str) -> bool:
     try:
         return hmac.compare_digest(a, b)
     except Exception:
-        # fallback; still time-varying, but avoids crashing
         return a == b
 
 def _require_admin():
@@ -115,7 +118,7 @@ def _require_admin():
 _scheduler_started = False
 
 def _run_with_pg_lock(lock_key: int, fn: Callable, *a, **k):
-    log = get_logger()
+    log = get_logger()  # safe: returns base logger when no request context
     try:
         with db_conn() as c:
             got = c.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
@@ -140,14 +143,13 @@ def _maybe_skip_rest(fn_name: str) -> bool:
 
 def _start_scheduler_once():
     global _scheduler_started
-    log = get_logger()
+    log = _base_log  # scheduler starts outside request context; use base logger
     if _scheduler_started or not RUN_SCHEDULER:
         return
     # Avoid double-start under Flask dev reloader
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        pass  # allow
+        pass
     elif os.environ.get("FLASK_ENV") == "development" and os.environ.get("WERKZEUG_RUN_MAIN") is None:
-        # Under dev server, first pass is the reloader parent—skip
         return
     try:
         sched = BackgroundScheduler(timezone=TZ_UTC)
@@ -436,8 +438,15 @@ def http_rest_window():
 
 # ───────── Boot ─────────
 def _on_boot():
-    init_db()
-    _start_scheduler_once()
+    # Make boot non-fatal so Gunicorn workers still bind even if DB/Telegram hiccup.
+    try:
+        init_db()
+    except Exception as e:
+        _base_log.exception("init_db failed (continuing to serve): %s", e)
+    try:
+        _start_scheduler_once()
+    except Exception as e:
+        _base_log.exception("scheduler start failed (continuing to serve): %s", e)
 
 _on_boot()
 
