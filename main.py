@@ -249,6 +249,72 @@ def http_motd():
     ok = send_match_of_the_day()
     return jsonify({"ok": bool(ok)})
 
+# --- Web-browser GET endpoints (admin key via ?key=...) ---
+
+@app.route("/admin/backfill-results", methods=["GET"])
+def http_backfill_results():
+    _require_admin()
+    # optional: ?max=400
+    try:
+        max_rows = int(request.args.get("max", "400"))
+    except Exception:
+        max_rows = 400
+    n = backfill_results_for_open_matches(max_rows)
+    return jsonify({"ok": True, "updated": int(n)})
+
+@app.route("/admin/prematch-scan", methods=["GET"])
+def http_prematch_scan():
+    _require_admin()
+    saved = prematch_scan_save()
+    return jsonify({"ok": True, "saved": int(saved)})
+
+@app.route("/admin/retry-unsent", methods=["GET"])
+def http_retry_unsent():
+    _require_admin()
+    # optional: ?minutes=30&limit=200
+    try:
+        minutes = int(request.args.get("minutes", "30"))
+    except Exception:
+        minutes = 30
+    try:
+        limit = int(request.args.get("limit", "200"))
+    except Exception:
+        limit = 200
+    n = retry_unsent_tips(minutes=minutes, limit=limit)
+    return jsonify({"ok": True, "resent": int(n)})
+
+@app.route("/admin/live-scan", methods=["GET"])
+def http_live_scan_once():
+    _require_admin()
+    saved, live_seen = production_scan()
+    return jsonify({"ok": True, "saved": int(saved), "live_seen": int(live_seen)})
+
+@app.route("/admin/train", methods=["GET"])
+def http_train_get():
+    _require_admin()
+    if not TRAIN_ENABLE:
+        return jsonify({"ok": False, "reason": "training disabled"}), 400
+    res = train_models()
+    return jsonify({"ok": True, "result": res})
+
+@app.route("/admin/auto-tune", methods=["GET"])
+def http_auto_tune_get():
+    _require_admin()
+    tuned = auto_tune_thresholds(14)
+    return jsonify({"ok": True, "tuned": tuned})
+
+@app.route("/admin/daily-digest", methods=["GET"])
+def http_daily_digest_get():
+    _require_admin()
+    msg = daily_accuracy_digest()
+    return jsonify({"ok": True, "sent": bool(msg)})
+
+@app.route("/admin/motd", methods=["GET"])
+def http_motd_get():
+    _require_admin()
+    ok = send_match_of_the_day()
+    return jsonify({"ok": bool(ok)})
+
 # ───────── Boot ─────────
 def _on_boot():
     init_db()
