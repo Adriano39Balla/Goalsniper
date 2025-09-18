@@ -156,23 +156,66 @@ def send_match_of_the_day():
         return False
 
 # ───────── Retry unsent ─────────
-def retry_unsent_tips(limit=30, batch=200):
-    """Retry tips not sent to Telegram."""
+def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
+    """
+    Re-send tips that failed to deliver to Telegram.
+    Your tips table has no `id` column; primary identity is (match_id, created_ts).
+    """
+    cutoff = int(time.time()) - minutes * 60
     retried = 0
-    try:
-        with db_conn() as c:
-            rows = c.execute("SELECT id, fixture_id, market, suggestion, confidence, odds, ev_pct "
-                             "FROM tips WHERE sent_at IS NULL ORDER BY id ASC LIMIT %s", (batch,)).fetchall()
-            for r in rows:
-                id, fid, market, suggestion, conf, odds, ev_pct = r
-                match = {"fid": fid, "league": "", "home": "?", "away": "?", "kickoff": _now()}
-                msg = _fmt_tip_message(match, market, suggestion, conf, odds, "retry", ev_pct)
-                send_telegram(msg)
-                c.execute("UPDATE tips SET sent_at=now() WHERE id=%s", (id,))
-                retried += 1
-            c.commit()
-    except Exception as e:
-        log.exception("[RETRY] failed: %s", e)
+
+    with db_conn() as c:
+        rows = c.execute(
+            """
+            SELECT
+                match_id,        -- 0
+                league,          -- 1
+                home,            -- 2
+                away,            -- 3
+                market,          -- 4
+                suggestion,      -- 5
+                confidence,      -- 6   (pct)
+                confidence_raw,  -- 7   (prob 0..1, may be NULL)
+                score_at_tip,    -- 8   "X-Y"
+                minute,          -- 9
+                created_ts,      -- 10
+                odds,            -- 11
+                book,            -- 12
+                ev_pct           -- 13
+            FROM tips
+            WHERE sent_ok = 0
+              AND created_ts >= %s
+            ORDER BY created_ts ASC
+            LIMIT %s
+            """,
+            (cutoff, limit),
+        ).fetchall()
+
+    for (
+        mid, league, home, away, market, sugg,
+        conf_pct, conf_raw, score, minute, cts,
+        odds, book, ev_pct
+    ) in rows:
+        # fallback if conf_raw is None
+        pct = float(conf_pct if conf_pct is not None else (100.0 * float(conf_raw or 0.0)))
+
+        text = _format_tip_message(
+            home=home, away=away, league=league,
+            minute=int(minute or 0), score=score or "0-0",
+            suggestion=sugg, prob_pct=float(pct),
+            feat={},  # not available here
+            odds=(float(odds) if odds is not None else None),
+            book=book, ev_pct=(float(ev_pct) if ev_pct is not None else None),
+        )
+
+        ok = send_telegram(text)
+        if ok:
+            with db_conn() as c2:
+                c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
+            retried += 1
+
+    if retried:
+        log.info("[RETRY] resent %d", retried)
     return retried
 
 # ───────── Backfill ─────────
