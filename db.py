@@ -1,4 +1,3 @@
-# file: db.py
 # Robust Postgres pool + schema bootstrap for goalsniper
 
 import os
@@ -207,6 +206,7 @@ SCHEMA_SQL = [
         payload    TEXT
     )
     """,
+    # NEW: fixtures table (used by scan stubs)
     """
     CREATE TABLE IF NOT EXISTS fixtures (
         fixture_id   BIGINT PRIMARY KEY,
@@ -224,10 +224,9 @@ SCHEMA_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_tips_sent           ON tips(sent_ok, created_ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_snap_by_match       ON tip_snapshots(match_id, created_ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_results_updated     ON match_results(updated_ts DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_odds_hist_match     ON odds_history(match_id, captured_ts DESC)"
-    "CREATE INDEX IF NOT EXISTS idx_fixtures_status     ON fixtures(status)",
+    "CREATE INDEX IF NOT EXISTS idx_odds_hist_match     ON odds_history(match_id, captured_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_fixtures_status     ON fixtures(status)"
 ]
-
 
 MIGRATIONS_SQL = [
     # idempotent add-columns in case older tables exist
