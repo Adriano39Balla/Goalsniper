@@ -1,4 +1,3 @@
-# file: scan.py
 # scanning logic for in-play + prematch + MOTD
 
 import os, time, datetime, logging
@@ -70,9 +69,10 @@ def production_scan():
                 if ok and conf >= CONF_MIN and (ev_pct or 0) >= EV_MIN:
                     msg = _fmt_tip_message(match, market, suggestion, conf, odds, book, ev_pct)
                     send_telegram(msg)
-                    c.execute("INSERT INTO tips(fixture_id, market, suggestion, confidence, odds, ev_pct, sent_at) "
-                              "VALUES (%s,%s,%s,%s,%s,%s,now())",
-                              (fid, market, suggestion, conf, odds, ev_pct))
+                    c.execute("INSERT INTO tips(match_id, league, home, away, market, suggestion, confidence, confidence_raw, created_ts, odds, book, ev_pct, sent_ok) "
+                              "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)",
+                              (fid, match["league"], match["home"], match["away"], market, suggestion,
+                               conf*100.0, conf, int(time.time()), odds, book, ev_pct))
                     saved += 1
             c.commit()
     except Exception as e:
@@ -93,9 +93,10 @@ def prematch_scan_save():
                 market, suggestion, conf = "Over/Under 2.5", "Over 2.5 Goals", 0.78
                 ok, odds, book, ev_pct = price_gate(market, suggestion, fid, prob=conf)
                 if ok and conf >= CONF_MIN and (ev_pct or 0) >= EV_MIN:
-                    c.execute("INSERT INTO tips(fixture_id, market, suggestion, confidence, odds, ev_pct, sent_at) "
-                              "VALUES (%s,%s,%s,%s,%s,%s,now())",
-                              (fid, market, suggestion, conf, odds, ev_pct))
+                    c.execute("INSERT INTO tips(match_id, league, home, away, market, suggestion, confidence, confidence_raw, created_ts, odds, book, ev_pct, sent_ok) "
+                              "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)",
+                              (fid, match["league"], match["home"], match["away"], market, suggestion,
+                               conf*100.0, conf, int(time.time()), odds, book, ev_pct))
                     saved += 1
             c.commit()
     except Exception as e:
@@ -111,9 +112,9 @@ def daily_accuracy_digest():
     try:
         with db_conn() as c:
             rows = c.execute(
-                "SELECT t.suggestion, t.odds, r.goals_home+r.goals_away AS goals "
-                "FROM tips t JOIN results r ON t.fixture_id=r.fixture_id "
-                "WHERE (t.sent_at AT TIME ZONE 'Europe/Berlin')::date=%s::date", (yesterday,)
+                "SELECT t.suggestion, t.odds, r.final_goals_h+r.final_goals_a AS goals "
+                "FROM tips t JOIN match_results r ON t.match_id=r.match_id "
+                "WHERE to_timestamp(t.created_ts) AT TIME ZONE 'Europe/Berlin'::text::date=%s::date", (yesterday,)
             ).fetchall()
         bets = len(rows)
         if bets == 0: return None
@@ -159,7 +160,6 @@ def send_match_of_the_day():
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
     """
     Re-send tips that failed to deliver to Telegram.
-    Your tips table has no `id` column; primary identity is (match_id, created_ts).
     """
     cutoff = int(time.time()) - minutes * 60
     retried = 0
@@ -168,20 +168,20 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
         rows = c.execute(
             """
             SELECT
-                match_id,        -- 0
-                league,          -- 1
-                home,            -- 2
-                away,            -- 3
-                market,          -- 4
-                suggestion,      -- 5
-                confidence,      -- 6   (pct)
-                confidence_raw,  -- 7   (prob 0..1, may be NULL)
-                score_at_tip,    -- 8   "X-Y"
-                minute,          -- 9
-                created_ts,      -- 10
-                odds,            -- 11
-                book,            -- 12
-                ev_pct           -- 13
+                match_id,
+                league,
+                home,
+                away,
+                market,
+                suggestion,
+                confidence,
+                confidence_raw,
+                score_at_tip,
+                minute,
+                created_ts,
+                odds,
+                book,
+                ev_pct
             FROM tips
             WHERE sent_ok = 0
               AND created_ts >= %s
@@ -196,19 +196,9 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
         conf_pct, conf_raw, score, minute, cts,
         odds, book, ev_pct
     ) in rows:
-        # fallback if conf_raw is None
         pct = float(conf_pct if conf_pct is not None else (100.0 * float(conf_raw or 0.0)))
-
-        text = _format_tip_message(
-            home=home, away=away, league=league,
-            minute=int(minute or 0), score=score or "0-0",
-            suggestion=sugg, prob_pct=float(pct),
-            feat={},  # not available here
-            odds=(float(odds) if odds is not None else None),
-            book=book, ev_pct=(float(ev_pct) if ev_pct is not None else None),
-        )
-
-        ok = send_telegram(text)
+        msg = f"♻️ RETRY\n{league}: {home} vs {away}\nTip: {sugg}\nConf: {pct:.1f}%\nOdds: {odds or '-'}"
+        ok = send_telegram(msg)
         if ok:
             with db_conn() as c2:
                 c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
@@ -221,6 +211,5 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
 # ───────── Backfill ─────────
 def backfill_results_for_open_matches(limit=300):
     """Fetch results for fixtures still open and update DB."""
-    # (placeholder — would query API-football /fixtures and update results table)
     log.info("[BACKFILL] placeholder run (limit=%s)", limit)
     return 0
