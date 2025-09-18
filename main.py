@@ -1,9 +1,13 @@
 import os, asyncio, httpx, math, json, re
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dtime, date
 from zoneinfo import ZoneInfo
 import psycopg
 from psycopg.rows import dict_row
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 # ---- ENV / CONFIG ----
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Berlin"))
@@ -332,6 +336,15 @@ async def settle_yesterday_and_digest_at_0830():
     await settle_for_date(now_local().date() - timedelta(days=1), send_digest=True)
 
 # ---- HARVESTING / BACKFILL ----
+@contextlib.asynccontextmanage
+async def advisory_lock(lock_id: int):
+    async with await psycopg.AsyncConnection.connect(DB_URL) as con:
+        # pg_advisory_lock is session-scoped; use try/finally
+        await con.execute("SELECT pg_advisory_lock(%s)", (lock_id,))
+        try: yield
+        finally:
+            await con.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
+
 def daterange(d1: date, d2: date):
     cur = d1
     while cur <= d2:
@@ -459,5 +472,54 @@ async def motd_at_10():
             f"Pick: *{sel.upper()} 2.5* | P={conf:.2f} | Odds={odds['over']:.2f}/{odds['under']:.2f} | EV={ev:+.2f} | λ≈{lam:.2f}")
     await send_telegram(text)
 
+async def scheduler_main():
+    # Ensure schema once on boot
+    await ensure_schema()
+
+    # Create scheduler (local-time aware)
+    sched = AsyncIOScheduler(timezone=str(TZ))
+
+    # 1) Predictor every 15 minutes (code already respects cooldown + API budget)
+    async def job_predict():
+        async with advisory_lock(1001):
+            await predict_and_send_for_today()
+    sched.add_job(job_predict, IntervalTrigger(minutes=15), id="predict-interval", coalesce=True, max_instances=1)
+
+    # 2) MOTD at 10:00 daily
+    async def job_motd():
+        async with advisory_lock(1002):
+            await motd_at_10()
+    sched.add_job(job_motd, CronTrigger(hour=10, minute=0), id="motd-10", coalesce=True, max_instances=1)
+
+    # 3) Digest at 08:30 daily
+    async def job_digest():
+        async with advisory_lock(1003):
+            await settle_yesterday_and_digest_at_0830()
+    sched.add_job(job_digest, CronTrigger(hour=8, minute=30), id="digest-0830", coalesce=True, max_instances=1)
+
+    # 4) Heartbeat at 08:00 daily
+    async def job_heartbeat():
+        async with advisory_lock(1004):
+            await maybe_send_daily_heartbeat()
+    sched.add_job(job_heartbeat, CronTrigger(hour=8, minute=0), id="heartbeat-0800", coalesce=True, max_instances=1)
+
+    # 5) Nightly training during cooldown (kick at 23:30; train_models.py checks cooldown too)
+    async def job_train():
+        # Import only when called to keep boot fast
+        from train_models import main as train_main
+        async with advisory_lock(1005):
+            await train_main()
+    sched.add_job(job_train, CronTrigger(hour=23, minute=30), id="train-2330", coalesce=True, max_instances=1)
+
+    # Start scheduler
+    sched.start()
+
+    # Keep process alive
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(scheduler_main())
