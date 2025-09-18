@@ -9,7 +9,10 @@ from zoneinfo import ZoneInfo
 
 from db import init_db, db_conn
 from telegram_utils import send_telegram
-from scan import production_scan, prematch_scan_save, send_match_of_the_day, backfill_results_for_open_matches, daily_accuracy_digest, retry_unsent_tips
+from scan import (
+    production_scan, prematch_scan_save, send_match_of_the_day,
+    backfill_results_for_open_matches, daily_accuracy_digest, retry_unsent_tips
+)
 from train_models import train_models, auto_tune_thresholds
 
 # ───────── Logging ─────────
@@ -38,7 +41,9 @@ BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 # ───────── Admin auth ─────────
 def _require_admin():
-    key = request.headers.get("X-API-Key") or request.args.get("key") or ((request.json or {}).get("key") if request.is_json else None)
+    key = request.headers.get("X-API-Key") or request.args.get("key") or (
+        (request.json or {}).get("key") if request.is_json else None
+    )
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         abort(401)
 
@@ -125,6 +130,93 @@ def health():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/stats")
+def stats():
+    try:
+        now = int(time.time())
+        day_ago = now - 24 * 3600
+        week_ago = now - 7 * 24 * 3600
+
+        with db_conn() as c:
+            (t24,) = c.execute(
+                "SELECT COUNT(*) FROM tips WHERE created_ts >= %s AND suggestion <> 'HARVEST'",
+                (day_ago,)
+            ).fetchone()
+            (t7d,) = c.execute(
+                "SELECT COUNT(*) FROM tips WHERE created_ts >= %s AND suggestion <> 'HARVEST'",
+                (week_ago,)
+            ).fetchone()
+            (unsent,) = c.execute(
+                "SELECT COUNT(*) FROM tips WHERE sent_ok=0 AND created_ts >= %s",
+                (week_ago,)
+            ).fetchone()
+
+            rows = c.execute("""
+                SELECT t.suggestion, t.odds, r.final_goals_h, r.final_goals_a, r.btts_yes
+                FROM tips t
+                JOIN match_results r ON r.match_id = t.match_id
+                WHERE t.created_ts >= %s
+                  AND t.suggestion <> 'HARVEST'
+                  AND t.sent_ok = 1
+            """, (week_ago,)).fetchall()
+
+        graded = wins = 0
+        stake = pnl = 0.0
+
+        for (sugg, odds, gh, ga, btts) in rows:
+            gh = int(gh or 0)
+            ga = int(ga or 0)
+            total = gh + ga
+            result = None
+
+            if sugg.startswith("Over") or sugg.startswith("Under"):
+                line = None
+                for tok in str(sugg).split():
+                    try:
+                        line = float(tok)
+                        break
+                    except:
+                        pass
+                if line is None:
+                    continue
+                result = (total > line) if sugg.startswith("Over") else (total < line)
+            elif sugg == "BTTS: Yes":
+                result = (gh > 0 and ga > 0)
+            elif sugg == "BTTS: No":
+                result = not (gh > 0 and ga > 0)
+            elif sugg == "Home Win":
+                result = (gh > ga)
+            elif sugg == "Away Win":
+                result = (ga > gh)
+
+            if result is None:
+                continue
+
+            graded += 1
+            if result:
+                wins += 1
+
+            if odds:
+                stake += 1.0
+                pnl += (float(odds) - 1.0) if result else -1.0
+
+        acc = (100.0 * wins / graded) if graded else 0.0
+        roi = (100.0 * pnl / stake) if stake > 0 else 0.0
+
+        return jsonify({
+            "ok": True,
+            "tips_last_24h": int(t24),
+            "tips_last_7d": int(t7d),
+            "unsent_last_7d": int(unsent),
+            "graded_last_7d": int(graded),
+            "wins_last_7d": int(wins),
+            "accuracy_last_7d_pct": round(acc, 1),
+            "roi_last_7d_pct": round(roi, 1),
+        })
+    except Exception as e:
+        log.exception("/stats failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/admin/scan", methods=["POST","GET"])
 def http_scan():
     _require_admin()
@@ -138,14 +230,6 @@ def http_train():
         return jsonify({"ok": False, "reason": "training disabled"}), 400
     res = train_models()
     return jsonify({"ok": True, "result": res})
-
-@app.route("/stats")
-def stats():
-    try:
-        now = int(time.time())
-        day_ago = now - 24*3600
-        week_ago = now - 7*24*3600
-        with db_conn() as c:
 
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest():
