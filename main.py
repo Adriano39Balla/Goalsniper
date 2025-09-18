@@ -139,6 +139,14 @@ def http_train():
     res = train_models()
     return jsonify({"ok": True, "result": res})
 
+@app.route("/stats")
+def stats():
+    try:
+        now = int(time.time())
+        day_ago = now - 24*3600
+        week_ago = now - 7*24*3600
+        with db_conn()
+
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest():
     _require_admin()
