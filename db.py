@@ -207,6 +207,17 @@ SCHEMA_SQL = [
         payload    TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS fixtures (
+        fixture_id   BIGINT PRIMARY KEY,
+        league_name  TEXT,
+        home         TEXT,
+        away         TEXT,
+        kickoff      TIMESTAMPTZ,
+        last_update  TIMESTAMPTZ,
+        status       TEXT
+    )
+    """,
     # helpful indexes
     "CREATE INDEX IF NOT EXISTS idx_tips_created        ON tips(created_ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_tips_match          ON tips(match_id)",
@@ -214,7 +225,9 @@ SCHEMA_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_snap_by_match       ON tip_snapshots(match_id, created_ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_results_updated     ON match_results(updated_ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_odds_hist_match     ON odds_history(match_id, captured_ts DESC)"
+    "CREATE INDEX IF NOT EXISTS idx_fixtures_status     ON fixtures(status)",
 ]
+
 
 MIGRATIONS_SQL = [
     # idempotent add-columns in case older tables exist
