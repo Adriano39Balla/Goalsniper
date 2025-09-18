@@ -1,224 +1,250 @@
-# db.py — pooled Postgres access + schema bootstrap + settings cache
+# file: db.py
+# Robust Postgres pool + schema bootstrap for goalsniper
 
 import os
+import json
 import time
 import logging
-from typing import Optional, Tuple, Any
+from contextlib import contextmanager
 
-from psycopg2.pool import SimpleConnectionPool
 import psycopg2
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+from psycopg2.pool import SimpleConnectionPool
+from psycopg2 import OperationalError, InterfaceError
 
 log = logging.getLogger("db")
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 
-# ---------- Connection pool ----------
+# --- DSN & pool --------------------------------------------------------------
 
-POOL: Optional[SimpleConnectionPool] = None
+DB_URL = os.getenv("DATABASE_URL")
+if not DB_URL:
+    raise SystemExit("DATABASE_URL is required")
 
-def _dsn_with_ssl(url: str) -> str:
-    if not url:
-        raise SystemExit("DATABASE_URL is required")
-    if "sslmode=" not in url:
-        url = url + (("&" if "?" in url else "?") + "sslmode=require")
-    return url
+# Always enforce SSL on managed DBs unless already present
+if "sslmode=" not in DB_URL:
+    DB_URL = DB_URL + (("&" if "?" in DB_URL else "?") + "sslmode=require")
 
-def _init_pool() -> None:
-    global POOL
-    if POOL:
-        return
-    db_url = os.getenv("DATABASE_URL", "")
-    dsn = _dsn_with_ssl(db_url)
-    POOL = SimpleConnectionPool(
-        minconn=1,
-        maxconn=int(os.getenv("DB_POOL_MAX", "5")),
-        dsn=dsn,
+POOL: SimpleConnectionPool | None = None
+
+def _new_conn():
+    # Keepalives help prevent idle disconnects
+    return psycopg2.connect(
+        DB_URL,
+        keepalives=1,
+        keepalives_idle=int(os.getenv("PG_KEEPALIVE_IDLE", "30")),
+        keepalives_interval=int(os.getenv("PG_KEEPALIVE_INTERVAL", "10")),
+        keepalives_count=int(os.getenv("PG_KEEPALIVE_COUNT", "5")),
     )
 
-class PooledConn:
+def _init_pool():
+    global POOL
+    if POOL is None:
+        maxconn = int(os.getenv("DB_POOL_MAX", "6"))
+        POOL = SimpleConnectionPool(minconn=1, maxconn=maxconn, dsn=DB_URL)
+        log.info("[DB] pool created (max=%d)", maxconn)
+
+# --- Context manager with auto-retry -----------------------------------------
+
+class _PooledCursor:
     """
     Usage:
-      with db_conn() as c:
-          c.execute("SELECT 1")
-          row = c.fetchone()
+        with db_conn() as c:
+            cur = c.execute("SELECT 1")
+            n = cur.fetchone()[0]
     """
     def __init__(self, pool: SimpleConnectionPool):
         self.pool = pool
-        self.conn: Optional[psycopg2.extensions.connection] = None
-        self.cur: Optional[psycopg2.extensions.cursor] = None
+        self.conn = None
+        self.cur = None
 
-    def __enter__(self) -> "PooledConn":
-        self.conn = self.pool.getconn()
-        self.conn.autocommit = True
-        self.cur = self.conn.cursor()
+    def __enter__(self):
+        self._acquire()
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        # Close cursor then return conn to pool
+        try:
+            if self.cur is not None:
+                try:
+                    self.cur.close()
+                except Exception:
+                    pass
+        finally:
+            if self.conn is not None:
+                try:
+                    self.pool.putconn(self.conn)
+                except Exception:
+                    pass
+            self.conn = None
+            self.cur = None
+
+    def _acquire(self):
+        _init_pool()
+        self.conn = POOL.getconn()  # type: ignore
+        self.conn.autocommit = True
+        self.cur = self.conn.cursor()
+
+    def _reset(self):
+        # Drop broken connection, grab a fresh one
         try:
             if self.cur:
-                self.cur.close()
+                try:
+                    self.cur.close()
+                except Exception:
+                    pass
         finally:
-            if self.conn:
-                self.pool.putconn(self.conn)
+            try:
+                if self.conn:
+                    self.pool.putconn(self.conn, close=True)
+            except Exception:
+                pass
+        self.conn = None
+        self.cur = None
+        self._acquire()
 
-    # thin cursor facades
-    def execute(self, sql: str, params: Tuple[Any, ...] = ()) -> "PooledConn":
-        assert self.cur is not None
-        self.cur.execute(sql, params or ())
-        return self
+    def execute(self, sql: str, params: tuple | list = ()):
+        try:
+            self.cur.execute(sql, params or ())
+            return self.cur
+        except (OperationalError, InterfaceError) as e:
+            log.warning("[DB] execute retry after connection error: %s", e)
+            self._reset()
+            self.cur.execute(sql, params or ())
+            return self.cur
 
-    def executemany(self, sql: str, seq_of_params):
-        assert self.cur is not None
-        self.cur.executemany(sql, seq_of_params)
-        return self
+    def executemany(self, sql: str, rows: list[tuple]):
+        try:
+            self.cur.executemany(sql, rows or [])
+            return self.cur
+        except (OperationalError, InterfaceError) as e:
+            log.warning("[DB] executemany retry after connection error: %s", e)
+            self._reset()
+            self.cur.executemany(sql, rows or [])
+            return self.cur
 
-    def fetchone(self):
-        assert self.cur is not None
-        return self.cur.fetchone()
+def db_conn() -> _PooledCursor:
+    """Get a pooled cursor context manager."""
+    _init_pool()
+    return _PooledCursor(POOL)  # type: ignore
 
-    def fetchall(self):
-        assert self.cur is not None
-        return self.cur.fetchall()
+# --- Schema & migrations ------------------------------------------------------
 
-def db_conn() -> PooledConn:
-    if POOL is None:
-        _init_pool()
-    # type: ignore[arg-type]
-    return PooledConn(POOL)  # pyright: ignore
+SCHEMA_SQL = [
+    # core tips storage (no id column by design; identity = match_id + created_ts)
+    """
+    CREATE TABLE IF NOT EXISTS tips (
+        match_id        BIGINT,
+        league_id       BIGINT,
+        league          TEXT,
+        home            TEXT,
+        away            TEXT,
+        market          TEXT,
+        suggestion      TEXT,
+        confidence      DOUBLE PRECISION,
+        confidence_raw  DOUBLE PRECISION,
+        score_at_tip    TEXT,
+        minute          INTEGER,
+        created_ts      BIGINT,
+        odds            DOUBLE PRECISION,
+        book            TEXT,
+        ev_pct          DOUBLE PRECISION,
+        sent_ok         INTEGER DEFAULT 1,
+        PRIMARY KEY (match_id, created_ts)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tip_snapshots (
+        match_id   BIGINT,
+        created_ts BIGINT,
+        payload    TEXT,
+        PRIMARY KEY (match_id, created_ts)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS prematch_snapshots (
+        match_id   BIGINT PRIMARY KEY,
+        created_ts BIGINT,
+        payload    TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS feedback (
+        id SERIAL PRIMARY KEY,
+        match_id BIGINT UNIQUE,
+        verdict  INTEGER,
+        created_ts BIGINT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS match_results (
+        match_id       BIGINT PRIMARY KEY,
+        final_goals_h  INTEGER,
+        final_goals_a  INTEGER,
+        btts_yes       INTEGER,
+        updated_ts     BIGINT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS odds_history (
+        match_id    BIGINT,
+        captured_ts BIGINT,
+        market      TEXT,
+        selection   TEXT,
+        odds        DOUBLE PRECISION,
+        book        TEXT,
+        PRIMARY KEY (match_id, market, selection, captured_ts)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS lineups (
+        match_id   BIGINT PRIMARY KEY,
+        created_ts BIGINT,
+        payload    TEXT
+    )
+    """,
+    # helpful indexes
+    "CREATE INDEX IF NOT EXISTS idx_tips_created        ON tips(created_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_tips_match          ON tips(match_id)",
+    "CREATE INDEX IF NOT EXISTS idx_tips_sent           ON tips(sent_ok, created_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_snap_by_match       ON tip_snapshots(match_id, created_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_results_updated     ON match_results(updated_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_odds_hist_match     ON odds_history(match_id, captured_ts DESC)"
+]
 
-# ---------- Schema bootstrap ----------
+MIGRATIONS_SQL = [
+    # idempotent add-columns in case older tables exist
+    "ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds           DOUBLE PRECISION",
+    "ALTER TABLE tips ADD COLUMN IF NOT EXISTS book           TEXT",
+    "ALTER TABLE tips ADD COLUMN IF NOT EXISTS ev_pct         DOUBLE PRECISION",
+    "ALTER TABLE tips ADD COLUMN IF NOT EXISTS confidence_raw DOUBLE PRECISION",
+    "ALTER TABLE tips ADD COLUMN IF NOT EXISTS sent_ok        INTEGER DEFAULT 1",
+]
 
 def init_db() -> None:
-    """
-    Creates (or evolves) all tables used by main.py/scan/trainers.
-    Idempotent and safe to call on every boot.
-    """
+    """Create tables and run safe migrations."""
+    _init_pool()
     with db_conn() as c:
-        # tips + snapshots
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS tips (
-            match_id       BIGINT,
-            league_id      BIGINT,
-            league         TEXT,
-            home           TEXT,
-            away           TEXT,
-            market         TEXT,
-            suggestion     TEXT,
-            confidence     DOUBLE PRECISION,
-            confidence_raw DOUBLE PRECISION,
-            score_at_tip   TEXT,
-            minute         INTEGER,
-            created_ts     BIGINT,
-            odds           DOUBLE PRECISION,
-            book           TEXT,
-            ev_pct         DOUBLE PRECISION,
-            sent_ok        INTEGER DEFAULT 1,
-            PRIMARY KEY (match_id, created_ts)
-        )""")
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS tip_snapshots (
-            match_id   BIGINT,
-            created_ts BIGINT,
-            payload    TEXT,
-            PRIMARY KEY (match_id, created_ts)
-        )""")
+        for sql in SCHEMA_SQL:
+            c.execute(sql)
+        for sql in MIGRATIONS_SQL:
+            try:
+                c.execute(sql)
+            except Exception as e:
+                # harmless if not applicable
+                log.debug("[DB] migration skipped: %s -> %s", sql, e)
+    log.info("[DB] schema ready")
 
-        # prematch snapshots (used by save_prematch_snapshot / trainer)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS prematch_snapshots (
-            match_id   BIGINT PRIMARY KEY,
-            created_ts BIGINT,
-            payload    TEXT
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
+# --- Settings helpers (used by app) ------------------------------------------
 
-        # odds history (aggregated, optional)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS odds_history (
-            match_id    BIGINT,
-            captured_ts BIGINT,
-            market      TEXT,
-            selection   TEXT,
-            odds        DOUBLE PRECISION,
-            book        TEXT,
-            PRIMARY KEY (match_id, market, selection, captured_ts)
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_match ON odds_history (match_id, captured_ts DESC)")
-
-        # results store for grading / digest
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS match_results (
-            match_id       BIGINT PRIMARY KEY,
-            final_goals_h  INTEGER,
-            final_goals_a  INTEGER,
-            btts_yes       INTEGER,
-            updated_ts     BIGINT
-        )""")
-
-        # lineups cache (prematch features)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS lineups (
-            match_id   BIGINT PRIMARY KEY,
-            created_ts BIGINT,
-            payload    TEXT
-        )""")
-
-        # misc
-        c.execute("CREATE TABLE IF NOT EXISTS feedback (id SERIAL PRIMARY KEY, match_id BIGINT UNIQUE, verdict INTEGER, created_ts BIGINT)")
-        c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-
-        # evolutive columns (defensive)
-        c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
-        c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS book TEXT")
-        c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS ev_pct DOUBLE PRECISION")
-        c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS confidence_raw DOUBLE PRECISION")
-
-        # indices for perf
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match   ON tips (match_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent    ON tips (sent_ok, created_ts DESC)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_snap_by_match ON tip_snapshots (match_id, created_ts DESC)")
-
-        log.info("[DB] schema OK")
-
-# ---------- Settings helpers (with small TTL cache) ----------
-
-class _TTLCache:
-    def __init__(self, ttl_sec: int):
-        self.ttl = ttl_sec
-        self.data: dict[str, tuple[float, Optional[str]]] = {}
-
-    def get(self, k: str) -> Optional[str]:
-        rec = self.data.get(k)
-        if not rec:
-            return None
-        ts, val = rec
-        if time.time() - ts > self.ttl:
-            self.data.pop(k, None)
-            return None
-        return val
-
-    def set(self, k: str, v: Optional[str]) -> None:
-        self.data[k] = (time.time(), v)
-
-    def invalidate(self, k: Optional[str] = None) -> None:
-        if k is None:
-            self.data.clear()
-        else:
-            self.data.pop(k, None)
-
-_SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC", "60"))
-_SETTINGS_CACHE = _TTLCache(_SETTINGS_TTL)
-
-def get_setting(key: str) -> Optional[str]:
+def get_setting(key: str) -> str | None:
     with db_conn() as c:
         row = c.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
-        return row[0] if row else None
+        return (row[0] if row else None)
 
 def set_setting(key: str, value: str) -> None:
     with db_conn() as c:
@@ -227,20 +253,10 @@ def set_setting(key: str, value: str) -> None:
             "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
             (key, value),
         )
-    _SETTINGS_CACHE.invalidate(key)
 
-def get_setting_cached(key: str) -> Optional[str]:
-    v = _SETTINGS_CACHE.get(key)
-    if v is None:
-        v = get_setting(key)
-        _SETTINGS_CACHE.set(key, v)
-    return v
-
-def invalidate_model_caches_for_key(_key: str) -> None:
-    """
-    Placeholder for model-cache invalidation. If your main.py also caches models,
-    it can import and call its own invalidator after updating settings.
-    We keep a stub here so `from db import invalidate_model_caches_for_key`
-    is safe even when main owns the model cache.
-    """
-    return None
+def get_setting_json(key: str) -> dict | None:
+    try:
+        raw = get_setting(key)
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
