@@ -145,7 +145,7 @@ def stats():
         now = int(time.time())
         day_ago = now - 24*3600
         week_ago = now - 7*24*3600
-        with db_conn()
+        with db_conn() as c:
 
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest():
