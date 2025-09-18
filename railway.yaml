@@ -1,9 +1,112 @@
 services:
   - name: goalsniper
-    start: "python main.py"
-    # No cron needed; APScheduler runs inside the process
-    envs:
-      - key: TZ
-        value: Europe/Berlin
-      - key: APIFOOTBALL_BUDGET_DAILY
-        value: "2200"
+    installCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 2 --threads 8 --timeout 180
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHON_VERSION: "3.11"
+      TZ: "Europe/Berlin"
+
+    healthcheck:
+      path: /health
+      interval: 30
+      timeout: 10
+      retries: 5
+
+    variables:
+      # --- Required secrets ---
+      - key: TELEGRAM_BOT_TOKEN
+        required: true
+      - key: TELEGRAM_CHAT_ID
+        required: true
+      - key: API_KEY                # API-Football key
+        required: true
+      - key: DATABASE_URL           # Postgres: postgres://user:pass@host:port/db
+        required: true
+
+      # --- Recommended (security) ---
+      - key: ADMIN_API_KEY          # protects /admin/* endpoints
+        required: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        required: false
+
+      # --- Scheduler & behavior toggles (safe defaults) ---
+      - key: RUN_SCHEDULER
+        value: "1"
+      - key: DAILY_ACCURACY_DIGEST_ENABLE
+        value: "1"
+      - key: MOTD_PREDICT
+        value: "1"
+      - key: TRAIN_ENABLE
+        value: "1"
+      - key: AUTO_TUNE_ENABLE
+        value: "1"
+
+      # --- Markets & thresholds (tweak if needed) ---
+      - key: OU_LINES               # which OU lines to model/scan
+        value: "2.5,3.5"
+      - key: CONF_THRESHOLD         # default % if per-market not set
+        value: "75"
+      - key: MIN_THRESH
+        value: "55"
+      - key: MAX_THRESH
+        value: "85"
+      - key: THRESH_MIN_PREDICTIONS
+        value: "25"
+      - key: TARGET_PRECISION
+        value: "0.60"
+
+      # --- Odds gating & EV ---
+      - key: MIN_ODDS_OU
+        value: "1.50"
+      - key: MIN_ODDS_BTTS
+        value: "1.50"
+      - key: MIN_ODDS_1X2
+        value: "1.50"
+      - key: MAX_ODDS_ALL
+        value: "20.0"
+      - key: EDGE_MIN_BPS           # min EV in basis points (e.g. 600 = +6.00%)
+        value: "600"
+
+      # --- Scan pacing & guardrails ---
+      - key: SCAN_INTERVAL_SEC
+        value: "300"
+      - key: DUP_COOLDOWN_MIN
+        value: "20"
+      - key: TIP_MIN_MINUTE
+        value: "12"
+      - key: BACKFILL_EVERY_MIN
+        value: "15"
+      - key: BACKFILL_DAYS
+        value: "14"
+      - key: STALE_GUARD_ENABLE
+        value: "1"
+      - key: STALE_STATS_MAX_SEC
+        value: "240"
+
+      # --- MOTD schedule (Berlin) ---
+      - key: MOTD_HOUR
+        value: "10"
+      - key: MOTD_MINUTE
+        value: "00"
+      - key: MOTD_CONF_MIN
+        value: "70"
+      # - key: MOTD_LEAGUE_IDS      # optional comma list, e.g. "39,140,61"
+
+      # --- Training schedule (UTC) ---
+      - key: TRAIN_HOUR_UTC
+        value: "02"
+      - key: TRAIN_MINUTE_UTC
+        value: "12"
+
+      # --- CatBoost / sklearn knobs (optional) ---
+      - key: CB_ITERATIONS
+        value: "400"
+      - key: CB_DEPTH
+        value: "6"
+      - key: CB_L2
+        value: "3.0"
+      - key: CB_LEARNING_RATE
+        value: "0.08"
+      - key: LR_C
+        value: "1.0"
