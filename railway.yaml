@@ -8,6 +8,15 @@ services:
       - key: TASK
         value: predict
 
+  - name: heartbeat
+    start: "python main.py"
+    cron: "*/5 * * * *"
+    envs:
+      - key: TZ
+        value: Europe/Berlin
+      - key: TASK
+        value: heartbeat
+
   - name: motd
     start: "python main.py"
     cron: "*/5 * * * *"
