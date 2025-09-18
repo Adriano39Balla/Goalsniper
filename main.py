@@ -1,13 +1,16 @@
-import os, asyncio, httpx, math, json, re
-import contextlib
+import os, asyncio, httpx, math, json, re, contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dtime, date
 from zoneinfo import ZoneInfo
+
 import psycopg
 from psycopg.rows import dict_row
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+
+from aiohttp import web
 
 # ---- ENV / CONFIG ----
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Berlin"))
@@ -25,16 +28,21 @@ MAX_LOOKBACK = int(os.getenv("LOOKBACK_MATCHES", "10"))               # recent m
 API_BASE = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 
+HTTP_PORT = int(os.getenv("PORT", "8000"))
+
 # ---- UTILITIES ----
-def now_local(): return datetime.now(TZ)
-def parse_hhmm(s):
+def now_local() -> datetime:
+    return datetime.now(TZ)
+
+def parse_hhmm(s: str) -> dtime:
     h, m = map(int, s.split(":")); return dtime(h, m)
-def within_cooldown():
+
+def within_cooldown() -> bool:
     n = now_local().time()
     s, e = parse_hhmm(COOLDOWN_START), parse_hhmm(COOLDOWN_END)
     return (n >= s) or (n < e)
 
-def is_exact_local_time(hhmm: str):
+def is_exact_local_time(hhmm: str) -> bool:
     t = parse_hhmm(hhmm); n = now_local()
     return n.hour == t.hour and n.minute == t.minute
 
@@ -62,6 +70,7 @@ def expected_value(prob: float, dec_odds: float):
     return prob * (dec_odds - 1.0) - (1.0 - prob)
 
 def poisson_p_total_ge_k(lambda_total: float, k: int) -> float:
+    # P(X >= k) for Poisson; 1 - CDF(k-1)
     cdf = 0.0
     for i in range(0, k):
         cdf += math.exp(-lambda_total) * lambda_total**i / math.factorial(i)
@@ -114,16 +123,29 @@ async def ensure_schema():
         await con.execute(SCHEMA_SQL)
         await con.commit()
 
+async def get_cfg(key: str):
+    async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
+        row = await con.execute("SELECT value FROM model_cfg WHERE key=%s", (key,))
+        r = await row.fetchone()
+        return r["value"] if r else None
+
+async def set_cfg(key: str, value):
+    async with await psycopg.AsyncConnection.connect(DB_URL) as con:
+        await con.execute(
+            "INSERT INTO model_cfg(key,value) VALUES (%s,%s) "
+            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            (key, json.dumps(value)),
+        )
+        await con.commit()
+
 async def get_policy():
     # Reads {'theta': float, 'ev_min': float} from model_cfg.policy; falls back to env defaults
     theta = float(os.getenv("THRESHOLD", "0.75"))
     ev_min = float(os.getenv("EV_MIN", "0.05"))
-    async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
-        row = await con.execute("SELECT value FROM model_cfg WHERE key='policy'")
-        r = await row.fetchone()
-        if r and isinstance(r["value"], dict):
-            theta = float(r["value"].get("theta", theta))
-            ev_min = float(r["value"].get("ev_min", ev_min))
+    pol = await get_cfg("policy")
+    if isinstance(pol, dict):
+        theta = float(pol.get("theta", theta))
+        ev_min = float(pol.get("ev_min", ev_min))
     return theta, ev_min
 
 # ---- API-FOOTBALL CALLS ----
@@ -203,6 +225,7 @@ async def compute_poisson_over25(home_id: int, away_id: int):
 def choose_pick(p_over, odds_over, p_under, odds_under, threshold, ev_min):
     if not odds_over or not odds_under: return None
     p_over_adj, p_under_adj = normalize_overround(implied_prob(odds_over), implied_prob(odds_under))
+    # conservative blend with market priors
     p_over_blend = 0.6 * p_over + 0.4 * p_over_adj
     p_under_blend = 1.0 - p_over_blend
     ev_over = expected_value(p_over_blend, odds_over)
@@ -235,6 +258,7 @@ async def upsert_fixture_row(fix_row):
         )
         await con.commit()
 
+# ---- HEARTBEAT ----
 async def maybe_send_daily_heartbeat():
     """Send 'Goalsniper AI live and scanning ✅' once per calendar day at 08:00 Europe/Berlin."""
     if not is_exact_local_time("08:00"):
@@ -335,13 +359,13 @@ async def settle_yesterday_and_digest_at_0830():
         return
     await settle_for_date(now_local().date() - timedelta(days=1), send_digest=True)
 
-# ---- HARVESTING / BACKFILL ----
-@contextlib.asynccontextmanage
+# ---- HARVESTING / BACKFILL (optional/manual) ----
+@contextlib.asynccontextmanager
 async def advisory_lock(lock_id: int):
     async with await psycopg.AsyncConnection.connect(DB_URL) as con:
-        # pg_advisory_lock is session-scoped; use try/finally
         await con.execute("SELECT pg_advisory_lock(%s)", (lock_id,))
-        try: yield
+        try:
+            yield
         finally:
             await con.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
 
@@ -382,60 +406,116 @@ async def backfill_days(days: int, send_digest: bool):
         await settle_for_date(d, send_digest=send_digest)
         print(f"[BACKFILL] settled {d}")
 
-# ---- ENTRYPOINT ----
-async def main():
+# ---- HTTP SERVER (/health, /stats) ----
+async def http_health(request):
+    return web.json_response({"ok": True, "time": now_local().isoformat(), "cooldown": within_cooldown()})
+
+async def http_stats(request):
+    # last 24h and last 7d summary
+    out = {"now": now_local().isoformat()}
+    async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
+        # 24h
+        rows = await con.execute("""
+            SELECT p.fixture_id, p.pick, p.odds_over, p.odds_under, p.sent_at, r.goals_home, r.goals_away
+            FROM predictions p
+            LEFT JOIN results r ON r.fixture_id = p.fixture_id
+            WHERE p.sent_at >= now() - interval '24 hours'
+        """); d24 = await rows.fetchall()
+        bets24 = len(d24)
+        wins24 = 0
+        for r in d24:
+            if r["goals_home"] is None or r["goals_away"] is None: continue
+            over25 = (r["goals_home"] + r["goals_away"]) >= 3
+            won = (r["pick"] == "over" and over25) or (r["pick"] == "under" and not over25)
+            wins24 += 1 if won else 0
+        out["last_24h"] = {"bets": bets24, "wins": wins24, "hit_rate": (wins24 / bets24) if bets24 else None}
+
+        # 7d
+        rows = await con.execute("""
+            SELECT p.fixture_id, p.pick, p.odds_over, p.odds_under, p.sent_at, r.goals_home, r.goals_away
+            FROM predictions p
+            LEFT JOIN results r ON r.fixture_id = p.fixture_id
+            WHERE p.sent_at >= now() - interval '7 days'
+        """); d7 = await rows.fetchall()
+        bets7 = len(d7); wins7 = 0
+        for r in d7:
+            if r["goals_home"] is None or r["goals_away"] is None: continue
+            over25 = (r["goals_home"] + r["goals_away"]) >= 3
+            won = (r["pick"] == "over" and over25) or (r["pick"] == "under" and not over25)
+            wins7 += 1 if won else 0
+        out["last_7d"] = {"bets": bets7, "wins": wins7, "hit_rate": (wins7 / bets7) if bets7 else None}
+
+        pol = await con.execute("SELECT value FROM model_cfg WHERE key='policy'")
+        pol_row = await pol.fetchone()
+        out["policy"] = pol_row["value"] if pol_row else None
+
+    return web.json_response(out)
+
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get("/health", http_health)
+    app.router.add_get("/stats", http_stats)
+    # simple root
+    async def root(_): return web.json_response({"name":"goalsniper", "status":"running"})
+    app.router.add_get("/", root)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
+    await site.start()
+    print(f"[HTTP] listening on 0.0.0.0:{HTTP_PORT}")
+
+# ---- SCHEDULER ----
+async def scheduler_main():
     if not (API_KEY and BOT and CHAT and DB_URL):
         raise SystemExit("Missing required env (APIFOOTBALL_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL).")
     await ensure_schema()
+    await start_http_server()
 
-    task = os.getenv("TASK", "predict")  # predict | motd | digest | harvest | backfill
-    if task == "digest":
-        await settle_yesterday_and_digest_at_0830()
-    elif task == "motd":
-        # live MOTD only at 10:00 local
-        if is_exact_local_time("10:00"):
-            theta, ev_min = await get_policy()
-        await motd_at_10()
-    elif task == "harvest":
-        start = os.getenv("START_DATE")
-        end = os.getenv("END_DATE")
-        if not (start and end):
-            raise SystemExit("For TASK=harvest you must set START_DATE=YYYY-MM-DD and END_DATE=YYYY-MM-DD")
-        await harvest_range(start, end)
-    elif task == "backfill":
-        days = int(os.getenv("BACKFILL_DAYS", "30"))
-        send_digest = os.getenv("BACKFILL_SEND_DIGEST", "false").lower() == "true"
-        await backfill_days(days, send_digest)
-    else:
-        await predict_and_send_for_today()
+    sched = AsyncIOScheduler(timezone=str(TZ))
 
-async def main():
-    if not (API_KEY and BOT and CHAT and DB_URL):
-        raise SystemExit("Missing required env (APIFOOTBALL_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL).")
-    await ensure_schema()
+    # Predictor every 15 minutes (internal code respects cooldown)
+    async def job_predict():
+        async with advisory_lock(1001):
+            await predict_and_send_for_today()
+    sched.add_job(job_predict, IntervalTrigger(minutes=15), id="predict-interval", coalesce=True, max_instances=1)
 
-    task = os.getenv("TASK", "predict")  # predict | motd | digest | harvest | backfill | heartbeat
+    # MOTD at 10:00 local
+    async def job_motd():
+        async with advisory_lock(1002):
+            await motd_at_10()
+    sched.add_job(job_motd, CronTrigger(hour=10, minute=0), id="motd-10", coalesce=True, max_instances=1)
 
-    if task == "heartbeat":
-        await maybe_send_daily_heartbeat()
-        return
-    elif task == "digest":
-        await settle_yesterday_and_digest_at_0830()
-    elif task == "motd":
-        await motd_at_10()
-    elif task == "harvest":
-        start = os.getenv("START_DATE"); end = os.getenv("END_DATE")
-        if not (start and end):
-            raise SystemExit("For TASK=harvest you must set START_DATE=YYYY-MM-DD and END_DATE=YYYY-MM-DD")
-        await harvest_range(start, end)
-    elif task == "backfill":
-        days = int(os.getenv("BACKFILL_DAYS", "30"))
-        send_digest = os.getenv("BACKFILL_SEND_DIGEST", "false").lower() == "true"
-        await backfill_days(days, send_digest)
-    else:
-        await predict_and_send_for_today()
+    # Digest at 08:30 local
+    async def job_digest():
+        async with advisory_lock(1003):
+            await settle_yesterday_and_digest_at_0830()
+    sched.add_job(job_digest, CronTrigger(hour=8, minute=30), id="digest-0830", coalesce=True, max_instances=1)
 
-# --- MOTD function (unchanged except for .upper()) ---
+    # Heartbeat at 08:00 local
+    async def job_heartbeat():
+        async with advisory_lock(1004):
+            await maybe_send_daily_heartbeat()
+    sched.add_job(job_heartbeat, CronTrigger(hour=8, minute=0), id="heartbeat-0800", coalesce=True, max_instances=1)
+
+    # (Optional) Nightly training hook can be added here when you wire CatBoost training into this version.
+    # Example:
+    # async def job_train():
+    #     from train_models import main as train_main
+    #     async with advisory_lock(1005):
+    #         await train_main()
+    # sched.add_job(job_train, CronTrigger(hour=23, minute=30), id="train-2330", coalesce=True, max_instances=1)
+
+    sched.start()
+
+    # Keep process alive
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+
+# ---- MOTD (kept at end) ----
 async def motd_at_10():
     if not is_exact_local_time("10:00"): 
         return
@@ -472,54 +552,6 @@ async def motd_at_10():
             f"Pick: *{sel.upper()} 2.5* | P={conf:.2f} | Odds={odds['over']:.2f}/{odds['under']:.2f} | EV={ev:+.2f} | λ≈{lam:.2f}")
     await send_telegram(text)
 
-async def scheduler_main():
-    # Ensure schema once on boot
-    await ensure_schema()
-
-    # Create scheduler (local-time aware)
-    sched = AsyncIOScheduler(timezone=str(TZ))
-
-    # 1) Predictor every 15 minutes (code already respects cooldown + API budget)
-    async def job_predict():
-        async with advisory_lock(1001):
-            await predict_and_send_for_today()
-    sched.add_job(job_predict, IntervalTrigger(minutes=15), id="predict-interval", coalesce=True, max_instances=1)
-
-    # 2) MOTD at 10:00 daily
-    async def job_motd():
-        async with advisory_lock(1002):
-            await motd_at_10()
-    sched.add_job(job_motd, CronTrigger(hour=10, minute=0), id="motd-10", coalesce=True, max_instances=1)
-
-    # 3) Digest at 08:30 daily
-    async def job_digest():
-        async with advisory_lock(1003):
-            await settle_yesterday_and_digest_at_0830()
-    sched.add_job(job_digest, CronTrigger(hour=8, minute=30), id="digest-0830", coalesce=True, max_instances=1)
-
-    # 4) Heartbeat at 08:00 daily
-    async def job_heartbeat():
-        async with advisory_lock(1004):
-            await maybe_send_daily_heartbeat()
-    sched.add_job(job_heartbeat, CronTrigger(hour=8, minute=0), id="heartbeat-0800", coalesce=True, max_instances=1)
-
-    # 5) Nightly training during cooldown (kick at 23:30; train_models.py checks cooldown too)
-    async def job_train():
-        # Import only when called to keep boot fast
-        from train_models import main as train_main
-        async with advisory_lock(1005):
-            await train_main()
-    sched.add_job(job_train, CronTrigger(hour=23, minute=30), id="train-2330", coalesce=True, max_instances=1)
-
-    # Start scheduler
-    sched.start()
-
-    # Keep process alive
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass
-
+# ---- BOOT ----
 if __name__ == "__main__":
     asyncio.run(scheduler_main())
