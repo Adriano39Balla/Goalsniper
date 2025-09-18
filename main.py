@@ -149,6 +149,123 @@ async def ensure_schema():
         await con.execute(SCHEMA_SQL)
         await con.commit()
 
+async def run_migrations_once():
+    """Idempotent, runs once per deploy to align schema with CatBoost build."""
+    key = "migration:supercomputer_v2"
+    already = await get_cfg(key)
+    if already:
+        return
+
+    MIGRATION_SQL = """
+    CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name='fixtures' AND column_name='league_id') THEN
+        ALTER TABLE fixtures ADD COLUMN league_id INT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name='fixtures' AND column_name='season') THEN
+        ALTER TABLE fixtures ADD COLUMN season INT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name='fixtures' AND column_name='home_id') THEN
+        ALTER TABLE fixtures ADD COLUMN home_id INT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name='fixtures' AND column_name='away_id') THEN
+        ALTER TABLE fixtures ADD COLUMN away_id INT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name='fixtures' AND column_name='goals_home') THEN
+        ALTER TABLE fixtures ADD COLUMN goals_home SMALLINT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name='fixtures' AND column_name='goals_away') THEN
+        ALTER TABLE fixtures ADD COLUMN goals_away SMALLINT;
+      END IF;
+    END$$;
+
+    CREATE TABLE IF NOT EXISTS odds_snapshots (
+      fixture_id INT,
+      ts TIMESTAMPTZ DEFAULT now(),
+      over25 REAL,
+      under25 REAL,
+      PRIMARY KEY (fixture_id, ts)
+    );
+
+    CREATE TABLE IF NOT EXISTS features (
+      fixture_id INT PRIMARY KEY,
+      computed_at TIMESTAMPTZ DEFAULT now(),
+      home_form_gf5 REAL, home_form_ga5 REAL,
+      away_form_gf5 REAL, away_form_ga5 REAL,
+      home_rest_days REAL, away_rest_days REAL,
+      league_goal_env REAL,
+      odds_over_implied REAL, odds_under_implied REAL,
+      odds_overround REAL, odds_over_drift REAL, odds_under_drift REAL
+    );
+
+    CREATE TABLE IF NOT EXISTS results (
+      fixture_id INT PRIMARY KEY,
+      goals_home SMALLINT,
+      goals_away SMALLINT,
+      settled_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS model_cfg (
+      key TEXT PRIMARY KEY,
+      value JSONB
+    );
+
+    CREATE TABLE IF NOT EXISTS model_registry (
+      model_id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      label TEXT,
+      version TEXT,
+      lib TEXT,
+      blob BYTEA,
+      meta JSONB
+    );
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name='predictions' AND column_name='policy_id') THEN
+        ALTER TABLE predictions ADD COLUMN policy_id TEXT DEFAULT 'global';
+      END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name='predictions' AND column_name='explain') THEN
+        ALTER TABLE predictions ADD COLUMN explain JSONB;
+      END IF;
+    END$$;
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE c.relname='idx_fixtures_kickoff' AND n.nspname = 'public'
+      ) THEN
+        CREATE INDEX idx_fixtures_kickoff ON fixtures(kickoff);
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE c.relname='idx_predictions_sent_at' AND n.nspname = 'public'
+      ) THEN
+        CREATE INDEX idx_predictions_sent_at ON predictions(sent_at);
+      END IF;
+    END$$;
+    """
+
+    async with await psycopg.AsyncConnection.connect(DB_URL) as con:
+        await con.execute(MIGRATION_SQL)
+        await con.commit()
+
+    await set_cfg(key, {"ran_at": now_local().isoformat()})
+    print("[MIGRATION] Completed supercomputer_v2 migration.")
+
 # ========= CFG HELPERS =========
 async def get_cfg(key: str):
     async with await psycopg.AsyncConnection.connect(DB_URL, row_factory=dict_row) as con:
@@ -628,6 +745,7 @@ async def scheduler_main():
     if not (API_KEY and BOT and CHAT and DB_URL):
         raise SystemExit("Missing required env (APIFOOTBALL_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL).")
     await ensure_schema()
+    await run_migrations_once()
     await start_http_server()
 
     sched = AsyncIOScheduler(timezone=str(TZ))
