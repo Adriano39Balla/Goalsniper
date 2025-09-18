@@ -212,15 +212,28 @@ async def get_odds_for_fixture(fixture_id: int):
 
 # ========= UPSERTS =========
 async def upsert_fixture_row(f):
-    fix=f["fixture"]; teams=f["teams"]; league=f["league"]; goals=f["goals"]
+    fix = f["fixture"]; teams = f["teams"]; league = f["league"]; goals = f["goals"]
     async with await psycopg.AsyncConnection.connect(DB_URL) as con:
         await con.execute("""
-            INSERT INTO fixtures(fixture_id,date,league_id,league_name,season,home_id,away_id,home,away,kickoff,status,goals_home,goals_away)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            INSERT INTO fixtures(
+                fixture_id, date, league_id, league_name, season,
+                home_id, away_id, home, away,
+                kickoff, status, goals_home, goals_away
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (fixture_id) DO UPDATE SET
-              date=EXCLUDED.date, league_id=EXCLUDED.league_id, league_name=EXCLUDED.league_name, season=EXCLUDED.season,
-              home_id=EXCLUDED.home_id, away_id=EXCLUDED.away_id, home=EXCLUDED.home, away=EXCLUDED.away,
-              kickoff=EXCLUDED.kickoff, status=EXCLUDED.status, goals_home=EXCLUDED.goals_home, goals_away=EXCLUDED.goals_away
+                date=EXCLUDED.date,
+                league_id=EXCLUDED.league_id,
+                league_name=EXCLUDED.league_name,
+                season=EXCLUDED.season,
+                home_id=EXCLUDED.home_id,
+                away_id=EXCLUDED.away_id,
+                home=EXCLUDED.home,
+                away=EXCLUDED.away,
+                kickoff=EXCLUDED.kickoff,
+                status=EXCLUDED.status,
+                goals_home=EXCLUDED.goals_home,
+                goals_away=EXCLUDED.goals_away
         """, (
             fix["id"],
             datetime.fromtimestamp(fix["timestamp"], tz=TZ).date(),
