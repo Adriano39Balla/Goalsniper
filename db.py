@@ -6,12 +6,12 @@ import json
 import time
 import atexit
 import logging
-from typing import Optional, Iterable, Any, Tuple
+from typing import Optional, Iterable, Tuple
 from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
-from psycopg2 import OperationalError, InterfaceError, sql
+from psycopg2 import OperationalError, InterfaceError
 from psycopg2.extras import DictCursor
 
 log = logging.getLogger("db")
@@ -23,7 +23,6 @@ if not DB_URL:
     raise SystemExit("DATABASE_URL is required")
 
 def _should_force_ssl(url: str) -> bool:
-    # Only auto-append sslmode for postgres URLs; allow opt-out via env.
     if not url.startswith(("postgres://", "postgresql://")):
         return False
     v = os.getenv("DB_SSLMODE_REQUIRE", "1").strip().lower()
@@ -36,15 +35,13 @@ if _should_force_ssl(DB_URL) and "sslmode=" not in DB_URL:
 POOL: Optional[SimpleConnectionPool] = None
 
 def _new_conn():
-    # application_name helps debugging in pg_stat_activity
-    app_name = os.getenv("PG_APP_NAME", "goalsniper")
     return psycopg2.connect(
         DB_URL,
         keepalives=1,
         keepalives_idle=int(os.getenv("PG_KEEPALIVE_IDLE", "30")),
         keepalives_interval=int(os.getenv("PG_KEEPALIVE_INTERVAL", "10")),
         keepalives_count=int(os.getenv("PG_KEEPALIVE_COUNT", "5")),
-        application_name=app_name,
+        application_name=os.getenv("PG_APP_NAME", "goalsniper"),
     )
 
 def _init_pool():
@@ -52,7 +49,6 @@ def _init_pool():
     if POOL is None:
         minconn = int(os.getenv("DB_POOL_MIN", "1"))
         maxconn = int(os.getenv("DB_POOL_MAX", "6"))
-        # build pool using connection factory to apply session settings after acquire
         POOL = SimpleConnectionPool(minconn=minconn, maxconn=maxconn, dsn=DB_URL)
         log.info("[DB] pool created (min=%d, max=%d)", minconn, maxconn)
         atexit.register(_close_pool)
@@ -69,9 +65,9 @@ def _close_pool():
 
 # --- Session settings ---------------------------------------------------------
 
-STMT_TIMEOUT_MS = int(os.getenv("PG_STATEMENT_TIMEOUT_MS", "15000"))  # 15s
-LOCK_TIMEOUT_MS = int(os.getenv("PG_LOCK_TIMEOUT_MS", "2000"))        # 2s
-IDLE_TX_TIMEOUT_MS = int(os.getenv("PG_IDLE_TX_TIMEOUT_MS", "30000")) # 30s
+STMT_TIMEOUT_MS = int(os.getenv("PG_STATEMENT_TIMEOUT_MS", "15000"))   # 15s
+LOCK_TIMEOUT_MS = int(os.getenv("PG_LOCK_TIMEOUT_MS", "2000"))         # 2s
+IDLE_TX_TIMEOUT_MS = int(os.getenv("PG_IDLE_TX_TIMEOUT_MS", "30000"))  # 30s
 FORCE_UTC = os.getenv("PG_FORCE_UTC", "1").strip().lower() not in {"0", "false", "no", ""}
 
 def _apply_session_settings(conn) -> None:
@@ -134,7 +130,6 @@ class _PooledCursor:
         finally:
             try:
                 if self.conn:
-                    # close=True to drop bad connections
                     self.pool.putconn(self.conn, close=True)
             except Exception:
                 pass
@@ -164,10 +159,6 @@ class _PooledCursor:
         return self._retry_loop(self.cur.executemany, sql_text, list(rows) or [])
 
 def db_conn(dict_rows: bool = False) -> _PooledCursor:
-    """
-    Borrow a connection as a cursor wrapper (autocommit).
-    Set dict_rows=True to get DictCursor.
-    """
     _init_pool()
     return _PooledCursor(POOL, dict_rows=dict_rows)  # type: ignore
 
@@ -175,12 +166,6 @@ def db_conn(dict_rows: bool = False) -> _PooledCursor:
 
 @contextmanager
 def tx(dict_rows: bool = False):
-    """
-    Transaction context:
-        with tx() as cur:
-            cur.execute("...")  # autocommit disabled inside
-    Commits on success, rollbacks on error, with transient-connection auto-retry on BEGIN.
-    """
     _init_pool()
     conn = None
     cur = None
@@ -192,7 +177,7 @@ def tx(dict_rows: bool = False):
             _apply_session_settings(conn)
             cur = conn.cursor(cursor_factory=DictCursor if dict_rows else None)
             break
-        except (OperationalError, InterfaceError) as e:
+        except (OperationalError, InterfaceError):
             if attempts >= MAX_RETRIES:
                 raise
             if conn:
@@ -205,25 +190,20 @@ def tx(dict_rows: bool = False):
         yield cur
         conn.commit()
     except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        try: conn.rollback()
+        except Exception: pass
         raise
     finally:
         try:
-            if cur:
-                cur.close()
+            if cur: cur.close()
         finally:
             if conn:
-                try:
-                    POOL.putconn(conn)
-                except Exception:
-                    pass
+                try: POOL.putconn(conn)
+                except Exception: pass
 
-# --- Schema & migrations ------------------------------------------------------
+# --- Schema: tables, migrations, then indexes --------------------------------
 
-SCHEMA_SQL = [
+SCHEMA_TABLES_SQL = [
     """
     CREATE TABLE IF NOT EXISTS tips (
         match_id        BIGINT,
@@ -268,12 +248,7 @@ SCHEMA_SQL = [
         created_ts BIGINT
     )
     """,
-    """
-    CREATE TABLE IF NOT EXISTS settings (
-        key   TEXT PRIMARY KEY,
-        value TEXT
-    )
-    """,
+    """CREATE TABLE IF NOT EXISTS settings ( key TEXT PRIMARY KEY, value TEXT )""",
     """
     CREATE TABLE IF NOT EXISTS match_results (
         match_id       BIGINT PRIMARY KEY,
@@ -301,7 +276,6 @@ SCHEMA_SQL = [
         payload    TEXT
     )
     """,
-    # ✅ Fixtures table for scan.py
     """
     CREATE TABLE IF NOT EXISTS fixtures (
         fixture_id   BIGINT PRIMARY KEY,
@@ -313,14 +287,6 @@ SCHEMA_SQL = [
         status       TEXT
     )
     """,
-    # helpful indexes
-    "CREATE INDEX IF NOT EXISTS idx_tips_created            ON tips(created_ts DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_tips_match              ON tips(match_id)",
-    "CREATE INDEX IF NOT EXISTS idx_tips_sent               ON tips(sent_ok, created_ts DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_snap_by_match           ON tip_snapshots(match_id, created_ts DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_results_updated         ON match_results(updated_ts DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_odds_hist_match         ON odds_history(match_id, captured_ts DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_fixtures_status_update  ON fixtures(status, last_update DESC)"
 ]
 
 MIGRATIONS_SQL = [
@@ -329,20 +295,40 @@ MIGRATIONS_SQL = [
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS ev_pct         DOUBLE PRECISION",
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS confidence_raw DOUBLE PRECISION",
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS sent_ok        INTEGER DEFAULT 1",
+    # ensure fixtures has these cols even on old DBs
     "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS last_update TIMESTAMPTZ",
     "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS status TEXT",
+]
+
+INDEX_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_tips_created           ON tips(created_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_tips_match             ON tips(match_id)",
+    "CREATE INDEX IF NOT EXISTS idx_tips_sent              ON tips(sent_ok, created_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_snap_by_match          ON tip_snapshots(match_id, created_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_results_updated        ON match_results(updated_ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_odds_hist_match        ON odds_history(match_id, captured_ts DESC)",
+    # run AFTER migrations so columns exist:
+    "CREATE INDEX IF NOT EXISTS idx_fixtures_status_update ON fixtures(status, last_update DESC)",
 ]
 
 def init_db() -> None:
     _init_pool()
     with db_conn() as c:
-        for sql_stmt in SCHEMA_SQL:
+        # 1) create tables (no-op if exist)
+        for sql_stmt in SCHEMA_TABLES_SQL:
             c.execute(sql_stmt)
+        # 2) run migrations
         for sql_stmt in MIGRATIONS_SQL:
             try:
                 c.execute(sql_stmt)
             except Exception as e:
                 log.debug("[DB] migration skipped: %s -> %s", sql_stmt, e)
+        # 3) create indexes (after columns exist)
+        for sql_stmt in INDEX_SQL:
+            try:
+                c.execute(sql_stmt)
+            except Exception as e:
+                log.debug("[DB] index skipped: %s -> %s", sql_stmt, e)
     log.info("[DB] schema ready")
 
 # --- Settings helpers --------------------------------------------------------
