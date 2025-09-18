@@ -231,6 +231,16 @@ async def upsert_fixture_row(fix_row):
         )
         await con.commit()
 
+async def maybe_send_daily_heartbeat():
+    """Send 'Goalsniper AI live and scanning ✅' once per calendar day at 08:00 Europe/Berlin."""
+    if not is_exact_local_time("08:00"):
+        return
+    day_key = f"heartbeat:{now_local().strftime('%Y-%m-%d')}"
+    already = await get_cfg(day_key)
+    if not already:
+        await send_telegram("Goalsniper AI live and scanning ✅")
+        await set_cfg(day_key, {"sent_at": now_local().isoformat()})
+
 # ---- CORE TASKS (LIVE) ----
 async def predict_and_send_for_today():
     if within_cooldown():
@@ -376,6 +386,32 @@ async def main():
     elif task == "harvest":
         start = os.getenv("START_DATE")
         end = os.getenv("END_DATE")
+        if not (start and end):
+            raise SystemExit("For TASK=harvest you must set START_DATE=YYYY-MM-DD and END_DATE=YYYY-MM-DD")
+        await harvest_range(start, end)
+    elif task == "backfill":
+        days = int(os.getenv("BACKFILL_DAYS", "30"))
+        send_digest = os.getenv("BACKFILL_SEND_DIGEST", "false").lower() == "true"
+        await backfill_days(days, send_digest)
+    else:
+        await predict_and_send_for_today()
+
+async def main():
+    if not (API_KEY and BOT and CHAT and DB_URL):
+        raise SystemExit("Missing required env (APIFOOTBALL_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL).")
+    await ensure_schema()
+
+    task = os.getenv("TASK", "predict")  # predict | motd | digest | harvest | backfill | heartbeat
+
+    if task == "heartbeat":
+        await maybe_send_daily_heartbeat()
+        return
+    elif task == "digest":
+        await settle_yesterday_and_digest_at_0830()
+    elif task == "motd":
+        await motd_at_10()
+    elif task == "harvest":
+        start = os.getenv("START_DATE"); end = os.getenv("END_DATE")
         if not (start and end):
             raise SystemExit("For TASK=harvest you must set START_DATE=YYYY-MM-DD and END_DATE=YYYY-MM-DD")
         await harvest_range(start, end)
