@@ -111,3 +111,8 @@ services:
         value: "200"
       - key: GUNICORN_LOGLEVEL
         value: "info"
+
+       - key: SYNC_FIXTURES_SEC
+         value: "60"
+       - key: PREMATCH_WINDOW_MIN
+         value: "120"
