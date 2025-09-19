@@ -11,7 +11,7 @@ from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
-from psycopg2 import OperationalError, InterfaceError
+from psycopg2 import OperationalError, InterfaceError, DatabaseError
 from psycopg2.extras import DictCursor
 
 log = logging.getLogger("db")
@@ -22,34 +22,38 @@ DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
     raise SystemExit("DATABASE_URL is required")
 
+# Normalize and enforce SSL (configurable)
 def _should_force_ssl(url: str) -> bool:
     if not url.startswith(("postgres://", "postgresql://")):
         return False
     v = os.getenv("DB_SSLMODE_REQUIRE", "1").strip().lower()
     return v not in {"0", "false", "no", ""}
 
-# Enforce SSL on managed DBs unless already present (configurable)
+if DB_URL.startswith("postgres://"):
+    # psycopg2 accepts both, but normalize anyway
+    DB_URL = "postgresql://" + DB_URL.split("://", 1)[1]
+
 if _should_force_ssl(DB_URL) and "sslmode=" not in DB_URL:
     DB_URL = DB_URL + (("&" if "?" in DB_URL else "?") + "sslmode=require")
 
 POOL: Optional[SimpleConnectionPool] = None
 
-def _new_conn():
-    return psycopg2.connect(
-        DB_URL,
-        keepalives=1,
-        keepalives_idle=int(os.getenv("PG_KEEPALIVE_IDLE", "30")),
-        keepalives_interval=int(os.getenv("PG_KEEPALIVE_INTERVAL", "10")),
-        keepalives_count=int(os.getenv("PG_KEEPALIVE_COUNT", "5")),
-        application_name=os.getenv("PG_APP_NAME", "goalsniper"),
-    )
+# Connection kwargs (TCP keepalives help with idle disconnects on managed PG)
+_CONN_KW = dict(
+    keepalives=1,
+    keepalives_idle=int(os.getenv("PG_KEEPALIVE_IDLE", "30")),
+    keepalives_interval=int(os.getenv("PG_KEEPALIVE_INTERVAL", "10")),
+    keepalives_count=int(os.getenv("PG_KEEPALIVE_COUNT", "5")),
+    application_name=os.getenv("PG_APP_NAME", "goalsniper"),
+)
 
 def _init_pool():
     global POOL
     if POOL is None:
         minconn = int(os.getenv("DB_POOL_MIN", "1"))
         maxconn = int(os.getenv("DB_POOL_MAX", "6"))
-        POOL = SimpleConnectionPool(minconn=minconn, maxconn=maxconn, dsn=DB_URL)
+        # Pass keepalive kwargs down to psycopg2.connect via the pool
+        POOL = SimpleConnectionPool(minconn=minconn, maxconn=maxconn, dsn=DB_URL, **_CONN_KW)
         log.info("[DB] pool created (min=%d, max=%d)", minconn, maxconn)
         atexit.register(_close_pool)
 
@@ -71,27 +75,58 @@ IDLE_TX_TIMEOUT_MS = int(os.getenv("PG_IDLE_TX_TIMEOUT_MS", "30000"))  # 30s
 FORCE_UTC = os.getenv("PG_FORCE_UTC", "1").strip().lower() not in {"0", "false", "no", ""}
 
 def _apply_session_settings(conn) -> None:
-    cur = conn.cursor()
+    """
+    Apply per-connection settings. Guard each SET so a dropped socket or
+    permission issue cannot kill the process at import/startup.
+    """
     try:
-        if FORCE_UTC:
-            cur.execute("SET TIME ZONE 'UTC'")
-        cur.execute("SET statement_timeout = %s", (STMT_TIMEOUT_MS,))
-        cur.execute("SET lock_timeout = %s", (LOCK_TIMEOUT_MS,))
-        cur.execute("SET idle_in_transaction_session_timeout = %s", (IDLE_TX_TIMEOUT_MS,))
-    finally:
-        cur.close()
+        cur = conn.cursor()
+        try:
+            if FORCE_UTC:
+                try:
+                    cur.execute("SET TIME ZONE 'UTC'")
+                except Exception as e:
+                    # Non-fatal: connection may be mid-termination; we'll retry on next checkout
+                    log.debug("[DB] SET TIME ZONE skipped: %s", e)
+            try:
+                cur.execute("SET statement_timeout = %s", (STMT_TIMEOUT_MS,))
+            except Exception as e:
+                log.debug("[DB] statement_timeout skip: %s", e)
+            try:
+                cur.execute("SET lock_timeout = %s", (LOCK_TIMEOUT_MS,))
+            except Exception as e:
+                log.debug("[DB] lock_timeout skip: %s", e)
+            try:
+                cur.execute("SET idle_in_transaction_session_timeout = %s", (IDLE_TX_TIMEOUT_MS,))
+            except Exception as e:
+                log.debug("[DB] idle_tx_timeout skip: %s", e)
+        finally:
+            try: cur.close()
+            except Exception: pass
+    except Exception as e:
+        # Also non-fatal; acquire code will pre-ping and possibly reconnect
+        log.debug("[DB] apply_session_settings failed: %s", e)
 
-# --- Context manager with auto-retry -----------------------------------------
+# --- Helpers ------------------------------------------------------------------
 
+PING_SQL = "SELECT 1"
 MAX_RETRIES = int(os.getenv("DB_MAX_RETRIES", "2"))
 BASE_BACKOFF_MS = int(os.getenv("DB_BASE_BACKOFF_MS", "100"))
+
+def _sleep_backoff(attempt: int):
+    backoff = min(2000, BASE_BACKOFF_MS * (2 ** attempt))
+    time.sleep(backoff / 1000.0)
+
+# --- Pooled cursor with retries & pre-ping -----------------------------------
 
 class _PooledCursor:
     """
     Autocommit cursor borrowed from pool.
     - Retries transient connection errors with bounded exponential backoff.
     - Applies session settings on first acquire and after reconnect.
+    - Pre-pings connection to avoid handing out dead sockets.
     - Optional dict rows via cursor_factory=DictCursor.
+    - execute()/executemany() return the *cursor* so chaining fetch* is OK.
     """
     def __init__(self, pool: SimpleConnectionPool, dict_rows: bool = False):
         self.pool = pool
@@ -100,7 +135,7 @@ class _PooledCursor:
         self.dict_rows = dict_rows
 
     def __enter__(self):
-        self._acquire()
+        self._acquire_with_retry()
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -115,12 +150,38 @@ class _PooledCursor:
             self.conn = None
             self.cur = None
 
-    def _acquire(self):
-        _init_pool()
+    def _acquire_once(self):
         self.conn = POOL.getconn()  # type: ignore
         self.conn.autocommit = True
         _apply_session_settings(self.conn)
+        # Pre-ping to ensure the socket is alive
+        try:
+            ping = self.conn.cursor()
+            ping.execute(PING_SQL)
+            ping.close()
+        except Exception:
+            # If ping fails, discard this connection and raise so caller can retry
+            try: self.pool.putconn(self.conn, close=True)
+            except Exception: pass
+            self.conn = None
+            raise
+        # Create the working cursor
         self.cur = self.conn.cursor(cursor_factory=DictCursor if self.dict_rows else None)
+
+    def _acquire_with_retry(self):
+        _init_pool()
+        attempts = 0
+        while True:
+            try:
+                self._acquire_once()
+                return
+            except (OperationalError, InterfaceError, DatabaseError) as e:
+                if attempts >= MAX_RETRIES:
+                    log.warning("[DB] acquire failed after %d retries: %s", attempts, e)
+                    raise
+                log.warning("[DB] acquire transient error, retrying: %s", e)
+                _sleep_backoff(attempts)
+                attempts += 1
 
     def _reset(self):
         try:
@@ -135,7 +196,7 @@ class _PooledCursor:
                 pass
         self.conn = None
         self.cur = None
-        self._acquire()
+        self._acquire_with_retry()
 
     def _retry_loop(self, fn, *args, **kwargs):
         attempts = 0
@@ -146,10 +207,9 @@ class _PooledCursor:
                 if attempts >= MAX_RETRIES:
                     log.warning("[DB] giving up after %d retries: %s", attempts, e)
                     raise
-                backoff = min(2000, BASE_BACKOFF_MS * (2 ** attempts))
-                log.warning("[DB] transient error, retrying in %dms: %s", backoff, e)
+                log.warning("[DB] transient error, resetting connection: %s", e)
                 self._reset()
-                time.sleep(backoff / 1000.0)
+                _sleep_backoff(attempts)
                 attempts += 1
 
     def execute(self, sql_text: str, params: Tuple | list = ()):
@@ -182,16 +242,27 @@ def tx(dict_rows: bool = False):
             conn = POOL.getconn()  # type: ignore
             conn.autocommit = False
             _apply_session_settings(conn)
+            # Pre-ping inside the transaction too
+            ping = conn.cursor()
+            try:
+                ping.execute(PING_SQL)
+            finally:
+                try: ping.close()
+                except Exception: pass
             cur = conn.cursor(cursor_factory=DictCursor if dict_rows else None)
             break
-        except (OperationalError, InterfaceError):
+        except (OperationalError, InterfaceError, DatabaseError) as e:
             if attempts >= MAX_RETRIES:
+                if conn:
+                    try: POOL.putconn(conn, close=True)  # type: ignore
+                    except Exception: pass
                 raise
             if conn:
                 try: POOL.putconn(conn, close=True)  # type: ignore
                 except Exception: pass
+            log.warning("[DB] tx acquire transient error, retrying: %s", e)
             attempts += 1
-            time.sleep(min(2000, BASE_BACKOFF_MS * (2 ** attempts)) / 1000.0)
+            _sleep_backoff(attempts-1)
 
     try:
         yield cur
@@ -342,7 +413,8 @@ def init_db() -> None:
 
 def get_setting(key: str) -> Optional[str]:
     with db_conn() as c:
-        row = c.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
+        cur = c.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = cur.fetchone()
         return (row[0] if row else None)
 
 def set_setting(key: str, value: str) -> None:
@@ -360,30 +432,3 @@ def get_setting_json(key: str) -> Optional[dict]:
     except Exception as e:
         log.warning("[DB] get_setting_json failed for key=%s: %s", key, e)
         return None
-
-def _start_scheduler_once():
-    global _scheduler_started
-    log = _base_log
-    if _scheduler_started or not RUN_SCHEDULER:
-        return
-
-    # ---- leader election with advisory lock (prevents multi-start across workers) ----
-    try:
-        with db_conn() as c:
-            got = c.execute("SELECT pg_try_advisory_lock(%s)", (9999,)).fetchone()[0]
-            if not got:
-                log.info("[SCHED] another worker holds leader lock; scheduler not started in this process")
-                return
-    except Exception as e:
-        log.warning("[SCHED] leader lock check failed; not starting scheduler: %s", e)
-        return
-    # ------------------------------------------------------------------------------
-
-    try:
-        sched = BackgroundScheduler(timezone=TZ_UTC)
-        ...
-        sched.start()
-        _scheduler_started = True
-        log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
-    except Exception as e:
-        log.exception("[SCHED] failed: %s", e)
