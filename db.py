@@ -34,21 +34,11 @@ if _should_force_ssl(DB_URL) and "sslmode=" not in DB_URL:
 
 POOL: Optional[SimpleConnectionPool] = None
 
-def _new_conn():
-    return psycopg2.connect(
-        DB_URL,
-        keepalives=1,
-        keepalives_idle=int(os.getenv("PG_KEEPALIVE_IDLE", "30")),
-        keepalives_interval=int(os.getenv("PG_KEEPALIVE_INTERVAL", "10")),
-        keepalives_count=int(os.getenv("PG_KEEPALIVE_COUNT", "5")),
-        application_name=os.getenv("PG_APP_NAME", "goalsniper"),
-    )
-
 def _init_pool():
     global POOL
     if POOL is None:
         minconn = int(os.getenv("DB_POOL_MIN", "1"))
-        maxconn = int(os.getenv("DB_POOL_MAX", "6"))
+        maxconn = int(os.getenv("DB_POOL_MAX", "4"))
         POOL = SimpleConnectionPool(minconn=minconn, maxconn=maxconn, dsn=DB_URL)
         log.info("[DB] pool created (min=%d, max=%d)", minconn, maxconn)
         atexit.register(_close_pool)
@@ -83,16 +73,16 @@ def _apply_session_settings(conn) -> None:
 
 # ───────── Pooled cursor with retries ─────────
 
-MAX_RETRIES = int(os.getenv("DB_MAX_RETRIES", "2"))
-BASE_BACKOFF_MS = int(os.getenv("DB_BASE_BACKOFF_MS", "100"))
+MAX_RETRIES = int(os.getenv("DB_MAX_RETRIES", "3"))
+BASE_BACKOFF_MS = int(os.getenv("DB_BASE_BACKOFF_MS", "150"))
 
 class _PooledCursor:
     """
     Autocommit cursor borrowed from pool.
-    - Retries transient connection errors with bounded exponential backoff.
-    - Applies session settings on first acquire and after reconnect.
-    - Supports optional dict rows via cursor_factory=DictCursor.
-    - Exposes fetchone()/fetchall() and forwards unknown attrs to the real cursor.
+    - Retries transient connection errors with bounded backoff.
+    - Applies session settings on acquire and after reconnect.
+    - Optional dict rows via cursor_factory=DictCursor.
+    - Exposes execute(), executemany(), fetchone(), fetchall().
     """
     def __init__(self, pool: SimpleConnectionPool, dict_rows: bool = False):
         self.pool = pool
@@ -121,7 +111,7 @@ class _PooledCursor:
     def execute(self, sql_text: str, params: Tuple | list = ()):
         def _call():
             self.cur.execute(sql_text, params or ())
-            return self.cur  # allow chaining: c.execute(...).fetchone()
+            return self.cur  # allows chaining: c.execute(...).fetchone()
         return self._retry_loop(_call)
 
     def executemany(self, sql_text: str, rows: Iterable[Tuple]):
@@ -137,47 +127,39 @@ class _PooledCursor:
     def fetchall(self):
         return self.cur.fetchall() if self.cur else []
 
-    # forward anything else to the underlying cursor (e.g., mogrify, fetchmany, description)
-    def __getattr__(self, name):
-        if name in {"cur", "conn", "pool", "dict_rows"}:
-            return super().__getattribute__(name)
-        if self.cur is not None and hasattr(self.cur, name):
-            return getattr(self.cur, name)
-        raise AttributeError(name)
-
     # internals
-
-def _acquire(self):
-    _init_pool()
-    attempts = 0
-    while True:
-        try:
-            self.conn = POOL.getconn()  # type: ignore
-            self.conn.autocommit = True
-            _apply_session_settings(self.conn)
-            self.cur = self.conn.cursor(cursor_factory=DictCursor if self.dict_rows else None)
-            # ping so we don't return a dead/stale connection
-            self.cur.execute("SELECT 1")
-            _ = self.cur.fetchone()
-            return
-        except (OperationalError, InterfaceError) as e:
-            # close and retry with backoff
+    def _acquire(self):
+        _init_pool()
+        attempts = 0
+        while True:
             try:
-                if self.cur:
-                    try: self.cur.close()
-                    except Exception: pass
-                if self.conn:
-                    self.pool.putconn(self.conn, close=True)
-            except Exception:
-                pass
-            self.conn = None
-            self.cur = None
-            if attempts >= MAX_RETRIES:
-                raise
-            backoff = min(2000, BASE_BACKOFF_MS * (2 ** attempts))
-            log.warning("[DB] acquire failed, retrying in %dms: %s", backoff, e)
-            time.sleep(backoff / 1000.0)
-            attempts += 1
+                self.conn = POOL.getconn()  # type: ignore
+                self.conn.autocommit = True
+                _apply_session_settings(self.conn)
+                self.cur = self.conn.cursor(cursor_factory=DictCursor if self.dict_rows else None)
+                # ping to ensure the connection is alive
+                self.cur.execute("SELECT 1")
+                _ = self.cur.fetchone()
+                return
+            except (OperationalError, InterfaceError) as e:
+                # close and retry with backoff
+                try:
+                    if self.cur:
+                        try: self.cur.close()
+                        except Exception: pass
+                    if self.conn:
+                        self.pool.putconn(self.conn, close=True)
+                except Exception:
+                    pass
+                self.conn = None
+                self.cur = None
+                if attempts >= MAX_RETRIES:
+                    log.warning("[DB] acquire failed after %d retries: %s", attempts, e)
+                    raise
+                backoff = min(2000, BASE_BACKOFF_MS * (2 ** attempts))
+                log.warning("[DB] acquire failed, retrying in %dms: %s", backoff, e)
+                time.sleep(backoff / 1000.0)
+                attempts += 1
 
     def _reset(self):
         try:
@@ -227,6 +209,9 @@ def tx(dict_rows: bool = False):
             conn.autocommit = False
             _apply_session_settings(conn)
             cur = conn.cursor(cursor_factory=DictCursor if dict_rows else None)
+            # ping
+            cur.execute("SELECT 1")
+            cur.fetchone()
             break
         except (OperationalError, InterfaceError):
             if attempts >= MAX_RETRIES:
