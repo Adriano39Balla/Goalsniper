@@ -146,12 +146,38 @@ class _PooledCursor:
         raise AttributeError(name)
 
     # internals
-    def _acquire(self):
-        _init_pool()
-        self.conn = POOL.getconn()  # type: ignore
-        self.conn.autocommit = True
-        _apply_session_settings(self.conn)
-        self.cur = self.conn.cursor(cursor_factory=DictCursor if self.dict_rows else None)
+
+def _acquire(self):
+    _init_pool()
+    attempts = 0
+    while True:
+        try:
+            self.conn = POOL.getconn()  # type: ignore
+            self.conn.autocommit = True
+            _apply_session_settings(self.conn)
+            self.cur = self.conn.cursor(cursor_factory=DictCursor if self.dict_rows else None)
+            # ping so we don't return a dead/stale connection
+            self.cur.execute("SELECT 1")
+            _ = self.cur.fetchone()
+            return
+        except (OperationalError, InterfaceError) as e:
+            # close and retry with backoff
+            try:
+                if self.cur:
+                    try: self.cur.close()
+                    except Exception: pass
+                if self.conn:
+                    self.pool.putconn(self.conn, close=True)
+            except Exception:
+                pass
+            self.conn = None
+            self.cur = None
+            if attempts >= MAX_RETRIES:
+                raise
+            backoff = min(2000, BASE_BACKOFF_MS * (2 ** attempts))
+            log.warning("[DB] acquire failed, retrying in %dms: %s", backoff, e)
+            time.sleep(backoff / 1000.0)
+            attempts += 1
 
     def _reset(self):
         try:
