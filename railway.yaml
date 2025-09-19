@@ -1,21 +1,30 @@
+# railway.yaml — single-service monolith (main.py + train_models.py)
+
 services:
   - name: goalsniper
-    installCommand: pip install -U pip && pip install -r requirements.txt
-    startCommand: gunicorn -c gunicorn_conf.py main:app
+    # Build/install
+    installCommand: |
+      pip install -U pip
+      pip install -r requirements.txt
+
+    # Start: SIMPLE & STABLE (Flask dev server run by main.py)
+    startCommand: python main.py
+
+    # If you prefer Gunicorn later, comment the line above and uncomment below:
+    # startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 -k gthread --threads 4 --timeout 120 --access-logfile -
 
     env:
       PYTHONUNBUFFERED: "1"
       PYTHON_VERSION: "3.11"
       TZ: "Europe/Berlin"
 
-    # Give the app + DB more time during cold starts so Railway doesn't bounce it
     healthcheck:
       path: /health
-      interval: 15
-      timeout: 20
-      retries: 30
+      interval: 10
+      timeout: 10
+      retries: 18
 
-    autoDeploy: false  # keep manual; prevent redeploys on every env var edit
+    autoDeploy: false
 
     variables:
       # ───── Required ─────
@@ -24,7 +33,7 @@ services:
       - key: APIFOOTBALL_KEY
         required: true
 
-      # Optional API base (we set an explicit default so it's not "required")
+      # Optional API base (defaults to https://v3.football.api-sports.io)
       - key: APISPORTS_BASE_URL
         value: "https://v3.football.api-sports.io"
 
@@ -32,7 +41,7 @@ services:
       - key: RUN_SCHEDULER
         value: "1"
       - key: SCHEDULER_LEADER
-        value: "1"          # set "0" on any additional web processes you scale out
+        value: "1"
       - key: SCAN_INTERVAL_SEC
         value: "300"
       - key: BACKFILL_EVERY_MIN
@@ -52,7 +61,7 @@ services:
       - key: MOTD_HOUR
         value: "10"
       - key: MOTD_MINUTE
-        value: "00"
+        value: "0"
 
       # ───── Odds / EV ─────
       - key: MIN_ODDS_OU
@@ -66,7 +75,7 @@ services:
       - key: ODDS_CACHE_TTL_SEC
         value: "120"
 
-      # ───── Telegram (flip SEND_MESSAGES when ready) ─────
+      # ───── Telegram (optional) — set SEND_MESSAGES="true" to broadcast ─────
       - key: TELEGRAM_BOT_TOKEN
         required: true
       - key: TELEGRAM_CHAT_ID
@@ -94,25 +103,16 @@ services:
       - key: DB_SSLMODE_REQUIRE
         value: "1"
 
-      # ───── Gunicorn tuning (consumed by gunicorn_conf.py) ─────
-      - key: WEB_CONCURRENCY
-        value: "1"
-      - key: GTHREADS
-        value: "4"
-      - key: GUNICORN_TIMEOUT
-        value: "120"
-      - key: GUNICORN_GRACEFUL_TIMEOUT
-        value: "30"
-      - key: GUNICORN_KEEPALIVE
-        value: "5"
+      # ───── Rest window (Berlin time) ─────
+      - key: REST_START_HOUR_BERLIN
+        value: "23"
+      - key: REST_END_HOUR_BERLIN
+        value: "7"
+
+      # ───── Optional Gunicorn hardening (only used if you enable Gunicorn) ─────
       - key: GUNICORN_MAX_REQUESTS
         value: "1000"
       - key: GUNICORN_MAX_REQUESTS_JITTER
         value: "200"
       - key: GUNICORN_LOGLEVEL
         value: "info"
-
-       - key: SYNC_FIXTURES_SEC
-         value: "60"
-       - key: PREMATCH_WINDOW_MIN
-         value: "120"
