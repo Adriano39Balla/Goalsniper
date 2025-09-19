@@ -19,6 +19,7 @@ except Exception:
 
 from psycopg2.extras import execute_values
 from telegram_utils import send_telegram
+from results_provider import fetch_results_for_fixtures, update_match_results
 from odds import fetch_odds, price_gate
 
 log = logging.getLogger("goalsniper")
@@ -432,6 +433,20 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
 
 # ───────── Backfill ─────────
 def backfill_results_for_open_matches(limit=300):
-    """Hook up your results provider and update match_results here."""
-    log.info("[BACKFILL] placeholder run (limit=%s)", limit)
-    return 0
+    """Fetch results for fixtures still open and update DB."""
+    try:
+        with db_conn() as c:
+            c.execute(
+                "SELECT fixture_id FROM fixtures WHERE status NOT IN ('FT','AET','PEN') ORDER BY last_update ASC LIMIT %s",
+                (limit,),
+            )
+            ids = [r[0] for r in c.fetchall()]
+        if not ids:
+            return 0
+        rows = list(fetch_results_for_fixtures(ids))
+        if not rows:
+            return 0
+        return update_match_results(rows)
+    except Exception as e:
+        log.exception("[BACKFILL] failed: %s", e)
+        return 0
