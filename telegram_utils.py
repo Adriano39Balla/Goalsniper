@@ -17,26 +17,25 @@ except Exception:
 
 log = logging.getLogger("telegram")
 
-# Env config
+# ───────── Env config ─────────
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_IDS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
 THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")  # optional: topics in supergroups
 SEND_MESSAGES = os.getenv("SEND_MESSAGES", "true").lower() in ("1", "true", "yes")
 
-# Parse mode: HTML (default), Markdown, MarkdownV2, or none
 PARSE_MODE = os.getenv("TELEGRAM_PARSE_MODE", "HTML").strip()
+ALLOW_HTML_TAGS = os.getenv("TELEGRAM_ALLOW_HTML_TAGS", "0").lower() in ("1", "true", "yes")
 
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-# Message constraints
 TG_HARD_MAX = 4096
 MAX_LEN = min(int(os.getenv("TELEGRAM_MAX_LEN", TG_HARD_MAX)), TG_HARD_MAX)
 
-# Circuit breaker state
+# ───────── Circuit breaker state ─────────
 _last_fail_ts = 0
 FAIL_COOLDOWN_SEC = int(os.getenv("TELEGRAM_FAIL_COOLDOWN_SEC", "60"))
 
-# HTTP session with retries
+# ───────── HTTP session with retries ─────────
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
@@ -55,6 +54,7 @@ _adapter = HTTPAdapter(max_retries=_retry, pool_connections=32, pool_maxsize=64)
 _session.mount("https://", _adapter)
 _session.mount("http://", _adapter)
 
+
 def _should_skip() -> bool:
     global _last_fail_ts
     if not (BOT_TOKEN and CHAT_IDS and SEND_MESSAGES):
@@ -63,12 +63,12 @@ def _should_skip() -> bool:
         return True
     return False
 
-# ───────── Parse-mode helpers ─────────
 
+# ───────── Parse-mode helpers ─────────
 _MD_V2_CHARS = r'[_*[\]()~`>#+\-=|{}.!]'  # Telegram MarkdownV2 reserved chars
 
 def _escape_md(text: str) -> str:
-    # Legacy Markdown (not V2): escape only _ * ` [ ]
+    # Legacy Markdown: escape only _ * ` [ ]
     return re.sub(r'([_*`$begin:math:display$$end:math:display$])', r'\\\1', text)
 
 def _escape_md_v2(text: str) -> str:
@@ -77,22 +77,21 @@ def _escape_md_v2(text: str) -> str:
 def _prepare_text(text: str) -> str:
     """
     Return body string according to PARSE_MODE.
-    - HTML: escape all HTML (safe, no formatting unless you pass tags yourself)
-    - Markdown/MarkdownV2: escape reserved chars so your *bold* etc. render safely
-    - none: send as plain text
+    - HTML: escapes unless ALLOW_HTML_TAGS=1
+    - Markdown / MarkdownV2: escapes reserved chars
+    - none: plain text
     """
     t = str(text or "")
     if PARSE_MODE.lower() == "html":
-        return html.escape(t)[:MAX_LEN]
+        return (t if ALLOW_HTML_TAGS else html.escape(t))[:MAX_LEN]
     if PARSE_MODE.lower() == "markdownv2":
         return _escape_md_v2(t)[:MAX_LEN]
     if PARSE_MODE.lower() == "markdown":
         return _escape_md(t)[:MAX_LEN]
-    # none
     return t[:MAX_LEN]
 
-# ───────── Chunking ─────────
 
+# ───────── Chunking ─────────
 def _split_message(s: str, limit: int) -> List[str]:
     """Split into safe chunks <= limit, preferring paragraph and line breaks."""
     if len(s) <= limit:
@@ -114,15 +113,15 @@ def _split_message(s: str, limit: int) -> List[str]:
         chunks.append(cur)
     return chunks
 
-# ───────── Sender ─────────
 
+# ───────── Sender ─────────
 def send_telegram(text: str, disable_preview: bool = True) -> bool:
     """
     Send a message to Telegram.
-    - Respects TELEGRAM_PARSE_MODE: HTML (default), Markdown, MarkdownV2, none
-    - Escapes/normalizes content for the chosen parse mode
+    - Respects TELEGRAM_PARSE_MODE (HTML / Markdown / MarkdownV2 / none)
+    - Escapes according to parse mode
     - Splits long messages safely (<=4096 chars)
-    - Retries with exponential backoff and honors 429 rate limits
+    - Retries with backoff and honors 429 rate limits
     - Supports multiple chat IDs and optional THREAD_ID (topics)
     Returns True if at least one send succeeds.
     """
@@ -158,10 +157,11 @@ def send_telegram(text: str, disable_preview: bool = True) -> bool:
                 try:
                     resp = _session.post(url, json=payload, timeout=(3, 10))
                     if resp.status_code == 200:
+                        if not succeeded:
+                            log.debug("[TELEGRAM] delivered to chat_id=%s (len=%d)", chat_id, len(part))
                         succeeded = True
                         break
                     if resp.status_code == 429:
-                        # Bot API returns {"parameters":{"retry_after":N}}
                         try:
                             retry_after = int(resp.json().get("parameters", {}).get("retry_after", 5))
                         except Exception:
@@ -177,10 +177,18 @@ def send_telegram(text: str, disable_preview: bool = True) -> bool:
                 time.sleep(backoff + random.uniform(0, 0.5))
                 backoff *= 2
 
-            # light pacing between chunks to avoid flood (esp. in groups)
             if idx < len(parts):
                 time.sleep(0.3 + random.uniform(0, 0.2))
 
     if not succeeded:
         _last_fail_ts = time.time()
     return succeeded
+
+
+def send_telegram_safe(text: str, **kwargs) -> bool:
+    """Safe wrapper that never raises; logs and returns False on failure."""
+    try:
+        return send_telegram(text, **kwargs)
+    except Exception as e:
+        log.warning("[TELEGRAM] send_telegram_safe failed: %s", e)
+        return False
