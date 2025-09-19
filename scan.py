@@ -217,12 +217,15 @@ def production_scan():
 
     try:
         with db_conn() as c:
-            c.execute("""
+            rows = c.execute(
+                """
                 SELECT fixture_id, league_name, home, away, kickoff, last_update, status
                 FROM fixtures
-                WHERE status IN ('NS','TBD')
-            """)
-            rows = c.fetchall()
+                WHERE
+                  status IN ('1H','HT','2H','ET','P','LIVE')
+                  OR (status IN ('NS','TBD') AND kickoff >= now() AND kickoff <= now() + interval '60 minutes')
+                """
+            ).fetchall()
 
         for fid, league, home, away, kickoff, last_update, status in rows:
             live_seen += 1
