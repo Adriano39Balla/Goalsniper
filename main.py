@@ -57,7 +57,7 @@ app = Flask(__name__)
 def get_logger() -> logging.Logger:
     return _base_log
 
-# ───────── Small DB helpers (psycopg2/3 safe) ─────────
+# ───────── Small DB helpers ─────────
 def _scalar(c, sql: str, params: tuple = ()):
     c.execute(sql, params)
     row = c.fetchone()
@@ -286,6 +286,11 @@ def _handle_sigterm(*_):
     _stop_scheduler()
     sys.exit(0)
 
+def _handle_sigint(*_):
+    _base_log.info("[BOOT] SIGINT received — shutting down gracefully")
+    _stop_scheduler()
+    sys.exit(0)
+
 # ───────── Routes ─────────
 @app.route("/")
 def root():
@@ -450,6 +455,17 @@ def http_auto_tune():
         _base_log.warning("[THRESH] failed to apply tuned thresholds after auto-tune", exc_info=True)
     return jsonify({"ok": True, "tuned": tuned})
 
+@app.route("/admin/apply-thresholds", methods=["POST"])
+def http_apply_thresholds():
+    """Force reloading thresholds from settings into running scan module (no restart needed)."""
+    _require_admin()
+    try:
+        _apply_tuned_thresholds()
+        return jsonify({"ok": True})
+    except Exception as e:
+        _base_log.exception("apply-thresholds failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/admin/motd", methods=["POST", "GET"])
 def http_motd():
     _require_admin()
@@ -525,8 +541,9 @@ def _on_boot():
     except Exception as e:
         _base_log.exception("scheduler start failed (continuing to serve): %s", e)
 
-# Ensure clean scheduler shutdown on SIGTERM (Railway stop/redeploy)
+# Ensure clean scheduler shutdown on signals (Railway stop/redeploy & local ctrl-c)
 signal.signal(signal.SIGTERM, _handle_sigterm)
+signal.signal(signal.SIGINT, _handle_sigint)
 
 _on_boot()
 
