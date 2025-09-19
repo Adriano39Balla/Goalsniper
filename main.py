@@ -31,11 +31,11 @@ import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from cachetools import TTLCache
-import psycopg2
-from psycopg2.pool import SimpleConnectionPool
-from psycopg2 import OperationalError, InterfaceError
-from psycopg2.extras import DictCursor
-from psycopg2.extras import execute_values
+import psycopg
+from psycopg.pool import SimpleConnectionPool
+from psycopg import OperationalError, InterfaceError
+from psycopg.extras import DictCursor
+from psycopg.extras import execute_values
 
 # training lives as a separate file, per your 4-file plan
 from train_models import (
