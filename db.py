@@ -22,17 +22,20 @@ DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
     raise SystemExit("DATABASE_URL is required")
 
+
 def _should_force_ssl(url: str) -> bool:
     if not url.startswith(("postgres://", "postgresql://")):
         return False
     v = os.getenv("DB_SSLMODE_REQUIRE", "1").strip().lower()
     return v not in {"0", "false", "no", ""}
 
+
 # Enforce SSL on managed DBs unless already present (configurable)
 if _should_force_ssl(DB_URL) and "sslmode=" not in DB_URL:
     DB_URL = DB_URL + (("&" if "?" in DB_URL else "?") + "sslmode=require")
 
 POOL: Optional[SimpleConnectionPool] = None
+
 
 def _init_pool():
     global POOL
@@ -42,6 +45,7 @@ def _init_pool():
         POOL = SimpleConnectionPool(minconn=minconn, maxconn=maxconn, dsn=DB_URL)
         log.info("[DB] pool created (min=%d, max=%d)", minconn, maxconn)
         atexit.register(_close_pool)
+
 
 def _close_pool():
     global POOL
@@ -53,12 +57,14 @@ def _close_pool():
             log.warning("[DB] pool close failed", exc_info=True)
         POOL = None
 
+
 # ───────── Session settings ─────────
 
 STMT_TIMEOUT_MS = int(os.getenv("PG_STATEMENT_TIMEOUT_MS", "15000"))   # 15s
 LOCK_TIMEOUT_MS = int(os.getenv("PG_LOCK_TIMEOUT_MS", "2000"))         # 2s
 IDLE_TX_TIMEOUT_MS = int(os.getenv("PG_IDLE_TX_TIMEOUT_MS", "30000"))  # 30s
 FORCE_UTC = os.getenv("PG_FORCE_UTC", "1").strip().lower() not in {"0", "false", "no", ""}
+
 
 def _apply_session_settings(conn) -> None:
     cur = conn.cursor()
@@ -71,10 +77,12 @@ def _apply_session_settings(conn) -> None:
     finally:
         cur.close()
 
+
 # ───────── Pooled cursor with retries ─────────
 
 MAX_RETRIES = int(os.getenv("DB_MAX_RETRIES", "3"))
 BASE_BACKOFF_MS = int(os.getenv("DB_BASE_BACKOFF_MS", "150"))
+
 
 class _PooledCursor:
     """
@@ -98,14 +106,27 @@ class _PooledCursor:
     def __exit__(self, exc_type, exc, tb):
         try:
             if self.cur is not None:
-                try: self.cur.close()
-                except Exception: pass
+                try:
+                    self.cur.close()
+                except Exception:
+                    pass
         finally:
             if self.conn is not None:
-                try: self.pool.putconn(self.conn)
-                except Exception: pass
+                try:
+                    self.pool.putconn(self.conn)
+                except Exception:
+                    pass
             self.conn = None
             self.cur = None
+
+    # delegate non-private attributes to the active cursor
+    def __getattr__(self, name):
+        # Do not intercept private attributes/methods (prevents "_acquire" issues)
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if self.cur is None:
+            raise AttributeError(name)
+        return getattr(self.cur, name)
 
     # cursor-like API
     def execute(self, sql_text: str, params: Tuple | list = ()):
@@ -130,10 +151,12 @@ class _PooledCursor:
     # internals
     def _acquire(self):
         _init_pool()
+        # keep using the same pool object everywhere
+        self.pool = POOL  # type: ignore
         attempts = 0
         while True:
             try:
-                self.conn = POOL.getconn()  # type: ignore
+                self.conn = self.pool.getconn()  # type: ignore
                 self.conn.autocommit = True
                 _apply_session_settings(self.conn)
                 self.cur = self.conn.cursor(cursor_factory=DictCursor if self.dict_rows else None)
@@ -145,10 +168,12 @@ class _PooledCursor:
                 # close and retry with backoff
                 try:
                     if self.cur:
-                        try: self.cur.close()
-                        except Exception: pass
+                        try:
+                            self.cur.close()
+                        except Exception:
+                            pass
                     if self.conn:
-                        self.pool.putconn(self.conn, close=True)
+                        self.pool.putconn(self.conn, close=True)  # type: ignore
                 except Exception:
                     pass
                 self.conn = None
@@ -164,12 +189,14 @@ class _PooledCursor:
     def _reset(self):
         try:
             if self.cur:
-                try: self.cur.close()
-                except Exception: pass
+                try:
+                    self.cur.close()
+                except Exception:
+                    pass
         finally:
             try:
                 if self.conn:
-                    self.pool.putconn(self.conn, close=True)
+                    self.pool.putconn(self.conn, close=True)  # type: ignore
             except Exception:
                 pass
         self.conn = None
@@ -191,9 +218,11 @@ class _PooledCursor:
                 time.sleep(backoff / 1000.0)
                 attempts += 1
 
+
 def db_conn(dict_rows: bool = False) -> _PooledCursor:
     _init_pool()
     return _PooledCursor(POOL, dict_rows=dict_rows)  # type: ignore
+
 
 # ───────── Explicit transaction scope ─────────
 
@@ -217,8 +246,10 @@ def tx(dict_rows: bool = False):
             if attempts >= MAX_RETRIES:
                 raise
             if conn:
-                try: POOL.putconn(conn, close=True)  # type: ignore
-                except Exception: pass
+                try:
+                    POOL.putconn(conn, close=True)  # type: ignore
+                except Exception:
+                    pass
             attempts += 1
             time.sleep(min(2000, BASE_BACKOFF_MS * (2 ** attempts)) / 1000.0)
 
@@ -226,16 +257,22 @@ def tx(dict_rows: bool = False):
         yield cur
         conn.commit()
     except Exception:
-        try: conn.rollback()
-        except Exception: pass
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
         try:
-            if cur: cur.close()
+            if cur:
+                cur.close()
         finally:
             if conn:
-                try: POOL.putconn(conn)
-                except Exception: pass
+                try:
+                    POOL.putconn(conn)  # type: ignore
+                except Exception:
+                    pass
+
 
 # ───────── Schema (tables → migrations → indexes) ─────────
 
@@ -346,6 +383,7 @@ INDEX_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_fixtures_status_update ON fixtures(status, last_update DESC)",
 ]
 
+
 def init_db() -> None:
     _init_pool()
     with db_conn() as c:
@@ -366,12 +404,14 @@ def init_db() -> None:
                 log.debug("[DB] index skipped: %s -> %s", sql_stmt, e)
     log.info("[DB] schema ready")
 
+
 # ───────── Settings helpers ─────────
 
 def get_setting(key: str) -> Optional[str]:
     with db_conn() as c:
         row = c.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
         return (row[0] if row else None)
+
 
 def set_setting(key: str, value: str) -> None:
     with db_conn() as c:
@@ -380,6 +420,7 @@ def set_setting(key: str, value: str) -> None:
             "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
             (key, value),
         )
+
 
 def get_setting_json(key: str) -> Optional[dict]:
     try:
