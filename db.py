@@ -153,10 +153,17 @@ class _PooledCursor:
                 attempts += 1
 
     def execute(self, sql_text: str, params: Tuple | list = ()):
-        return self._retry_loop(self.cur.execute, sql_text, params or ())
+        def _call():
+            self.cur.execute(sql_text, params or ())
+            return self.cur
+        return self._retry_loop(_call)
 
     def executemany(self, sql_text: str, rows: Iterable[Tuple]):
-        return self._retry_loop(self.cur.executemany, sql_text, list(rows) or [])
+        rows = list(rows) or []
+        def _call():
+            self.cur.executemany(sql_text, rows)
+            return self.cur
+        return self._retry_loop(_call)
 
 def db_conn(dict_rows: bool = False) -> _PooledCursor:
     _init_pool()
