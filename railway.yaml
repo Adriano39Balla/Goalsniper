@@ -12,6 +12,7 @@ services:
       interval: 10
       timeout: 10
       retries: 18
+    autoDeploy: false
 
     variables:
       # Required
