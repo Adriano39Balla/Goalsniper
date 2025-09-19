@@ -1,7 +1,7 @@
 services:
   - name: goalsniper
-    installCommand: pip install -r requirements.txt
-    startCommand: startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 -k gthread --threads 8 --timeout 180 --access-logfile -
+    installCommand: pip install -U pip && pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 -k gthread --threads 8 --timeout 180 --access-logfile -
     env:
       PYTHONUNBUFFERED: "1"
       PYTHON_VERSION: "3.11"
@@ -15,9 +15,9 @@ services:
 
     variables:
       # --- Required secrets ---
-      - key: DATABASE_URL           # postgres://user:pass@host:port/db
+      - key: DATABASE_URL                 # postgres://user:pass@host:port/db
         required: true
-      - key: API_KEY                # API-Football key
+      - key: API_KEY                      # API-Football key
         required: true
       - key: TELEGRAM_BOT_TOKEN
         required: false
@@ -27,8 +27,10 @@ services:
       # --- Security ---
       - key: ADMIN_API_KEY
         required: false
+      - key: ALLOW_QUERY_KEY              # allow ?key= in admin calls if true
+        value: "0"
 
-      # --- Toggles / scheduling (these ARE used by your code) ---
+      # --- Toggles / scheduling ---
       - key: RUN_SCHEDULER
         value: "1"
       - key: TRAIN_ENABLE
@@ -52,7 +54,7 @@ services:
       - key: BACKFILL_EVERY_MIN
         value: "15"
 
-      # --- Odds gating / EV (optional; your code supports these) ---
+      # --- Odds / EV gates ---
       - key: MIN_ODDS_OU
         value: "1.50"
       - key: MIN_ODDS_BTTS
@@ -63,14 +65,23 @@ services:
         value: "20.0"
       - key: ODDS_CACHE_TTL_SEC
         value: "120"
+      # optional:
+      # - key: ODDS_SOURCE              # auto|live|prematch
+      #   value: "auto"
+      # - key: ODDS_BOOK_WHITELIST     # comma list, e.g. "Pinnacle,bet365"
+      #   value: ""
+      # - key: ODDS_BOOK_BLACKLIST
+      #   value: ""
 
       # --- Telegram behavior ---
-      - key: SEND_MESSAGES          # set "false" to disable messages
+      - key: SEND_MESSAGES
         value: "true"
       - key: TELEGRAM_FAIL_COOLDOWN_SEC
         value: "60"
+      - key: TELEGRAM_PARSE_MODE          # HTML|Markdown|MarkdownV2|none
+        value: "Markdown"
 
-      # --- DB session safety (optional) ---
+      # --- DB session safety ---
       - key: PG_STATEMENT_TIMEOUT_MS
         value: "15000"
       - key: PG_LOCK_TIMEOUT_MS
