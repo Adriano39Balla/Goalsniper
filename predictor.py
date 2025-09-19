@@ -1,5 +1,5 @@
 # file: predictor.py
-# Minimal model hook for adaptive scan(); swap with your real model.
+# Model hook for adaptive scan(); safe fallback to odds when no model.
 
 from __future__ import annotations
 import os
@@ -7,7 +7,7 @@ import json
 import pickle
 import logging
 import threading
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional
 
 log = logging.getLogger("predictor")
 
@@ -16,7 +16,7 @@ MODEL_PATH = os.getenv("MODEL_PATH", "model.pkl")              # e.g., /data/mod
 MODEL_KIND = os.getenv("MODEL_KIND", "").strip().lower()       # "", "pickle", "json"
 PREDICTOR_STRICT = os.getenv("PREDICTOR_STRICT", "0").lower() not in {"0", "false", "no", ""}
 
-# Optional: allow a small per-fixture cache (seconds). 0 disables.
+# Per-fixture cache TTL (0 disables)
 PREDICTION_CACHE_TTL = int(os.getenv("PREDICTION_CACHE_TTL", "0"))
 
 # ───────── Internal State ─────────
@@ -24,13 +24,26 @@ _model: Any = None
 _model_loaded = False
 _model_lock = threading.RLock()
 
-# very small TTL cache: { fid: (ts, dict) }
+# { fid: (ts, dict) }
 _pred_cache: Dict[int, tuple[float, Dict[str, float]]] = {}
 _pred_cache_lock = threading.RLock()
+
 
 def _now() -> float:
     import time
     return time.time()
+
+
+def clear_model_cache() -> None:
+    """Reset loaded model and cache (e.g., after retrain)."""
+    global _model, _model_loaded
+    with _model_lock:
+        _model = None
+        _model_loaded = False
+    with _pred_cache_lock:
+        _pred_cache.clear()
+    log.info("[predictor] model + cache cleared")
+
 
 def _load_model() -> Optional[Any]:
     """
@@ -47,10 +60,10 @@ def _load_model() -> Optional[Any]:
             return _model
         try:
             if not os.path.exists(MODEL_PATH):
+                log.info("[predictor] MODEL_PATH not found: %s (fallback to odds de-vig)", MODEL_PATH)
                 _model = None
                 _model_loaded = True
-                log.info("[predictor] MODEL_PATH not found: %s (fallback to odds de-vig)", MODEL_PATH)
-                return _model
+                return None
 
             # Determine kind
             kind = MODEL_KIND or ("json" if MODEL_PATH.endswith(".json") else "pickle")
@@ -58,7 +71,6 @@ def _load_model() -> Optional[Any]:
             if kind == "json":
                 with open(MODEL_PATH, "r", encoding="utf-8") as f:
                     obj = json.load(f)
-                # Accept either a static probability mapping or a config your real predictor might use
                 if not isinstance(obj, dict):
                     log.warning("[predictor] JSON model is not a dict; ignoring")
                     obj = {}
@@ -68,6 +80,7 @@ def _load_model() -> Optional[Any]:
                 with open(MODEL_PATH, "rb") as f:
                     _model = pickle.load(f)
                 log.info("[predictor] loaded PICKLE model: %s (%s)", MODEL_PATH, type(_model).__name__)
+
             _model_loaded = True
         except Exception as e:
             _model = None
@@ -75,9 +88,11 @@ def _load_model() -> Optional[Any]:
             log.warning("[predictor] failed to load model (%s): %s — fallback to odds de-vig", MODEL_PATH, e, exc_info=False)
         return _model
 
+
 def warm_model() -> bool:
     """Optionally call this at boot to load the model early."""
     return _load_model() is not None
+
 
 def _predict_with_json_model(model_obj: dict, fid: int) -> Dict[str, float]:
     """
@@ -86,19 +101,19 @@ def _predict_with_json_model(model_obj: dict, fid: int) -> Dict[str, float]:
     """
     data = model_obj.get("data", {})
     if isinstance(data, dict):
-        # NOTE: you could key by fixture/league here if your JSON contains that.
         return {str(k): float(v) for k, v in data.items() if v is not None}
     return {}
+
 
 def _predict_with_pickle(model: Any, fid: int) -> Dict[str, float]:
     """
     Call into your real model. This stub simply tries common interfaces:
-      - model.predict_proba(features) -> mapping or array you map yourself
+      - model.predict_proba(features) -> mapping or array
       - model.predict(features) -> you map it to probabilities
     Replace 'features_for(fid)' with your own feature builder when ready.
     """
     try:
-        # from features import features_for  # <- your own implementation
+        # from features import features_for
         # feats = features_for(fid)
         # if hasattr(model, "predict_proba"):
         #     probs = model.predict_proba(feats)
@@ -106,11 +121,11 @@ def _predict_with_pickle(model: Any, fid: int) -> Dict[str, float]:
         # elif hasattr(model, "predict"):
         #     y = model.predict(feats)
         #     return postprocess_to_market_probs(y)
-        # Placeholder: return empty to fallback to odds-based hints
         return {}
     except Exception as e:
         log.warning("[predictor] model prediction failed for fid=%s: %s", fid, e)
         return {}
+
 
 def _get_cached_prediction(fid: int) -> Optional[Dict[str, float]]:
     if PREDICTION_CACHE_TTL <= 0:
@@ -125,17 +140,18 @@ def _get_cached_prediction(fid: int) -> Optional[Dict[str, float]]:
         _pred_cache.pop(fid, None)
         return None
 
+
 def _put_cached_prediction(fid: int, val: Dict[str, float]) -> None:
     if PREDICTION_CACHE_TTL <= 0:
         return
     with _pred_cache_lock:
-        # tiny cache: cap ~200 items by random eviction (simple & fast)
         if len(_pred_cache) >= 200:
             try:
                 _pred_cache.pop(next(iter(_pred_cache)))
             except Exception:
                 _pred_cache.clear()
         _pred_cache[fid] = (_now(), val)
+
 
 def predict_for_fixture(fid: int) -> Dict[str, float]:
     """
@@ -154,7 +170,6 @@ def predict_for_fixture(fid: int) -> Dict[str, float]:
     model = _load_model()
     if model is None:
         if PREDICTOR_STRICT:
-            # In strict mode we want to notice missing model in logs, but still return {}
             log.debug("[predictor] strict mode: model missing (fid=%s)", fid)
         return {}
 
@@ -169,7 +184,8 @@ def predict_for_fixture(fid: int) -> Dict[str, float]:
         try:
             x = float(v)
             if not (0.0 <= x <= 1.0):
-                continue
+                # Clip instead of discard
+                x = max(0.0, min(1.0, x))
             out[str(k)] = x
         except Exception:
             continue
