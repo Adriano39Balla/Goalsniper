@@ -6,6 +6,7 @@ import time
 import uuid
 import hmac
 import logging
+import signal
 from typing import Any, Callable, Optional
 from datetime import datetime
 
@@ -38,6 +39,12 @@ def get_logger():
         pass
     return _base_log
 
+# ───────── Small DB helpers (psycopg2/3 safe) ─────────
+def _scalar(c, sql: str, params: tuple = ()):
+    c.execute(sql, params)
+    row = c.fetchone()
+    return row[0] if row else None
+
 # ───────── Env helpers ─────────
 def env_bool(name: str, default: bool = False) -> bool:
     val = os.getenv(name)
@@ -53,7 +60,7 @@ def env_int(name: str, default: int) -> int:
 
 # ───────── Env ─────────
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")  # empty means: all admin endpoints will 401
-ALLOW_QUERY_KEY = env_bool("ALLOW_QUERY_KEY", False)  # discourage ?key= by default
+ALLOW_QUERY_KEY = env_bool("ALLOW_QUERY_KEY", False)
 
 RUN_SCHEDULER = env_bool("RUN_SCHEDULER", True)
 SCAN_INTERVAL_SEC = env_int("SCAN_INTERVAL_SEC", 300)
@@ -68,7 +75,7 @@ DAILY_ACCURACY_MINUTE = env_int("DAILY_ACCURACY_MINUTE", 0)
 MOTD_ENABLE = env_bool("MOTD_ENABLE", True)
 MOTD_HOUR = env_int("MOTD_HOUR", 10)
 MOTD_MINUTE = env_int("MOTD_MINUTE", 0)
-SEND_BOOT_TELEGRAM = env_bool("SEND_BOOT_TELEGRAM", False)  # avoid spam across multi-proc
+SEND_BOOT_TELEGRAM = env_bool("SEND_BOOT_TELEGRAM", False)
 
 TZ_UTC = ZoneInfo("UTC")
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
@@ -82,7 +89,6 @@ def is_rest_window_now() -> bool:
     h = datetime.now(BERLIN_TZ).hour
     if REST_START_HOUR_BERLIN <= REST_END_HOUR_BERLIN:
         return REST_START_HOUR_BERLIN <= h < REST_END_HOUR_BERLIN
-    # wrap across midnight (e.g., 23..24 & 0..6)
     return (h >= REST_START_HOUR_BERLIN) or (h < REST_END_HOUR_BERLIN)
 
 # ───────── Request middleware ─────────
@@ -116,19 +122,26 @@ def _require_admin():
 
 # ───────── Scheduler ─────────
 _scheduler_started = False
+_scheduler_ref: Optional[BackgroundScheduler] = None
 
 def _run_with_pg_lock(lock_key: int, fn: Callable, *a, **k):
-    log = get_logger()  # safe: returns base logger when no request context
+    log = get_logger()
     try:
         with db_conn() as c:
-            got = c.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
+            # execute() may return None (psycopg2) → always fetch from cursor
+            c.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            row = c.fetchone()
+            got = bool(row and row[0])
             if not got:
                 log.info("[LOCK %s] busy; skipped.", lock_key)
                 return None
             try:
                 return fn(*a, **k)
             finally:
-                c.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                try:
+                    c.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                except Exception:
+                    pass
     except Exception as e:
         log.exception("[LOCK %s] failed: %s", lock_key, e)
         return None
@@ -142,8 +155,8 @@ def _maybe_skip_rest(fn_name: str) -> bool:
     return False
 
 def _start_scheduler_once():
-    global _scheduler_started
-    log = _base_log  # scheduler starts outside request context; use base logger
+    global _scheduler_started, _scheduler_ref
+    log = _base_log
     if _scheduler_started or not RUN_SCHEDULER:
         return
     # Avoid double-start under Flask dev reloader
@@ -154,7 +167,6 @@ def _start_scheduler_once():
     try:
         sched = BackgroundScheduler(timezone=TZ_UTC)
 
-        # live in-play scanning (no-op during rest window)
         def _scan_job():
             if _maybe_skip_rest("scan"):
                 return
@@ -165,13 +177,11 @@ def _start_scheduler_once():
             seconds=SCAN_INTERVAL_SEC, id="scan", max_instances=1, coalesce=True, misfire_grace_time=60
         )
 
-        # backfill results (can run at night — cheap and non-live)
         sched.add_job(
             lambda: _run_with_pg_lock(1002, backfill_results_for_open_matches, 400),
             "interval", minutes=BACKFILL_EVERY_MIN, id="backfill", max_instances=1, coalesce=True, misfire_grace_time=120
         )
 
-        # daily digest
         if DAILY_ACCURACY_DIGEST_ENABLE:
             sched.add_job(
                 lambda: _run_with_pg_lock(1003, daily_accuracy_digest),
@@ -179,7 +189,6 @@ def _start_scheduler_once():
                 id="digest", max_instances=1, coalesce=True, misfire_grace_time=3600
             )
 
-        # match of the day
         if MOTD_ENABLE:
             sched.add_job(
                 lambda: _run_with_pg_lock(1004, send_match_of_the_day),
@@ -187,7 +196,6 @@ def _start_scheduler_once():
                 id="motd", max_instances=1, coalesce=True, misfire_grace_time=3600
             )
 
-        # training (fixed UTC time)
         if TRAIN_ENABLE:
             sched.add_job(
                 lambda: _run_with_pg_lock(1005, train_models),
@@ -195,7 +203,6 @@ def _start_scheduler_once():
                 id="train", max_instances=1, coalesce=True, misfire_grace_time=3600
             )
 
-        # auto-tune thresholds (UTC; cheap)
         if AUTO_TUNE_ENABLE:
             sched.add_job(
                 lambda: _run_with_pg_lock(1006, auto_tune_thresholds, 14),
@@ -203,7 +210,6 @@ def _start_scheduler_once():
                 id="auto_tune", max_instances=1, coalesce=True, misfire_grace_time=3600
             )
 
-        # retry unsent (also cheap; allowed at night)
         sched.add_job(
             lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200),
             "interval", minutes=10, id="retry", max_instances=1, coalesce=True, misfire_grace_time=120
@@ -211,6 +217,7 @@ def _start_scheduler_once():
 
         sched.start()
         _scheduler_started = True
+        _scheduler_ref = sched
 
         if SEND_BOOT_TELEGRAM:
             try:
@@ -222,6 +229,14 @@ def _start_scheduler_once():
 
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
+
+def _stop_scheduler(*_args):
+    try:
+        if _scheduler_ref and _scheduler_ref.running:
+            _base_log.info("[SCHED] shutting down…")
+            _scheduler_ref.shutdown(wait=False)
+    except Exception:
+        _base_log.warning("[SCHED] shutdown error", exc_info=True)
 
 # ───────── Routes ─────────
 @app.route("/")
@@ -245,15 +260,14 @@ def health():
     try:
         with db_conn() as c:
             c.execute("SELECT 1")
-        resp["db"] = "ok"
-        if deep:
-            try:
-                (n,) = c.execute("SELECT COUNT(*) FROM tips").fetchone()
-                resp["tips_count"] = int(n)
-            except Exception as e:
-                resp["tips_count_error"] = str(e)
+            resp["db"] = "ok"
+            if deep:
+                try:
+                    n = _scalar(c, "SELECT COUNT(*) FROM tips") or 0
+                    resp["tips_count"] = int(n)
+                except Exception as e:
+                    resp["tips_count_error"] = str(e)
     except Exception as e:
-        # Do NOT 500; report degraded state but keep 200
         resp["db"] = "down"
         resp["error"] = str(e)
         log.warning("/health degraded: %s", e)
@@ -268,26 +282,28 @@ def stats():
         day_ago = now - 24 * 3600
         week_ago = now - 7 * 24 * 3600
         with db_conn() as c:
-            (t24,) = c.execute(
-                "SELECT COUNT(*) FROM tips WHERE created_ts >= %s AND suggestion <> 'HARVEST'",
+            t24 = int(_scalar(
+                c, "SELECT COUNT(*) FROM tips WHERE created_ts >= %s AND suggestion <> 'HARVEST'",
                 (day_ago,)
-            ).fetchone()
-            (t7d,) = c.execute(
-                "SELECT COUNT(*) FROM tips WHERE created_ts >= %s AND suggestion <> 'HARVEST'",
+            ) or 0)
+            t7d = int(_scalar(
+                c, "SELECT COUNT(*) FROM tips WHERE created_ts >= %s AND suggestion <> 'HARVEST'",
                 (week_ago,)
-            ).fetchone()
-            (unsent,) = c.execute(
-                "SELECT COUNT(*) FROM tips WHERE sent_ok=0 AND created_ts >= %s",
+            ) or 0)
+            unsent = int(_scalar(
+                c, "SELECT COUNT(*) FROM tips WHERE sent_ok=0 AND created_ts >= %s",
                 (week_ago,)
-            ).fetchone()
-            rows = c.execute("""
+            ) or 0)
+
+            c.execute("""
                 SELECT t.suggestion, t.odds, r.final_goals_h, r.final_goals_a, r.btts_yes
                 FROM tips t
                 JOIN match_results r ON r.match_id = t.match_id
                 WHERE t.created_ts >= %s
                   AND t.suggestion <> 'HARVEST'
                   AND t.sent_ok = 1
-            """, (week_ago,)).fetchall()
+            """, (week_ago,))
+            rows = c.fetchall() or []
 
         graded = wins = 0
         stake = pnl = 0.0
@@ -351,8 +367,7 @@ def stats():
         log.exception("/stats failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ── Admin endpoints (single definitions, GET+POST where appropriate) ──
-
+# ── Admin endpoints ──
 @app.route("/admin/scan", methods=["POST", "GET"])
 def http_scan():
     _require_admin()
@@ -419,7 +434,6 @@ def http_retry_unsent():
     n = retry_unsent_tips(minutes=minutes, limit=limit)
     return jsonify({"ok": True, "resent": int(n)})
 
-# Optional: REST window config endpoint (admin)
 @app.route("/admin/rest-window", methods=["GET","POST"])
 def http_rest_window():
     _require_admin()
@@ -444,7 +458,6 @@ def http_rest_window():
 
 # ───────── Boot ─────────
 def _on_boot():
-    # Make boot non-fatal so Gunicorn workers still bind even if DB/Telegram hiccup.
     try:
         init_db()
     except Exception as e:
@@ -453,6 +466,9 @@ def _on_boot():
         _start_scheduler_once()
     except Exception as e:
         _base_log.exception("scheduler start failed (continuing to serve): %s", e)
+
+# Ensure clean scheduler shutdown on SIGTERM (Railway stop/redeploy)
+signal.signal(signal.SIGTERM, _stop_scheduler)
 
 _on_boot()
 
