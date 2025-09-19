@@ -1,6 +1,8 @@
 # file: db.py
 # Robust Postgres pool + schema bootstrap for goalsniper
 
+from __future__ import annotations
+
 import os
 import json
 import time
@@ -363,14 +365,32 @@ SCHEMA_TABLES_SQL = [
 ]
 
 MIGRATIONS_SQL = [
+    # tips safeguard columns (idempotent)
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds           DOUBLE PRECISION",
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS book           TEXT",
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS ev_pct         DOUBLE PRECISION",
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS confidence_raw DOUBLE PRECISION",
     "ALTER TABLE tips ADD COLUMN IF NOT EXISTS sent_ok        INTEGER DEFAULT 1",
-    # ensure fixtures has these cols even on old DBs
+
+    # fixtures: ensure scheduling columns exist
     "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS last_update TIMESTAMPTZ",
     "ALTER TABLE fixtures ADD COLUMN IF NOT EXISTS status TEXT",
+
+    # (best-effort) keep kickoff as TIMESTAMPTZ if someone created it as TIMESTAMP earlier
+    """
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='fixtures' AND column_name='kickoff' AND data_type='timestamp without time zone'
+      ) THEN
+        EXECUTE 'ALTER TABLE fixtures ALTER COLUMN kickoff TYPE TIMESTAMPTZ USING kickoff AT TIME ZONE ''UTC''';
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      -- ignore if cannot alter (e.g., permissions), we can still run
+      NULL;
+    END $$;
+    """,
 ]
 
 INDEX_SQL = [
@@ -381,6 +401,7 @@ INDEX_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_results_updated        ON match_results(updated_ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_odds_hist_match        ON odds_history(match_id, captured_ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_fixtures_status_update ON fixtures(status, last_update DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_fixtures_kickoff       ON fixtures(kickoff DESC)",
 ]
 
 
@@ -395,7 +416,7 @@ def init_db() -> None:
             try:
                 c.execute(sql_stmt)
             except Exception as e:
-                log.debug("[DB] migration skipped: %s -> %s", sql_stmt, e)
+                log.debug("[DB] migration skipped: %s -> %s", sql_stmt.splitlines()[0][:80], e)
         # 3) create indexes (after columns exist)
         for sql_stmt in INDEX_SQL:
             try:
