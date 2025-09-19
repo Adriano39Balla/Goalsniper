@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import time
-import threading
 import statistics
 import logging
 from typing import Dict, List, Tuple, Optional
@@ -13,11 +12,12 @@ from typing import Dict, List, Tuple, Optional
 import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+from cachetools import TTLCache
 
 log = logging.getLogger("odds")
 
 # ───────── Env ─────────
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("APIFOOTBALL_KEY")
 BASE_URL = os.getenv("APISPORTS_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
 
 HEADERS = {
@@ -68,30 +68,14 @@ adapter = HTTPAdapter(max_retries=retry, pool_connections=64, pool_maxsize=128)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
-# ───────── Cache (thread-safe, bounded) ─────────
-# value: (ts, data)
-_ODDS_CACHE: Dict[int, Tuple[float, dict]] = {}
-_CACHE_LOCK = threading.RLock()
+# ───────── Cache (auto-evicting TTL LRU) ─────────
+_ODDS_CACHE: TTLCache[int, dict] = TTLCache(maxsize=ODDS_CACHE_MAX_ITEMS, ttl=ODDS_CACHE_TTL_SEC)
 
 def _cache_get(fid: int) -> Optional[dict]:
-    now = time.time()
-    with _CACHE_LOCK:
-        entry = _ODDS_CACHE.get(fid)
-        if not entry:
-            return None
-        ts, data = entry
-        if now - ts <= ODDS_CACHE_TTL_SEC:
-            return data
-        _ODDS_CACHE.pop(fid, None)
-        return None
+    return _ODDS_CACHE.get(fid)
 
 def _cache_put(fid: int, data: dict) -> None:
-    with _CACHE_LOCK:
-        if len(_ODDS_CACHE) >= ODDS_CACHE_MAX_ITEMS:
-            cutoff = int(max(1, ODDS_CACHE_MAX_ITEMS * 0.1))
-            for key, _ in sorted(_ODDS_CACHE.items(), key=lambda kv: kv[1][0])[:cutoff]:
-                _ODDS_CACHE.pop(key, None)
-        _ODDS_CACHE[fid] = (time.time(), data)
+    _ODDS_CACHE[fid] = data
 
 # ───────── Helpers ─────────
 def _api_get(path: str, params: dict) -> Optional[dict]:
@@ -107,16 +91,19 @@ def _api_get(path: str, params: dict) -> Optional[dict]:
             timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
         )
         if not r.ok:
-            # Quiet logs for known transient statuses
             if r.status_code in (429, 500, 502, 503, 504):
                 log.debug("odds api non-200 %s for %s params=%s", r.status_code, path, params)
             else:
                 log.warning("odds api %s for %s params=%s", r.status_code, path, params)
             return None
-        js = r.json()
+        try:
+            js = r.json()
+        except ValueError as e:
+            log.error("Invalid JSON from odds API (%s): %s", path, e)
+            return None
         return js if isinstance(js, dict) else None
     except Exception as e:
-        log.debug("odds api request failed for %s: %s", path, e)
+        log.warning("odds api request failed for %s: %s", path, e)
         return None
 
 def _market_name_normalize(s: str) -> str:
@@ -141,13 +128,6 @@ def _book_ok(name: str) -> bool:
     return True
 
 def _aggregate_price(vals: List[Tuple[float, str]], prob_hint: Optional[float]):
-    """
-    Robust-ish aggregation:
-      1) drop odds <= 0 and apply book filters
-      2) median-based outlier trim (cap = median * ODDS_OUTLIER_MULT)
-      3) cap by fair odds if prob_hint present (fair * ODDS_FAIR_MAX_MULT)
-      4) choose 'best' or median-closest
-    """
     xs = [(float(o or 0.0), str(b)) for (o, b) in vals if (o or 0) > 0 and _book_ok(b)]
     if not xs:
         return None, None
@@ -157,7 +137,7 @@ def _aggregate_price(vals: List[Tuple[float, str]], prob_hint: Optional[float]):
     cap_outlier = med * max(1.0, ODDS_OUTLIER_MULT)
     trimmed = [(o, b) for (o, b) in xs if o <= cap_outlier] or xs
 
-    # fair-odds cap (if probability hint available)
+    # fair-odds cap
     if prob_hint is not None and prob_hint > 0:
         fair = 1.0 / max(1e-6, float(prob_hint))
         cap_fair = fair * max(1.0, ODDS_FAIR_MAX_MULT)
@@ -183,19 +163,10 @@ def _min_odds_for_market(market: str) -> float:
     return 1.01
 
 def _ev(prob: float, odds: float) -> float:
-    """Return expected value as decimal (0.05 = +5%)."""
     return prob * max(0.0, float(odds)) - 1.0
 
 # ───────── Fetch odds ─────────
 def fetch_odds(fid: int, prob_hints: Optional[Dict[str, float]] = None) -> dict:
-    """
-    Aggregated odds map:
-      { "BTTS": {...}, "1X2": {...}, "OU_2.5": {...}, ... }
-
-    - Prefers /odds/live (when ODDS_SOURCE=auto|live)
-    - Falls back to /odds (prematch) when enabled
-    - Cached per fixture with TTL + LRU-ish bounding
-    """
     cached = _cache_get(fid)
     if cached is not None:
         return cached
@@ -209,6 +180,9 @@ def fetch_odds(fid: int, prob_hints: Optional[Dict[str, float]] = None) -> dict:
             js = _api_get("odds", {"fixture": fid}) or {}
     if not js and ODDS_SOURCE == "prematch":
         js = _api_get("odds", {"fixture": fid}) or {}
+
+    if not js:
+        log.debug("No odds available for fixture %s (source=%s)", fid, ODDS_SOURCE)
 
     by_market: Dict[str, Dict[str, List[Tuple[float, str]]]] = {}
     try:
@@ -236,7 +210,8 @@ def fetch_odds(fid: int, prob_hints: Optional[Dict[str, float]] = None) -> dict:
                                 by_market.setdefault("1X2", {}).setdefault("Home", []).append((odd, book_name))
                             elif lbl in ("away", "2"):
                                 by_market.setdefault("1X2", {}).setdefault("Away", []).append((odd, book_name))
-                        # Draw ignored intentionally
+                            elif lbl == "draw":
+                                log.debug("Skipping draw odds for fixture %s", fid)
                     elif mname == "OU":
                         for v in vals:
                             lbl = (v.get("value") or "").strip().lower()
@@ -255,7 +230,6 @@ def fetch_odds(fid: int, prob_hints: Optional[Dict[str, float]] = None) -> dict:
 
     out: Dict[str, Dict[str, dict]] = {}
     for mkey, side_map in by_market.items():
-        # require distinct bookmakers for each side
         def _distinct_count(lst: List[Tuple[float, str]]) -> int:
             return len({b for _, b in lst})
         if not side_map:
@@ -299,10 +273,7 @@ def fetch_odds(fid: int, prob_hints: Optional[Dict[str, float]] = None) -> dict:
 # ───────── Price gate ─────────
 def price_gate(market: str, suggestion: str, fid: int, prob: Optional[float] = None):
     """
-    Return (pass, odds, book, ev_pct). Enforces:
-      - odds required unless ALLOW_TIPS_WITHOUT_ODDS=1
-      - odds between floors and MAX_ODDS_ALL
-      - EV >= 0 if prob given
+    Return (pass, odds, book, ev_pct).
     """
     odds_map = fetch_odds(fid)
     odds: Optional[float] = None
@@ -334,7 +305,6 @@ def price_gate(market: str, suggestion: str, fid: int, prob: Optional[float] = N
     if odds is None:
         return (ALLOW_TIPS_WITHOUT_ODDS, odds, book, None)
 
-    # Floor/ceiling checks
     if not (_min_odds_for_market(market) <= float(odds) <= MAX_ODDS_ALL):
         return (False, odds, book, None)
 
