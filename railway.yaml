@@ -1,38 +1,48 @@
 services:
   - name: goalsniper
     installCommand: pip install -U pip && pip install -r requirements.txt
-    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 -k gthread --threads 8 --timeout 180 --access-logfile -
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 -k gthread --threads 4 --timeout 120 --access-logfile -
     env:
       PYTHONUNBUFFERED: "1"
       PYTHON_VERSION: "3.11"
       TZ: "Europe/Berlin"
 
     healthcheck:
-      path: /
+      path: /health
       interval: 10
       timeout: 10
       retries: 18
 
     variables:
-      # --- Required secrets ---
-      - key: DATABASE_URL                 # postgres://user:pass@host:port/db
+      # Required
+      - key: DATABASE_URL
         required: true
-      - key: API_KEY                      # API-Football key
+      - key: API_KEY
         required: true
+
+      # Telegram (optional)
       - key: TELEGRAM_BOT_TOKEN
         required: false
       - key: TELEGRAM_CHAT_ID
         required: false
+      - key: TELEGRAM_PARSE_MODE
+        value: "Markdown"
+      - key: SEND_MESSAGES
+        value: "true"
 
-      # --- Security ---
+      # Security
       - key: ADMIN_API_KEY
         required: false
-      - key: ALLOW_QUERY_KEY              # allow ?key= in admin calls if true
+      - key: ALLOW_QUERY_KEY
         value: "0"
 
-      # --- Toggles / scheduling ---
+      # Scheduler / jobs
       - key: RUN_SCHEDULER
         value: "1"
+      - key: SCAN_INTERVAL_SEC
+        value: "300"
+      - key: BACKFILL_EVERY_MIN
+        value: "15"
       - key: TRAIN_ENABLE
         value: "1"
       - key: AUTO_TUNE_ENABLE
@@ -49,12 +59,8 @@ services:
         value: "10"
       - key: MOTD_MINUTE
         value: "00"
-      - key: SCAN_INTERVAL_SEC
-        value: "300"
-      - key: BACKFILL_EVERY_MIN
-        value: "15"
 
-      # --- Odds / EV gates ---
+      # Odds / EV
       - key: MIN_ODDS_OU
         value: "1.50"
       - key: MIN_ODDS_BTTS
@@ -65,23 +71,8 @@ services:
         value: "20.0"
       - key: ODDS_CACHE_TTL_SEC
         value: "120"
-      # optional:
-      # - key: ODDS_SOURCE              # auto|live|prematch
-      #   value: "auto"
-      # - key: ODDS_BOOK_WHITELIST     # comma list, e.g. "Pinnacle,bet365"
-      #   value: ""
-      # - key: ODDS_BOOK_BLACKLIST
-      #   value: ""
 
-      # --- Telegram behavior ---
-      - key: SEND_MESSAGES
-        value: "true"
-      - key: TELEGRAM_FAIL_COOLDOWN_SEC
-        value: "60"
-      - key: TELEGRAM_PARSE_MODE          # HTML|Markdown|MarkdownV2|none
-        value: "Markdown"
-
-      # --- DB session safety ---
+      # DB session safety
       - key: PG_STATEMENT_TIMEOUT_MS
         value: "15000"
       - key: PG_LOCK_TIMEOUT_MS
