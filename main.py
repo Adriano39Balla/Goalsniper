@@ -6,7 +6,7 @@ import time
 import uuid
 import hmac
 import logging
-import signal
+import signal, sys
 from typing import Any, Callable, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -125,6 +125,16 @@ def _require_admin():
 # ───────── Scheduler ─────────
 _scheduler_started = False
 _scheduler_ref: Optional[BackgroundScheduler] = None
+
+def _on_sigterm(*_):
+    _base_log.info("[BOOT] SIGTERM received — shutting down (likely platform restart)")
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+    except Exception:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _on_sigterm)
 
 def _run_with_pg_lock(lock_key: int, fn: Callable, *a, **k):
     log = get_logger()
