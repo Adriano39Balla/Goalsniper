@@ -18,7 +18,8 @@ log = logging.getLogger("odds")
 
 # ───────── Env ─────────
 API_KEY = os.getenv("API_KEY")
-BASE_URL = os.getenv("APISPORTS_BASE_URL", "https://v3.football.api-sports.io")
+BASE_URL = os.getenv("APISPORTS_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
+
 HEADERS = {
     "x-apisports-key": API_KEY or "",
     "Accept": "application/json",
@@ -32,6 +33,10 @@ ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))
 ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))
 MAX_ODDS_ALL = float(os.getenv("MAX_ODDS_ALL", "20.0"))
 FALLBACK_TO_PREMATCH_ON_EMPTY_LIVE = os.getenv("FALLBACK_TO_PREMATCH_ON_EMPTY_LIVE", "1").lower() not in {"0","false","no"}
+
+# Optional book filters
+BOOK_WHITELIST = {b.strip().lower() for b in os.getenv("ODDS_BOOK_WHITELIST", "").split(",") if b.strip()}
+BOOK_BLACKLIST = {b.strip().lower() for b in os.getenv("ODDS_BOOK_BLACKLIST", "").split(",") if b.strip()}
 
 # Market-specific floors
 MIN_ODDS_OU = float(os.getenv("MIN_ODDS_OU", "1.50"))
@@ -47,17 +52,21 @@ HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "10.0"))
 ODDS_CACHE_TTL_SEC = int(os.getenv("ODDS_CACHE_TTL_SEC", "120"))
 ODDS_CACHE_MAX_ITEMS = int(os.getenv("ODDS_CACHE_MAX_ITEMS", "2000"))
 
-# ───────── Session ─────────
+# ───────── Session (larger pool + resilient retries) ─────────
 session = requests.Session()
 retry = Retry(
     total=3,
+    connect=3,
+    read=3,
     backoff_factor=0.6,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=frozenset(["GET"]),
     respect_retry_after_header=True,
     raise_on_status=False,
 )
-session.mount("https://", HTTPAdapter(max_retries=retry))
+adapter = HTTPAdapter(max_retries=retry, pool_connections=64, pool_maxsize=128)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
 # ───────── Cache (thread-safe, bounded) ─────────
 # value: (ts, data)
@@ -73,16 +82,13 @@ def _cache_get(fid: int) -> Optional[dict]:
         ts, data = entry
         if now - ts <= ODDS_CACHE_TTL_SEC:
             return data
-        # expired
         _ODDS_CACHE.pop(fid, None)
         return None
 
 def _cache_put(fid: int, data: dict) -> None:
     with _CACHE_LOCK:
         if len(_ODDS_CACHE) >= ODDS_CACHE_MAX_ITEMS:
-            # drop ~10% oldest entries to keep map small
-            cutoff = int(ODDS_CACHE_MAX_ITEMS * 0.1) or 1
-            # sort by ts ascending
+            cutoff = int(max(1, ODDS_CACHE_MAX_ITEMS * 0.1))
             for key, _ in sorted(_ODDS_CACHE.items(), key=lambda kv: kv[1][0])[:cutoff]:
                 _ODDS_CACHE.pop(key, None)
         _ODDS_CACHE[fid] = (time.time(), data)
@@ -92,7 +98,7 @@ def _api_get(path: str, params: dict) -> Optional[dict]:
     if not API_KEY:
         log.debug("API key missing; odds API disabled")
         return None
-    url = f"{BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    url = f"{BASE_URL}/{path.lstrip('/')}"
     try:
         r = session.get(
             url,
@@ -101,9 +107,11 @@ def _api_get(path: str, params: dict) -> Optional[dict]:
             timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
         )
         if not r.ok:
-            # Log minimally to avoid noisy logs on rate limits
+            # Quiet logs for known transient statuses
             if r.status_code in (429, 500, 502, 503, 504):
                 log.debug("odds api non-200 %s for %s params=%s", r.status_code, path, params)
+            else:
+                log.warning("odds api %s for %s params=%s", r.status_code, path, params)
             return None
         js = r.json()
         return js if isinstance(js, dict) else None
@@ -124,15 +132,23 @@ def _market_name_normalize(s: str) -> str:
 def _fmt_line(line: float) -> str:
     return f"{line}".rstrip("0").rstrip(".")
 
+def _book_ok(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if BOOK_WHITELIST and n not in BOOK_WHITELIST:
+        return False
+    if n in BOOK_BLACKLIST:
+        return False
+    return True
+
 def _aggregate_price(vals: List[Tuple[float, str]], prob_hint: Optional[float]):
     """
     Robust-ish aggregation:
-      1) drop obviously invalid odds (<=0)
-      2) median-based outlier trimming (cap by median * ODDS_OUTLIER_MULT)
-      3) optional fair-odds cap based on prob_hint
-      4) choose 'best' or 'median-closest'
+      1) drop odds <= 0 and apply book filters
+      2) median-based outlier trim (cap = median * ODDS_OUTLIER_MULT)
+      3) cap by fair odds if prob_hint present (fair * ODDS_FAIR_MAX_MULT)
+      4) choose 'best' or median-closest
     """
-    xs = [(float(o or 0.0), str(b)) for (o, b) in vals if (o or 0) > 0]
+    xs = [(float(o or 0.0), str(b)) for (o, b) in vals if (o or 0) > 0 and _book_ok(b)]
     if not xs:
         return None, None
 
@@ -154,7 +170,6 @@ def _aggregate_price(vals: List[Tuple[float, str]], prob_hint: Optional[float]):
     # median-of-trimmed
     med2 = statistics.median([o for (o, _) in trimmed])
     pick = min(trimmed, key=lambda t: abs(t[0] - med2))
-    # include median count for explainability
     distinct_books = len({b for _, b in trimmed})
     return float(pick[0]), f"{pick[1]} (median of {distinct_books})"
 
@@ -200,6 +215,8 @@ def fetch_odds(fid: int, prob_hints: Optional[Dict[str, float]] = None) -> dict:
         for r in (js.get("response") or []):
             for bk in (r.get("bookmakers") or []):
                 book_name = (bk.get("name") or "Book").strip()
+                if not _book_ok(book_name):
+                    continue
                 for mkt in (bk.get("bets") or []):
                     mname = _market_name_normalize(mkt.get("name", ""))
                     vals = (mkt.get("values") or [])
@@ -219,21 +236,20 @@ def fetch_odds(fid: int, prob_hints: Optional[Dict[str, float]] = None) -> dict:
                                 by_market.setdefault("1X2", {}).setdefault("Home", []).append((odd, book_name))
                             elif lbl in ("away", "2"):
                                 by_market.setdefault("1X2", {}).setdefault("Away", []).append((odd, book_name))
-                            # Note: Draw intentionally ignored unless you want it later
+                        # Draw ignored intentionally
                     elif mname == "OU":
                         for v in vals:
                             lbl = (v.get("value") or "").strip().lower()
-                            # expected format like "Over 2.5" / "Under 2.5"
                             if "over" in lbl or "under" in lbl:
                                 parts = lbl.split()
                                 try:
                                     ln = float(parts[-1])
-                                    key = f"OU_{_fmt_line(ln)}"
-                                    side = "Over" if "over" in lbl else "Under"
-                                    odd = float(v.get("odd") or 0)
-                                    by_market.setdefault(key, {}).setdefault(side, []).append((odd, book_name))
                                 except Exception:
                                     continue
+                                key = f"OU_{_fmt_line(ln)}"
+                                side = "Over" if "over" in lbl else "Under"
+                                odd = float(v.get("odd") or 0)
+                                by_market.setdefault(key, {}).setdefault(side, []).append((odd, book_name))
     except Exception as e:
         log.debug("parse odds response failed for fid=%s: %s", fid, e)
 
@@ -242,6 +258,8 @@ def fetch_odds(fid: int, prob_hints: Optional[Dict[str, float]] = None) -> dict:
         # require distinct bookmakers for each side
         def _distinct_count(lst: List[Tuple[float, str]]) -> int:
             return len({b for _, b in lst})
+        if not side_map:
+            continue
         if not all(_distinct_count(lst) >= ODDS_REQUIRE_N_BOOKS for lst in side_map.values()):
             continue
 
@@ -298,18 +316,12 @@ def price_gate(market: str, suggestion: str, fid: int, prob: Optional[float] = N
 
     elif market == "1X2":
         d = odds_map.get("1X2", {})
-        if suggestion == "Home Win":
-            tgt = "Home"
-        elif suggestion == "Away Win":
-            tgt = "Away"
-        else:
-            tgt = None
+        tgt = "Home" if suggestion == "Home Win" else ("Away" if suggestion == "Away Win" else None)
         if tgt and tgt in d:
             odds, book = d[tgt]["odds"], d[tgt]["book"]
 
     elif market.startswith("Over/Under"):
         try:
-            # suggestions like "Over 2.5 Goals" or "Under 2.5 Goals"
             parts = str(suggestion).split()
             ln = float(parts[1])
             d = odds_map.get(f"OU_{_fmt_line(ln)}", {})
