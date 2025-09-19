@@ -1,20 +1,21 @@
-# file: railway.yaml
 services:
   - name: goalsniper
     installCommand: pip install -U pip && pip install -r requirements.txt
-    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 -k gthread --threads 4 --timeout 120 --access-logfile -
+    startCommand: gunicorn -c gunicorn_conf.py main:app
+
     env:
       PYTHONUNBUFFERED: "1"
       PYTHON_VERSION: "3.11"
       TZ: "Europe/Berlin"
 
+    # Give the app + DB more time during cold starts so Railway doesn't bounce it
     healthcheck:
       path: /health
-      interval: 10
-      timeout: 10
-      retries: 18
+      interval: 15
+      timeout: 20
+      retries: 30
 
-    autoDeploy: false
+    autoDeploy: false  # keep manual; prevent redeploys on every env var edit
 
     variables:
       # ───── Required ─────
@@ -22,32 +23,22 @@ services:
         required: true
       - key: APIFOOTBALL_KEY
         required: true
-      - key: TELEGRAM_BOT_TOKEN
-        required: true
-      - key: TELEGRAM_CHAT_ID
-        required: true
-      - key: ADMIN_API_KEY
-        required: true
 
-      # ───── API base (optional; code defaults to https://v3.football.api-sports.io) ─────
+      # Optional API base (we set an explicit default so it's not "required")
       - key: APISPORTS_BASE_URL
         value: "https://v3.football.api-sports.io"
 
       # ───── Scheduler / jobs ─────
       - key: RUN_SCHEDULER
         value: "1"
-      - key: SCHEDULER_LEADER        # set "0" on secondary web processes if you scale out
-        value: "1"
+      - key: SCHEDULER_LEADER
+        value: "1"          # set "0" on any additional web processes you scale out
       - key: SCAN_INTERVAL_SEC
         value: "300"
       - key: BACKFILL_EVERY_MIN
         value: "15"
       - key: TRAIN_ENABLE
         value: "1"
-      - key: TRAIN_HOUR_UTC
-        value: "2"
-      - key: TRAIN_MINUTE_UTC
-        value: "12"
       - key: AUTO_TUNE_ENABLE
         value: "1"
       - key: DAILY_ACCURACY_DIGEST_ENABLE
@@ -61,27 +52,9 @@ services:
       - key: MOTD_HOUR
         value: "10"
       - key: MOTD_MINUTE
-        value: "0"
-      - key: SEND_BOOT_TELEGRAM
-        value: "0"
+        value: "00"
 
-      # ───── Night rest window (Berlin local) ─────
-      - key: REST_START_HOUR_BERLIN
-        value: "23"
-      - key: REST_END_HOUR_BERLIN
-        value: "7"
-
-      # ───── Odds / EV controls ─────
-      - key: ODDS_SOURCE
-        value: "auto"
-      - key: ODDS_AGGREGATION
-        value: "median"
-      - key: ODDS_OUTLIER_MULT
-        value: "1.8"
-      - key: ODDS_REQUIRE_N_BOOKS
-        value: "2"
-      - key: ODDS_FAIR_MAX_MULT
-        value: "2.5"
+      # ───── Odds / EV ─────
       - key: MIN_ODDS_OU
         value: "1.50"
       - key: MIN_ODDS_BTTS
@@ -90,62 +63,28 @@ services:
         value: "1.50"
       - key: MAX_ODDS_ALL
         value: "20.0"
-      - key: FALLBACK_TO_PREMATCH_ON_EMPTY_LIVE
-        value: "1"
-      - key: ODDS_BOOK_WHITELIST
-        value: ""
-      - key: ODDS_BOOK_BLACKLIST
-        value: ""
       - key: ODDS_CACHE_TTL_SEC
         value: "120"
-      - key: FEED_STALE_SEC
-        value: "300"
-      - key: MAX_TELEGRAM_PER_SCAN
-        value: "5"
 
-      # ───── Predictor hook (optional) ─────
-      - key: MODEL_PATH
-        value: "/data/model.pkl"
-      - key: MODEL_KIND
-        value: ""
-      - key: PREDICTION_CACHE_TTL
+      # ───── Telegram (flip SEND_MESSAGES when ready) ─────
+      - key: TELEGRAM_BOT_TOKEN
+        required: true
+      - key: TELEGRAM_CHAT_ID
+        required: true
+      - key: TELEGRAM_PARSE_MODE
+        value: "Markdown"
+      - key: TELEGRAM_ALLOW_HTML_TAGS
         value: "0"
-      - key: PREDICTOR_STRICT
+      - key: SEND_MESSAGES
+        value: "false"
+
+      # ───── Security ─────
+      - key: ADMIN_API_KEY
+        required: true
+      - key: ALLOW_QUERY_KEY
         value: "0"
 
-      # ───── Calibration & auto-tune ─────
-      - key: TRAIN_WINDOW_DAYS
-        value: "28"
-      - key: TUNE_WINDOW_DAYS
-        value: "14"
-      - key: MIN_BETS_FOR_TRAIN
-        value: "150"
-      - key: MIN_BETS_FOR_TUNE
-        value: "80"
-      - key: CALIBRATION_BINS
-        value: "10"
-      - key: EV_CAP
-        value: "0.50"
-
-      # ───── Initial thresholds ─────
-      - key: CONF_MIN
-        value: "0.75"
-      - key: EV_MIN
-        value: "0.00"
-      - key: MOTD_CONF_MIN
-        value: "0.78"
-      - key: MOTD_EV_MIN
-        value: "0.05"
-
-      # ───── DB pool & session safety ─────
-      - key: DB_POOL_MIN
-        value: "1"
-      - key: DB_POOL_MAX
-        value: "4"
-      - key: DB_MAX_RETRIES
-        value: "3"
-      - key: DB_BASE_BACKOFF_MS
-        value: "150"
+      # ───── DB session safety ─────
       - key: PG_STATEMENT_TIMEOUT_MS
         value: "15000"
       - key: PG_LOCK_TIMEOUT_MS
@@ -154,34 +93,18 @@ services:
         value: "30000"
       - key: DB_SSLMODE_REQUIRE
         value: "1"
-      - key: PG_FORCE_UTC
+
+      # ───── Gunicorn tuning (consumed by gunicorn_conf.py) ─────
+      - key: WEB_CONCURRENCY
         value: "1"
-
-      # ───── HTTP shared timeouts / UA ─────
-      - key: HTTP_CONNECT_TIMEOUT
-        value: "3.0"
-      - key: HTTP_READ_TIMEOUT
-        value: "10.0"
-      - key: HTTP_RESULTS_TIMEOUT
-        value: "10.0"
-      - key: HTTP_USER_AGENT
-        value: "goalsniper/1.0 (+railway)"
-
-      # ───── Telegram options ─────
-      - key: TELEGRAM_PARSE_MODE
-        value: "Markdown"
-      - key: TELEGRAM_ALLOW_HTML_TAGS
-        value: "0"
-      - key: TELEGRAM_THREAD_ID
-        value: ""
-      - key: TELEGRAM_MAX_LEN
-        value: "4096"
-      - key: TELEGRAM_FAIL_COOLDOWN_SEC
-        value: "60"
-      - key: SEND_MESSAGES
-        value: "true"
-
-      # ───── Gunicorn misc ─────
+      - key: GTHREADS
+        value: "4"
+      - key: GUNICORN_TIMEOUT
+        value: "120"
+      - key: GUNICORN_GRACEFUL_TIMEOUT
+        value: "30"
+      - key: GUNICORN_KEEPALIVE
+        value: "5"
       - key: GUNICORN_MAX_REQUESTS
         value: "1000"
       - key: GUNICORN_MAX_REQUESTS_JITTER
