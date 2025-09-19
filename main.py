@@ -302,24 +302,34 @@ def root():
 @app.route("/health")
 def health():
     """
-    Readiness/diagnostic endpoint.
-    - Always returns 200 so platform probes won't kill the app.
-    - Includes db status; optionally returns counts when ?deep=1.
+    Readiness endpoint:
+      - Always returns 200 quickly (no DB by default)
+      - Add ?db=1 for DB ping (still returns 200 even if DB is down)
+      - Add ?deep=1 to include counts (slow; for humans, not probes)
     """
     log = get_logger()
+    want_db = request.args.get("db") in ("1", "true", "yes")
     deep = request.args.get("deep") in ("1", "true", "yes")
+
     resp: dict[str, Any] = {"ok": True, "service": "goalsniper", "scheduler": RUN_SCHEDULER}
 
+    # Fast path: no DB check for readiness
+    if not want_db and not deep:
+        return jsonify(resp), 200
+
+    # Optional DB ping (best-effort, but never 500)
     try:
+        t0 = time.time()
         with db_conn() as c:
             c.execute("SELECT 1")
-            resp["db"] = "ok"
-            if deep:
-                try:
-                    n = _scalar(c, "SELECT COUNT(*) FROM tips") or 0
-                    resp["tips_count"] = int(n)
-                except Exception as e:
-                    resp["tips_count_error"] = str(e)
+        resp["db"] = "ok"
+        resp["db_ms"] = int((time.time() - t0) * 1000)
+        if deep:
+            try:
+                (n,) = c.execute("SELECT COUNT(*) FROM tips").fetchone()  # type: ignore
+                resp["tips_count"] = int(n)
+            except Exception as e:
+                resp["tips_count_error"] = str(e)
     except Exception as e:
         resp["db"] = "down"
         resp["error"] = str(e)
