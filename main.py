@@ -22,34 +22,39 @@ from scan import (
     backfill_results_for_open_matches, daily_accuracy_digest, retry_unsent_tips
 )
 from train_models import train_models, auto_tune_thresholds, load_thresholds_from_settings
-import scan as scan_mod  # <— to patch runtime thresholds
+import scan as scan_mod  # to patch runtime thresholds
 
-# ───────── Logging ─────────
+# ───────── Logging (global request_id injection) ─────────
+# We inject request_id into ALL LogRecords via a custom LogRecordFactory.
+# This prevents ValueError "Formatting field not found: request_id" in background threads.
 
-class RequestIdFilter(logging.Filter):
-    """Ensure every log record has 'request_id' so formatter never KeyErrors."""
-    def filter(self, record: logging.LogRecord) -> bool:
+def _record_factory_with_request_id():
+    base_factory = logging.getLogRecordFactory()
+    def factory(*args, **kwargs):
+        record = base_factory(*args, **kwargs)
+        # Attach request_id safely for ALL loggers/threads
         try:
-            if has_request_context():
-                rid = getattr(g, "request_id", None)
-                record.request_id = rid or "-"
-            else:
-                record.request_id = "-"
+            if not hasattr(record, "request_id"):
+                if has_request_context():
+                    rid = getattr(g, "request_id", None)
+                    record.request_id = rid or "-"
+                else:
+                    record.request_id = "-"
         except Exception:
             record.request_id = "-"
-        return True
+        return record
+    return factory
 
+logging.setLogRecordFactory(_record_factory_with_request_id())
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(request_id)s - %(message)s"
 )
 _base_log = logging.getLogger("goalsniper")
-_base_log.addFilter(RequestIdFilter())
 
 app = Flask(__name__)
 
 def get_logger() -> logging.Logger:
-    # With RequestIdFilter, plain logger is enough (format includes request_id)
     return _base_log
 
 # ───────── Small DB helpers (psycopg2/3 safe) ─────────
@@ -105,7 +110,7 @@ def is_rest_window_now() -> bool:
         return REST_START_HOUR_BERLIN <= h < REST_END_HOUR_BERLIN
     return (h >= REST_START_HOUR_BERLIN) or (h < REST_END_HOUR_BERLIN)
 
-# ───────── Threshold application (new) ─────────
+# ───────── Threshold application ─────────
 def _apply_tuned_thresholds():
     """
     Load CONF_MIN / EV_MIN / MOTD_* from DB settings and apply to scan module globals.
@@ -512,7 +517,7 @@ def _on_boot():
     except Exception as e:
         _base_log.exception("init_db failed (continuing to serve): %s", e)
     try:
-        _apply_tuned_thresholds()   # <— apply thresholds from settings at boot
+        _apply_tuned_thresholds()   # apply thresholds from settings at boot
     except Exception as e:
         _base_log.warning("[THRESH] apply at boot failed (continuing): %s", e, exc_info=True)
     try:
@@ -527,5 +532,5 @@ _on_boot()
 
 if __name__ == "__main__":
     # Use gunicorn/uwsgi in prod instead of Flask dev server.
-    # Example: gunicorn -w 2 -k gthread -t 60 -b 0.0.0.0:8080 main:app
+    # Example: gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:8080 main:app
     app.run(host=os.getenv("HOST","0.0.0.0"), port=int(os.getenv("PORT","8080")))
