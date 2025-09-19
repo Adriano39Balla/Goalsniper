@@ -1,5 +1,6 @@
 # Web
 Flask==3.0.3
+# Gunicorn is optional; safe to keep installed even if you run python main.py
 gunicorn==21.2.0
 
 # HTTP
@@ -17,5 +18,5 @@ APScheduler==3.10.4
 tzdata==2024.1
 tzlocal==5.2
 
-# Caching
+# Caching (odds cache)
 cachetools==5.3.3
