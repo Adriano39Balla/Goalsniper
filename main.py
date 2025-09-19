@@ -9,13 +9,11 @@ import logging
 import signal, sys
 from typing import Any, Callable, Optional
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, request, abort, g, has_request_context
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.executors.pool import ThreadPoolExecutor as APS_ThreadPoolExecutor
 from apscheduler.triggers.cron import CronTrigger
-from zoneinfo import ZoneInfo
 
 from db import init_db, db_conn
 from telegram_utils import send_telegram
@@ -26,19 +24,31 @@ from scan import (
 from train_models import train_models, auto_tune_thresholds
 
 # ───────── Logging ─────────
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
+
+class RequestIdFilter(logging.Filter):
+    """Ensure every log record has 'request_id' so formatter never KeyErrors."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if has_request_context():
+                rid = getattr(g, "request_id", None)
+                record.request_id = rid or "-"
+            else:
+                record.request_id = "-"
+        except Exception:
+            record.request_id = "-"
+        return True
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s %(request_id)s - %(message)s"
+)
 _base_log = logging.getLogger("goalsniper")
+_base_log.addFilter(RequestIdFilter())
+
 app = Flask(__name__)
 
-def get_logger():
-    """Return a logger that includes request_id when there is a request context."""
-    try:
-        if has_request_context():
-            rid = getattr(g, "request_id", None)
-            if rid:
-                return logging.LoggerAdapter(_base_log, extra={"request_id": rid})
-    except Exception:
-        pass
+def get_logger() -> logging.Logger:
+    # With RequestIdFilter, plain logger is enough (format includes request_id)
     return _base_log
 
 # ───────── Small DB helpers (psycopg2/3 safe) ─────────
@@ -65,6 +75,7 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")  # empty means: all admin endpoin
 ALLOW_QUERY_KEY = env_bool("ALLOW_QUERY_KEY", False)
 
 RUN_SCHEDULER = env_bool("RUN_SCHEDULER", True)
+SCHEDULER_LEADER = env_bool("SCHEDULER_LEADER", True)  # set False on non-leader workers if you scale web
 SCAN_INTERVAL_SEC = env_int("SCAN_INTERVAL_SEC", 300)
 BACKFILL_EVERY_MIN = env_int("BACKFILL_EVERY_MIN", 15)
 TRAIN_ENABLE = env_bool("TRAIN_ENABLE", True)
@@ -126,21 +137,10 @@ def _require_admin():
 _scheduler_started = False
 _scheduler_ref: Optional[BackgroundScheduler] = None
 
-def _on_sigterm(*_):
-    _base_log.info("[BOOT] SIGTERM received — shutting down (likely platform restart)")
-    try:
-        from apscheduler.schedulers.background import BackgroundScheduler
-    except Exception:
-        pass
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, _on_sigterm)
-
 def _run_with_pg_lock(lock_key: int, fn: Callable, *a, **k):
     log = get_logger()
     try:
         with db_conn() as c:
-            # execute() may return None (psycopg2) → always fetch from cursor
             c.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
             row = c.fetchone()
             got = bool(row and row[0])
@@ -167,17 +167,26 @@ def _maybe_skip_rest(fn_name: str) -> bool:
     return False
 
 def _start_scheduler_once():
+    """
+    Starts BackgroundScheduler exactly once per process, and only if:
+      - RUN_SCHEDULER = true
+      - SCHEDULER_LEADER = true (use this to ensure only one process runs the scheduler)
+    """
     global _scheduler_started, _scheduler_ref
     log = _base_log
-    if _scheduler_started or not RUN_SCHEDULER:
+    if _scheduler_started or not RUN_SCHEDULER or not SCHEDULER_LEADER:
+        if not SCHEDULER_LEADER:
+            log.info("[SCHED] disabled in this process (SCHEDULER_LEADER=false)")
         return
+
     # Avoid double-start under Flask dev reloader
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         pass
     elif os.environ.get("FLASK_ENV") == "development" and os.environ.get("WERKZEUG_RUN_MAIN") is None:
         return
+
     try:
-        sched = BackgroundScheduler(timezone=TZ_UTC)
+        sched = BackgroundScheduler(timezone=TZ_UTC, job_defaults={"coalesce": True, "max_instances": 1})
 
         def _scan_job():
             if _maybe_skip_rest("scan"):
@@ -249,6 +258,11 @@ def _stop_scheduler(*_args):
             _scheduler_ref.shutdown(wait=False)
     except Exception:
         _base_log.warning("[SCHED] shutdown error", exc_info=True)
+
+def _handle_sigterm(*_):
+    _base_log.info("[BOOT] SIGTERM received — shutting down gracefully")
+    _stop_scheduler()
+    sys.exit(0)
 
 # ───────── Routes ─────────
 @app.route("/")
@@ -480,7 +494,7 @@ def _on_boot():
         _base_log.exception("scheduler start failed (continuing to serve): %s", e)
 
 # Ensure clean scheduler shutdown on SIGTERM (Railway stop/redeploy)
-signal.signal(signal.SIGTERM, _stop_scheduler)
+signal.signal(signal.SIGTERM, _handle_sigterm)
 
 _on_boot()
 
