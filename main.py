@@ -21,7 +21,8 @@ from scan import (
     production_scan, prematch_scan_save, send_match_of_the_day,
     backfill_results_for_open_matches, daily_accuracy_digest, retry_unsent_tips
 )
-from train_models import train_models, auto_tune_thresholds
+from train_models import train_models, auto_tune_thresholds, load_thresholds_from_settings
+import scan as scan_mod  # <— to patch runtime thresholds
 
 # ───────── Logging ─────────
 
@@ -103,6 +104,22 @@ def is_rest_window_now() -> bool:
     if REST_START_HOUR_BERLIN <= REST_END_HOUR_BERLIN:
         return REST_START_HOUR_BERLIN <= h < REST_END_HOUR_BERLIN
     return (h >= REST_START_HOUR_BERLIN) or (h < REST_END_HOUR_BERLIN)
+
+# ───────── Threshold application (new) ─────────
+def _apply_tuned_thresholds():
+    """
+    Load CONF_MIN / EV_MIN / MOTD_* from DB settings and apply to scan module globals.
+    This lets auto-tuned thresholds take effect without reloading the process.
+    """
+    th = load_thresholds_from_settings()
+    scan_mod.CONF_MIN = th["CONF_MIN"]
+    scan_mod.EV_MIN = th["EV_MIN"]
+    scan_mod.MOTD_CONF_MIN = th["MOTD_CONF_MIN"]
+    scan_mod.MOTD_EV_MIN = th["MOTD_EV_MIN"]
+    _base_log.info(
+        "[THRESH] applied: CONF_MIN=%.2f EV_MIN=%.2f MOTD_CONF_MIN=%.2f MOTD_EV_MIN=%.2f",
+        scan_mod.CONF_MIN, scan_mod.EV_MIN, scan_mod.MOTD_CONF_MIN, scan_mod.MOTD_EV_MIN
+    )
 
 # ───────── Request middleware ─────────
 @app.before_request
@@ -420,6 +437,12 @@ def http_digest():
 def http_auto_tune():
     _require_admin()
     tuned = auto_tune_thresholds(14)
+    # If tuning succeeded, immediately apply from DB settings into scan module
+    try:
+        if tuned.get("ok"):
+            _apply_tuned_thresholds()
+    except Exception:
+        _base_log.warning("[THRESH] failed to apply tuned thresholds after auto-tune", exc_info=True)
     return jsonify({"ok": True, "tuned": tuned})
 
 @app.route("/admin/motd", methods=["POST", "GET"])
@@ -488,6 +511,10 @@ def _on_boot():
         init_db()
     except Exception as e:
         _base_log.exception("init_db failed (continuing to serve): %s", e)
+    try:
+        _apply_tuned_thresholds()   # <— apply thresholds from settings at boot
+    except Exception as e:
+        _base_log.warning("[THRESH] apply at boot failed (continuing): %s", e, exc_info=True)
     try:
         _start_scheduler_once()
     except Exception as e:
