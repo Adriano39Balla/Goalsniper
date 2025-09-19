@@ -360,3 +360,30 @@ def get_setting_json(key: str) -> Optional[dict]:
     except Exception as e:
         log.warning("[DB] get_setting_json failed for key=%s: %s", key, e)
         return None
+
+def _start_scheduler_once():
+    global _scheduler_started
+    log = _base_log
+    if _scheduler_started or not RUN_SCHEDULER:
+        return
+
+    # ---- leader election with advisory lock (prevents multi-start across workers) ----
+    try:
+        with db_conn() as c:
+            got = c.execute("SELECT pg_try_advisory_lock(%s)", (9999,)).fetchone()[0]
+            if not got:
+                log.info("[SCHED] another worker holds leader lock; scheduler not started in this process")
+                return
+    except Exception as e:
+        log.warning("[SCHED] leader lock check failed; not starting scheduler: %s", e)
+        return
+    # ------------------------------------------------------------------------------
+
+    try:
+        sched = BackgroundScheduler(timezone=TZ_UTC)
+        ...
+        sched.start()
+        _scheduler_started = True
+        log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
+    except Exception as e:
+        log.exception("[SCHED] failed: %s", e)
