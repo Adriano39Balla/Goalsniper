@@ -1,18 +1,9 @@
-# railway.yaml — single-service monolith (main.py + train_models.py)
-
 services:
   - name: goalsniper
-    # Build/install
     installCommand: |
       pip install -U pip
       pip install -r requirements.txt
-
-    # Start: SIMPLE & STABLE (Flask dev server run by main.py)
     startCommand: python main.py
-
-    # If you prefer Gunicorn later, comment the line above and uncomment below:
-    # startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 -k gthread --threads 4 --timeout 120 --access-logfile -
-
     env:
       PYTHONUNBUFFERED: "1"
       PYTHON_VERSION: "3.11"
@@ -23,21 +14,15 @@ services:
       interval: 10
       timeout: 10
       retries: 18
-
     autoDeploy: false
 
     variables:
-      # ───── Required ─────
       - key: DATABASE_URL
         required: true
       - key: APIFOOTBALL_KEY
         required: true
-
-      # Optional API base (defaults to https://v3.football.api-sports.io)
       - key: APISPORTS_BASE_URL
-        value: "https://v3.football.api-sports.io"
-
-      # ───── Scheduler / jobs ─────
+        value: "https://v3.football.api-sports.ip"
       - key: RUN_SCHEDULER
         value: "1"
       - key: SCHEDULER_LEADER
