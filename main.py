@@ -234,25 +234,31 @@ def root():
 @app.route("/health")
 def health():
     """
-    Lightweight health: DB ping only.
-    Use /health?deep=1 for heavier checks (counts).
+    Readiness/diagnostic endpoint.
+    - Always returns 200 so platform probes won't kill the app.
+    - Includes db status; optionally returns counts when ?deep=1.
     """
     log = get_logger()
     deep = request.args.get("deep") in ("1", "true", "yes")
+    resp: dict[str, Any] = {"ok": True, "service": "goalsniper", "scheduler": RUN_SCHEDULER}
+
     try:
         with db_conn() as c:
             c.execute("SELECT 1")
-            resp: dict[str, Any] = {"ok": True, "db": "ok"}
-            if deep:
-                try:
-                    (n,) = c.execute("SELECT COUNT(*) FROM tips").fetchone()
-                    resp["tips_count"] = int(n)
-                except Exception as e:
-                    resp["tips_count_error"] = str(e)
-            return jsonify(resp)
+        resp["db"] = "ok"
+        if deep:
+            try:
+                (n,) = c.execute("SELECT COUNT(*) FROM tips").fetchone()
+                resp["tips_count"] = int(n)
+            except Exception as e:
+                resp["tips_count_error"] = str(e)
     except Exception as e:
-        log.exception("/health failed: %s", e)
-        return jsonify({"ok": False, "error": str(e)}), 500
+        # Do NOT 500; report degraded state but keep 200
+        resp["db"] = "down"
+        resp["error"] = str(e)
+        log.warning("/health degraded: %s", e)
+
+    return jsonify(resp), 200
 
 @app.route("/stats")
 def stats():
