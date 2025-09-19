@@ -9,9 +9,11 @@ import logging
 import signal
 from typing import Any, Callable, Optional
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, jsonify, request, abort, g, has_request_context
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor as APS_ThreadPoolExecutor
 from apscheduler.triggers.cron import CronTrigger
 from zoneinfo import ZoneInfo
 
