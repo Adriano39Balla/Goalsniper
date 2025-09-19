@@ -1,6 +1,57 @@
 services:
   - name: goalsniper
+
+    # Make sure the builder uses Python 3.11 at BUILD time
+    build:
+      env:
+        PYTHON_VERSION: "3.11.9"
+
     installCommand: pip install -U pip && pip install -r requirements.txt
     startCommand: python main.py
+
     env:
-      PYTHON_VERSION: "3.11"
+      PYTHONUNBUFFERED: "1"
+      TZ: "Europe/Berlin"
+
+      # ── App env (same as before, trimmed here for brevity) ──
+      RUN_SCHEDULER: "1"
+      SCHEDULER_LEADER: "1"
+      SCAN_INTERVAL_SEC: "300"
+      BACKFILL_EVERY_MIN: "15"
+      TRAIN_ENABLE: "1"
+      AUTO_TUNE_ENABLE: "1"
+      DAILY_ACCURACY_DIGEST_ENABLE: "1"
+      DAILY_ACCURACY_HOUR: "8"
+      DAILY_ACCURACY_MINUTE: "0"
+      MOTD_ENABLE: "1"
+      MOTD_HOUR: "10"
+      MOTD_MINUTE: "00"
+
+      MIN_ODDS_OU: "1.50"
+      MIN_ODDS_BTTS: "1.50"
+      MIN_ODDS_1X2: "1.50"
+      MAX_ODDS_ALL: "20.0"
+      ODDS_CACHE_TTL_SEC: "120"
+
+      GUNICORN_LOGLEVEL: "info"   # harmless with python main.py
+
+    healthcheck:
+      path: /health
+      interval: 10
+      timeout: 10
+      retries: 18
+
+    autoDeploy: false
+
+    variables:
+      # Required secrets (set in Railway UI)
+      - key: DATABASE_URL
+        required: true
+      - key: APIFOOTBALL_KEY
+        required: true
+      - key: TELEGRAM_BOT_TOKEN
+        required: true
+      - key: TELEGRAM_CHAT_ID
+        required: true
+      - key: ADMIN_API_KEY
+        required: true
