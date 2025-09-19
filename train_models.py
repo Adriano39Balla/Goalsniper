@@ -5,7 +5,7 @@ import os
 import json
 import time
 import logging
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Iterable
 
 from db import db_conn, get_setting, set_setting, get_setting_json
 
@@ -20,7 +20,7 @@ BINS = int(os.getenv("CALIBRATION_BINS", "10"))
 EV_CAP = float(os.getenv("EV_CAP", "0.50"))
 
 # Settings keys
-CAL_KEY = "calibration_overall"   # JSON: { "bins": [[low,high,obs_rate,count], ...] }
+CAL_KEY = "calibration_overall"   # JSON: { "bins": [[low,high,obs_rate,count], ...], ... }
 CONF_KEY = "CONF_MIN"
 EV_KEY = "EV_MIN"
 MOTD_CONF_KEY = "MOTD_CONF_MIN"
@@ -77,13 +77,20 @@ def _load_graded_tips(days: int) -> List[Tuple[float, float, str, Optional[int],
             """,
             (cutoff,),
         )
-        rows = c.fetchall()
+        rows = c.fetchall() or []
 
     out: List[Tuple[float, float, str, Optional[int], Optional[int]]] = []
     for cr, odds, sugg, gh, ga in rows:
         try:
-            out.append((float(cr or 0.0), float(odds or 0.0), str(sugg or ""), (None if gh is None else int(gh)), (None if ga is None else int(ga))))
+            out.append((
+                float(cr or 0.0),
+                float(odds or 0.0),
+                str(sugg or ""),
+                (None if gh is None else int(gh)),
+                (None if ga is None else int(ga)),
+            ))
         except Exception:
+            # skip malformed row
             continue
     return out
 
@@ -100,22 +107,27 @@ def _build_calibration(bets: List[Tuple[float, float, str, Optional[int], Option
 
     width = 1.0 / max(1, BINS)
     eps = 1e-9
+    # bins store [low, high, wins, n]
     bins = [[i * width, (i + 1) * width + (eps if i == BINS - 1 else 0.0), 0, 0] for i in range(BINS)]
-    # bins: [low, high, wins, n]
 
     for conf_raw, _odds, sugg, gh, ga in bets:
         idx = min(int(conf_raw / width), BINS - 1)
         win = _is_win(sugg, gh, ga)
         if win is None:
             continue
-        bins[idx][3] += 1
+        bins[idx][3] += 1  # n
         if win:
-            bins[idx][2] += 1
+            bins[idx][2] += 1  # wins
 
     out_bins = []
     for (low, high, wins, n) in bins:
         obs = (wins / n) if n > 0 else None
-        out_bins.append([round(low, 3), round(high, 3), (round(obs, 4) if obs is not None else None), n])
+        out_bins.append([
+            round(low, 3),
+            round(high, 3),
+            (round(obs, 4) if obs is not None else None),
+            int(n),
+        ])
 
     return {"bins": out_bins, "created_ts": created_ts, "bins_count": BINS}
 
@@ -124,12 +136,13 @@ def _prob_from_calibration(cal: Optional[Dict], conf_raw: float) -> float:
     if cal:
         try:
             for (low, high, obs, n) in cal.get("bins") or []:
-                if conf_raw >= low and conf_raw < high:
-                    if obs is not None and n >= 10:
+                if conf_raw >= float(low) and conf_raw < float(high):
+                    if obs is not None and int(n) >= 10:
                         return float(obs)
                     break
         except Exception:
             pass
+    # simple shrinkage toward 0.5 to avoid overconfidence
     alpha = 0.15
     return (1 - alpha) * float(conf_raw) + alpha * 0.5
 
@@ -195,6 +208,7 @@ def auto_tune_thresholds(window_days: int = TUNE_WINDOW_DAYS) -> dict:
     for cmin in conf_grid:
         for emin in ev_grid:
             n, pnl = _historical_roi_for_thresholds(bets, cal, cmin, emin)
+            # require enough bets for stability
             if n < max(30, int(0.05 * len(bets))):
                 continue
             roi = pnl / max(n, 1)  # units per bet
@@ -240,7 +254,7 @@ def load_thresholds_from_settings(defaults: Optional[Dict[str, float]] = None) -
     Read CONF_MIN / EV_MIN / MOTD_* from settings table.
     Use in main.py boot to override env/runtime knobs:
         th = load_thresholds_from_settings()
-        CONF_MIN = th["CONF_MIN"]; EV_MIN = th["EV_MIN"]; ...
+        # apply to scan.py at runtime (see note below)
     """
     defaults = defaults or {
         "CONF_MIN": float(os.getenv("CONF_MIN", "0.75")),
@@ -257,7 +271,7 @@ def load_thresholds_from_settings(defaults: Optional[Dict[str, float]] = None) -
 
 # ───────── Utils ─────────
 
-def frange(start: float, stop: float, step: float):
+def frange(start: float, stop: float, step: float) -> Iterable[float]:
     v = start
     while v <= stop + 1e-9:
         yield v
