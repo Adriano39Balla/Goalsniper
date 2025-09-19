@@ -9,9 +9,9 @@ services:
 
     healthcheck:
       path: /
-      interval: 30
-      timeout: 10
-      retries: 5
+      interval: 10
+      timeout: 5
+      retries: 12
 
     variables:
       # --- Required secrets ---
