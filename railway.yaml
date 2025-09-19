@@ -1,7 +1,7 @@
 services:
   - name: goalsniper
     installCommand: pip install -r requirements.txt
-    startCommand: I startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 2 -k gthread --threads 8 --timeout 180
+    startCommand: startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 -k gthread --threads 8 --timeout 180 --access-logfile -
     env:
       PYTHONUNBUFFERED: "1"
       PYTHON_VERSION: "3.11"
