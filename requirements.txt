@@ -15,7 +15,7 @@ psycopg2-binary==2.9.9
 # Scheduling / timezones
 APScheduler==3.10.4
 tzdata==2024.1
-tzlocal==5.2  # explicit pin; APScheduler uses it
+tzlocal==5.2
 
-# Caching used in odds.py
+# Caching
 cachetools==5.3.3
