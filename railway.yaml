@@ -1,6 +1,7 @@
 services:
   - name: goalsniper
     installCommand: pip install -U pip && pip install -r requirements.txt
+    # You can also use: gunicorn -c gunicorn_conf.py main:app
     startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 -k gthread --threads 4 --timeout 120 --access-logfile -
     env:
       PYTHONUNBUFFERED: "1"
@@ -12,34 +13,25 @@ services:
       interval: 10
       timeout: 10
       retries: 18
+
     autoDeploy: false
 
     variables:
-      # Required
+      # ───── Required ─────
       - key: DATABASE_URL
         required: true
-      - key: API_KEY
+      - key: APIFOOTBALL_KEY
         required: true
 
-      # Telegram (optional)
-      - key: TELEGRAM_BOT_TOKEN
-        required: false
-      - key: TELEGRAM_CHAT_ID
-        required: false
-      - key: TELEGRAM_PARSE_MODE
-        value: "Markdown"
-      - key: SEND_MESSAGES
-        value: "true"
+      # Optional API base (defaults to https://v3.football.api-sports.io)
+      - key: APISPORTS_BASE_URL
+        required: true
 
-      # Security
-      - key: ADMIN_API_KEY
-        required: false
-      - key: ALLOW_QUERY_KEY
-        value: "0"
-
-      # Scheduler / jobs
+      # ───── Scheduler / jobs ─────
       - key: RUN_SCHEDULER
         value: "1"
+      - key: SCHEDULER_LEADER
+        value: "1"          # set to "0" on secondary web processes if you scale out
       - key: SCAN_INTERVAL_SEC
         value: "300"
       - key: BACKFILL_EVERY_MIN
@@ -61,7 +53,7 @@ services:
       - key: MOTD_MINUTE
         value: "00"
 
-      # Odds / EV
+      # ───── Odds / EV ─────
       - key: MIN_ODDS_OU
         value: "1.50"
       - key: MIN_ODDS_BTTS
@@ -73,7 +65,25 @@ services:
       - key: ODDS_CACHE_TTL_SEC
         value: "120"
 
-      # DB session safety
+      # ───── Telegram (optional) ─────
+      - key: TELEGRAM_BOT_TOKEN
+        required: true
+      - key: TELEGRAM_CHAT_ID
+        required: true
+      - key: TELEGRAM_PARSE_MODE
+        value: "Markdown"
+      - key: TELEGRAM_ALLOW_HTML_TAGS
+        value: "0"
+      - key: SEND_MESSAGES
+        value: "false"      # flip to "true" when you want to start broadcasting
+
+      # ───── Security ─────
+      - key: ADMIN_API_KEY
+        required: true
+      - key: ALLOW_QUERY_KEY
+        value: "0"
+
+      # ───── DB session safety ─────
       - key: PG_STATEMENT_TIMEOUT_MS
         value: "15000"
       - key: PG_LOCK_TIMEOUT_MS
@@ -82,3 +92,11 @@ services:
         value: "30000"
       - key: DB_SSLMODE_REQUIRE
         value: "1"
+
+      # ───── Gunicorn hardening ─────
+      - key: GUNICORN_MAX_REQUESTS
+        value: "1000"
+      - key: GUNICORN_MAX_REQUESTS_JITTER
+        value: "200"
+      - key: GUNICORN_LOGLEVEL
+        value: "info"
