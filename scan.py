@@ -63,13 +63,16 @@ def _fmt_tip_message(match, market, suggestion, conf, odds, book, ev_pct):
     home, away = match.get("home"), match.get("away")
     league = match.get("league")
 
+    odds_str = "-" if odds is None else f"{float(odds):.2f}"
+    book_str = book or "best"
+
     msg = (
         f"⚽️ *{league}*\n"
         f"{home} vs {away}\n"
         f"🕒 Kickoff: {kickoff} Berlin\n"
         f"🎯 *Tip:* {suggestion}\n"
         f"📊 *Confidence:* {conf*100:.1f}%\n"
-        f"💰 *Odds:* {odds:.2f} @ {book or 'best'}"
+        f"💰 *Odds:* {odds_str} @ {book_str}"
     )
     if ev_pct is not None:
         msg += f" • *EV:* {ev_pct:+.1f}%"
@@ -152,10 +155,11 @@ def _prob_hints_from_model_or_odds(fid: int, odds_map: dict) -> Dict[str, float]
     return hints
 
 # ───────── Adaptive candidate selection ─────────
-def _best_candidate_for_fixture(fid: int) -> Optional[Tuple[str, str, float, float, str, Optional[float]]]:
+def _best_candidate_for_fixture(fid: int) -> Optional[Tuple[str, str, float, Optional[float], Optional[str], Optional[float]]]:
     """
     Returns best passing candidate:
     (market, suggestion, prob, odds, book, ev_pct) or None.
+    Note: odds/book can be None if ALLOW_TIPS_WITHOUT_ODDS=1.
     """
     odds_map = fetch_odds(fid)
     if not odds_map:
@@ -200,8 +204,10 @@ def _best_candidate_for_fixture(fid: int) -> Optional[Tuple[str, str, float, flo
         edge = (ev_pct or 0.0)
         if edge > best_ev:
             best_ev = edge
-            best = (market, suggestion, prob, float(odds), str(book or "best"),
-                    float(ev_pct) if ev_pct is not None else None)
+            best = (market, suggestion, prob,
+                    (float(odds) if odds is not None else None),
+                    (str(book) if book is not None else None),
+                    (float(ev_pct) if ev_pct is not None else None))
 
     return best
 
@@ -322,7 +328,6 @@ def daily_accuracy_digest():
 
             is_win = False
             if s.startswith("Over") or s.startswith("Under"):
-                # parse line from suggestion "Over X.Y Goals"
                 try:
                     line = float(s.split()[1])
                 except Exception:
@@ -354,7 +359,7 @@ def daily_accuracy_digest():
 
 # ───────── MOTD (adaptive) ─────────
 def send_match_of_the_day():
-    candidates: List[Tuple[float, dict, str, str, float, float, str, Optional[float]]] = []
+    candidates: List[Tuple[float, dict, str, str, float, Optional[float], Optional[str], Optional[float]]] = []
     try:
         with db_conn() as c:
             c.execute("""
@@ -411,7 +416,8 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
             odds, book, ev_pct
         ) in rows:
             pct = float(conf_pct if conf_pct is not None else (100.0 * float(conf_raw or 0.0)))
-            msg = f"♻️ RETRY\n{league}: {home} vs {away}\nTip: {sugg}\nConf: {pct:.1f}%\nOdds: {odds or '-'}"
+            odds_str = "-" if odds is None else f"{float(odds):.2f}"
+            msg = f"♻️ RETRY\n{league}: {home} vs {away}\nTip: {sugg}\nConf: {pct:.1f}%\nOdds: {odds_str}"
             ok = send_telegram(msg)
             if ok:
                 delivered_keys.append((mid, cts))
@@ -419,7 +425,8 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
         if delivered_keys:
             if db_tx:
                 with db_tx() as cur:
-                    execute_values(cur,
+                    execute_values(
+                        cur,
                         "UPDATE tips AS t SET sent_ok=1 FROM (VALUES %s) AS v(match_id, created_ts) "
                         "WHERE t.match_id=v.match_id AND t.created_ts=v.created_ts",
                         delivered_keys
