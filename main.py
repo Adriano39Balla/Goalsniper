@@ -299,41 +299,45 @@ def root():
         "request_id": getattr(g, "request_id", None)
     })
 
-@app.route("/health")
+@app.route("/health", methods=["GET", "HEAD"])
+@app.route("/healthz", methods=["GET", "HEAD"])
+@app.route("/_health", methods=["GET", "HEAD"])
 def health():
     """
     Readiness endpoint:
-      - Always returns 200 quickly (no DB by default)
-      - Add ?db=1 for DB ping (still returns 200 even if DB is down)
-      - Add ?deep=1 to include counts (slow; for humans, not probes)
+      - Fast 200 by default (no DB)
+      - ?db=1 adds a DB ping (still 200 even if DB is down)
+      - ?deep=1 adds counts (for humans)
     """
-    log = get_logger()
     want_db = request.args.get("db") in ("1", "true", "yes")
     deep = request.args.get("deep") in ("1", "true", "yes")
 
     resp: dict[str, Any] = {"ok": True, "service": "goalsniper", "scheduler": RUN_SCHEDULER}
 
-    # Fast path: no DB check for readiness
+    # Fast path for platform probes
     if not want_db and not deep:
         return jsonify(resp), 200
 
-    # Optional DB ping (best-effort, but never 500)
+    # DB ping (best-effort)
     try:
         t0 = time.time()
         with db_conn() as c:
             c.execute("SELECT 1")
         resp["db"] = "ok"
         resp["db_ms"] = int((time.time() - t0) * 1000)
-        if deep:
-            try:
-                (n,) = c.execute("SELECT COUNT(*) FROM tips").fetchone()  # type: ignore
-                resp["tips_count"] = int(n)
-            except Exception as e:
-                resp["tips_count_error"] = str(e)
     except Exception as e:
         resp["db"] = "down"
         resp["error"] = str(e)
-        log.warning("/health degraded: %s", e)
+        return jsonify(resp), 200
+
+    # Optional deep count in a NEW context (don't reuse a closed one)
+    if deep:
+        try:
+            with db_conn() as c2:
+                (n,) = c2.execute("SELECT COUNT(*) FROM tips").fetchone()
+            resp["tips_count"] = int(n)
+        except Exception as e:
+            resp["tips_count_error"] = str(e)
 
     return jsonify(resp), 200
 
