@@ -1,8 +1,21 @@
+# Web
 Flask==3.0.3
 gunicorn==21.2.0
+
+# HTTP
 requests==2.32.3
 urllib3==2.2.2
+
+# Env
 python-dotenv==1.0.1
+
+# DB
 psycopg2-binary==2.9.9
+
+# Scheduling / timezones
 APScheduler==3.10.4
 tzdata==2024.1
+tzlocal==5.2  # explicit pin; APScheduler uses it
+
+# Caching used in odds.py
+cachetools==5.3.3
