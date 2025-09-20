@@ -4,3 +4,4 @@ requests==2.32.3
 cachetools==5.3.3
 APScheduler==3.10.4
 psycopg2-binary==2.9.9
+tzdata==2024.1
