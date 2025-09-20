@@ -1,21 +1,18 @@
 services:
   - name: goalsniper
-
     build:
       env:
-        # Ensure Railway installs Python 3.11 at BUILD time
         PYTHON_VERSION: "3.11"
 
     installCommand: pip install -U pip && pip install -r requirements.txt
-    
-    # ✅ Use Gunicorn for production instead of Flask dev server
-    startCommand: gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:8080 main:app
+    startCommand: gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:$PORT main:app
 
     env:
       PYTHONUNBUFFERED: "1"
       TZ: "Europe/Berlin"
+      TELEGRAM_PARSE_MODE: "Markdown"   # ← so *bold* renders
 
-      # ── App env ──
+      # Scheduler / scanning
       RUN_SCHEDULER: "1"
       SCHEDULER_LEADER: "1"
       SCAN_INTERVAL_SEC: "300"
@@ -29,11 +26,18 @@ services:
       MOTD_HOUR: "10"
       MOTD_MINUTE: "00"
 
+      # Odds gates
       MIN_ODDS_OU: "1.50"
       MIN_ODDS_BTTS: "1.50"
       MIN_ODDS_1X2: "1.50"
       MAX_ODDS_ALL: "20.0"
       ODDS_CACHE_TTL_SEC: "120"
+
+      # DB safety (optional but recommended)
+      PG_STATEMENT_TIMEOUT_MS: "15000"
+      PG_LOCK_TIMEOUT_MS: "2000"
+      PG_IDLE_TX_TIMEOUT_MS: "30000"
+      DB_SSLMODE_REQUIRE: "1"
 
       GUNICORN_LOGLEVEL: "info"
 
@@ -46,7 +50,6 @@ services:
     autoDeploy: false
 
     variables:
-      # Required secrets (set in Railway UI)
       - key: DATABASE_URL
         required: true
       - key: APIFOOTBALL_KEY
