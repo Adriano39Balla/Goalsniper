@@ -4,7 +4,7 @@ services:
     # Make sure the builder uses Python 3.11 at BUILD time
     build:
       env:
-        PYTHON_VERSION: "3.11.9"
+        PYTHON_VERSION: "3.11"
 
     installCommand: pip install -U pip && pip install -r requirements.txt
     startCommand: python main.py
