@@ -7,3 +7,4 @@ APScheduler==3.10.4
 tzdata==2024.1
 tzlocal==5.2
 cachetools==5.3.3
+gunicorn
