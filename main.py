@@ -1776,6 +1776,9 @@ def _on_boot():
     except Exception:
         pass
 
+def _on_boot():
+    _init_pool(); init_db(); set_setting("boot_ts", str(int(time.time())))
+
 # Ensure clean scheduler shutdown on signals
 signal.signal(signal.SIGTERM, _handle_sigterm)
 signal.signal(signal.SIGINT, _handle_sigint)
