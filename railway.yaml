@@ -1,19 +1,21 @@
 services:
   - name: goalsniper
 
-    # Make sure the builder uses Python 3.11 at BUILD time
     build:
       env:
+        # Ensure Railway installs Python 3.11 at BUILD time
         PYTHON_VERSION: "3.11"
 
     installCommand: pip install -U pip && pip install -r requirements.txt
-    startCommand: python main.py
+    
+    # ✅ Use Gunicorn for production instead of Flask dev server
+    startCommand: gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:8080 main:app
 
     env:
       PYTHONUNBUFFERED: "1"
       TZ: "Europe/Berlin"
 
-      # ── App env (same as before, trimmed here for brevity) ──
+      # ── App env ──
       RUN_SCHEDULER: "1"
       SCHEDULER_LEADER: "1"
       SCAN_INTERVAL_SEC: "300"
@@ -33,7 +35,7 @@ services:
       MAX_ODDS_ALL: "20.0"
       ODDS_CACHE_TTL_SEC: "120"
 
-      GUNICORN_LOGLEVEL: "info"   # harmless with python main.py
+      GUNICORN_LOGLEVEL: "info"
 
     healthcheck:
       path: /health
