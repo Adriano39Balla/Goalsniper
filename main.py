@@ -1,6 +1,6 @@
 # main.py
 # goalsniper — single-file app (Flask API, scheduler, DB, odds, predictor, scan, results)
-# NOTE: training/auto-tune lives in separate train_models.py as requested.
+# Opta supercomputer style — robust logging, scheduler leadership, adaptive scanning.
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ import statistics
 from typing import Any, Dict, List, Tuple, Optional, Iterable, Callable
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from contextlib import contextmanager
 
 # 3rd party
 from flask import Flask, jsonify, request, abort, g, has_request_context
@@ -34,10 +35,9 @@ from cachetools import TTLCache
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2 import OperationalError, InterfaceError
-from psycopg2.extras import DictCursor
-from psycopg2.extras import execute_values
+from psycopg2.extras import DictCursor, execute_values
 
-# training lives as a separate file, per your 4-file plan
+# training lives as a separate file
 from train_models import (
     train_models, auto_tune_thresholds, load_thresholds_from_settings
 )
@@ -351,7 +351,7 @@ class _PooledCursor:
                     log.warning("[DB] acquire failed after %d retries: %s", attempts, e)
                     raise
                 backoff = min(2000, BASE_BACKOFF_MS * (2 ** attempts))
-                log.warning("[DB] acquire failed, retrying in %dms: %s", backoff, e)
+                log.warning("[DB] acquire failed, retrying in %dms: %d/%s", backoff, attempts+1, MAX_RETRIES)
                 time.sleep(backoff / 1000.0)
                 attempts += 1
 
@@ -390,8 +390,6 @@ class _PooledCursor:
 def db_conn(dict_rows: bool = False) -> _PooledCursor:
     _init_pool()
     return _PooledCursor(POOL, dict_rows=dict_rows)  # type: ignore
-
-from contextlib import contextmanager
 
 @contextmanager
 def tx(dict_rows: bool = False):
@@ -592,7 +590,7 @@ def get_setting_json(key: str) -> Optional[dict]:
 # API-Football odds client + EV gating
 # ───────────────────────────────────────────────────────────────────────────────
 
-APIFOOTBALL_KEY = os.getenv("APIFOOTBALL_KEY", "")
+APIFOOTBALL_KEY = os.getenv("APIFOOTBALL_KEY", "") or os.getenv("API_KEY", "")
 APISPORTS_BASE_URL = os.getenv("APISPORTS_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
 
 ODDS_HEADERS = {
@@ -761,7 +759,6 @@ def fetch_odds(fid: int, prob_hints: Optional[Dict[str, float]] = None) -> dict:
                                 by_market.setdefault("1X2", {}).setdefault("Home", []).append((odd, book_name))
                             elif lbl in ("away", "2"):
                                 by_market.setdefault("1X2", {}).setdefault("Away", []).append((odd, book_name))
-                            # draw ignored
                     elif mname == "OU":
                         for v in vals:
                             lbl = (v.get("value") or "").strip().lower()
@@ -879,7 +876,7 @@ _model_lock = threading.RLock()
 _pred_cache: Dict[int, tuple[float, Dict[str, float]]] = {}
 _pred_cache_lock = threading.RLock()
 
-def _now() -> float:
+def _now_ts() -> float:
     return time.time()
 
 def _load_model() -> Optional[Any]:
@@ -926,7 +923,7 @@ def _predict_with_json_model(model_obj: dict, fid: int) -> Dict[str, float]:
 
 def _predict_with_pickle(model: Any, fid: int) -> Dict[str, float]:
     try:
-        # plug your real model here (features_for(fid) etc.). For now, fallback.
+        # plug your real model here
         return {}
     except Exception as e:
         log.warning("[predictor] prediction failed fid=%s: %s", fid, e)
@@ -939,7 +936,7 @@ def _get_cached_prediction(fid: int) -> Optional[Dict[str, float]]:
         entry = _pred_cache.get(fid)
         if not entry: return None
         ts, val = entry
-        if (_now() - ts) <= PREDICTION_CACHE_TTL:
+        if (_now_ts() - ts) <= PREDICTION_CACHE_TTL:
             return val
         _pred_cache.pop(fid, None)
         return None
@@ -953,7 +950,7 @@ def _put_cached_prediction(fid: int, val: Dict[str, float]) -> None:
                 _pred_cache.pop(next(iter(_pred_cache)))
             except Exception:
                 _pred_cache.clear()
-        _pred_cache[fid] = (_now(), val)
+        _pred_cache[fid] = (_now_ts(), val)
 
 def predict_for_fixture(fid: int) -> Dict[str, float]:
     cached = _get_cached_prediction(fid)
@@ -1299,7 +1296,8 @@ def prematch_scan_save() -> int:
 def daily_accuracy_digest() -> Optional[str]:
     """Summarize yesterday’s accuracy and ROI (proper grading for BTTS/OU/1X2)."""
     today = _now_dt().astimezone(BERLIN_TZ).date()
-    yesterday = today - datetime.timedelta(days=1)
+    import datetime as _dt
+    yesterday = today - _dt.timedelta(days=1)
     msg = None
     try:
         with db_conn() as c:
@@ -1459,31 +1457,6 @@ def backfill_results_for_open_matches(limit=300) -> int:
 # Import training/tuning helpers from the separate module
 from train_models import train_models, auto_tune_thresholds, load_thresholds_from_settings  # noqa: E402
 
-# ───────── Logging (global request_id injection) ─────────
-def _record_factory_with_request_id():
-    base_factory = logging.getLogRecordFactory()
-    def factory(*args, **kwargs):
-        record = base_factory(*args, **kwargs)
-        try:
-            # Attach request_id safely for ALL loggers/threads
-            if not hasattr(record, "request_id"):
-                if has_request_context():
-                    rid = getattr(g, "request_id", None)
-                    record.request_id = rid or "-"
-                else:
-                    record.request_id = "-"
-        except Exception:
-            record.request_id = "-"
-        return record
-    return factory
-
-logging.setLogRecordFactory(_record_factory_with_request_id())
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(request_id)s - %(message)s"
-)
-log = logging.getLogger("goalsniper")
-
 app = Flask(__name__)
 
 def get_logger() -> logging.Logger:
@@ -1526,6 +1499,16 @@ def _assign_request_id():
 def _inject_request_id(resp):
     resp.headers["X-Request-ID"] = getattr(g, "request_id", "")
     return resp
+
+# Nightly cooldown (Berlin)
+REST_START_HOUR_BERLIN = env_int("REST_START_HOUR_BERLIN", 23)
+REST_END_HOUR_BERLIN   = env_int("REST_END_HOUR_BERLIN", 7)
+
+def is_rest_window_now() -> bool:
+    h = datetime.now(BERLIN_TZ).hour
+    if REST_START_HOUR_BERLIN <= REST_END_HOUR_BERLIN:
+        return REST_START_HOUR_BERLIN <= h < REST_END_HOUR_BERLIN
+    return (h >= REST_START_HOUR_BERLIN) or (h < REST_END_HOUR_BERLIN)
 
 # ───────── Threshold application (runtime) ─────────
 def _apply_tuned_thresholds():
@@ -1590,7 +1573,7 @@ def _start_scheduler_once():
     """
     Starts BackgroundScheduler exactly once per process, and only if:
       - RUN_SCHEDULER = true
-      - SCHEDULER_LEADER = true (use this to ensure only one process runs the scheduler)
+      - SCHEDULER_LEADER = true
     """
     global _scheduler_started, _scheduler_ref
     if _scheduler_started or not RUN_SCHEDULER or not SCHEDULER_LEADER:
@@ -1598,7 +1581,7 @@ def _start_scheduler_once():
             log.info("[SCHED] disabled in this process (SCHEDULER_LEADER=false)")
         return
 
-    # Avoid double-start under Flask dev reloader
+    # Avoid double-start under dev reloader
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         pass
     elif os.environ.get("FLASK_ENV") == "development" and os.environ.get("WERKZEUG_RUN_MAIN") is None:
