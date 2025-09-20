@@ -1,5 +1,5 @@
 # file: train_models.py
-# Super merged trainer/tuner for goalsniper
+# Super merged trainer/tuner for goalsniper (fixed)
 # - Learns in-play & prematch logistic models (with calibration)
 # - Persists raw-space weights to DB (so main.py can score without sklearn)
 # - ROI-aware auto-threshold tuning (CONF_MIN/EV_MIN + MOTD variants)
@@ -21,23 +21,11 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import DictCursor
 
-# Optional heavy deps (sklearn); degrade gracefully if missing
-try:
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.isotonic import IsotonicRegression
-    from sklearn.metrics import (
-        brier_score_loss, accuracy_score, log_loss, precision_score,
-        roc_auc_score, precision_recall_curve
-    )
-    _SK_OK = True
-except Exception as _e:
-    _SK_OK = False
-
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
-logger = logging.getLogger("trainer")
+log = logging.getLogger("trainer")
 
 # ------------------------------------------------------------------------------
 # Env / constants
@@ -89,7 +77,7 @@ MOTD_CONF_KEY  = "MOTD_CONF_MIN"
 MOTD_EV_KEY    = "MOTD_EV_MIN"
 CAL_KEY        = "calibration_overall"  # for ROI gate mapping of confidence_raw->p
 
-# Feature sets (aligned with old main.py live extraction & prematch snapshot)
+# Feature sets
 FEATURES: List[str] = [
     "minute",
     "goals_h","goals_a","goals_sum","goals_diff",
@@ -106,13 +94,21 @@ PRE_FEATURES: List[str] = [
     "pm_ov25_h","pm_ov35_h","pm_btts_h",
     "pm_ov25_a","pm_ov35_a","pm_btts_a",
     "pm_ov25_h2h","pm_ov35_h2h","pm_btts_h2h",
-    # placeholders (keep model compatibility with live heads)
+    # placeholders to align shapes with in-play head
     "minute","goals_h","goals_a","goals_sum","goals_diff",
     "xg_h","xg_a","xg_sum","xg_diff","sot_h","sot_a","sot_sum",
     "sh_total_h","sh_total_a","cor_h","cor_a","cor_sum",
     "pos_h","pos_a","pos_diff","red_h","red_a","red_sum",
     "yellow_h","yellow_a",
 ]
+
+# Market cutoffs (train-time snapshot limit)
+TIP_MAX_MINUTE = int(os.getenv("TIP_MAX_MINUTE", "75"))
+MARKET_CUTOFFS: Dict[str, int] = {
+    "OU": TIP_MAX_MINUTE,
+    "BTTS": TIP_MAX_MINUTE,
+    "1X2": TIP_MAX_MINUTE,
+}
 
 EPS = 1e-6
 
@@ -159,7 +155,7 @@ def get_setting_json(key: str) -> Optional[dict]:
         raw = get_setting(key)
         return json.loads(raw) if raw else None
     except Exception as e:
-        logger.warning("[TRAIN] get_setting_json failed for key=%s: %s", key, e)
+        log.warning("[TRAIN] get_setting_json failed for key=%s: %s", key, e)
         return None
 
 def _exec(conn, sql: str, params: Tuple = ()) -> None:
@@ -210,15 +206,25 @@ def _percent(x: float) -> float:
 def _fmt_line(line: float) -> str:
     return f"{line}".rstrip("0").rstrip(".")
 
+def _parse_ou_lines(raw: str) -> List[float]:
+    out: List[float] = []
+    for tok in str(raw).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(float(tok))
+        except Exception:
+            pass
+    return sorted(set(out)) or [2.5, 3.5]
+
 def _logit_vec(p: np.ndarray) -> np.ndarray:
     p = np.clip(p.astype(float), 1e-6, 1-1e-6)
     return np.log(p/(1.0-p))
 
-
 # ------------------------------------------------------------------------------
-# Data loaders
+# Data loaders  (conn is optional now; fixed signatures)
 # ------------------------------------------------------------------------------
-
 def _ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     for c in cols:
         if c not in df.columns:
@@ -226,96 +232,110 @@ def _ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     df[cols] = df[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return df[cols]
 
-def load_inplay_data(conn, min_minute: int = TRAIN_MIN_MINUTE) -> pd.DataFrame:
-    q = """
-    WITH latest AS (
-      SELECT match_id, MAX(created_ts) AS ts
-      FROM tip_snapshots
-      GROUP BY match_id
-    )
-    SELECT l.match_id, s.created_ts, s.payload,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
-    FROM latest l
-    JOIN tip_snapshots s ON s.match_id = l.match_id AND s.created_ts = l.ts
-    JOIN match_results r ON r.match_id = l.match_id
-    """
-    rows = _read_sql(conn, q)
-    if rows.empty:
-        return pd.DataFrame()
+def load_inplay_data(conn=None, min_minute: int = TRAIN_MIN_MINUTE) -> pd.DataFrame:
+    close_after = False
+    if conn is None:
+        conn = _connect(); close_after = True
+    try:
+        q = """
+        WITH latest AS (
+          SELECT match_id, MAX(created_ts) AS ts
+          FROM tip_snapshots
+          GROUP BY match_id
+        )
+        SELECT l.match_id, s.created_ts, s.payload,
+               r.final_goals_h, r.final_goals_a, r.btts_yes
+        FROM latest l
+        JOIN tip_snapshots s ON s.match_id = l.match_id AND s.created_ts = l.ts
+        JOIN match_results r ON r.match_id = l.match_id
+        """
+        rows = _read_sql(conn, q)
+        if rows.empty:
+            return pd.DataFrame()
 
-    feats: List[Dict[str,Any]] = []
-    for _, row in rows.iterrows():
-        try:
-            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else (row["payload"] or {})
-            stat = payload.get("stat") or {}
-            gh = float(payload.get("gh", 0)); ga = float(payload.get("ga", 0))
-            f = {
-                "_mid": int(row["match_id"]), "_ts": float(row["created_ts"]),
-                "minute": float(payload.get("minute", 0)),
-                "goals_h": gh, "goals_a": ga, "goals_sum": gh+ga, "goals_diff": gh-ga,
-                "xg_h": float(stat.get("xg_h",0)), "xg_a": float(stat.get("xg_a",0)),
-                "xg_sum": float(stat.get("xg_h",0)+stat.get("xg_a",0)),
-                "xg_diff": float(stat.get("xg_h",0)-stat.get("xg_a",0)),
-                "sot_h": float(stat.get("sot_h",0)), "sot_a": float(stat.get("sot_a",0)),
-                "sot_sum": float(stat.get("sot_h",0)+stat.get("sot_a",0)),
-                "cor_h": float(stat.get("cor_h",0)), "cor_a": float(stat.get("cor_a",0)),
-                "cor_sum": float(stat.get("cor_h",0)+stat.get("cor_a",0)),
-                "pos_h": float(stat.get("pos_h",0)), "pos_a": float(stat.get("pos_a",0)),
-                "pos_diff": float(stat.get("pos_h",0)-stat.get("pos_a",0)),
-                "red_h": float(stat.get("red_h",0)), "red_a": float(stat.get("red_a",0)),
-                "red_sum": float(stat.get("red_h",0)+stat.get("red_a",0)),
-                "sh_total_h": float(stat.get("sh_total_h",0)), "sh_total_a": float(stat.get("sh_total_a",0)),
-                "yellow_h": float(stat.get("yellow_h",0)), "yellow_a": float(stat.get("yellow_a",0)),
-                "final_goals_h": int(row["final_goals_h"] or 0),
-                "final_goals_a": int(row["final_goals_a"] or 0),
-                "btts_yes": int(row["btts_yes"] or 0),
-                "final_goals_sum": int(row["final_goals_h"] or 0) + int(row["final_goals_a"] or 0),
-                "final_goals_diff": int(row["final_goals_h"] or 0) - int(row["final_goals_a"] or 0),
-            }
-            feats.append(f)
-        except Exception:
-            continue
-    if not feats:
-        return pd.DataFrame()
+        feats: List[Dict[str,Any]] = []
+        for _, row in rows.iterrows():
+            try:
+                payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else (row["payload"] or {})
+                stat = payload.get("stat") or {}
+                gh = float(payload.get("gh", 0)); ga = float(payload.get("ga", 0))
+                f = {
+                    "_mid": int(row["match_id"]), "_ts": float(row["created_ts"]),
+                    "minute": float(payload.get("minute", 0)),
+                    "goals_h": gh, "goals_a": ga, "goals_sum": gh+ga, "goals_diff": gh-ga,
+                    "xg_h": float(stat.get("xg_h",0)), "xg_a": float(stat.get("xg_a",0)),
+                    "xg_sum": float(stat.get("xg_h",0)+stat.get("xg_a",0)),
+                    "xg_diff": float(stat.get("xg_h",0)-stat.get("xg_a",0)),
+                    "sot_h": float(stat.get("sot_h",0)), "sot_a": float(stat.get("sot_a",0)),
+                    "sot_sum": float(stat.get("sot_h",0)+stat.get("sot_a",0)),
+                    "cor_h": float(stat.get("cor_h",0)), "cor_a": float(stat.get("cor_a",0)),
+                    "cor_sum": float(stat.get("cor_h",0)+stat.get("cor_a",0)),
+                    "pos_h": float(stat.get("pos_h",0)), "pos_a": float(stat.get("pos_a",0)),
+                    "pos_diff": float(stat.get("pos_h",0)-stat.get("pos_a",0)),
+                    "red_h": float(stat.get("red_h",0)), "red_a": float(stat.get("red_a",0)),
+                    "red_sum": float(stat.get("red_h",0)+stat.get("red_a",0)),
+                    "sh_total_h": float(stat.get("sh_total_h",0)), "sh_total_a": float(stat.get("sh_total_a",0)),
+                    "yellow_h": float(stat.get("yellow_h",0)), "yellow_a": float(stat.get("yellow_a",0)),
+                    "final_goals_h": int(row["final_goals_h"] or 0),
+                    "final_goals_a": int(row["final_goals_a"] or 0),
+                    "btts_yes": int(row["btts_yes"] or 0),
+                    "final_goals_sum": int(row["final_goals_h"] or 0) + int(row["final_goals_a"] or 0),
+                    "final_goals_diff": int(row["final_goals_h"] or 0) - int(row["final_goals_a"] or 0),
+                }
+                feats.append(f)
+            except Exception:
+                continue
+        if not feats:
+            return pd.DataFrame()
 
-    df = pd.DataFrame(feats)
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    df["minute"] = df["minute"].clip(0, 120)
-    df = df[df["minute"] >= float(min_minute)].copy()
+        df = pd.DataFrame(feats)
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df["minute"] = df["minute"].clip(0, 120)
+        df = df[df["minute"] >= float(min_minute)].copy()
 
-    if RECENCY_MONTHS > 0:
-        cutoff = pd.Timestamp.utcnow().timestamp() - RECENCY_MONTHS*30*24*3600
-        df = df[df["_ts"] >= cutoff].copy()
-    return df
+        if RECENCY_MONTHS > 0:
+            cutoff = pd.Timestamp.utcnow().timestamp() - RECENCY_MONTHS*30*24*3600
+            df = df[df["_ts"] >= cutoff].copy()
+        return df
+    finally:
+        if close_after:
+            conn.close()
 
-def load_prematch_data(conn) -> pd.DataFrame:
-    q = """
-    SELECT p.match_id, p.created_ts, p.payload,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
-    FROM prematch_snapshots p
-    JOIN match_results r ON r.match_id = p.match_id
-    """
-    rows = _read_sql(conn, q)
-    if rows.empty:
-        return pd.DataFrame()
+def load_prematch_data(conn=None) -> pd.DataFrame:
+    close_after = False
+    if conn is None:
+        conn = _connect(); close_after = True
+    try:
+        q = """
+        SELECT p.match_id, p.created_ts, p.payload,
+               r.final_goals_h, r.final_goals_a, r.btts_yes
+        FROM prematch_snapshots p
+        JOIN match_results r ON r.match_id = p.match_id
+        """
+        rows = _read_sql(conn, q)
+        if rows.empty:
+            return pd.DataFrame()
 
-    feats: List[Dict[str,Any]] = []
-    for _, row in rows.iterrows():
-        try:
-            payload = json.loads(row["payload"]) or {}
-            feat = (payload.get("feat") or {})
-            f = {k: float(feat.get(k, 0.0) or 0.0) for k in PRE_FEATURES}
-            gh_f = int(row["final_goals_h"] or 0); ga_f = int(row["final_goals_a"] or 0)
-            f["_ts"] = int(row["created_ts"] or 0)
-            f["final_goals_sum"]  = gh_f + ga_f
-            f["final_goals_diff"] = gh_f - ga_f
-            f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
-            feats.append(f)
-        except Exception:
-            continue
-    if not feats:
-        return pd.DataFrame()
-    return pd.DataFrame(feats).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        feats: List[Dict[str,Any]] = []
+        for _, row in rows.iterrows():
+            try:
+                payload = json.loads(row["payload"]) or {}
+                feat = (payload.get("feat") or {})
+                f = {k: float(feat.get(k, 0.0) or 0.0) for k in PRE_FEATURES}
+                gh_f = int(row["final_goals_h"] or 0); ga_f = int(row["final_goals_a"] or 0)
+                f["_ts"] = int(row["created_ts"] or 0)
+                f["final_goals_sum"]  = gh_f + ga_f
+                f["final_goals_diff"] = gh_f - ga_f
+                f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
+                feats.append(f)
+            except Exception:
+                continue
+        if not feats:
+            return pd.DataFrame()
+        return pd.DataFrame(feats).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    finally:
+        if close_after:
+            conn.close()
 
 # ------------------------------------------------------------------------------
 # Recency weights
@@ -333,7 +353,6 @@ def recency_weights(ts: np.ndarray) -> Optional[np.ndarray]:
 # ------------------------------------------------------------------------------
 # Modeling helpers (logistic + calibration) — robust & portable
 # ------------------------------------------------------------------------------
-
 from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
@@ -343,7 +362,6 @@ from sklearn.metrics import (
 
 def fit_lr_safe(X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None
                ) -> Optional[LogisticRegression]:
-    """Stable LR fit with sane defaults; returns None if only one class present."""
     if len(np.unique(y)) < 2:
         return None
     C = float(os.getenv("LR_C", "1.0"))
@@ -362,10 +380,6 @@ def _logit_vec(p: np.ndarray) -> np.ndarray:
     return np.log(p/(1.0-p))
 
 def _fit_calibration(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[str, object]:
-    """
-    Choose Platt (on logits) vs Isotonic by validation Brier.
-    Returns ('platt', (a,b)) or ('isotonic', IsotonicRegression()).
-    """
     y = y_true.astype(int)
     z = _logit_vec(p_raw).reshape(-1, 1)
 
@@ -391,17 +405,12 @@ def _apply_calibration(p_raw: np.ndarray, cal_kind: str, cal_obj) -> np.ndarray:
         a, b = cal_obj
         z = _logit_vec(p_raw)
         return 1.0/(1.0+np.exp(-(a*z + b)))
-    # isotonic
     return np.asarray(cal_obj.predict(p_raw), dtype=float)
 
 def _weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[str, float]:
     return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
 
 def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Return (X_std, mean, scale). Zero-variance columns left unscaled.
-    (We’ll fold mean/scale back into raw-space weights for serving.)
-    """
     mean = X.mean(axis=0)
     scale = X.std(axis=0, ddof=0)
     scale = np.where(scale <= 1e-12, 1.0, scale)
@@ -410,11 +419,6 @@ def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]
 
 def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray,
                            features: List[str]) -> Tuple[float, Dict[str, float]]:
-    """
-    Convert weights learned on standardized features back to raw space:
-      w_raw_j = w_std_j / scale_j
-      b_raw   = b_std - sum_j w_std_j * mean_j / scale_j
-    """
     w_std = model.coef_.ravel().astype(float)
     b_std = float(model.intercept_.ravel()[0])
     w_raw = (w_std / scale).astype(float)
@@ -426,11 +430,6 @@ def build_model_blob(model: LogisticRegression, features: List[str],
                      cal_kind: str, cal_obj,
                      mean: Optional[np.ndarray] = None,
                      scale: Optional[np.ndarray] = None) -> Dict[str, object]:
-    """
-    Serialize model for serving in main.py (no sklearn dependency at runtime).
-    If mean/scale provided, fold them into raw-space weights.
-    Cal: store Platt directly; Isotonic ≈ Platt via logit→logit linear fit to keep serving simple.
-    """
     if mean is not None and scale is not None:
         intercept, weights = _fold_std_into_weights(model, mean, scale, features)
     else:
@@ -447,7 +446,6 @@ def build_model_blob(model: LogisticRegression, features: List[str],
         a, b = cal_obj
         blob["calibration"] = {"method": "platt", "a": float(a), "b": float(b)}
     else:
-        # approximate isotonic with a platt-like linear fit in logit space
         x = np.concatenate([
             np.linspace(0.01, 0.10, 30),
             np.linspace(0.10, 0.90, 120),
@@ -461,15 +459,9 @@ def build_model_blob(model: LogisticRegression, features: List[str],
     return blob
 
 # ------------------------------------------------------------------------------
-# Splits, filters, and diagnostics
+# Splits, filters, diagnostics
 # ------------------------------------------------------------------------------
-
-def time_order_split(df: pd.DataFrame, test_size: float
-                    ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Time-ordered split if _ts exists; else random (seeded).
-    Returns boolean masks (train_mask, test_mask) for df index order.
-    """
+def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray, np.ndarray]:
     if "_ts" not in df.columns:
         n = len(df); idx = np.arange(n)
         rng = np.random.default_rng(42); rng.shuffle(idx)
@@ -487,10 +479,6 @@ def time_order_split(df: pd.DataFrame, test_size: float
     return tr, te
 
 def _minute_cutoff_for_market(market: str) -> Optional[int]:
-    """
-    Market-specific latest snapshot minute to train on (None = no cutoff).
-    Falls back to TIP_MAX_MINUTE if set, and allows per-market overrides via MARKET_CUTOFFS.
-    """
     m = (market or "").upper()
     if m.startswith("PRE "):
         return None
@@ -503,7 +491,6 @@ def _minute_cutoff_for_market(market: str) -> Optional[int]:
     return TIP_MAX_MINUTE
 
 def _ece(y_true: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
-    """Expected Calibration Error."""
     y = y_true.astype(int); p = np.clip(p.astype(float), 0, 1)
     edges = np.linspace(0.0, 1.0, bins + 1); ece = 0.0
     for i in range(bins):
@@ -517,12 +504,6 @@ def _ece(y_true: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
 
 def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray,
                     features: List[str]) -> np.ndarray:
-    """
-    Keep rows where the outcome isn't trivially decided at snapshot.
-      - OU_L: drop rows where goals_sum > line (Over guaranteed)
-      - BTTS: drop rows where both teams have already scored
-      - 1X2: keep all (never fully locked until FT)
-    """
     fidx = {f: i for i, f in enumerate(features)}
     keep = np.ones(len(y_all), dtype=bool)
 
@@ -539,18 +520,11 @@ def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray,
         keep &= ~(goals_sum > ln)
     elif market_key == "BTTS_YES":
         keep &= ~((gh > 0) & (ga > 0))
-    # 1X2_* : no filter
-
     return keep
 
-
 # ------------------------------------------------------------------------------
-# Single-head trainer and full orchestration
+# Single-head trainer and orchestration
 # ------------------------------------------------------------------------------
-
-def _percent(x: float) -> float:
-    return float(x) * 100.0
-
 def _pick_threshold_for_target_precision(
     y_true: np.ndarray,
     p_cal: np.ndarray,
@@ -558,7 +532,6 @@ def _pick_threshold_for_target_precision(
     min_preds: int = 25,
     default_threshold: float = 0.65,
 ) -> float:
-    """Choose probability threshold to hit target precision, with sensible fallbacks."""
     y = y_true.astype(int); p = np.asarray(p_cal, dtype=float)
     best_t: Optional[float] = None
     candidates = np.arange(0.50, 0.951, 0.005)
@@ -591,9 +564,6 @@ def _pick_threshold_for_target_precision(
 
     return float(best_t if best_t is not None else default_threshold)
 
-def _fmt_line(line: float) -> str:
-    return f"{line}".rstrip("0").rstrip(".")
-
 def _train_binary_head(
     X_all: np.ndarray,
     y_all: np.ndarray,
@@ -611,15 +581,9 @@ def _train_binary_head(
     metrics_name: Optional[str] = None,
     train_minute_cutoff: Optional[int] = None,
 ) -> Tuple[bool, Dict[str, object], Optional[np.ndarray]]:
-    """
-    Train one binary head (e.g., BTTS_YES, OU_2.5, WLD_HOME).
-    Standardizes X on train, folds scaler into raw-space weights for serving.
-    Applies undecided-snapshot filter on train fold for relevant markets.
-    """
     if len(np.unique(y_all)) < 2:
         return False, {}, None
 
-    # Optional minute cutoff for train fold (column 0 is 'minute' by convention)
     if train_minute_cutoff is not None:
         try:
             mt = (X_all[:, 0] <= float(train_minute_cutoff))
@@ -627,14 +591,11 @@ def _train_binary_head(
         except Exception:
             pass
 
-    # Filter trivially decided snapshots for this head (train only)
     try:
         undecided = _mask_undecided(model_key, X_all, y_all, feature_names)
         new_mask_tr = mask_tr & undecided
         if np.any(new_mask_tr):
             mask_tr = new_mask_tr
-        else:
-            log.info("[TRAIN] %s: undecided filter removed all train rows; skipping the filter.", model_key)
     except Exception:
         pass
 
@@ -642,22 +603,18 @@ def _train_binary_head(
     y_tr, y_te = y_all[mask_tr], y_all[mask_te]
     ts_tr      = ts_all[mask_tr]
 
-    # Standardize on train fold
     X_tr_std, mu, sd = _standardize_fit(X_tr)
     X_te_std = (X_te - mu) / sd
 
-    # Recency weights
     sw = recency_weights(ts_tr)
     model = fit_lr_safe(X_tr_std, y_tr, sample_weight=sw)
     if model is None:
         return False, {}, None
 
-    # Validate and calibrate on validation fold
     p_raw_te = model.predict_proba(X_te_std)[:, 1]
     cal_kind, cal_obj = _fit_calibration(y_te, p_raw_te)
     p_cal = _apply_calibration(p_raw_te, cal_kind, cal_obj)
 
-    # Metrics
     mets: Dict[str, object] = {
         "brier": float(brier_score_loss(y_te, p_cal)),
         "auc": float(roc_auc_score(y_te, p_cal)) if len(np.unique(y_te)) > 1 else float("nan"),
@@ -671,12 +628,10 @@ def _train_binary_head(
     if metrics_name:
         log.info("[METRICS] %s: %s", metrics_name, mets)
 
-    # Serialize (fold scaler into raw-space weights)
     blob = build_model_blob(model, feature_names, cal_kind, cal_obj, mean=mu, scale=sd)
     for k in (f"model_latest:{model_key}", f"model:{model_key}"):
         set_setting(k, json.dumps(blob))
 
-    # Optional: derive/update per-market threshold from validation fold
     if threshold_label:
         thr_prob = _pick_threshold_for_target_precision(
             y_true=y_te,
@@ -690,21 +645,143 @@ def _train_binary_head(
 
     return True, mets, p_cal
 
+# ------------------------------------------------------------------------------
+# Thresholds I/O + tuner (NEW)
+# ------------------------------------------------------------------------------
+_DEFAULTS = {
+    "CONF_MIN": float(os.getenv("CONF_MIN", "0.75")),
+    "EV_MIN": float(os.getenv("EV_MIN", "0.00")),
+    "MOTD_CONF_MIN": float(os.getenv("MOTD_CONF_MIN", "0.78")),
+    "MOTD_EV_MIN": float(os.getenv("MOTD_EV_MIN", "0.05")),
+}
+
+def _to_float(s: Optional[str], default: float) -> float:
+    try:
+        return float(s) if s is not None else default
+    except Exception:
+        return default
+
+def load_thresholds_from_settings() -> Dict[str, float]:
+    vals = {
+      "CONF_MIN": _to_float(get_setting(CONF_KEY), _DEFAULTS["CONF_MIN"]),
+      "EV_MIN": _to_float(get_setting(EV_KEY), _DEFAULTS["EV_MIN"]),
+      "MOTD_CONF_MIN": _to_float(get_setting(MOTD_CONF_KEY), _DEFAULTS["MOTD_CONF_MIN"]),
+      "MOTD_EV_MIN": _to_float(get_setting(MOTD_EV_KEY), _DEFAULTS["MOTD_EV_MIN"]),
+    }
+    return vals
+
+def _roi_for_rows(rows: pd.DataFrame) -> Tuple[float, int, float, int]:
+    if rows.empty:
+        return 0.0, 0, 0.0, 0
+    pnl = 0.0; wins = 0; stake = 0.0
+    for _, r in rows.iterrows():
+        s = str(r["suggestion"] or "")
+        gh = int(r["final_goals_h"] or 0); ga = int(r["final_goals_a"] or 0)
+        total = gh + ga
+        win = None
+        if s.startswith("Over") or s.startswith("Under"):
+            line = None
+            for tok in s.split():
+                try:
+                    line = float(tok); break
+                except Exception:
+                    pass
+            if line is not None:
+                win = (total > line) if s.startswith("Over") else (total < line)
+        elif s == "BTTS: Yes":
+            win = bool(int(r["btts_yes"] or 0))
+        elif s == "BTTS: No":
+            win = not bool(int(r["btts_yes"] or 0))
+        elif s == "Home Win":
+            win = gh > ga
+        elif s == "Away Win":
+            win = ga > gh
+
+        if win is None:
+            continue
+        try:
+            o = float(r["odds"]) if r["odds"] is not None else None
+        except Exception:
+            o = None
+        stake += 1.0
+        if win:
+            wins += 1
+            pnl += ((o - 1.0) if o is not None else 0.0)
+        else:
+            pnl -= 1.0
+    roi = (pnl / stake) if stake > 0 else 0.0
+    acc = (wins / stake) if stake > 0 else 0.0
+    return float(roi), int(stake), float(acc), int(wins)
+
+def auto_tune_thresholds(window_days: int = TUNE_WINDOW_DAYS) -> Dict[str, object]:
+    try:
+        conn = _connect()
+        _ensure_training_tables(conn)
+        q = """
+        SELECT t.suggestion, t.odds, t.confidence_raw, t.ev_pct,
+               r.final_goals_h, r.final_goals_a, r.btts_yes
+        FROM tips t
+        JOIN match_results r ON r.match_id = t.match_id
+        WHERE to_timestamp(t.created_ts) >= now() - interval %s
+          AND t.sent_ok = 1
+        """
+        wnd = f"'{int(max(1, window_days))} days'"
+        df = pd.read_sql_query(q, conn, params=(wnd,))
+    except Exception as e:
+        log.exception("auto_tune_thresholds: query failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+    if df.empty:
+        vals = load_thresholds_from_settings()
+        return {"ok": False, "reason": "no_data", **vals}
+
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df["confidence_raw"] = pd.to_numeric(df["confidence_raw"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["ev_pct"] = pd.to_numeric(df["ev_pct"], errors="coerce")
+    tested = 0
+
+    conf_grid = np.round(np.arange(0.55, 0.901, 0.01), 3)
+    ev_grid = np.round(np.arange(0.00, 0.201, 0.01), 3)
+
+    best = {"CONF_MIN": _DEFAULTS["CONF_MIN"], "EV_MIN": _DEFAULTS["EV_MIN"], "roi": -1e9, "n": 0, "acc": 0.0}
+    for cthr in conf_grid:
+        for evthr in ev_grid:
+            sub = df[(df["confidence_raw"] >= cthr) & (df["ev_pct"] >= (evthr * 100.0))]
+            if len(sub) < THRESH_MIN_PREDICTIONS:
+                continue
+            roi, n, acc, wins = _roi_for_rows(sub)
+            tested += 1
+            if (roi > best["roi"] + 1e-9) or (abs(roi - best["roi"]) < 1e-9 and n > best["n"]):
+                best = {"CONF_MIN": float(cthr), "EV_MIN": float(evthr), "roi": float(roi), "n": int(n), "acc": float(acc)}
+
+    if best["roi"] == -1e9:
+        vals = load_thresholds_from_settings()
+        return {"ok": False, "reason": "no_feasible_combo", "tested": tested, **vals}
+
+    set_setting(CONF_KEY, f"{best['CONF_MIN']:.4f}")
+    set_setting(EV_KEY, f"{best['EV_MIN']:.4f}")
+
+    motd_conf = float(np.clip(best["CONF_MIN"] + 0.03, 0.55, 0.95))
+    motd_ev = float(np.clip(best["EV_MIN"] + 0.02, 0.00, 0.50))
+    set_setting(MOTD_CONF_KEY, f"{motd_conf:.4f}")
+    set_setting(MOTD_EV_KEY, f"{motd_ev:.4f}")
+
+    return {
+        "ok": True,
+        "best": {"CONF_MIN": best["CONF_MIN"], "EV_MIN": best["EV_MIN"], "roi": best["roi"], "n": best["n"], "acc": best["acc"]},
+        "motd": {"MOTD_CONF_MIN": motd_conf, "MOTD_EV_MIN": motd_ev},
+        "tested": int(tested),
+    }
+
+# ------------------------------------------------------------------------------
+# Training orchestrator
+# ------------------------------------------------------------------------------
 def train_models(
     db_url: Optional[str] = None,
     min_minute: Optional[int] = None,
     test_size: Optional[float] = None,
     min_rows: Optional[int] = None,
 ) -> Dict[str, object]:
-    """
-    Orchestrates:
-      - Load labeled in-play snapshots and prematch snapshots
-      - Train BTTS / OU lines / WLD heads (prematch & in-play)
-      - Calibrate, persist models to settings as JSON blobs consumable by main.py
-      - Learn per-market probability thresholds targeting a precision level
-      - Save a compact metrics bundle for observability
-    """
-    # args/env
     min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
     test_size  = float(test_size  if test_size  is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
     min_rows   = int(min_rows   if min_rows   is not None else os.getenv("MIN_ROWS", 150))
@@ -727,7 +804,6 @@ def train_models(
             X_all  = _ensure_columns(df_ip, FEATURES).values
             ts_all = df_ip["_ts"].values
 
-            # BTTS
             ok, mets, _ = _train_binary_head(
                 X_all, df_ip["btts_yes"].values.astype(int), ts_all,
                 tr_mask, te_mask, FEATURES, "BTTS_YES", "BTTS",
@@ -735,10 +811,8 @@ def train_models(
                 "BTTS_YES", _minute_cutoff_for_market("BTTS")
             )
             summary["trained"]["BTTS_YES"] = ok
-            if ok:
-                summary["metrics"]["BTTS_YES"] = mets
+            if ok: summary["metrics"]["BTTS_YES"] = mets
 
-            # OU lines (label: final_goals_sum > line)
             totals = df_ip["final_goals_sum"].values.astype(int)
             for line in ou_lines:
                 name = f"OU_{_fmt_line(line)}"
@@ -751,18 +825,14 @@ def train_models(
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
-                    # Back-compat alias for O25 if line==2.5
                     if abs(line - 2.5) < 1e-6:
                         blob = get_setting_json(f"model_latest:{name}")
                         if blob is not None:
                             for k in ("model_latest:O25", "model:O25"):
                                 set_setting(k, json.dumps(blob))
 
-            # 1X2 heads (3 one-vs-rest)
             gd = df_ip["final_goals_diff"].values.astype(int)
-            y_home = (gd > 0).astype(int)
-            y_draw = (gd == 0).astype(int)
-            y_away = (gd < 0).astype(int)
+            y_home = (gd > 0).astype(int); y_draw = (gd == 0).astype(int); y_away = (gd < 0).astype(int)
 
             ok_h, mets_h, p_h = _train_binary_head(
                 X_all, y_home, ts_all, tr_mask, te_mask, FEATURES,
@@ -779,13 +849,11 @@ def train_models(
                 "WLD_AWAY", None, target_precision, min_preds, min_thresh, max_thresh, 0.45,
                 "WLD_AWAY", _minute_cutoff_for_market("1X2")
             )
-
             summary["trained"].update({"WLD_HOME": ok_h, "WLD_DRAW": ok_d, "WLD_AWAY": ok_a})
             if ok_h: summary["metrics"]["WLD_HOME"] = mets_h
             if ok_d: summary["metrics"]["WLD_DRAW"] = mets_d
             if ok_a: summary["metrics"]["WLD_AWAY"] = mets_a
 
-            # Derive single 1X2 threshold from max-normalized head probs
             if ok_h and ok_d and ok_a and (p_h is not None) and (p_d is not None) and (p_a is not None):
                 ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_d, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
                 phn, pdn, pan = p_h / ps, p_d / ps, p_a / ps
@@ -815,7 +883,6 @@ def train_models(
             Xp_all = _ensure_columns(df_pre, PRE_FEATURES).values
             ts_pre = df_pre["_ts"].values
 
-            # PRE BTTS
             ok, mets, _ = _train_binary_head(
                 Xp_all, df_pre["label_btts"].values.astype(int), ts_pre,
                 tr_mask, te_mask, PRE_FEATURES, "PRE_BTTS_YES", "PRE BTTS",
@@ -823,10 +890,8 @@ def train_models(
                 "PRE_BTTS_YES", None
             )
             summary["trained"]["PRE_BTTS_YES"] = ok
-            if ok:
-                summary["metrics"]["PRE_BTTS_YES"] = mets
+            if ok: summary["metrics"]["PRE_BTTS_YES"] = mets
 
-            # PRE OU
             totals = df_pre["final_goals_sum"].values.astype(int)
             for line in ou_lines:
                 name = f"PRE_OU_{_fmt_line(line)}"
@@ -837,10 +902,8 @@ def train_models(
                     name, None
                 )
                 summary["trained"][name] = ok
-                if ok:
-                    summary["metrics"][name] = mets
+                if ok: summary["metrics"][name] = mets
 
-            # PRE 1X2 (draw suppressed)
             gd = df_pre["final_goals_diff"].values.astype(int)
             y_home = (gd > 0).astype(int); y_away = (gd < 0).astype(int)
 
@@ -878,7 +941,6 @@ def train_models(
             log.info("Prematch: not enough labeled data (have %d, need >= %d).", len(df_pre), min_rows)
             summary["trained"]["PRE_BTTS_YES"] = False
 
-        # ===== Bundle metrics for observability =====
         metrics_bundle = {
             "trained_at_utc": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
             **summary["metrics"],
@@ -901,72 +963,43 @@ def train_models(
         return {"ok": False, "error": str(e)}
 
 # ------------------------------------------------------------------------------
-# CLI entrypoint
+# CLI
 # ------------------------------------------------------------------------------
-
-import argparse
-
-def _cli_main() -> None:
+if __name__ == "__main__":
+    import argparse
     ap = argparse.ArgumentParser(prog="train_models.py", description="goalsniper — training & tuning")
-    ap.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"),
-                    help="Python logging level (DEBUG, INFO, WARNING, ERROR)")
-
+    ap.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     sub = ap.add_subparsers(dest="cmd", required=False)
 
-    # train
-    ap_train = sub.add_parser("train", help="train models (in-play + prematch)")
-    ap_train.add_argument("--min-minute", type=int, default=int(os.getenv("TRAIN_MIN_MINUTE", 15)),
-                          help="minimum in-play snapshot minute to include")
-    ap_train.add_argument("--test-size", type=float, default=float(os.getenv("TRAIN_TEST_SIZE", 0.25)),
-                          help="holdout fraction for validation")
-    ap_train.add_argument("--min-rows", type=int, default=int(os.getenv("MIN_ROWS", 150)),
-                          help="minimum labeled rows required to run training")
+    p_train = sub.add_parser("train")
+    p_train.add_argument("--min-minute", type=int, default=int(os.getenv("TRAIN_MIN_MINUTE", 15)))
+    p_train.add_argument("--test-size", type=float, default=float(os.getenv("TRAIN_TEST_SIZE", 0.25)))
+    p_train.add_argument("--min-rows", type=int, default=int(os.getenv("MIN_ROWS", 150)))
 
-    # tune
-    ap_tune = sub.add_parser("tune", help="auto-tune CONF_MIN / EV_MIN via recent ROI grid-search")
-    ap_tune.add_argument("--window-days", type=int, default=int(os.getenv("TUNE_WINDOW_DAYS", "14")),
-                         help="lookback window for tuning on realized results")
+    p_tune = sub.add_parser("tune")
+    p_tune.add_argument("--window-days", type=int, default=int(os.getenv("TUNE_WINDOW_DAYS", "14")))
 
-    # show thresholds
-    sub.add_parser("show-thresholds", help="print thresholds currently stored in settings")
+    sub.add_parser("show-thresholds")
 
     args = ap.parse_args()
-
-    # logging
-    logging.basicConfig(
-        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
-        format="[%(asctime)s] %(levelname)s - %(message)s",
-    )
+    logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+                        format="[%(asctime)s] %(levelname)s - %(message)s")
 
     cmd = args.cmd or "train"
 
     if cmd == "train":
-        res = train_models(
-            min_minute=args.min_minute,
-            test_size=args.test_size,
-            min_rows=args.min_rows,
-        )
+        res = train_models(min_minute=args.min_minute, test_size=args.test_size, min_rows=args.min_rows)
         print(json.dumps(res, indent=2))
-        return
-
-    if cmd == "tune":
+    elif cmd == "tune":
         res = auto_tune_thresholds(window_days=args.window_days)
         print(json.dumps(res, indent=2))
-        return
-
-    if cmd == "show-thresholds":
+    elif cmd == "show-thresholds":
         vals = load_thresholds_from_settings()
         print(json.dumps(vals, indent=2))
-        return
-
-    # default fallback
-    res = train_models(
-        min_minute=int(os.getenv("TRAIN_MIN_MINUTE", 15)),
-        test_size=float(os.getenv("TRAIN_TEST_SIZE", 0.25)),
-        min_rows=int(os.getenv("MIN_ROWS", 150)),
-    )
-    print(json.dumps(res, indent=2))
-
-
-if __name__ == "__main__":
-    _cli_main()
+    else:
+        res = train_models(
+            min_minute=int(os.getenv("TRAIN_MIN_MINUTE", 15)),
+            test_size=float(os.getenv("TRAIN_TEST_SIZE", 0.25)),
+            min_rows=int(os.getenv("MIN_ROWS", 150)),
+        )
+        print(json.dumps(res, indent=2))
