@@ -1,62 +1,52 @@
+# railway.yaml
 services:
-  - name: goalsniper
-    build:
-      env:
-        PYTHON_VERSION: "3.11"
-
-    installCommand: pip install -U pip && pip install -r requirements.txt
-    startCommand: gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:$PORT main:app
-
-    env:
-      PYTHONUNBUFFERED: "1"
-      TZ: "Europe/Berlin"
-      TELEGRAM_PARSE_MODE: "Markdown"   # ← so *bold* renders
-
-      # Scheduler / scanning
-      RUN_SCHEDULER: "1"
-      SCHEDULER_LEADER: "1"
-      SCAN_INTERVAL_SEC: "300"
-      BACKFILL_EVERY_MIN: "15"
-      TRAIN_ENABLE: "1"
-      AUTO_TUNE_ENABLE: "1"
-      DAILY_ACCURACY_DIGEST_ENABLE: "1"
-      DAILY_ACCURACY_HOUR: "8"
-      DAILY_ACCURACY_MINUTE: "0"
-      MOTD_ENABLE: "1"
-      MOTD_HOUR: "10"
-      MOTD_MINUTE: "00"
-
-      # Odds gates
-      MIN_ODDS_OU: "1.50"
-      MIN_ODDS_BTTS: "1.50"
-      MIN_ODDS_1X2: "1.50"
-      MAX_ODDS_ALL: "20.0"
-      ODDS_CACHE_TTL_SEC: "120"
-
-      # DB safety (optional but recommended)
-      PG_STATEMENT_TIMEOUT_MS: "15000"
-      PG_LOCK_TIMEOUT_MS: "2000"
-      PG_IDLE_TX_TIMEOUT_MS: "30000"
-      DB_SSLMODE_REQUIRE: "1"
-
-      GUNICORN_LOGLEVEL: "info"
-
-    healthcheck:
-      path: /health
-      interval: 10
-      timeout: 10
-      retries: 18
-
-    autoDeploy: false
-
-    variables:
+  - name: web
+    startCommand: >
+      gunicorn main:app
+      --workers=2 --threads=2
+      --timeout=120 --graceful-timeout=30
+      --bind 0.0.0.0:$PORT
+      --max-requests=300 --max-requests-jitter=50
+    envs:
+      - key: NIXPACKS_PYTHON_VERSION
+        value: "3.11"
+      - key: RUN_SCHEDULER
+        value: "0"      # web should NOT run scheduler
+      - key: SCHEDULER_LEADER
+        value: "0"
+      - key: TRAIN_ENABLE
+        value: "0"      # web should NOT run training
+      - key: DB_POOL_MIN
+        value: "1"
+      - key: DB_POOL_MAX
+        value: "4"
+      # Secrets → leave value blank here, set them in Railway UI
       - key: DATABASE_URL
-        required: true
-      - key: APIFOOTBALL_KEY
-        required: true
       - key: TELEGRAM_BOT_TOKEN
-        required: true
       - key: TELEGRAM_CHAT_ID
-        required: true
-      - key: ADMIN_API_KEY
-        required: true
+      - key: APIFOOTBALL_KEY
+
+  - name: worker
+    startCommand: >
+      python -c "import time, main;
+      main._init_pool(); main.init_db();
+      main._apply_tuned_thresholds(); main._start_scheduler_once();
+      print('scheduler up'); time.sleep(10**9)"
+    envs:
+      - key: NIXPACKS_PYTHON_VERSION
+        value: "3.11"
+      - key: RUN_SCHEDULER
+        value: "1"
+      - key: SCHEDULER_LEADER
+        value: "1"
+      - key: TRAIN_ENABLE
+        value: "0"       # flip to "1" only if you want nightly training
+      - key: DB_POOL_MIN
+        value: "1"
+      - key: DB_POOL_MAX
+        value: "4"
+      # Secrets → leave value blank here, set them in Railway UI
+      - key: DATABASE_URL
+      - key: TELEGRAM_BOT_TOKEN
+      - key: TELEGRAM_CHAT_ID
+      - key: APIFOOTBALL_KEY
