@@ -21,8 +21,27 @@ from psycopg2.pool import SimpleConnectionPool
 from psycopg2 import OperationalError, InterfaceError
 from psycopg2.extras import DictCursor, execute_values
 
-# training/tuning helpers (separate file)
-from train_models import train_models, auto_tune_thresholds, load_thresholds_from_settings
+# training/tuning helpers (guarded import to avoid boot crash if symbols move)
+import logging
+try:
+    from train_models import train_models as _train_models, auto_tune_thresholds as _auto_tune_thresholds, load_thresholds_from_settings as _load_thresholds_from_settings
+    _TRAIN_MODULE_AVAILABLE = True
+except Exception as _imp_err:
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("goalsniper").warning("[import] train_models import problem: %s", _imp_err)
+    _TRAIN_MODULE_AVAILABLE = False
+    # Fallbacks so app still boots; admin endpoints/scheduler will gate on availability.
+    def _train_models(*_a, **_k):
+        raise RuntimeError("train_models not available")
+    def _auto_tune_thresholds(*_a, **_k):
+        return {"ok": False, "reason": "auto_tune_thresholds not available"}
+    def _load_thresholds_from_settings():
+        return {
+            "CONF_MIN": float(os.getenv("CONF_MIN", "0.75")),
+            "EV_MIN": float(os.getenv("EV_MIN", "0.00")),
+            "MOTD_CONF_MIN": float(os.getenv("MOTD_CONF_MIN", "0.78")),
+            "MOTD_EV_MIN": float(os.getenv("MOTD_EV_MIN", "0.05")),
+        }
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Logging with request-id injection
@@ -82,11 +101,38 @@ MAX_LEN_TG=min(env_int("TELEGRAM_MAX_LEN", TG_HARD_MAX), TG_HARD_MAX)
 FAIL_COOLDOWN_SEC=env_int("TELEGRAM_FAIL_COOLDOWN_SEC", 60)
 _last_fail_ts_tg=0
 
-_session_tg=requests.Session()
-_session_tg.mount("https://", HTTPAdapter(max_retries=Retry(total=3, connect=3, read=3, backoff_factor=0.7,
+# Thread-local sessions (why: requests.Session is not guaranteed thread-safe)
+_thread_local = threading.local()
+
+def _build_session(kind: str) -> requests.Session:
+    s = requests.Session()
+    if kind == "tg":
+        s.mount("https://", HTTPAdapter(max_retries=Retry(total=3, connect=3, read=3, backoff_factor=0.7,
                         status_forcelist=[429,500,502,503,504], allowed_methods=frozenset(["POST"]),
                         respect_retry_after_header=True, raise_on_status=False), pool_connections=32, pool_maxsize=64))
-_session_tg.mount("http://", HTTPAdapter())
+        s.mount("http://", HTTPAdapter())
+    else:
+        s.mount("https://", HTTPAdapter(max_retries=Retry(total=3,connect=3,read=3,backoff_factor=0.6,
+                        status_forcelist=[429,500,502,503,504],allowed_methods=frozenset(["GET"]),
+                        respect_retry_after_header=True,raise_on_status=False), pool_connections=64, pool_maxsize=128))
+        s.mount("http://", HTTPAdapter())
+    return s
+
+def _get_tg_session() -> requests.Session:
+    s = getattr(_thread_local, "tg_session", None)
+    if s is None:
+        s = _build_session("tg"); _thread_local.tg_session = s
+    return s
+
+def _get_http_session() -> requests.Session:
+    s = getattr(_thread_local, "http_session", None)
+    if s is None:
+        s = _build_session("http"); _thread_local.http_session = s
+    return s
+
+# Legacy singletons kept for compatibility (not used directly anymore)
+_session_tg=_build_session("tg")
+_session_http=_build_session("http")
 
 def _tg_prepare(text:str)->str:
     t=str(text or "")
@@ -107,6 +153,8 @@ def _tg_split(s:str,limit:int)->List[str]:
     return out
 
 def send_telegram(text:str, disable_preview:bool=True)->bool:
+    # why: per-thread session eliminates rare concurrent post bugs
+    sess = _get_tg_session()
     global _last_fail_ts_tg
     if not (BOT_TOKEN and CHAT_IDS and SEND_MESSAGES): return False
     if _last_fail_ts_tg and time.time()-_last_fail_ts_tg<FAIL_COOLDOWN_SEC: return False
@@ -123,7 +171,7 @@ def send_telegram(text:str, disable_preview:bool=True)->bool:
             backoff=1.5
             for _ in range(3):
                 try:
-                    r=_session_tg.post(url, json=payload, timeout=(3,10))
+                    r=sess.post(url, json=payload, timeout=(3,10))
                     if r.status_code==200: ok_any=True; break
                     if r.status_code==429:
                         try: time.sleep(int(r.json().get("parameters",{}).get("retry_after",5)))
@@ -240,6 +288,13 @@ class _PooledCursor:
     def executemany(self, sql_text:str, rows:Iterable[Tuple]):
         rows=list(rows) or []
         def _call(): self.cur.executemany(sql_text, rows); return self.cur
+        return self._retry_loop(_call)
+    def execute_values(self, sql_text:str, rows:Iterable[Tuple], page_size:int=200):
+        # why: wrap psycopg2.extras.execute_values with the same retry logic
+        rows = list(rows) or []
+        def _call():
+            execute_values(self.cur, sql_text, rows, page_size=page_size)
+            return self.cur
         return self._retry_loop(_call)
     def fetchone(self): return self.cur.fetchone() if self.cur else None
     def fetchall(self): return self.cur.fetchall() if self.cur else []
@@ -370,12 +425,9 @@ HTTP_READ_TIMEOUT=env_float("HTTP_READ_TIMEOUT",10.0)
 ODDS_CACHE_TTL_SEC=env_int("ODDS_CACHE_TTL_SEC",120)
 ODDS_CACHE_MAX_ITEMS=env_int("ODDS_CACHE_MAX_ITEMS",2000)
 
-_session_http=requests.Session()
-_session_http.mount("https://", HTTPAdapter(max_retries=Retry(total=3,connect=3,read=3,backoff_factor=0.6,
-                        status_forcelist=[429,500,502,503,504],allowed_methods=frozenset(["GET"]),
-                        respect_retry_after_header=True,raise_on_status=False), pool_connections=64, pool_maxsize=128))
-_session_http.mount("http://", HTTPAdapter())
+# Thread-safe cache access
 _ODDS_CACHE: TTLCache[int, dict] = TTLCache(maxsize=ODDS_CACHE_MAX_ITEMS, ttl=ODDS_CACHE_TTL_SEC)
+_odds_cache_lock = threading.RLock()
 
 def _book_ok(name:str)->bool:
     n=(name or "").strip().lower()
@@ -393,14 +445,16 @@ def _market_name_normalize(s:str)->str:
 def _api_get(path:str, params:dict)->Optional[dict]:
     if not APIFOOTBALL_KEY: return None
     url=f"{APISPORTS_BASE_URL}/{path.lstrip('/')}"
+    sess = _get_http_session()
     try:
-        r=_session_http.get(url, headers=ODDS_HEADERS, params=params, timeout=(HTTP_CONNECT_TIMEOUT,HTTP_READ_TIMEOUT))
+        r=sess.get(url, headers=ODDS_HEADERS, params=params, timeout=(HTTP_CONNECT_TIMEOUT,HTTP_READ_TIMEOUT))
         if not r.ok: return None
         js=r.json(); return js if isinstance(js,dict) else None
     except: return None
 
 def fetch_odds(fid:int, prob_hints:Optional[Dict[str,float]]=None)->dict:
-    cached=_ODDS_CACHE.get(fid)
+    with _odds_cache_lock:
+        cached=_ODDS_CACHE.get(fid)
     if cached is not None: return cached
     js={}
     if ODDS_SOURCE in ("auto","live"):
@@ -438,7 +492,9 @@ def fetch_odds(fid:int, prob_hints:Optional[Dict[str,float]]=None)->dict:
                                 odd=float(v.get("odd") or 0)
                                 by_market.setdefault(key,{}).setdefault(side,[]).append((odd,book_name))
     except Exception as e: log.debug("[odds] parse fail fid=%s: %s", fid, e)
-    _ODDS_CACHE[fid]=by_market; return by_market
+    with _odds_cache_lock:
+        _ODDS_CACHE[fid]=by_market
+    return by_market
 
 def price_gate(market:str,suggestion:str,fid:int,prob:Optional[float]=None):
     odds_map=fetch_odds(fid); odds=None; book=None
@@ -461,6 +517,7 @@ def price_gate(market:str,suggestion:str,fid:int,prob:Optional[float]=None):
         edge=prob*float(odds)-1.0; ev_pct=round(edge*100,1)
         if edge<0: return (False, odds, book, ev_pct)
     return (True, float(odds), book, ev_pct)
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Predictor hook (supports JSON/pickle; caches per-fixture briefly)
@@ -519,7 +576,6 @@ def _predict_with_json_model(model_obj: dict, fid: int) -> Dict[str, float]:
     data = model_obj.get("data") or {}
     if not isinstance(data, dict):
         return {}
-    # Expect keys like "BTTS: Yes", "Over 2.5 Goals", "Home Win" with values in [0,1]
     out = {}
     for k, v in data.items():
         try:
@@ -531,10 +587,6 @@ def _predict_with_json_model(model_obj: dict, fid: int) -> Dict[str, float]:
     return out
 
 def _predict_with_pickle(model: Any, fid: int) -> Dict[str, float]:
-    """
-    Plug your real feature builder + inference here.
-    For now return empty -> caller will fall back to odds-implied de-vig probabilities.
-    """
     try:
         return {}
     except Exception as e:
@@ -605,7 +657,8 @@ def fetch_results_for_fixtures(fixture_ids: Iterable[int]) -> List[Tuple[int, in
     for fid in fixture_ids:
         try:
             url = f"{APISPORTS_BASE_URL}/fixtures"
-            resp = _session_http.get(url, headers=RESULTS_HEADERS, params={"id": fid}, timeout=HTTP_RESULTS_TIMEOUT)
+            sess = _get_http_session()
+            resp = sess.get(url, headers=RESULTS_HEADERS, params={"id": fid}, timeout=HTTP_RESULTS_TIMEOUT)
             if not resp.ok:
                 continue
             js = resp.json()
@@ -698,7 +751,6 @@ def _normalize_pair(a: float, b: float) -> Tuple[float, float]:
     return a / s, b / s
 
 def _prob_hints_from_model_or_odds(fid: int, odds_map: dict) -> Dict[str, float]:
-    # Try model first
     try:
         probs = predict_for_fixture(fid)
         if isinstance(probs, dict) and probs:
@@ -706,10 +758,8 @@ def _prob_hints_from_model_or_odds(fid: int, odds_map: dict) -> Dict[str, float]
     except Exception as e:
         log.warning("[model] predict failed fid=%s: %s", fid, e)
 
-    # Fallback: de-vig two-way from odds
     hints: Dict[str, float] = {}
 
-    # BTTS
     d = odds_map.get("BTTS", {})
     if isinstance(d, dict) and d:
         yes = d.get("Yes") or []
@@ -720,7 +770,6 @@ def _prob_hints_from_model_or_odds(fid: int, odds_map: dict) -> Dict[str, float]
         hints["BTTS: Yes"] = p_yes
         hints["BTTS: No"]  = p_no
 
-    # 1X2 (H/A only; draw suppressed)
     d = odds_map.get("1X2", {})
     if isinstance(d, dict) and d:
         h = d.get("Home") or []
@@ -731,7 +780,6 @@ def _prob_hints_from_model_or_odds(fid: int, odds_map: dict) -> Dict[str, float]
         hints["Home Win"] = p_h
         hints["Away Win"] = p_a
 
-    # OU lines
     for mk, sides in odds_map.items():
         if not str(mk).startswith("OU_"):
             continue
@@ -750,9 +798,6 @@ def _prob_hints_from_model_or_odds(fid: int, odds_map: dict) -> Dict[str, float]
     return hints
 
 def _best_candidate_for_fixture(fid: int) -> Optional[Tuple[str, str, float, Optional[float], Optional[str], Optional[float]]]:
-    """
-    Returns: (market, suggestion, prob, odds, book, ev_pct) if gates pass; else None.
-    """
     odds_map = fetch_odds(fid)
     if not odds_map:
         return None
@@ -760,19 +805,16 @@ def _best_candidate_for_fixture(fid: int) -> Optional[Tuple[str, str, float, Opt
     prob_hints = _prob_hints_from_model_or_odds(fid, odds_map)
     candidates: List[Tuple[str, str, float]] = []
 
-    # BTTS
     if "BTTS: Yes" in prob_hints:
         candidates.append(("BTTS", "BTTS: Yes", prob_hints["BTTS: Yes"]))
     if "BTTS: No" in prob_hints:
         candidates.append(("BTTS", "BTTS: No", prob_hints["BTTS: No"]))
 
-    # 1X2
     if "Home Win" in prob_hints:
         candidates.append(("1X2", "Home Win", prob_hints["Home Win"]))
     if "Away Win" in prob_hints:
         candidates.append(("1X2", "Away Win", prob_hints["Away Win"]))
 
-    # OU
     for mk in list(odds_map.keys()):
         if not str(mk).startswith("OU_"):
             continue
@@ -805,10 +847,6 @@ def _best_candidate_for_fixture(fid: int) -> Optional[Tuple[str, str, float, Opt
     return best
 
 def production_scan() -> Tuple[int, int]:
-    """
-    Evaluate live/soon fixtures from DB, save best passing pick per fixture, and notify.
-    Returns: (saved_count, live_seen)
-    """
     saved, live_seen = 0, 0
     to_insert: List[Tuple] = []
     to_notify: List[Tuple[str, dict]] = []
@@ -844,8 +882,7 @@ def production_scan() -> Tuple[int, int]:
 
         if to_insert:
             with db_conn() as c:
-                execute_values(
-                    c.cur,
+                c.execute_values(
                     """
                     INSERT INTO tips(
                         match_id, league, home, away, market, suggestion,
@@ -895,8 +932,7 @@ def prematch_scan_save() -> int:
 
         if to_insert:
             with db_conn() as c:
-                execute_values(
-                    c.cur,
+                c.execute_values(
                     """
                     INSERT INTO tips(
                         match_id, league, home, away, market, suggestion,
@@ -912,7 +948,6 @@ def prematch_scan_save() -> int:
     return saved
 
 def daily_accuracy_digest() -> Optional[str]:
-    """Summarize yesterday’s accuracy and ROI."""
     today = _now_dt().astimezone(BERLIN_TZ).date()
     import datetime as _dt
     yesterday = today - _dt.timedelta(days=1)
@@ -1032,8 +1067,7 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
 
         if delivered:
             with db_conn() as c2:
-                execute_values(
-                    c2.cur,
+                c2.execute_values(
                     """
                     UPDATE tips AS t SET sent_ok=1
                     FROM (VALUES %s) AS v(match_id, created_ts)
@@ -1070,7 +1104,6 @@ def backfill_results_for_open_matches(limit=300) -> int:
 # Flask app, admin auth, request-id middleware, thresholds application
 # ───────────────────────────────────────────────────────────────────────────────
 
-# (train_models helpers were imported earlier in Chunk 2)
 app = Flask(__name__)
 
 def get_logger() -> logging.Logger:
@@ -1130,7 +1163,7 @@ def _apply_tuned_thresholds():
     Load CONF_MIN / EV_MIN / MOTD_* from DB settings and apply to module globals.
     """
     try:
-        th = load_thresholds_from_settings()
+        th = _load_thresholds_from_settings()
         globals()["CONF_MIN"] = float(th["CONF_MIN"])
         globals()["EV_MIN"] = float(th["EV_MIN"])
         globals()["MOTD_CONF_MIN"] = float(th["MOTD_CONF_MIN"])
@@ -1245,20 +1278,24 @@ def _start_scheduler_once():
             )
 
         # Training
-        if TRAIN_ENABLE:
+        if TRAIN_ENABLE and _TRAIN_MODULE_AVAILABLE:
             sched.add_job(
-                lambda: _run_with_pg_lock(1005, train_models),
+                lambda: _run_with_pg_lock(1005, _train_models),
                 CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
                 id="train", max_instances=1, coalesce=True, misfire_grace_time=3600
             )
+        elif TRAIN_ENABLE and not _TRAIN_MODULE_AVAILABLE:
+            log.warning("[SCHED] TRAIN_ENABLE=1 but train_models module unavailable; skipping train job.")
 
         # Auto-tune
-        if AUTO_TUNE_ENABLE:
+        if AUTO_TUNE_ENABLE and _TRAIN_MODULE_AVAILABLE:
             sched.add_job(
-                lambda: _run_with_pg_lock(1006, auto_tune_thresholds, 14),
+                lambda: _run_with_pg_lock(1006, _auto_tune_thresholds, 14),
                 CronTrigger(hour=4, minute=7, timezone=TZ_UTC),
                 id="auto_tune", max_instances=1, coalesce=True, misfire_grace_time=3600
             )
+        elif AUTO_TUNE_ENABLE and not _TRAIN_MODULE_AVAILABLE:
+            log.warning("[SCHED] AUTO_TUNE_ENABLE=1 but training module unavailable; skipping auto_tune job.")
 
         # Retry unsent
         sched.add_job(
@@ -1447,7 +1484,9 @@ def http_train():
     _require_admin()
     if not TRAIN_ENABLE:
         return jsonify({"ok": False, "reason": "training disabled"}), 400
-    res = train_models()
+    if not _TRAIN_MODULE_AVAILABLE:
+        return jsonify({"ok": False, "reason": "training module not available"}), 400
+    res = _train_models()
     return jsonify({"ok": True, "result": res})
 
 @app.route("/admin/digest", methods=["POST", "GET"])
@@ -1459,7 +1498,9 @@ def http_digest():
 @app.route("/admin/auto-tune", methods=["POST", "GET"])
 def http_auto_tune():
     _require_admin()
-    tuned = auto_tune_thresholds(14)
+    if not _TRAIN_MODULE_AVAILABLE:
+        return jsonify({"ok": False, "reason": "auto_tune not available"}), 400
+    tuned = _auto_tune_thresholds(14)
     try:
         if tuned.get("ok"):
             _apply_tuned_thresholds()
