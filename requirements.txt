@@ -1,13 +1,9 @@
 Flask==3.0.3
 gunicorn==21.2.0
 requests==2.32.3
-urllib3==2.2.2
 cachetools==5.3.3
-python-dotenv==1.0.1
-psycopg2-binary==2.9.9
 APScheduler==3.10.4
-tzdata==2024.1
-tzlocal==5.2
+psycopg2-binary==2.9.9
 numpy==1.26.4
 pandas==2.2.2
-scikit-learn==1.5.2
+scikit-learn==1.4.2
