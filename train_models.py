@@ -1,4 +1,6 @@
-# file: train_models.py — calibration + auto-threshold tuning for goalsniper
+# file: train_models.py
+# calibration + auto-threshold tuning for goalsniper (standalone, no imports from main.py)
+
 from __future__ import annotations
 
 import os
@@ -6,106 +8,102 @@ import json
 import time
 import logging
 from typing import List, Tuple, Optional, Dict, Iterable
-from contextlib import contextmanager
 
+# ───────── Minimal DB helpers (standalone to avoid circular import with main.py) ─────────
 import psycopg2
 from psycopg2.extras import DictCursor
 
 log = logging.getLogger("train")
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Config (override via env)
-# ───────────────────────────────────────────────────────────────────────────────
-TRAIN_WINDOW_DAYS = int(os.getenv("TRAIN_WINDOW_DAYS", "28"))
-TUNE_WINDOW_DAYS  = int(os.getenv("TUNE_WINDOW_DAYS", "14"))
-MIN_BETS_FOR_TRAIN = int(os.getenv("MIN_BETS_FOR_TRAIN", "150"))
-MIN_BETS_FOR_TUNE  = int(os.getenv("MIN_BETS_FOR_TUNE", "80"))
-BINS = int(os.getenv("CALIBRATION_BINS", "10"))
-EV_CAP = float(os.getenv("EV_CAP", "0.50"))  # clamp EV in tuning to avoid outliers
+DB_URL = os.getenv("DATABASE_URL")
+if not DB_URL:
+    raise SystemExit("DATABASE_URL is required for train_models.py")
 
-# Settings keys in DB
-CAL_KEY       = "calibration_overall"   # JSON: { "bins": [[low,high,obs_rate,count], ...], ... }
-CONF_KEY      = "CONF_MIN"
-EV_KEY        = "EV_MIN"
-MOTD_CONF_KEY = "MOTD_CONF_MIN"
-MOTD_EV_KEY   = "MOTD_EV_MIN"
+def _should_force_ssl(url: str) -> bool:
+    if not url.startswith(("postgres://", "postgresql://")):
+        return False
+    v = os.getenv("DB_SSLMODE_REQUIRE", "1").strip().lower()
+    return v not in {"0", "false", "no", ""}
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Local DB helpers (independent of main.py to avoid circular imports)
-# ───────────────────────────────────────────────────────────────────────────────
-_DATABASE_URL = os.getenv("DATABASE_URL", "")
+if _should_force_ssl(DB_URL) and "sslmode=" not in DB_URL:
+    DB_URL = DB_URL + (("&" if "?" in DB_URL else "?") + "sslmode=require")
 
-def _dsn_with_ssl(url: str) -> str:
-    if not url:
-        raise RuntimeError("DATABASE_URL is required for training module")
-    need_ssl = os.getenv("DB_SSLMODE_REQUIRE", "1").strip().lower() not in {"0","false","no",""}
-    if need_ssl and "sslmode=" not in url and url.startswith(("postgres://","postgresql://")):
-        url = url + (("&" if "?" in url else "?") + "sslmode=require")
-    return url
+STMT_TIMEOUT_MS = int(os.getenv("PG_STATEMENT_TIMEOUT_MS", "15000"))
+LOCK_TIMEOUT_MS = int(os.getenv("PG_LOCK_TIMEOUT_MS", "2000"))
+IDLE_TX_TIMEOUT_MS = int(os.getenv("PG_IDLE_TX_TIMEOUT_MS", "30000"))
+FORCE_UTC = os.getenv("PG_FORCE_UTC", "1").strip().lower() not in {"0","false","no",""}
 
-@contextmanager
-def db_conn(dict_rows: bool = False):
-    dsn = _dsn_with_ssl(_DATABASE_URL)
-    conn = psycopg2.connect(dsn)  # autocommit off by default (we'll mostly read)
-    try:
-        with conn:
-            with conn.cursor(cursor_factory=DictCursor if dict_rows else None) as cur:
-                yield cur
-    finally:
+class _DB:
+    def __enter__(self):
+        self.conn = psycopg2.connect(DB_URL)
+        self.conn.autocommit = True
+        with self.conn.cursor() as cur:
+            if FORCE_UTC:
+                cur.execute("SET TIME ZONE 'UTC'")
+            cur.execute("SET statement_timeout = %s", (STMT_TIMEOUT_MS,))
+            cur.execute("SET lock_timeout = %s", (LOCK_TIMEOUT_MS,))
+            cur.execute("SET idle_in_transaction_session_timeout = %s", (IDLE_TX_TIMEOUT_MS,))
+        self.cur = self.conn.cursor(cursor_factory=DictCursor)
+        return self.cur
+    def __exit__(self, exc_type, exc, tb):
         try:
-            conn.close()
-        except Exception:
-            pass
+            self.cur.close()
+        finally:
+            self.conn.close()
+
+def db_conn():
+    return _DB()
 
 def get_setting(key: str) -> Optional[str]:
-    try:
-        with db_conn() as c:
-            c.execute("SELECT value FROM settings WHERE key=%s", (key,))
-            row = c.fetchone()
-            return (row[0] if row else None)
-    except Exception as e:
-        log.warning("[TRAIN] get_setting(%s) failed: %s", key, e)
-        return None
+    with db_conn() as c:
+        c.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = c.fetchone()
+        return (row[0] if row else None)
 
 def set_setting(key: str, value: str) -> None:
-    try:
-        with db_conn() as c:
-            c.execute(
-                "INSERT INTO settings(key,value) VALUES(%s,%s) "
-                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                (key, value),
-            )
-    except Exception as e:
-        log.warning("[TRAIN] set_setting(%s) failed: %s", key, e)
+    with db_conn() as c:
+        c.execute(
+            "INSERT INTO settings(key,value) VALUES(%s,%s) "
+            "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+            (key, value),
+        )
 
 def get_setting_json(key: str) -> Optional[dict]:
     try:
         raw = get_setting(key)
         return json.loads(raw) if raw else None
     except Exception as e:
-        log.warning("[TRAIN] get_setting_json(%s) failed: %s", key, e)
+        log.warning("[TRAIN] get_setting_json failed for key=%s: %s", key, e)
         return None
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Core helpers
-# ───────────────────────────────────────────────────────────────────────────────
-def _cutoff(days: int) -> int:
-    return int(time.time()) - days * 24 * 3600
+# ───────── Defaults (override via env) ─────────
+TRAIN_WINDOW_DAYS = int(os.getenv("TRAIN_WINDOW_DAYS", "28"))
+TUNE_WINDOW_DAYS  = int(os.getenv("TUNE_WINDOW_DAYS", "14"))
+MIN_BETS_FOR_TRAIN = int(os.getenv("MIN_BETS_FOR_TRAIN", "150"))
+MIN_BETS_FOR_TUNE  = int(os.getenv("MIN_BETS_FOR_TUNE", "80"))
+BINS = int(os.getenv("CALIBRATION_BINS", "10"))
+EV_CAP = float(os.getenv("EV_CAP", "0.50"))
 
+# Settings keys
+CAL_KEY = "calibration_overall"   # JSON: { "bins": [[low,high,obs_rate,count], ...], ... }
+CONF_KEY = "CONF_MIN"
+EV_KEY = "EV_MIN"
+MOTD_CONF_KEY = "MOTD_CONF_MIN"
+MOTD_EV_KEY = "MOTD_EV_MIN"
+
+# ───────── Helpers ─────────
 def _is_win(sugg: str, gh: Optional[int], ga: Optional[int]) -> Optional[bool]:
-    """Return True/False for win/loss; None if cannot grade (missing line etc.)."""
+    """Return True/False for win/loss; None if cannot grade."""
     if gh is None or ga is None:
         return None
     gh, ga = int(gh), int(ga)
     total = gh + ga
     s = str(sugg or "")
     if s.startswith("Over") or s.startswith("Under"):
-        # extract first float found
         ln = None
         for tok in s.split():
             try:
-                ln = float(tok)
-                break
+                ln = float(tok); break
             except Exception:
                 continue
         if ln is None:
@@ -121,10 +119,13 @@ def _is_win(sugg: str, gh: Optional[int], ga: Optional[int]) -> Optional[bool]:
         return ga > gh
     return None
 
+def _cutoff(days: int) -> int:
+    return int(time.time()) - days * 24 * 3600
+
 def _load_graded_tips(days: int) -> List[Tuple[float, float, str, Optional[int], Optional[int]]]:
     """
     Returns: (confidence_raw, odds, suggestion, final_goals_h, final_goals_a)
-    Only includes rows with results and sent_ok=1 (joins can still yield NULLs for old rows).
+    Only includes rows with results and sent_ok=1.
     """
     cutoff = _cutoff(days)
     with db_conn() as c:
@@ -155,9 +156,7 @@ def _load_graded_tips(days: int) -> List[Tuple[float, float, str, Optional[int],
             continue
     return out
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Calibration
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────── Calibration ─────────
 def _build_calibration(bets: List[Tuple[float, float, str, Optional[int], Optional[int]]]) -> Dict:
     """
     Equal-width bin calibration over confidence_raw in [0,1].
@@ -176,9 +175,9 @@ def _build_calibration(bets: List[Tuple[float, float, str, Optional[int], Option
         win = _is_win(sugg, gh, ga)
         if win is None:
             continue
-        bins[idx][3] += 1  # n
+        bins[idx][3] += 1
         if win:
-            bins[idx][2] += 1  # wins
+            bins[idx][2] += 1
 
     out_bins = []
     for (low, high, wins, n) in bins:
@@ -189,7 +188,6 @@ def _build_calibration(bets: List[Tuple[float, float, str, Optional[int], Option
             (round(obs, 4) if obs is not None else None),
             int(n),
         ])
-
     return {"bins": out_bins, "created_ts": created_ts, "bins_count": BINS}
 
 def _prob_from_calibration(cal: Optional[Dict], conf_raw: float) -> float:
@@ -198,12 +196,11 @@ def _prob_from_calibration(cal: Optional[Dict], conf_raw: float) -> float:
         try:
             for (low, high, obs, n) in cal.get("bins") or []:
                 if conf_raw >= float(low) and conf_raw < float(high):
-                    if obs is not None and int(n) >= 10:  # support threshold
+                    if obs is not None and int(n) >= 10:
                         return float(obs)
                     break
         except Exception:
             pass
-    # light shrinkage to avoid overconfidence when no bin support
     alpha = 0.15
     return (1 - alpha) * float(conf_raw) + alpha * 0.5
 
@@ -221,22 +218,23 @@ def train_models() -> dict:
     log.info("[TRAIN] calibration saved (%d/%d bins with data)", bins_with_data, BINS)
     return {"ok": True, "bins_with_data": bins_with_data, "total_bets": len(bets)}
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Threshold tuning
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────── Threshold tuning ─────────
 def _historical_roi_for_thresholds(
     bets: List[Tuple[float, float, str, Optional[int], Optional[int]]],
     cal: Optional[Dict],
     conf_min: float,
     ev_min: float,
 ) -> Tuple[int, float]:
+    """
+    Returns (n_bets_used, pnl_units) after applying thresholds on calibrated prob/EV.
+    Uses realized outcomes for PnL; EV is only a gate.
+    """
     pnl = 0.0
     n = 0
     for conf_raw, odds, sugg, gh, ga in bets:
         if odds is None or odds <= 1.0 or odds > 1000.0:
             continue
         p = _prob_from_calibration(cal, conf_raw)
-        # clamp EV contribution to avoid extreme outliers driving tuning
         ev = max(min(p * odds - 1.0, EV_CAP), -EV_CAP)
         if p < conf_min or ev < ev_min:
             continue
@@ -248,6 +246,10 @@ def _historical_roi_for_thresholds(
     return n, pnl
 
 def auto_tune_thresholds(window_days: int = TUNE_WINDOW_DAYS) -> dict:
+    """
+    Grid-search over (CONF_MIN, EV_MIN) to maximize historical ROI over the recent window.
+    Persists best thresholds to settings and returns summary.
+    """
     bets = _load_graded_tips(window_days)
     if len(bets) < MIN_BETS_FOR_TUNE:
         msg = f"not enough bets to tune: {len(bets)}/{MIN_BETS_FOR_TUNE}"
@@ -263,7 +265,6 @@ def auto_tune_thresholds(window_days: int = TUNE_WINDOW_DAYS) -> dict:
     for cmin in conf_grid:
         for emin in ev_grid:
             n, pnl = _historical_roi_for_thresholds(bets, cal, cmin, emin)
-            # Avoid overfitting to tiny samples
             if n < max(30, int(0.05 * len(bets))):
                 continue
             roi = pnl / max(n, 1)
@@ -271,15 +272,13 @@ def auto_tune_thresholds(window_days: int = TUNE_WINDOW_DAYS) -> dict:
                 best = {"roi": roi, "conf": cmin, "ev": emin, "bets": n, "pnl": pnl}
 
     if best["conf"] is None:
-        msg = "no viable thresholds found"
+        msg = "no viable thresholds found (grid too strict or data too small)"
         log.info("[TUNE] %s", msg)
         return {"ok": False, "reason": msg}
 
-    # Persist thresholds
     set_setting(CONF_KEY, str(best["conf"]))
     set_setting(EV_KEY, str(best["ev"]))
 
-    # Derive stricter MOTD thresholds
     motd_conf = min(0.95, round(best["conf"] + 0.02, 2))
     motd_ev   = min(0.20, round(best["ev"] + 0.02, 2))
     set_setting(MOTD_CONF_KEY, str(motd_conf))
@@ -296,9 +295,7 @@ def auto_tune_thresholds(window_days: int = TUNE_WINDOW_DAYS) -> dict:
         "using_calibration": bool(cal),
     }
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Threshold loader for runtime (used by main.py)
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────── Threshold loader (used by main.py at boot) ─────────
 def _try_float(v: Optional[str], default: float) -> float:
     try:
         return float(v) if v is not None else default
@@ -319,9 +316,7 @@ def load_thresholds_from_settings(defaults: Optional[Dict[str, float]] = None) -
         "MOTD_EV_MIN":   _try_float(get_setting(MOTD_EV_KEY), defaults["MOTD_EV_MIN"]),
     }
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Utils
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────── Utils ─────────
 def frange(start: float, stop: float, step: float) -> Iterable[float]:
     v = start
     while v <= stop + 1e-9:
