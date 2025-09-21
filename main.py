@@ -1786,7 +1786,7 @@ def send_match_of_the_day() -> bool:
     prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best
     return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
 
-def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
+def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:
     """
     Pick per-market confidence thresholds that meet TARGET_PRECISION while maximizing realized ROI.
 
