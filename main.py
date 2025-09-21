@@ -1795,10 +1795,10 @@ def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:
     Tie-breakers: higher precision, then larger n. Requires >= THRESH_MIN_PREDICTIONS.
     If no threshold meets target precision, accept within PREC_TOL below target *and* ROI > 0.
     """
-    if not AUTO_TUNE_ENABLE:
+    if not APPLY_TUNE_ENABLE:
         return {}
 
-    PREC_TOL = float(os.getenv("AUTO_TUNE_PREC_TOL", "0.03"))  # allow 3pp below target if ROI>0
+    PREC_TOL = float(os.getenv("APPLY_TUNE_PREC_TOL", "0.03"))  # allow 3pp below target if ROI>0
     cutoff = int(time.time()) - days * 24 * 3600
 
     with db_conn() as c:
@@ -1820,7 +1820,7 @@ def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:
         ).fetchall()
 
     if not rows:
-        send_telegram("🔧 Auto-tune: no labeled tips with odds in window.")
+        send_telegram("🔧 Apply-tune: no labeled tips with odds in window.")
         return {}
 
     # Prepare per-market arrays
