@@ -1,5 +1,4 @@
-# file: main.py
-goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate.
+"""goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate."""
 
 import os, json, time, logging, requests, psycopg2
 import numpy as np
@@ -247,11 +246,12 @@ def init_db():
             payload TEXT
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
-             match_id BIGINT PRIMARY KEY,
-             created_ts BIGINT,
-             payload TEXT
-         )""")
-         c.execute("CREATE INDEX IF NOT EXISTS idx_prematch_created ON prematch_snapshots (created_ts DESC)")
+            match_id BIGINT PRIMARY KEY,
+            created_ts BIGINT,
+            payload TEXT
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_prematch_created ON prematch_snapshots (created_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_market ON odds_history (market, captured_ts DESC)")
         # Evolutive columns (idempotent)
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
         except: pass
@@ -486,7 +486,6 @@ def calibrate_and_retune_from_tips(conn, target_precision: float,
         log.info("Tips calibration/threshold updates: %s", updates)
     return updates
 # ---- end optional block ----
-
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
     require_stats_minute = int(os.getenv("REQUIRE_STATS_MINUTE","35"))
     require_fields = int(os.getenv("REQUIRE_DATA_FIELDS","2"))
@@ -1952,6 +1951,45 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
         log.info("[RETRY] resent %d", retried)
     return retried
 
+# Utility: backfill prematch snapshots for recent days (used by /admin/backfill-prematch)
+def backfill_prematch_snapshots(days: int = 7) -> int:
+    """
+    For the last `days`, collect NS fixtures (Berlin-local dates), compute prematch features,
+    and persist into prematch_snapshots. Returns number of snapshots written.
+    """
+    wrote = 0
+    try:
+        # Iterate each Berlin-local day window
+        for d in range(days):
+            day = datetime.now(BERLIN_TZ).date() - timedelta(days=d)
+            start_local = datetime.combine(day, datetime.min.time(), tzinfo=BERLIN_TZ)
+            end_local = start_local + timedelta(days=1)
+            dates_utc = {
+                start_local.astimezone(ZoneInfo("UTC")).date(),
+                (end_local - timedelta(seconds=1)).astimezone(ZoneInfo("UTC")).date(),
+            }
+            fixtures: list[dict] = []
+            for ud in sorted(dates_utc):
+                js = _api_get(FOOTBALL_API_URL, {"date": ud.strftime("%Y-%m-%d")}) or {}
+                for r in js.get("response", []) if isinstance(js, dict) else []:
+                    st = (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+                    if st == "NS":
+                        fixtures.append(r)
+            fixtures = [f for f in fixtures if not _blocked_league(f.get("league") or {})]
+
+            for fx in fixtures:
+                try:
+                    feat = extract_prematch_features(fx)
+                    if not feat:
+                        continue
+                    save_prematch_snapshot(fx, feat)
+                    wrote += 1
+                except Exception:
+                    continue
+    except Exception as e:
+        log.warning("backfill_prematch_snapshots failed: %s", e)
+    return wrote
+
 # ───────── Scheduler ─────────
 def _run_with_pg_lock(lock_key: int, fn, *a, **k):
     try:
@@ -2151,7 +2189,9 @@ def telegram_webhook(secret: str):
 
 # ───────── Boot ─────────
 def _on_boot():
-    _init_pool(); init_db(); set_setting("boot_ts", str(int(time.time())))
+    _init_pool()
+    init_db()
+    set_setting("boot_ts", str(int(time.time())))
 
 _on_boot()
 
