@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 
-# 3rd party
 from flask import Flask, jsonify, request, abort, g, has_request_context
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -1469,6 +1468,15 @@ def stats():
     except Exception as e:
         log.exception("/stats failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/healthz")
+def healthcheck():
+    try:
+        with db_conn() as cur:
+            cur.execute("SELECT 1")
+        return jsonify({"status": "ok", "db": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "db": str(e)}), 500
 
 # ── Admin endpoints ──
 @app.route("/admin/scan", methods=["POST", "GET"])
