@@ -1,53 +1,8 @@
 # railway.yaml
 services:
-  - name: web
-    startCommand: >
-      gunicorn main:app
-      --workers=2 --threads=2
-      --timeout=120 --graceful-timeout=30
-      --bind 0.0.0.0:$PORT
-      --max-requests=300 --max-requests-jitter=50
-    healthcheckPath: /healthz
-    envs:
-      - key: NIXPACKS_PYTHON_VERSION
-        value: "3.11"
-      - key: RUN_SCHEDULER
-        value: "0"      # web should NOT run scheduler
-      - key: SCHEDULER_LEADER
-        value: "0"
-      - key: TRAIN_ENABLE
-        value: "0"      # web should NOT run training
-      - key: DB_POOL_MIN
-        value: "1"
-      - key: DB_POOL_MAX
-        value: "4"
-      # Secrets → leave value blank here, set them in Railway UI
-      - key: DATABASE_URL
-      - key: TELEGRAM_BOT_TOKEN
-      - key: TELEGRAM_CHAT_ID
-      - key: APIFOOTBALL_KEY
-
-  - name: worker
-    startCommand: >
-      python -c "import time, main;
-      main._init_pool(); main.init_db();
-      main._apply_tuned_thresholds(); main._start_scheduler_once();
-      print('scheduler up'); time.sleep(10**9)"
-    envs:
-      - key: NIXPACKS_PYTHON_VERSION
-        value: "3.11"
-      - key: RUN_SCHEDULER
-        value: "1"
-      - key: SCHEDULER_LEADER
-        value: "1"
-      - key: TRAIN_ENABLE
-        value: "0"       # flip to "1" only if you want nightly training
-      - key: DB_POOL_MIN
-        value: "1"
-      - key: DB_POOL_MAX
-        value: "4"
-      # Secrets → leave value blank here, set them in Railway UI
-      - key: DATABASE_URL
-      - key: TELEGRAM_BOT_TOKEN
-      - key: TELEGRAM_CHAT_ID
-      - key: APIFOOTBALL_KEY
+  api:
+    build:
+      builder: python:3.11
+      buildCommand: pip install -r requirements.txt
+      startCommand: python main.py
+    
