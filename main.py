@@ -246,6 +246,12 @@ def init_db():
             created_ts BIGINT,
             payload TEXT
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
+             match_id BIGINT PRIMARY KEY,
+             created_ts BIGINT,
+             payload TEXT
+         )""")
+         c.execute("CREATE INDEX IF NOT EXISTS idx_prematch_created ON prematch_snapshots (created_ts DESC)")
         # Evolutive columns (idempotent)
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
         except: pass
@@ -426,7 +432,8 @@ def calibrate_and_retune_from_tips(conn, target_precision: float,
                                    min_preds: int, min_thr_pct: float, max_thr_pct: float,
                                    days: int = 365) -> Dict[str, float]:
     try:
-        df = load_graded_tips(conn, days=days)  # from train_models
+        from train_models import load_graded_tips, fit_platt, _get_setting_json, _set_setting, _logit_vec, _percent  # type: ignore
+        df = load_graded_tips(conn, days=days)
     except Exception as e:
         log.info("Tips calibration skipped (helpers not available): %s", e)
         return {}
@@ -1692,7 +1699,7 @@ def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
 MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
 
 def send_match_of_the_day() -> bool:
-    if not os.getenv("MOTD_PREDICT","1") not in ("0","false","False","no","NO"):
+    if os.getenv("MOTD_PREDICT","1") in ("0","false","False","no","NO"):
         return send_telegram("🏅 MOTD disabled.")
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
