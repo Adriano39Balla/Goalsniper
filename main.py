@@ -2035,8 +2035,8 @@ def _start_scheduler_once():
                           CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
                           id="train", max_instances=1, coalesce=True)
 
-        if AUTO_TUNE_ENABLE:
-            sched.add_job(lambda: _run_with_pg_lock(1006, auto_tune_thresholds, 14),
+        if Apply_TUNE_ENABLE:
+            sched.add_job(lambda: _run_with_pg_lock(1006, apply_tune_thresholds, 14),
                           CronTrigger(hour=4, minute=7, timezone=TZ_UTC),
                           id="auto_tune", max_instances=1, coalesce=True)
 
