@@ -1,6 +1,5 @@
 # file: train_models.py
 
-
 import argparse, json, os, logging, math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -221,6 +220,7 @@ def load_prematch_data(conn) -> pd.DataFrame:
     if not feats: return pd.DataFrame()
     return pd.DataFrame(feats).replace([np.inf,-np.inf], np.nan).fillna(0.0)
 
+
 # ─────────────────────── Modeling helpers ─────────────────────── #
 
 def fit_lr_safe(X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray]=None) -> Optional[LogisticRegression]:
@@ -361,6 +361,7 @@ def _pick_threshold_for_target_precision(
             if acc > best_acc: best_t, best_acc = float(t), acc
 
     return float(best_t if best_t is not None else default_threshold)
+
 
 # ─────────────────────── Split & weights ─────────────────────── #
 
@@ -543,6 +544,7 @@ def _train_binary_head(
         _set_setting(conn, f"conf_threshold:{threshold_label}", f"{thr_pct:.2f}")
 
     return True, mets, p_cal
+
 
 # ─────────────────────── Entry point ─────────────────────── #
 
