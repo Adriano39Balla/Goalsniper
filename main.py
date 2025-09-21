@@ -1183,11 +1183,13 @@ SCHEDULER_LEADER = os.getenv("SCHEDULER_LEADER", "1").lower() in {"1","true","ye
 SCAN_INTERVAL_SEC   = env_int("SCAN_INTERVAL_SEC", 300)
 BACKFILL_EVERY_MIN  = env_int("BACKFILL_EVERY_MIN", 15)
 
-TRAIN_ENABLE     = os.getenv("TRAIN_ENABLE", "1").lower() in {"1","true","yes"}
-TRAIN_HOUR_UTC   = env_int("TRAIN_HOUR_UTC", 2)
-TRAIN_MINUTE_UTC = env_int("TRAIN_MINUTE_UTC", 12)
+TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1").lower() in {"1","true","yes"}
+TRAIN_HOUR_LOCAL   = env_int("TRAIN_HOUR_LOCAL", 6)   # Berlin time
+TRAIN_MINUTE_LOCAL = env_int("TRAIN_MINUTE_LOCAL", 12)
 
 AUTO_TUNE_ENABLE = os.getenv("AUTO_TUNE_ENABLE", "0").lower() in {"1","true","yes"}
+AUTO_TUNE_HOUR_LOCAL   = env_int("AUTO_TUNE_HOUR_LOCAL", 6)  # Berlin time
+AUTO_TUNE_MINUTE_LOCAL = env_int("AUTO_TUNE_MINUTE_LOCAL", 7)
 
 DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1").lower() in {"1","true","yes"}
 DAILY_ACCURACY_HOUR   = env_int("DAILY_ACCURACY_HOUR", 8)
@@ -1278,21 +1280,21 @@ def _start_scheduler_once():
 
         # Training
         if TRAIN_ENABLE and _TRAIN_MODULE_AVAILABLE:
-            sched.add_job(
-                lambda: _run_with_pg_lock(1005, _train_models),
-                CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
-                id="train", max_instances=1, coalesce=True, misfire_grace_time=3600
-            )
+             sched.add_job(
+                 lambda: _run_with_pg_lock(1005, _train_models),
+                 CronTrigger(hour=TRAIN_HOUR_LOCAL, minute=TRAIN_MINUTE_LOCAL, timezone=BERLIN_TZ),
+                 id="train", max_instances=1, coalesce=True, misfire_grace_time=3600
+             )
         elif TRAIN_ENABLE and not _TRAIN_MODULE_AVAILABLE:
             log.warning("[SCHED] TRAIN_ENABLE=1 but train_models module unavailable; skipping train job.")
 
         # Auto-tune
         if AUTO_TUNE_ENABLE and _TRAIN_MODULE_AVAILABLE:
-            sched.add_job(
-                lambda: _run_with_pg_lock(1006, _auto_tune_thresholds, 14),
-                CronTrigger(hour=4, minute=7, timezone=TZ_UTC),
-                id="auto_tune", max_instances=1, coalesce=True, misfire_grace_time=3600
-            )
+             sched.add_job(
+                 lambda: _run_with_pg_lock(1006, _auto_tune_thresholds, 14),
+                 CronTrigger(hour=AUTO_TUNE_HOUR_LOCAL, minute=AUTO_TUNE_MINUTE_LOCAL, timezone=BERLIN_TZ),
+                 id="auto_tune", max_instances=1, coalesce=True, misfire_grace_time=3600
+             )
         elif AUTO_TUNE_ENABLE and not _TRAIN_MODULE_AVAILABLE:
             log.warning("[SCHED] AUTO_TUNE_ENABLE=1 but training module unavailable; skipping auto_tune job.")
 
