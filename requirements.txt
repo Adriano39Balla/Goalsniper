@@ -6,5 +6,7 @@ psycopg2-binary==2.9.9
 apscheduler==3.10.4
 python-dotenv==1.0.1
 numpy==1.26.4
-redis==5.0.8           
-sentry-sdk==2.13.0     
+pandas==2.2.2
+scikit-learn==1.5.1
+redis==5.0.8
+sentry-sdk==2.13.0
