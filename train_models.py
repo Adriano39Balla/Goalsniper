@@ -220,6 +220,89 @@ def load_prematch_data(conn) -> pd.DataFrame:
     if not feats: return pd.DataFrame()
     return pd.DataFrame(feats).replace([np.inf,-np.inf], np.nan).fillna(0.0)
 
+# ─────────────────────── Optional helpers for main.py calibration ─────────────────────── #
+
+def _tip_outcome_for_result(suggestion: str, gh: int, ga: int, btts_yes: int) -> Optional[int]:
+    s = (suggestion or "").strip()
+    total = int(gh) + int(ga)
+    if s.startswith("Over") or s.startswith("Under"):
+        # parse line
+        try:
+            line = None
+            for tok in s.split():
+                try:
+                    line = float(tok)
+                    break
+                except:
+                    pass
+            if line is None:
+                return None
+        except:
+            return None
+        if s.startswith("Over"):
+            if total > line: return 1
+            if abs(total - line) < 1e-9: return None
+            return 0
+        else:
+            if total < line: return 1
+            if abs(total - line) < 1e-9: return None
+            return 0
+    if s == "BTTS: Yes": return 1 if int(btts_yes) == 1 else 0
+    if s == "BTTS: No":  return 1 if int(btts_yes) == 0 else 0
+    if s == "Home Win":  return 1 if gh > ga else 0
+    if s == "Away Win":  return 1 if ga > gh else 0
+    return None
+
+def load_graded_tips(conn, days: int = 365) -> pd.DataFrame:
+    """
+    For calibrate_and_retune_from_tips in main.py.
+    Returns a DataFrame with columns: [market, suggestion, prob, y]
+    """
+    cutoff = int(pd.Timestamp.utcnow().timestamp()) - days*24*3600
+    q = """
+    SELECT t.market, t.suggestion,
+           COALESCE(t.confidence_raw, t.confidence/100.0) AS prob,
+           t.match_id,
+           r.final_goals_h, r.final_goals_a, r.btts_yes
+    FROM tips t
+    JOIN match_results r ON r.match_id = t.match_id
+    WHERE t.created_ts >= %s
+      AND t.suggestion <> 'HARVEST'
+      AND t.sent_ok = 1
+    """
+    df = _read_sql(conn, q, (cutoff,))
+    if df.empty:
+        return df
+    ys = []
+    for _, row in df.iterrows():
+        y = _tip_outcome_for_result(
+            str(row["suggestion"]),
+            int(row["final_goals_h"] or 0),
+            int(row["final_goals_a"] or 0),
+            int(row["btts_yes"] or 0),
+        )
+        ys.append(np.nan if y is None else int(y))
+    df["y"] = ys
+    df = df.dropna(subset=["prob", "y"]).copy()
+    df["prob"] = df["prob"].astype(float).clip(1e-6, 1-1e-6)
+    df["y"] = df["y"].astype(int)
+    return df[["market", "suggestion", "prob", "y"]]
+
+def _logit_vec(p: np.ndarray) -> np.ndarray:
+    p = np.clip(p.astype(float), 1e-6, 1-1e-6)
+    return np.log(p/(1.0-p))
+
+def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
+    """
+    Simple Platt scaling on logits; returns (a, b) such that sigmoid(a*logit(p_raw)+b)
+    """
+    y = y_true.astype(int)
+    z = _logit_vec(p_raw).reshape(-1,1)
+    lr = LogisticRegression(max_iter=1000, solver="lbfgs").fit(z, y)
+    a = float(lr.coef_.ravel()[0]); b = float(lr.intercept_.ravel()[0])
+    return a, b
+
+def _percent(x: float) -> float: return float(x)*100.0
 
 # ─────────────────────── Modeling helpers ─────────────────────── #
 
@@ -236,10 +319,6 @@ def fit_lr_safe(X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray
         C=C,
         random_state=42,
     ).fit(X, y, sample_weight=sample_weight)
-
-def _logit_vec(p: np.ndarray) -> np.ndarray:
-    p = np.clip(p.astype(float), 1e-6, 1-1e-6)
-    return np.log(p/(1.0-p))
 
 def _fit_calibration(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[str, Any]:
     """Return ('platt',(a,b)) or ('isotonic', IsotonicRegression)."""
@@ -275,9 +354,25 @@ def _apply_calibration(p_raw: np.ndarray, cal_kind: str, cal_obj) -> np.ndarray:
 def _weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[str,float]:
     return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
 
+def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (X_std, mean, scale). Any zero-variance column is left unscaled."""
+    mean = X.mean(axis=0)
+    scale = X.std(axis=0, ddof=0)
+    scale = np.where(scale <= 1e-12, 1.0, scale)
+    Xs = (X - mean) / scale
+    return Xs, mean, scale
+
+def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray, features: List[str]) -> Tuple[float, Dict[str, float]]:
+    """Convert weights learned on standardized X back to raw feature space."""
+    w_std = model.coef_.ravel().astype(float)
+    b_std = float(model.intercept_.ravel()[0])
+    w_raw = (w_std / scale).astype(float)
+    b_raw = float(b_std - np.sum(w_std * (mean / scale)))
+    weights = {name: float(w) for name, w in zip(features, w_raw.tolist())}
+    return b_raw, weights
+
 def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: str, cal_obj,
                      mean: Optional[np.ndarray]=None, scale: Optional[np.ndarray]=None) -> Dict[str,Any]:
-    # If mean/scale provided (we trained on standardized X), fold them into raw-space weights.
     if mean is not None and scale is not None:
         intercept, weights = _fold_std_into_weights(model, mean, scale, features)
     else:
@@ -293,7 +388,7 @@ def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: s
         a,b = cal_obj
         blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
     else:
-        # keep serving simple: approximate isotonic in logit space
+        # approximate isotonic with a Platt-like mapping to keep serving simple
         x = np.concatenate([
             np.linspace(0.01, 0.10, 30),
             np.linspace(0.10, 0.90, 120),
@@ -305,29 +400,9 @@ def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: s
         blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
     return blob
 
-def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (X_std, mean, scale). Any zero-variance column is left unscaled."""
-    mean = X.mean(axis=0)
-    scale = X.std(axis=0, ddof=0)
-    scale = np.where(scale <= 1e-12, 1.0, scale)
-    Xs = (X - mean) / scale
-    return Xs, mean, scale
+# ─────────────────────── Thresholding & splits ─────────────────────── #
 
-def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray, features: List[str]) -> Tuple[float, Dict[str, float]]:
-    """Convert weights learned on standardized X back to raw feature space."""
-    # model.coef_ is for standardized features => w_std
-    w_std = model.coef_.ravel().astype(float)
-    b_std = float(model.intercept_.ravel()[0])
-    # raw weights
-    w_raw = (w_std / scale).astype(float)
-    # intercept shift: b_raw = b_std - sum_j (w_std_j * mean_j / scale_j)
-    b_raw = float(b_std - np.sum(w_std * (mean / scale)))
-    weights = {name: float(w) for name, w in zip(features, w_raw.tolist())}
-    return b_raw, weights
-
-# ─────────────────────── Thresholding ─────────────────────── #
-
-def _percent(x: float) -> float: return float(x)*100.0
+def _percent(x: float) -> float: return float(x)*100.0  # re-exposed for main.py
 
 def _pick_threshold_for_target_precision(
     y_true: np.ndarray, p_cal: np.ndarray, target_precision: float,
@@ -361,9 +436,6 @@ def _pick_threshold_for_target_precision(
             if acc > best_acc: best_t, best_acc = float(t), acc
 
     return float(best_t if best_t is not None else default_threshold)
-
-
-# ─────────────────────── Split & weights ─────────────────────── #
 
 def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray,np.ndarray]:
     if "_ts" not in df.columns:
@@ -421,7 +493,6 @@ def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, featu
     fidx = {f:i for i,f in enumerate(features)}
     keep = np.ones(len(y_all), dtype=bool)
 
-    # helpers
     def col(name): return X_all[:, fidx[name]] if name in fidx else np.zeros(len(X_all))
 
     goals_sum = col("goals_sum")
@@ -432,13 +503,9 @@ def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, featu
             ln = float(market_key.split("_", 1)[1].replace(",", "."))
         except Exception:
             ln = 2.5
-        # if goals_sum > line, Over is already guaranteed; drop that snapshot
         keep &= ~(goals_sum > ln)
     elif market_key == "BTTS_YES":
-        # both already scored -> BTTS is locked as True; drop
         keep &= ~((gh > 0) & (ga > 0))
-    # 1X2_* : no drop
-
     return keep
 
 def _train_binary_head(
@@ -459,20 +526,9 @@ def _train_binary_head(
     metrics_name: Optional[str] = None,
     train_minute_cutoff: Optional[int] = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
-    """
-    Train one binary head (e.g., BTTS_YES, OU_2.5, WLD_HOME).
-
-    Changes vs. original:
-      - Standardize X on train fold (mean/std), then fold scaler back into weights
-        so serving code in main.py remains unchanged.
-      - Drop trivial/decided in-play snapshots for this head (focus on uncertain states).
-      - Deterministic LogisticRegression (random_state) + tunable C via LR_C.
-    """
-    # sanity
     if len(np.unique(y_all)) < 2:
         return False, {}, None
 
-    # Apply minute cutoff on training rows (col 0 is 'minute'), if provided
     if train_minute_cutoff is not None:
         try:
             mt = (X_all[:, 0] <= float(train_minute_cutoff))
@@ -480,39 +536,30 @@ def _train_binary_head(
         except Exception:
             pass
 
-    # Drop trivial/decided snapshots for this specific head (train only)
     try:
         undecided = _mask_undecided(model_key, X_all, y_all, feature_names)
         new_mask_tr = mask_tr & undecided
         if np.any(new_mask_tr):
             mask_tr = new_mask_tr
-        else:
-            logger.info("[TRAIN] %s: undecided filter removed all train rows; proceeding without it.", model_key)
-    except Exception as _:
-        # be permissive; training should still proceed
+    except Exception:
         pass
 
-    # Split to folds
     X_tr, X_te = X_all[mask_tr], X_all[mask_te]
     y_tr, y_te = y_all[mask_tr], y_all[mask_te]
     ts_tr      = ts_all[mask_tr]
 
-    # Standardize on train, apply to test
     X_tr_std, mu, sd = _standardize_fit(X_tr)
     X_te_std = (X_te - mu) / sd
 
-    # Fit LR with recency weights
     sw = recency_weights(ts_tr)
     model = fit_lr_safe(X_tr_std, y_tr, sample_weight=sw)
     if model is None:
         return False, {}, None
 
-    # Validate (calibration on validation fold)
     p_raw_te = model.predict_proba(X_te_std)[:, 1]
     cal_kind, cal_obj = _fit_calibration(y_te, p_raw_te)
     p_cal = _apply_calibration(p_raw_te, cal_kind, cal_obj)
 
-    # Metrics
     mets = {
         "brier": float(brier_score_loss(y_te, p_cal)),
         "auc": float(roc_auc_score(y_te, p_cal)) if len(np.unique(y_te)) > 1 else float("nan"),
@@ -526,12 +573,10 @@ def _train_binary_head(
     if metrics_name:
         logger.info("[METRICS] %s: %s", metrics_name, mets)
 
-    # Serialize model: fold scaler into raw-space weights so serving stays unchanged
     blob = build_model_blob(model, feature_names, cal_kind, cal_obj, mean=mu, scale=sd)
     for k in (f"model_latest:{model_key}", f"model:{model_key}"):
         _set_setting(conn, k, json.dumps(blob))
 
-    # Optional: derive/update per-market threshold from validation fold
     if threshold_label:
         thr_prob = _pick_threshold_for_target_precision(
             y_true=y_te,
@@ -544,7 +589,6 @@ def _train_binary_head(
         _set_setting(conn, f"conf_threshold:{threshold_label}", f"{thr_pct:.2f}")
 
     return True, mets, p_cal
-
 
 # ─────────────────────── Entry point ─────────────────────── #
 
