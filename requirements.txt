@@ -1,11 +1,10 @@
-Flask==3.0.3
+flask==3.0.3
+gunicorn==22.0.0
 requests==2.32.3
-urllib3==2.2.2
-python-dotenv==1.0.1
+urllib3==2.2.3
 psycopg2-binary==2.9.9
 apscheduler==3.10.4
-pytz==2024.1
+python-dotenv==1.0.1
 numpy==1.26.4
-scipy==1.12.0
-pandas==2.2.2
-scikit-learn==1.5.2
+redis==5.0.8           
+sentry-sdk==2.13.0     
