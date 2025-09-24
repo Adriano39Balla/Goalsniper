@@ -2,7 +2,8 @@
 
 import argparse, json, os, logging, math
 from typing import Any, Dict, List, Optional, Tuple
-
+from xgboost import XGBClassifier
+from joblib import dump
 import numpy as np
 import pandas as pd
 import psycopg2
@@ -587,6 +588,12 @@ def _train_binary_head(
         _set_setting(conn, f"conf_threshold:{threshold_label}", f"{thr_pct:.2f}")
 
     return True, mets, p_cal
+
+def train_xgb_btts(X_train, y_train):
+    model = XGBClassifier(n_estimators=100, max_depth=4, use_label_encoder=False, eval_metric='logloss')
+    model.fit(X_train, y_train)
+    dump(model, "model_xgb_BTTS.joblib")
+    return model
 
 # ─────────────────────── Entry point ─────────────────────── #
 
