@@ -984,7 +984,8 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
                                 by_market.setdefault("1X2", {}).setdefault("Away", []).append((float(v.get("odd") or 0), book_name))
                     elif mname == "OU":
                         for v in vals:
-                            lbl = (v.get("value") or "").lower()
+                            val = v.get("value")
+                            lbl = str(val).lower() if val is not None else ""
                             if ("over" in lbl) or ("under" in lbl):
                                 try:
                                     ln = float(lbl.split()[-1])
