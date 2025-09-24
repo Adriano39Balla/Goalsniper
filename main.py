@@ -2,13 +2,13 @@
 # Upgraded: circuit breaker, Redis-backed caches (optional), Prometheus-style metrics,
 # DB pool health checks, admin/webhook hardening, and auto-tune wiring fixes — without trimming logic.
 
-import os, json, time, logging, requests, psycopg2
+import os, json, time, logging, requests, psycopg2, asyncio, httpx
 import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from flask import Flask, jsonify, request, abort
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
@@ -19,8 +19,8 @@ from apscheduler.triggers.cron import CronTrigger
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except Exception:
-    pass
+except Exception as e:
+    log.exception("Context info — failed because: %s", e)
 
 # ───────── Optional production add-ons ─────────
 SENTRY_DSN = os.getenv("SENTRY_DSN")
@@ -31,9 +31,8 @@ if SENTRY_DSN:
             dsn=SENTRY_DSN,
             traces_sample_rate=float(os.getenv("SENTRY_TRACES", "0.0")),
         )
-    except Exception:
-        # Sentry is optional; keep running if it fails
-        pass
+    except Exception as e:
+        log.exception("Context info — failed because: %s", e)
 
 REDIS_URL = os.getenv("REDIS_URL")
 _redis = None
@@ -50,6 +49,13 @@ if REDIS_URL:
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 log = logging.getLogger("goalsniper")
 app = Flask(__name__)
+
+# ───────── Safe float helper ─────────
+def safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 # ───────── Minimal Prometheus-style metrics ─────────
 from collections import defaultdict
@@ -70,8 +76,8 @@ def _metric_inc(name: str, label: Optional[str] = None, n: int = 1) -> None:
                 METRICS[name][None] += n
         else:
             METRICS[name][label] += n
-    except Exception:
-        pass
+    except Exception as e:
+        log.exception("Context info — failed because: %s", e)
 
 def _metric_obs_duration(job: str, t0: float) -> None:
     try:
@@ -79,8 +85,23 @@ def _metric_obs_duration(job: str, t0: float) -> None:
         arr.append(time.time() - t0)
         if len(arr) > 50:
             METRICS["job_duration_seconds"][job] = arr[-50:]
-    except Exception:
-        pass
+    except Exception as e:
+        log.exception("Context info — failed because: %s", e)
+
+# ───────── Profiling decorator ─────────
+def profile_op(name: str) -> Callable:
+    def decorator(fn: Callable) -> Callable:
+        def wrapper(*a, **k):
+            t0 = time.time()
+            try:
+                return fn(*a, **k)
+            finally:
+                duration = time.time() - t0
+                METRICS["job_duration_seconds"][name].append(duration)
+                if len(METRICS["job_duration_seconds"][name]) > 50:
+                    METRICS["job_duration_seconds"][name] = METRICS["job_duration_seconds"][name][-50:]
+        return wrapper
+    return decorator
 
 # ───────── Required envs (fail fast) — ADDED ─────────
 def _require_env(name: str) -> str:
@@ -269,33 +290,31 @@ def _db_ping() -> bool:
 # ───────── Settings cache (Redis-backed when available) ─────────
 class _KVCache:
     def __init__(self, ttl): self.ttl=ttl; self.data={}
-    def get(self, k): 
-        if _redis:
-            try:
-                v = _redis.get(f"gs:{k}")
-                return v.decode("utf-8") if v is not None else None
-            except Exception:
-                pass
-        v=self.data.get(k); 
-        if not v: return None
-        ts,val=v
-        if time.time()-ts>self.ttl: self.data.pop(k,None); return None
-        return val
+    def get_setting(key: str) -> Optional[str]:
+    if _redis:
+        try:
+            val = _redis.mget([f"gs:settings:{key}"])[0]
+            if val:
+                return val.decode("utf-8")
+        except Exception as e:
+            log.error("Redis bulk-get failed: %s", e)
+    # fallback to DB
+    ...
     def set(self,k,v):
         if _redis:
             try:
                 _redis.setex(f"gs:{k}", self.ttl, v if v is not None else "")
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                log.exception("Context info — failed because: %s", e)
         self.data[k]=(time.time(),v)
     def invalidate(self,k=None):
         if _redis and k:
             try:
                 _redis.delete(f"gs:{k}")
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                log.exception("Context info — failed because: %s", e)
         self.data.clear() if k is None else self.data.pop(k,None)
 
 _SETTINGS_CACHE, _MODELS_CACHE = _KVCache(SETTINGS_TTL), _KVCache(MODELS_TTL)
@@ -429,6 +448,18 @@ def _api_get(url: str, params: dict, timeout: int = 15):
             API_CB["opened_until"] = time.time() + API_CB_COOLDOWN_SEC
             log.warning("[CB] API-Football opened due to exceptions")
         return None
+
+# ───────── Async fetches ─────────
+async def async_api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
+    if not API_KEY:
+        return None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            r = await client.get(url, params=params, headers=HEADERS)
+            return r.json() if r.status_code == 200 else None
+        except Exception as e:
+            log.error("[ASYNC] GET %s failed: %s", url, e)
+            return None
 
 # ───────── League filter ─────────
 _BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
@@ -606,8 +637,8 @@ def extract_prematch_features(f: dict) -> Dict[str, float]:
         dts_a = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_a]
         if dts_h: feat["rest_days_h"] = (datetime.now(tz=TZ_UTC) - max(dts_h).astimezone(TZ_UTC)).days
         if dts_a: feat["rest_days_a"] = (datetime.now(tz=TZ_UTC) - max(dts_a).astimezone(TZ_UTC)).days
-    except Exception:
-        pass
+    except Exception as e:
+        log.exception("Context info — failed because: %s", e)
 
     return feat
 
@@ -699,6 +730,40 @@ def fetch_odds(fid: int) -> Dict[str, Dict[str, Any]]:
     if not agg: NEG_CACHE[k] = (now, True)
     return agg
 
+def save_tips(match: dict, tips: List[dict]) -> None:
+    if not tips:
+        return
+    fid = (match.get("fixture") or {}).get("id")
+    lid = (match.get("league") or {}).get("id")
+    league = (match.get("league") or {}).get("name")
+    home = (match.get("teams") or {}).get("home", {}).get("name")
+    away = (match.get("teams") or {}).get("away", {}).get("name")
+    gh, ga = (match.get("goals") or {}).get("home"), (match.get("goals") or {}).get("away")
+    minute = int(((match.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
+    created = int(time.time())
+
+    rows = []
+    for t in tips:
+        rows.append((
+            fid, lid, league, home, away,
+            t["market"], t["suggestion"],
+            t["confidence"], t["confidence_raw"],
+            f"{gh}-{ga}", minute, created,
+            t.get("odds"), t.get("book"), t.get("ev_pct"), 1
+        ))
+
+    with db_conn() as c:
+        try:
+            c.executemany(
+                "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT DO NOTHING",
+                rows
+            )
+            _metric_inc("tips_generated_total", n=len(rows))
+        except Exception as e:
+            log.exception("save_tips batch failed: %s", e)
+
 # ───────── Model scoring helpers (preserved) ─────────
 MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
 EPS=1e-12
@@ -771,8 +836,8 @@ def _parse_market_cutoffs(s: str) -> dict[str, int]:
         k, v = tok.split("=", 1)
         try:
             out[k.strip().upper()] = int(float(v.strip()))
-        except Exception:
-            pass
+        except Exception as e:
+            log.exception("Context info — failed because: %s", e)
     return out
 
 _MARKET_CUTOFFS = _parse_market_cutoffs(MARKET_CUTOFFS_RAW)
@@ -813,29 +878,28 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
     return m <= int(cutoff)
 
-def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
-    if not vals:
-        return None, None
-    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
+def _aggregate_price(odds_list: List[Tuple[float,str]], prob_hint: Optional[float]=None) -> Tuple[Optional[float],Optional[str]]:
+    xs = [o for o,_ in odds_list if o and o>0]
     if not xs:
         return None, None
-    import statistics
-    med = statistics.median(xs)
-    cleaned = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
-    if not cleaned:
-        cleaned = vals
-    xs2 = sorted([o for (o, _) in cleaned])
-    med2 = statistics.median(xs2)
-    if prob_hint is not None and prob_hint > 0:
-        fair = 1.0 / max(1e-6, float(prob_hint))
-        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-        cleaned = [(o, b) for (o, b) in cleaned if o <= cap] or cleaned
-    if ODDS_AGGREGATION == "best":
-        best = max(cleaned, key=lambda t: t[0])
-        return float(best[0]), str(best[1])
-    target = med2
-    pick = min(cleaned, key=lambda t: abs(t[0] - target))
-    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
+
+    # Tukey/IQR filtering
+    arr = np.array(sorted(xs), dtype=float)
+    q1, q3 = np.percentile(arr, 25), np.percentile(arr, 75)
+    iqr = max(1e-9, q3 - q1)
+    lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    xs2 = [o for o in xs if lo <= o <= hi] or xs
+
+    # Cap odds relative to fair
+    if prob_hint and prob_hint > 0:
+        fair = 1.0 / max(prob_hint, 1e-6)
+        cap = fair * ODDS_FAIR_MAX_MULT
+        xs2 = [o for o in xs2 if o <= cap] or xs2
+
+    med = float(np.median(xs2))
+    tgt = med if ODDS_AGGREGATION == "median" else max(xs2)
+    pick = min(odds_list, key=lambda t: abs((t[0] or 0) - tgt) if t[0] else 999)
+    return pick
 
 # Full aggregated odds map (overrides any earlier simplified version if present)
 def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
@@ -891,8 +955,8 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
                                     by_market.setdefault(key, {}).setdefault(side, []).append((float(v.get("odd") or 0), book_name))
                                 except:
                                     pass
-    except Exception:
-        pass
+    except Exception as e:
+        log.exception("Context info — failed because: %s", e)
 
     out: dict[str, dict[str, dict]] = {}
     for mkey, side_map in by_market.items():
@@ -1183,8 +1247,8 @@ def production_scan() -> Tuple[int, int]:
                 if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
                     try:
                         save_snapshot_from_match(m, feat)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.exception("Context info — failed because: %s", e)
 
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
@@ -1648,8 +1712,8 @@ def prematch_scan_save() -> int:
 
         try:
             save_prematch_snapshot(fx, feat)
-        except Exception:
-            pass
+        except Exception as e:
+            log.exception("Context info — failed because: %s", e)
 
         candidates: List[Tuple[str, str, float]] = []
 
