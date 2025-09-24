@@ -6,6 +6,7 @@ import os, json, time, logging, requests, psycopg2, asyncio, httpx
 import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
+from collections import deque
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple, Callable
@@ -89,6 +90,22 @@ def _metric_obs_duration(job: str, t0: float) -> None:
             METRICS["job_duration_seconds"][job] = arr[-50:]
     except Exception as e:
         log.exception("Context info — failed because: %s", e)
+
+def _rolling_stat(m, stat_type, minutes=5, home=True):
+    events = m.get("events", [])
+    minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
+    team_name = m["teams"]["home"]["name"] if home else m["teams"]["away"]["name"]
+    count = 0
+    for ev in events:
+        ev_min = ev.get("time", {}).get("elapsed")
+        if ev_min is not None and (minute - ev_min) < minutes and (minute - ev_min) >= 0:
+            if stat_type == "goal":
+                if ev.get("type", "").lower() == "goal" and (ev.get("team", {}) or {}).get("name") == team_name:
+                    count += 1
+            elif stat_type == "card":
+                if ev.get("type", "").lower() == "card" and (ev.get("team", {}) or {}).get("name") == team_name:
+                    count += 1
+    return count
 
 # ───────── Profiling decorator ─────────
 def profile_op(name: str) -> Callable:
@@ -601,7 +618,6 @@ def extract_features(m: dict) -> Dict[str,float]:
     sh = stats.get(home, {}) or {}
     sa = stats.get(away, {}) or {}
 
-    # Robust fallbacks for provider label drift
     xg_h = _num(sh.get("Expected Goals", 0))
     xg_a = _num(sa.get("Expected Goals", 0))
     sot_h = _num(sh.get("Shots on Target", sh.get("Shots on Goal", 0)))
@@ -625,6 +641,20 @@ def extract_features(m: dict) -> Dict[str,float]:
                 if t == home: red_h += 1
                 elif t == away: red_a += 1
 
+    # --- New: Rolling/momentum features ---
+    # Goals/cards in last 5 and 10 minutes, for home and away
+    goals_h_5 = _rolling_stat(m, "goal", 5, home=True)
+    goals_a_5 = _rolling_stat(m, "goal", 5, home=False)
+    goals_h_10 = _rolling_stat(m, "goal", 10, home=True)
+    goals_a_10 = _rolling_stat(m, "goal", 10, home=False)
+    cards_h_5 = _rolling_stat(m, "card", 5, home=True)
+    cards_a_5 = _rolling_stat(m, "card", 5, home=False)
+
+    xg_momentum_h = 0.0
+    xg_momentum_a = 0.0
+    shots_momentum_h = 0.0
+    shots_momentum_a = 0.0
+
     return {
         "minute": float(minute),
         "goals_h": float(gh), "goals_a": float(ga),
@@ -647,7 +677,15 @@ def extract_features(m: dict) -> Dict[str,float]:
         "red_h": float(red_h), "red_a": float(red_a),
         "red_sum": float(red_h + red_a),
 
-        "yellow_h": float(yellow_h), "yellow_a": float(yellow_a)
+        "yellow_h": float(yellow_h), "yellow_a": float(yellow_a),
+
+        # --- New rolling and momentum features ---
+        "goals_h_last5": float(goals_h_5), "goals_a_last5": float(goals_a_5),
+        "goals_h_last10": float(goals_h_10), "goals_a_last10": float(goals_a_10),
+        "cards_h_last5": float(cards_h_5), "cards_a_last5": float(cards_a_5),
+        "xg_momentum_h": float(xg_momentum_h), "xg_momentum_a": float(xg_momentum_a),
+        "shots_momentum_h": float(shots_momentum_h), "shots_momentum_a": float(shots_momentum_a),
+        # Add more as you get richer event data
     }
 
 # ───────── Prematch feature extraction ─────────
@@ -665,8 +703,10 @@ def extract_prematch_features(f: dict) -> Dict[str, float]:
 
     if recent_h:
         feat["avg_goals_h"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_h])
+        feat["form_h"] = sum(1 for m in recent_h if ((m.get("goals") or {}).get("home", 0) > (m.get("goals") or {}).get("away", 0)))
     if recent_a:
         feat["avg_goals_a"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_a])
+        feat["form_a"] = sum(1 for m in recent_a if ((m.get("goals") or {}).get("away", 0) > (m.get("goals") or {}).get("home", 0)))
     if h2h:
         feat["avg_goals_h2h"] = np.mean([(m.get("goals") or {}).get("home", 0) + (m.get("goals") or {}).get("away", 0) for m in h2h])
 
@@ -677,6 +717,23 @@ def extract_prematch_features(f: dict) -> Dict[str, float]:
         if dts_a: feat["rest_days_a"] = (datetime.now(tz=TZ_UTC) - max(dts_a).astimezone(TZ_UTC)).days
     except Exception as e:
         log.exception("Context info — failed because: %s", e)
+
+    # --- New: League position, ELO, advanced form features if available ---
+    lg = ((f.get("league") or {}) or {})
+    try:
+        # If API provides table/standings info, can add here. Placeholder for now.
+        # feat["league_pos_h"], feat["league_pos_a"] = ...
+        pass
+    except Exception:
+        pass
+
+    # Rolling avg goals for/against last 3/5 matches
+    if recent_h:
+        feat["ga_for_h_last3"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_h[:3]])
+        feat["ga_against_h_last3"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_h[:3]])
+    if recent_a:
+        feat["ga_for_a_last3"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_a[:3]])
+        feat["ga_against_a_last3"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_a[:3]])
 
     return feat
 
