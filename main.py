@@ -1611,7 +1611,7 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     if updated: log.info("[RESULTS] backfilled %d", updated)
     return updated
 
-def daily_accuracy_digest(window_days: int = 7) -> Optional[str]:
+def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
     if not DAILY_ACCURACY_DIGEST_ENABLE: return None
     backfill_results_for_open_matches(400)
 
@@ -2151,7 +2151,7 @@ def _start_scheduler_once():
                       "interval", minutes=BACKFILL_EVERY_MIN, id="backfill", max_instances=1, coalesce=True)
 
         if DAILY_ACCURACY_DIGEST_ENABLE:
-            sched.add_job(lambda: _run_with_pg_lock(1003, daily_accuracy_digest),
+            sched.add_job(lambda: _run_with_pg_lock(1003, lambda: daily_accuracy_digest(1)),
                           CronTrigger(hour=int(os.getenv("DAILY_ACCURACY_HOUR", "3")),
                                       minute=int(os.getenv("DAILY_ACCURACY_MINUTE", "6")),
                                       timezone=BERLIN_TZ),
@@ -2236,7 +2236,7 @@ def http_train():
 def http_train_notify(): _require_admin(); auto_train_job(); return jsonify({"ok": True})
 
 @app.route("/admin/digest", methods=["POST","GET"])
-def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
+def http_digest(): _require_admin(); msg=daily_accuracy_digest(1); return jsonify({"ok": True, "sent": bool(msg)})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
 def http_auto_tune(): _require_admin(); tuned=auto_tune_thresholds(14); return jsonify({"ok": True, "tuned": tuned})
