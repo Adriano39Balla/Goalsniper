@@ -9,3 +9,5 @@ python-dotenv==1.0.1
 APScheduler==3.10.4
 redis==5.0.8
 sentry-sdk==2.13.0
+xgboost==2.0.3
+joblib==1.4.2
