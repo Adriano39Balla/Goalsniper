@@ -402,8 +402,6 @@ def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: s
 
 # ─────────────────────── Thresholding & splits ─────────────────────── #
 
-def _percent(x: float) -> float: return float(x)*100.0  # re-exposed for main.py
-
 def _pick_threshold_for_target_precision(
     y_true: np.ndarray, p_cal: np.ndarray, target_precision: float,
     min_preds: int = 25, default_threshold: float = 0.65
