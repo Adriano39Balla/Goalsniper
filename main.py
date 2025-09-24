@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple, Callable
 from flask import Flask, jsonify, request, abort
 from urllib3.util.retry import Retry
+from joblib import load
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -769,6 +770,12 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     if mdl is not None: _MODELS_CACHE.set(name, mdl)
     return mdl
 
+def load_ensemble_model(model_name: str):
+    path = f"models/{model_name}.joblib"
+    if os.path.exists(path):
+        return load(path)
+    return None
+
 # ───────── Logistic predict ─────────
 def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
     w=mdl.get("weights") or {}; s=mdl.get("intercept",0.0)
@@ -778,6 +785,13 @@ def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float
     if isinstance(cal,dict) and cal.get("method")=="sigmoid":
         a=cal.get("a",1.0); b=cal.get("b",0.0)
         prob=1/(1+np.exp(-(a*prob+b)))
+    return float(prob)
+
+def predict_ensemble(model, features: dict) -> float:
+    # Features must be in the same order as training
+    import numpy as np
+    X = np.array([[features.get(k, 0.0) for k in model.feature_names_in_]])
+    prob = model.predict_proba(X)[0, 1]  # probability for class 1
     return float(prob)
 
 # ───────── Odds fetch + aggregation (with negative cache) ─────────
