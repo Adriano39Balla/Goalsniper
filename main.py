@@ -1458,8 +1458,7 @@ def production_scan() -> Tuple[int, int]:
                             sent_ct += 1
                     saved += len(batched_rows)
                     per_league_counter[league_id] = per_league_counter.get(league_id, 0) + len(batched_rows)
-
-                            sent = send_telegram(_format_tip_message(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct))
+                    sent = send_telegram(_format_tip_message(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct))
                             if sent:
                                 c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
                                 _metric_inc("tips_sent_total", n=1)
