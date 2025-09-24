@@ -19,8 +19,9 @@ from apscheduler.triggers.cron import CronTrigger
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except Exception as e:
-    log.exception("Context info — failed because: %s", e)
+except Exception:
+    # logging not configured yet
+    print("[bootstrap] dotenv load failed", flush=True)
 
 # ───────── Optional production add-ons ─────────
 SENTRY_DSN = os.getenv("SENTRY_DSN")
@@ -31,8 +32,9 @@ if SENTRY_DSN:
             dsn=SENTRY_DSN,
             traces_sample_rate=float(os.getenv("SENTRY_TRACES", "0.0")),
         )
-    except Exception as e:
-        log.exception("Context info — failed because: %s", e)
+    except Exception:
+        # Sentry is optional; ignore init errors pre-logger
+        pass
 
 REDIS_URL = os.getenv("REDIS_URL")
 _redis = None
@@ -289,35 +291,71 @@ def _db_ping() -> bool:
 
 # ───────── Settings cache (Redis-backed when available) ─────────
 class _KVCache:
-    def __init__(self, ttl): self.ttl=ttl; self.data={}
-    def get_setting(key: str) -> Optional[str]:
+    def __init__(self, ttl: int):
+        self.ttl = ttl
+        self.data: Dict[str, Tuple[float, Optional[str]]] = {}
+
+    def get(self, k: str) -> Optional[str]:
+        # Prefer Redis if available (single-get fast path)
         if _redis:
             try:
-                val = _redis.mget([f"gs:settings:{key}"])[0]
-                if val:
-                    return val.decode("utf-8")
-            except Exception as e:
-                log.error("Redis bulk-get failed: %s", e)
-        # fallback to DB
-        ...
-    def set(self,k,v):
+                v = _redis.get(f"gs:{k}")
+                if v is not None:
+                    return v.decode("utf-8")
+            except Exception:
+                pass
+        # Fallback in-memory with TTL
+        rec = self.data.get(k)
+        if not rec:
+            return None
+        ts, val = rec
+        if time.time() - ts > self.ttl:
+            self.data.pop(k, None)
+            return None
+        return val
+
+    def set(self, k: str, v: Optional[str]) -> None:
         if _redis:
             try:
                 _redis.setex(f"gs:{k}", self.ttl, v if v is not None else "")
                 return
-            except Exception as e:
-                log.exception("Context info — failed because: %s", e)
-        self.data[k]=(time.time(),v)
-    def invalidate(self,k=None):
+            except Exception:
+                pass
+        self.data[k] = (time.time(), v)
+
+    def invalidate(self, k: Optional[str] = None) -> None:
         if _redis and k:
             try:
                 _redis.delete(f"gs:{k}")
                 return
-            except Exception as e:
-                log.exception("Context info — failed because: %s", e)
-        self.data.clear() if k is None else self.data.pop(k,None)
+            except Exception:
+                pass
+        if k is None:
+            self.data.clear()
+        else:
+            self.data.pop(k, None)
 
 _SETTINGS_CACHE, _MODELS_CACHE = _KVCache(SETTINGS_TTL), _KVCache(MODELS_TTL)
+
+def redis_bulk_get(keys: List[str]) -> Dict[str, Optional[str]]:
+    """
+    Bulk get for Redis-backed caches: returns {key: value_or_None}.
+    Namespacing 'gs:' is applied automatically for K/V caches in this service.
+    Falls back to individual .get if Redis is not available.
+    """
+    out: Dict[str, Optional[str]] = {}
+    if _redis and keys:
+        try:
+            ns_keys = [f"gs:{k}" for k in keys]
+            vals = _redis.mget(ns_keys)
+            for k, v in zip(keys, vals or []):
+                out[k] = v.decode("utf-8") if v is not None else None
+            return out
+        except Exception as e:
+            log.warning("redis_bulk_get failed; falling back to single gets: %s", e)
+    for k in keys:
+        out[k] = _SETTINGS_CACHE.get(k)
+    return out
 
 # ───────── Settings helpers ─────────
 def get_setting(key: str) -> Optional[str]:
@@ -1381,33 +1419,45 @@ def production_scan() -> Tuple[int, int]:
                 for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank) in enumerate(ranked):
                     if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
                         continue
-
                     created_ts = base_now + idx
                     raw = float(prob)
                     prob_pct = round(raw * 100.0, 1)
 
-                    try:
-                        with db_conn() as c2:
-                            c2.execute(
-                                "INSERT INTO tips("
-                                "match_id,league_id,league,home,away,market,suggestion,"
-                                "confidence,confidence_raw,score_at_tip,minute,created_ts,"
-                                "odds,book,ev_pct,sent_ok"
-                                ") VALUES ("
-                                "%s,%s,%s,%s,%s,%s,%s,"
-                                "%s,%s,%s,%s,%s,"
-                                "%s,%s,%s,%s"
-                                ")",
-                                (
-                                    fid, league_id, league, home, away,
-                                    market_txt, suggestion,
-                                    float(prob_pct), raw, score, minute, created_ts,
-                                    (float(odds) if odds is not None else None),
-                                    (book or None),
-                                    (float(ev_pct) if ev_pct is not None else None),
-                                    0,
-                                ),
-                             )
+                    msg = _format_tip_message(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct)
+
+                    batched_rows.append((
+                        fid, league_id, league, home, away,
+                        market_txt, suggestion,
+                        float(prob_pct), raw, score, minute, created_ts,
+                        (float(odds) if odds is not None else None),
+                        (book or None),
+                        (float(ev_pct) if ev_pct is not None else None),
+                        0,  # sent_ok = 0 initially
+                    ))
+                    to_notify.append((created_ts, msg))
+                    per_match += 1
+                    if MAX_TIPS_PER_SCAN and (saved + len(batched_rows)) >= MAX_TIPS_PER_SCAN:
+                        break
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        break
+
+                # batch insert then notify + update sent_ok
+                if batched_rows:
+                    with db_conn() as c2:
+                        c2.cur.executemany(
+                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                            batched_rows
+                        )
+                    sent_ct = 0
+                    for created_ts, msg in to_notify:
+                        if send_telegram(msg):
+                            with db_conn() as c3:
+                                c3.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
+                            _metric_inc("tips_sent_total", n=1)
+                            sent_ct += 1
+                    saved += len(batched_rows)
+                    per_league_counter[league_id] = per_league_counter.get(league_id, 0) + len(batched_rows)
 
                             sent = send_telegram(_format_tip_message(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct))
                             if sent:
