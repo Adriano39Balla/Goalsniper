@@ -1258,191 +1258,194 @@ def production_scan() -> Tuple[int, int]:
     now_ts = int(time.time())
     per_league_counter: dict[int, int] = {}
 
-    with db_conn() as c:
-        for m in matches:
-            try:
-                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-                if not fid:
-                    continue
+    for m in matches:
+        try:
+            fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+            if not fid:
+                continue
 
-                if DUP_COOLDOWN_MIN > 0:
-                    cutoff = now_ts - DUP_COOLDOWN_MIN * 60
+            if DUP_COOLDOWN_MIN > 0:
+                cutoff = now_ts - DUP_COOLDOWN_MIN * 60
+                with db_conn() as c:
                     if c.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
                         (fid, cutoff),
                     ).fetchone():
                         continue
 
-                feat = extract_features(m)
-                minute = int(feat.get("minute", 0))
-                if not stats_coverage_ok(feat, minute):
+            feat = extract_features(m)
+            minute = int(feat.get("minute", 0))
+            if not stats_coverage_ok(feat, minute):
+                continue
+            if minute < TIP_MIN_MINUTE:
+                continue
+            if is_feed_stale(fid, m, minute):
+                continue
+
+            if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
+                try:
+                    save_snapshot_from_match(m, feat)
+                except Exception as e:
+                    log.exception("Context info — failed because: %s", e)
+
+            league_id, league = _league_name(m)
+            home, away = _teams(m)
+            score = _pretty_score(m)
+
+            candidates: List[Tuple[str, str, float]] = []
+
+            # OU
+            for line in OU_LINES:
+                mdl = _load_ou_model_for_line(line)
+                if not mdl:
                     continue
-                if minute < TIP_MIN_MINUTE:
+                mk = f"Over/Under {_fmt_line(line)}"
+                thr = _get_market_threshold(mk)
+
+                p_over = _score_prob(feat, mdl)
+                sug_over = f"Over {_fmt_line(line)} Goals"
+                if (
+                    p_over * 100.0 >= thr
+                    and _candidate_is_sane(sug_over, feat)
+                    and market_cutoff_ok(minute, mk, sug_over)
+                ):
+                    candidates.append((mk, sug_over, p_over))
+
+                p_under = 1.0 - p_over
+                sug_under = f"Under {_fmt_line(line)} Goals"
+                if (
+                    p_under * 100.0 >= thr
+                    and _candidate_is_sane(sug_under, feat)
+                    and market_cutoff_ok(minute, mk, sug_under)
+                ):
+                    candidates.append((mk, sug_under, p_under))
+
+            # BTTS
+            mdl_btts = load_model_from_settings("BTTS_YES")
+            if mdl_btts:
+                mk = "BTTS"
+                thr = _get_market_threshold(mk)
+
+                p_yes = _score_prob(feat, mdl_btts)
+                if (
+                    p_yes * 100.0 >= thr
+                    and _candidate_is_sane("BTTS: Yes", feat)
+                    and market_cutoff_ok(minute, mk, "BTTS: Yes")
+                ):
+                    candidates.append((mk, "BTTS: Yes", p_yes))
+
+                p_no = 1.0 - p_yes
+                if (
+                    p_no * 100.0 >= thr
+                    and _candidate_is_sane("BTTS: No", feat)
+                    and market_cutoff_ok(minute, mk, "BTTS: No")
+                ):
+                    candidates.append((mk, "BTTS: No", p_no))
+
+            # 1X2 (draw suppressed)
+            mh, md, ma = _load_wld_models()
+            if mh and md and ma:
+                mk = "1X2"
+                thr = _get_market_threshold(mk)
+                ph = _score_prob(feat, mh)
+                pd = _score_prob(feat, md)
+                pa = _score_prob(feat, ma)
+                s = max(EPS, ph + pd + pa)
+                ph, pa = ph / s, pa / s
+
+                if ph * 100.0 >= thr and market_cutoff_ok(minute, mk, "Home Win"):
+                    candidates.append((mk, "Home Win", ph))
+                if pa * 100.0 >= thr and market_cutoff_ok(minute, mk, "Away Win"):
+                    candidates.append((mk, "Away Win", pa))
+
+            if not candidates:
+                continue
+
+            odds_map = fetch_odds(fid) if API_KEY else {}
+            ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
+
+            for mk, sug, prob in candidates:
+                if sug not in ALLOWED_SUGGESTIONS:
                     continue
-                if is_feed_stale(fid, m, minute):
+
+                # odds lookup (use aggregated map)
+                odds = None
+                book = None
+                if mk == "BTTS":
+                    d = odds_map.get("BTTS", {})
+                    tgt = "Yes" if sug.endswith("Yes") else "No"
+                    if tgt in d:
+                        odds, book = d[tgt]["odds"], d[tgt]["book"]
+                elif mk == "1X2":
+                    d = odds_map.get("1X2", {})
+                    tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
+                    if tgt and tgt in d:
+                        odds, book = d[tgt]["odds"], d[tgt]["book"]
+                elif mk.startswith("Over/Under"):
+                    ln = _parse_ou_line_from_suggestion(sug)
+                    d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
+                    tgt = "Over" if sug.startswith("Over") else "Under"
+                    if tgt in d:
+                        odds, book = d[tgt]["odds"], d[tgt]["book"]
+
+                # gate on presence (and floor/ceiling) + compute EV
+                pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
+                if not pass_odds:
                     continue
+                if odds is None:
+                    odds = odds2
+                    book = book2
 
-                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
-                    try:
-                        save_snapshot_from_match(m, feat)
-                    except Exception as e:
-                        log.exception("Context info — failed because: %s", e)
-
-                league_id, league = _league_name(m)
-                home, away = _teams(m)
-                score = _pretty_score(m)
-
-                candidates: List[Tuple[str, str, float]] = []
-
-                # OU
-                for line in OU_LINES:
-                    mdl = _load_ou_model_for_line(line)
-                    if not mdl:
+                ev_pct = None
+                if odds is not None:
+                    edge = _ev(prob, float(odds))
+                    ev_pct = round(edge * 100.0, 1)
+                    if int(round(edge * 10000)) < EDGE_MIN_BPS:
                         continue
-                    mk = f"Over/Under {_fmt_line(line)}"
-                    thr = _get_market_threshold(mk)
+                else:
+                    continue  # odds mandatory by default
 
-                    p_over = _score_prob(feat, mdl)
-                    sug_over = f"Over {_fmt_line(line)} Goals"
-                    if (
-                        p_over * 100.0 >= thr
-                        and _candidate_is_sane(sug_over, feat)
-                        and market_cutoff_ok(minute, mk, sug_over)
-                    ):
-                        candidates.append((mk, sug_over, p_over))
+                rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0)
+                ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score))
 
-                    p_under = 1.0 - p_over
-                    sug_under = f"Under {_fmt_line(line)} Goals"
-                    if (
-                        p_under * 100.0 >= thr
-                        and _candidate_is_sane(sug_under, feat)
-                        and market_cutoff_ok(minute, mk, sug_under)
-                    ):
-                        candidates.append((mk, sug_under, p_under))
+            if not ranked:
+                continue
 
-                # BTTS
-                mdl_btts = load_model_from_settings("BTTS_YES")
-                if mdl_btts:
-                    mk = "BTTS"
-                    thr = _get_market_threshold(mk)
+            ranked.sort(key=lambda x: x[6], reverse=True)
 
-                    p_yes = _score_prob(feat, mdl_btts)
-                    if (
-                        p_yes * 100.0 >= thr
-                        and _candidate_is_sane("BTTS: Yes", feat)
-                        and market_cutoff_ok(minute, mk, "BTTS: Yes")
-                    ):
-                        candidates.append((mk, "BTTS: Yes", p_yes))
+            batched_rows = []
+            to_notify = []
+            per_match = 0
+            base_now = int(time.time())
 
-                    p_no = 1.0 - p_yes
-                    if (
-                        p_no * 100.0 >= thr
-                        and _candidate_is_sane("BTTS: No", feat)
-                        and market_cutoff_ok(minute, mk, "BTTS: No")
-                    ):
-                        candidates.append((mk, "BTTS: No", p_no))
-
-                # 1X2 (draw suppressed)
-                mh, md, ma = _load_wld_models()
-                if mh and md and ma:
-                    mk = "1X2"
-                    thr = _get_market_threshold(mk)
-                    ph = _score_prob(feat, mh)
-                    pd = _score_prob(feat, md)
-                    pa = _score_prob(feat, ma)
-                    s = max(EPS, ph + pd + pa)
-                    ph, pa = ph / s, pa / s
-
-                    if ph * 100.0 >= thr and market_cutoff_ok(minute, mk, "Home Win"):
-                        candidates.append((mk, "Home Win", ph))
-                    if pa * 100.0 >= thr and market_cutoff_ok(minute, mk, "Away Win"):
-                        candidates.append((mk, "Away Win", pa))
-
-                if not candidates:
+            for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank) in enumerate(ranked):
+                if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
                     continue
+                created_ts = base_now + idx
+                raw = float(prob)
+                prob_pct = round(raw * 100.0, 1)
 
-                odds_map = fetch_odds(fid) if API_KEY else {}
-                ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
+                msg = _format_tip_message(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct)
 
-                for mk, sug, prob in candidates:
-                    if sug not in ALLOWED_SUGGESTIONS:
-                        continue
+                batched_rows.append((
+                    fid, league_id, league, home, away,
+                    market_txt, suggestion,
+                    float(prob_pct), raw, score, minute, created_ts,
+                    (float(odds) if odds is not None else None),
+                    (book or None),
+                    (float(ev_pct) if ev_pct is not None else None),
+                    0,  # sent_ok = 0 initially
+                ))
+                to_notify.append((created_ts, msg))
+                per_match += 1
+                if MAX_TIPS_PER_SCAN and (saved + len(batched_rows)) >= MAX_TIPS_PER_SCAN:
+                    break
+                if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                    break
 
-                    # odds lookup (use aggregated map)
-                    odds = None
-                    book = None
-                    if mk == "BTTS":
-                        d = odds_map.get("BTTS", {})
-                        tgt = "Yes" if sug.endswith("Yes") else "No"
-                        if tgt in d:
-                            odds, book = d[tgt]["odds"], d[tgt]["book"]
-                    elif mk == "1X2":
-                        d = odds_map.get("1X2", {})
-                        tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
-                        if tgt and tgt in d:
-                            odds, book = d[tgt]["odds"], d[tgt]["book"]
-                    elif mk.startswith("Over/Under"):
-                        ln = _parse_ou_line_from_suggestion(sug)
-                        d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
-                        tgt = "Over" if sug.startswith("Over") else "Under"
-                        if tgt in d:
-                            odds, book = d[tgt]["odds"], d[tgt]["book"]
-
-                    # gate on presence (and floor/ceiling) + compute EV
-                    pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
-                    if not pass_odds:
-                        continue
-                    if odds is None:
-                        odds = odds2
-                        book = book2
-
-                    ev_pct = None
-                    if odds is not None:
-                        edge = _ev(prob, float(odds))
-                        ev_pct = round(edge * 100.0, 1)
-                        if int(round(edge * 10000)) < EDGE_MIN_BPS:
-                            continue
-                    else:
-                        continue  # odds mandatory by default
-
-                    rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0)
-                    ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score))
-
-                if not ranked:
-                    continue
-
-                ranked.sort(key=lambda x: x[6], reverse=True)
-
-                per_match = 0
-                base_now = int(time.time())
-
-                for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank) in enumerate(ranked):
-                    if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
-                        continue
-                    created_ts = base_now + idx
-                    raw = float(prob)
-                    prob_pct = round(raw * 100.0, 1)
-
-                    msg = _format_tip_message(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct)
-
-                    batched_rows.append((
-                        fid, league_id, league, home, away,
-                        market_txt, suggestion,
-                        float(prob_pct), raw, score, minute, created_ts,
-                        (float(odds) if odds is not None else None),
-                        (book or None),
-                        (float(ev_pct) if ev_pct is not None else None),
-                        0,  # sent_ok = 0 initially
-                    ))
-                    to_notify.append((created_ts, msg))
-                    per_match += 1
-                    if MAX_TIPS_PER_SCAN and (saved + len(batched_rows)) >= MAX_TIPS_PER_SCAN:
-                        break
-                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                        break
-
-                # batch insert then notify + update sent_ok
-                if batched_rows:
+            # batch insert then notify + update sent_ok
+            if batched_rows:
+                try:
                     with db_conn() as c2:
                         c2.cur.executemany(
                             "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
@@ -1458,29 +1461,16 @@ def production_scan() -> Tuple[int, int]:
                             sent_ct += 1
                     saved += len(batched_rows)
                     per_league_counter[league_id] = per_league_counter.get(league_id, 0) + len(batched_rows)
-                    sent = send_telegram(_format_tip_message(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct))
-                            if sent:
-                                c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
-                                _metric_inc("tips_sent_total", n=1)
-                    except Exception as e:
-                        log.exception("[PROD] insert/send failed: %s", e)
-                        continue
+                except Exception as e:
+                    log.exception("[PROD] insert/send failed: %s", e)
+                    continue
 
-                    saved += 1
-                    per_match += 1
-                    per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
+            if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                break
 
-                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                        break
-                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                        break
-
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
-
-            except Exception as e:
-                log.exception("[PROD] match loop failed: %s", e)
-                continue
+        except Exception as e:
+            log.exception("[PROD] match loop failed: %s", e)
+            continue
 
     log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
     _metric_inc("tips_generated_total", n=saved)
