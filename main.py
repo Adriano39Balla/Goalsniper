@@ -108,6 +108,33 @@ def _rolling_stat(m, stat_type, minutes=5, home=True):
                     count += 1
     return count
 
+def load_meta_tipgate_model():
+    path = "models/model_meta_tipgate.joblib"
+    if os.path.exists(path):
+        return load(path)
+    return None
+
+def extract_meta_features(tip_candidate: dict, feat: dict, context: dict = None) -> dict:
+    """
+    tip_candidate: dict with 'market', 'suggestion', 'confidence', 'odds', etc.
+    feat: match features as from extract_features
+    context: optional dict, e.g., {'recent_accuracy': 0.78}
+    """
+    features = {
+        "market": str(tip_candidate.get("market", "")),
+        "suggestion": str(tip_candidate.get("suggestion", "")),
+        "confidence": float(tip_candidate.get("confidence", 0.0)),
+        "odds": float(tip_candidate.get("odds", 0.0)),
+        "minute": float(feat.get("minute", 0.0)),
+        "league_id": int(tip_candidate.get("league_id", 0)),
+        "ev": float(tip_candidate.get("ev_pct", 0.0)),
+        "model_type": str(tip_candidate.get("model_type", "")),
+        # ... add as desired
+    }
+    if context and "recent_accuracy" in context:
+        features["recent_accuracy"] = float(context["recent_accuracy"])
+    return features
+
 # ───────── Profiling decorator ─────────
 def profile_op(name: str) -> Callable:
     def decorator(fn: Callable) -> Callable:
@@ -1394,25 +1421,17 @@ def production_scan() -> Tuple[int, int]:
 
             # BTTS
             mdl_btts = load_model_from_settings("BTTS_YES")
-            if mdl_btts:
-                mk = "BTTS"
-                thr = _get_market_threshold(mk)
-
+            mdl_xgb_btts = load_ensemble_model("xgb_BTTS")
+            if mdl_btts and mdl_xgb_btts:
+                prob_lr = _score_prob(feat, mdl_btts)
+                prob_xgb = predict_ensemble(mdl_xgb_btts, feat)
+                p_yes = (prob_lr + prob_xgb) / 2  # or use your preferred weighting
+            elif mdl_btts:
                 p_yes = _score_prob(feat, mdl_btts)
-                if (
-                    p_yes * 100.0 >= thr
-                    and _candidate_is_sane("BTTS: Yes", feat)
-                    and market_cutoff_ok(minute, mk, "BTTS: Yes")
-                ):
-                    candidates.append((mk, "BTTS: Yes", p_yes))
-
-                p_no = 1.0 - p_yes
-                if (
-                    p_no * 100.0 >= thr
-                    and _candidate_is_sane("BTTS: No", feat)
-                    and market_cutoff_ok(minute, mk, "BTTS: No")
-                ):
-                    candidates.append((mk, "BTTS: No", p_no))
+            elif mdl_xgb_btts:
+                p_yes = predict_ensemble(mdl_xgb_btts, feat)
+            else:
+                p_yes = None
 
             # 1X2 (draw suppressed)
             mh, md, ma = _load_wld_models()
@@ -1535,6 +1554,27 @@ def production_scan() -> Tuple[int, int]:
                     per_league_counter[league_id] = per_league_counter.get(league_id, 0) + len(batched_rows)
                 except Exception as e:
                     log.exception("[PROD] insert/send failed: %s", e)
+                    continue
+
+            meta_model = load_meta_tipgate_model()
+            if meta_model:
+                tip_candidate = {
+                    "market": mk,  # e.g. "BTTS"
+                    "suggestion": sug,  # e.g. "YES"
+                    "confidence": prob * 100.0,
+                    "odds": odds,
+                    "minute": minute,
+                    "league_id": league_id,
+                    "ev_pct": ev_pct,
+                    "model_type": "ensemble" if mdl_xgb_btts else "logreg"
+                }
+                meta_features = extract_meta_features(tip_candidate, feat, context={
+                    "recent_accuracy": get_recent_accuracy(league_id, mk)
+                })
+                # Ensure order matches model.feature_names_in_
+                meta_X = [[meta_features.get(k, 0) for k in meta_model.feature_names_in_]]
+                meta_prob = meta_model.predict_proba(meta_X)[0, 1]
+                if meta_prob < 0.75:  # Set threshold as needed
                     continue
 
             if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
