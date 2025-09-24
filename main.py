@@ -291,15 +291,15 @@ def _db_ping() -> bool:
 class _KVCache:
     def __init__(self, ttl): self.ttl=ttl; self.data={}
     def get_setting(key: str) -> Optional[str]:
-    if _redis:
-        try:
-            val = _redis.mget([f"gs:settings:{key}"])[0]
-            if val:
-                return val.decode("utf-8")
-        except Exception as e:
-            log.error("Redis bulk-get failed: %s", e)
-    # fallback to DB
-    ...
+        if _redis:
+            try:
+                val = _redis.mget([f"gs:settings:{key}"])[0]
+                if val:
+                    return val.decode("utf-8")
+            except Exception as e:
+                log.error("Redis bulk-get failed: %s", e)
+        # fallback to DB
+        ...
     def set(self,k,v):
         if _redis:
             try:
