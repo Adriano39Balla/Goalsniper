@@ -195,6 +195,7 @@ STALE_GUARD_ENABLE = os.getenv("STALE_GUARD_ENABLE", "1") not in ("0","false","F
 STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
 MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
 TIP_MAX_MINUTE_ENV = os.getenv("TIP_MAX_MINUTE", "")
+NEG_TTL_SEC = int(os.getenv("NEG_TTL_SEC", "600"))  # 10 minutes instead of 45s
 
 MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
 MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
@@ -1350,7 +1351,7 @@ def production_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
-        log.info("[PROD] no live")
+        log.info("[PROD] No live matches, skipping scan and API calls")
         return 0, 0
 
     saved = 0
