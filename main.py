@@ -1199,6 +1199,61 @@ def _get_market_threshold(m: str) -> float:
     except: return float(CONF_THRESHOLD)
 def _get_market_threshold_pre(m: str) -> float: return _get_market_threshold(f"PRE {m}")
 
+# --- Market-specific knobs & helpers for O/U and BTTS (added) ---
+CONF_THRESHOLD_OU       = float(os.getenv("CONF_THRESHOLD_OU", "70"))   # confidence threshold specifically for Over/Under
+CONF_THRESHOLD_BTTS     = float(os.getenv("CONF_THRESHOLD_BTTS", "75")) # confidence threshold specifically for BTTS
+
+EDGE_MIN_BPS_OU         = int(os.getenv("EDGE_MIN_BPS_OU", "600"))      # 6% EV floor for O/U (bps = basis points * 100)
+EDGE_MIN_BPS_BTTS       = int(os.getenv("EDGE_MIN_BPS_BTTS", "700"))    # 7% EV floor for BTTS
+
+XG_OU_MIN               = float(os.getenv("XG_OU_MIN", "0.25"))         # minimum combined xG for Over suggestions
+SOT_BTTS_MIN            = int(os.getenv("SOT_BTTS_MIN", "2"))          # minimum combined shots-on-target for BTTS
+CORNERS_BTTS_MIN        = int(os.getenv("CORNERS_BTTS_MIN", "3"))      # minimum combined corners for BTTS
+
+def _get_market_threshold_dynamic(market: str) -> float:
+    try:
+        m = (market or "").upper()
+        if "OVER" in m or "UNDER" in m or m.startswith("OVER/UNDER"):
+            return float(CONF_THRESHOLD_OU)
+        if "BTTS" in m:
+            return float(CONF_THRESHOLD_BTTS)
+    except Exception:
+        pass
+    return float(CONF_THRESHOLD)
+
+def _edge_min_bps_for_market(market: str) -> int:
+    try:
+        m = (market or "").upper()
+        if "OVER" in m or "UNDER" in m or m.startswith("OVER/UNDER"):
+            return int(EDGE_MIN_BPS_OU)
+        if "BTTS" in m:
+            return int(EDGE_MIN_BPS_BTTS)
+    except Exception:
+        pass
+    return int(EDGE_MIN_BPS)
+
+def _market_attack_signals_ok(feat: Dict[str, Any], market: str) -> bool:
+    """
+    Extra sanity checks:
+      - For Over: require combined xG >= XG_OU_MIN
+      - For BTTS: require combined SOT or corners meet minimum
+    """
+    try:
+        mk = (market or "").upper()
+        if "OVER" in mk or "UNDER" in mk or mk.startswith("OVER/UNDER"):
+            xg_h = float(feat.get("xg_h", 0.0) or 0.0)
+            xg_a = float(feat.get("xg_a", 0.0) or 0.0)
+            return (xg_h + xg_a) >= float(XG_OU_MIN)
+        if "BTTS" in mk:
+            sot_h = int(feat.get("sot_h", 0) or 0)
+            sot_a = int(feat.get("sot_a", 0) or 0)
+            cor_h = int(feat.get("cor_h", 0) or 0)
+            cor_a = int(feat.get("cor_a", 0) or 0)
+            return (sot_h + sot_a) >= int(SOT_BTTS_MIN) or (cor_h + cor_a) >= int(CORNERS_BTTS_MIN)
+    except Exception:
+        return True
+    return True
+
 def _as_bool(s: str) -> bool:
     return str(s).strip() not in ("0","false","False","no","NO","")
 
@@ -1434,6 +1489,15 @@ def production_scan() -> Tuple[int, int]:
             else:
                 p_yes = None
 
+            if p_yes is not None:
+                mk = "BTTS"
+                thr = _get_market_threshold(mk)
+                if p_yes * 100.0 >= thr and _candidate_is_sane("BTTS: Yes", feat) and market_cutoff_ok(minute, mk, "BTTS: Yes"):
+                    candidates.append((mk, "BTTS: Yes", p_yes))
+                q = 1.0 - p_yes
+                if q * 100.0 >= thr and _candidate_is_sane("BTTS: No", feat) and market_cutoff_ok(minute, mk, "BTTS: No"):
+                    candidates.append((mk, "BTTS: No", q))
+
             # 1X2 (draw suppressed)
             mh, md, ma = _load_wld_models()
             if mh and md and ma:
@@ -1456,6 +1520,7 @@ def production_scan() -> Tuple[int, int]:
             odds_map = fetch_odds(fid) if API_KEY else {}
             ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
 
+            # --- Candidate evaluation with market-specific thresholds and heuristics ---
             for mk, sug, prob in candidates:
                 if sug not in ALLOWED_SUGGESTIONS:
                     continue
@@ -1473,14 +1538,14 @@ def production_scan() -> Tuple[int, int]:
                     tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
                     if tgt and tgt in d:
                         odds, book = d[tgt]["odds"], d[tgt]["book"]
-                elif mk.startswith("Over/Under"):
+                elif mk.startswith("Over/Under") or mk.upper().startswith("OVER") or mk.upper().startswith("UNDER"):
                     ln = _parse_ou_line_from_suggestion(sug)
                     d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
                     tgt = "Over" if sug.startswith("Over") else "Under"
                     if tgt in d:
                         odds, book = d[tgt]["odds"], d[tgt]["book"]
 
-                # gate on presence (and floor/ceiling) + compute EV
+                # gate on presence (and floor/ceiling) + compute EV (but use market-specific thresholds)
                 pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
                 if not pass_odds:
                     continue
@@ -1488,14 +1553,35 @@ def production_scan() -> Tuple[int, int]:
                     odds = odds2
                     book = book2
 
-                ev_pct = None
-                if odds is not None:
-                    edge = _ev(prob, float(odds))
-                    ev_pct = round(edge * 100.0, 1)
-                    if int(round(edge * 10000)) < EDGE_MIN_BPS:
+                if odds is None:
+                    # odds still missing and ALLOW_TIPS_WITHOUT_ODDS disabled
+                    log.debug("[FILTER] fid=%s league=%s market=%s sug=%s -> missing odds after aggregation", fid, league, mk, sug)
+                    continue
+
+                edge = _ev(prob, float(odds))
+                ev_pct = round(edge * 100.0, 1)
+                ev_bps = int(round(edge * 10000))
+
+                thr = _get_market_threshold_dynamic(mk)
+                edge_bps_req = _edge_min_bps_for_market(mk)
+
+                # heuristic checks for O/U and BTTS
+                if ("OVER" in mk.upper()) or ("UNDER" in mk.upper()) or ("BTTS" in mk.upper()):
+                    if not _market_attack_signals_ok(feat, mk):
+                        log.info("[FILTER-H] fid=%s league_id=%s league=%s market=%s sug=%s prob=%.3f odds=%s ev=%+.2f bps=%d -> SKIP heuristic",
+                                 fid, league_id, league, mk, sug, prob, odds, ev_pct, ev_bps)
                         continue
-                else:
-                    continue  # odds mandatory by default
+
+                # confidence threshold (market-specific)
+                if prob * 100.0 < thr:
+                    log.debug("[FILTER] fid=%s market=%s sug=%s prob=%.2f < thr=%.2f -> SKIP low confidence", fid, mk, sug, prob*100.0, thr)
+                    continue
+
+                # EV / edge check (market-specific)
+                if ev_bps < edge_bps_req:
+                    log.info("[FILTER] fid=%s league_id=%s league=%s market=%s sug=%s prob=%.3f odds=%s ev_pct=%+.2f bps=%d -> SKIP edge too small (need %d)",
+                             fid, league_id, league, mk, sug, prob, odds, ev_pct, ev_bps, edge_bps_req)
+                    continue
 
                 rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0)
                 ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score))
