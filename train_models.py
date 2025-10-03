@@ -305,6 +305,76 @@ def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
 
 def _percent(x: float) -> float: return float(x)*100.0
 
+# New helper: recommend market-specific thresholds for OU and BTTS
+def recommend_ou_btts_thresholds(conn, days: int = 30) -> Dict[str, Any]:
+    """
+    Analyze recent tips with results to recommend per-market confidence thresholds
+    and precision for Over/Under and BTTS. Returns a dict like:
+      {"OU": {"best_thr": 70, "precision": 0.62, "n": 120}, "BTTS": {...}}
+    Use as a guide for setting CONF_THRESHOLD_OU and CONF_THRESHOLD_BTTS.
+    """
+    cutoff = int(pd.Timestamp.utcnow().timestamp()) - days * 24 * 3600
+    q = """
+    SELECT t.market, t.suggestion,
+           COALESCE(t.confidence_raw, t.confidence/100.0) AS prob,
+           t.odds,
+           r.final_goals_h, r.final_goals_a, r.btts_yes
+    FROM tips t
+    JOIN match_results r ON r.match_id = t.match_id
+    WHERE t.created_ts >= %s
+      AND t.suggestion <> 'HARVEST'
+      AND t.sent_ok = 1
+    """
+    df = _read_sql(conn, q, (cutoff,))
+    out: Dict[str, Any] = {}
+    if df.empty:
+        return out
+
+    # normalize prob and compute outcome y for each tip
+    df["prob"] = df["prob"].fillna(0.0).astype(float)
+    df["odds"] = df.get("odds").fillna(0.0).astype(float)
+    ys = []
+    for _, row in df.iterrows():
+        y = _tip_outcome_for_result(str(row["suggestion"]), int(row["final_goals_h"] or 0), int(row["final_goals_a"] or 0), int(row["btts_yes"] or 0))
+        ys.append(int(y) if y is not None else None)
+    df["y"] = ys
+    df = df[df["y"].notnull()].copy()
+    if df.empty:
+        return out
+
+    # OU (match Over/Under suggestions) and BTTS grouped sets
+    df["market_norm"] = df["market"].fillna("").astype(str).str.upper()
+    df["sugg_norm"] = df["suggestion"].fillna("").astype(str).str.upper()
+
+    mk_ou = df[df["market_norm"].str.contains("OU") | df["sugg_norm"].str.contains("OVER") | df["sugg_norm"].str.contains("UNDER")]
+    mk_btts = df[df["market_norm"].str.contains("BTTS") | df["sugg_norm"].str.contains("BTTS")]
+
+    def _pick_best_threshold(mk_df: pd.DataFrame, label: str) -> None:
+        if mk_df.empty:
+            return
+        candidates = []
+        for thr in range(55, 96):  # 55..95
+            sel = mk_df[mk_df["prob"] >= (thr / 100.0)]
+            n = len(sel)
+            if n < 20:
+                continue
+            prec = float(sel["y"].sum() / max(1, n))
+            candidates.append((thr, n, prec))
+        if not candidates:
+            # fallback: overall precision
+            total_n = len(mk_df)
+            prec = float(mk_df["y"].sum() / max(1, total_n))
+            out[label] = {"best_thr": None, "precision": prec, "n": int(total_n)}
+            return
+        # choose highest precision, tie-breaker: larger n
+        candidates.sort(key=lambda x: (x[2], x[1]), reverse=True)
+        best_thr, best_n, best_prec = candidates[0]
+        out[label] = {"best_thr": int(best_thr), "precision": float(best_prec), "n": int(best_n)}
+
+    _pick_best_threshold(mk_ou, "OU")
+    _pick_best_threshold(mk_btts, "BTTS")
+    return out
+
 # ─────────────────────── Modeling helpers ─────────────────────── #
 
 def fit_lr_safe(X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray]=None) -> Optional[LogisticRegression]:
