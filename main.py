@@ -2,17 +2,15 @@
 # Upgraded: circuit breaker, Redis-backed caches (optional), Prometheus-style metrics,
 # DB pool health checks, admin/webhook hardening, and auto-tune wiring fixes — without trimming logic.
 
-import os, json, time, logging, requests, psycopg2, asyncio, httpx
+import os, json, time, logging, requests, psycopg2
 import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
-from collections import deque
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple, Callable
+from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
 from urllib3.util.retry import Retry
-from joblib import load
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -22,8 +20,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
-    # logging not configured yet
-    print("[bootstrap] dotenv load failed", flush=True)
+    pass
 
 # ───────── Optional production add-ons ─────────
 SENTRY_DSN = os.getenv("SENTRY_DSN")
@@ -35,7 +32,7 @@ if SENTRY_DSN:
             traces_sample_rate=float(os.getenv("SENTRY_TRACES", "0.0")),
         )
     except Exception:
-        # Sentry is optional; ignore init errors pre-logger
+        # Sentry is optional; keep running if it fails
         pass
 
 REDIS_URL = os.getenv("REDIS_URL")
@@ -53,13 +50,6 @@ if REDIS_URL:
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 log = logging.getLogger("goalsniper")
 app = Flask(__name__)
-
-# ───────── Safe float helper ─────────
-def safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
 
 # ───────── Minimal Prometheus-style metrics ─────────
 from collections import defaultdict
@@ -80,8 +70,8 @@ def _metric_inc(name: str, label: Optional[str] = None, n: int = 1) -> None:
                 METRICS[name][None] += n
         else:
             METRICS[name][label] += n
-    except Exception as e:
-        log.exception("Context info — failed because: %s", e)
+    except Exception:
+        pass
 
 def _metric_obs_duration(job: str, t0: float) -> None:
     try:
@@ -89,66 +79,8 @@ def _metric_obs_duration(job: str, t0: float) -> None:
         arr.append(time.time() - t0)
         if len(arr) > 50:
             METRICS["job_duration_seconds"][job] = arr[-50:]
-    except Exception as e:
-        log.exception("Context info — failed because: %s", e)
-
-def _rolling_stat(m, stat_type, minutes=5, home=True):
-    events = m.get("events", [])
-    minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
-    team_name = m["teams"]["home"]["name"] if home else m["teams"]["away"]["name"]
-    count = 0
-    for ev in events:
-        ev_min = ev.get("time", {}).get("elapsed")
-        if ev_min is not None and (minute - ev_min) < minutes and (minute - ev_min) >= 0:
-            if stat_type == "goal":
-                if ev.get("type", "").lower() == "goal" and (ev.get("team", {}) or {}).get("name") == team_name:
-                    count += 1
-            elif stat_type == "card":
-                if ev.get("type", "").lower() == "card" and (ev.get("team", {}) or {}).get("name") == team_name:
-                    count += 1
-    return count
-
-def load_meta_tipgate_model():
-    path = "models/model_meta_tipgate.joblib"
-    if os.path.exists(path):
-        return load(path)
-    return None
-
-def extract_meta_features(tip_candidate: dict, feat: dict, context: dict = None) -> dict:
-    """
-    tip_candidate: dict with 'market', 'suggestion', 'confidence', 'odds', etc.
-    feat: match features as from extract_features
-    context: optional dict, e.g., {'recent_accuracy': 0.78}
-    """
-    features = {
-        "market": str(tip_candidate.get("market", "")),
-        "suggestion": str(tip_candidate.get("suggestion", "")),
-        "confidence": float(tip_candidate.get("confidence", 0.0)),
-        "odds": float(tip_candidate.get("odds", 0.0)),
-        "minute": float(feat.get("minute", 0.0)),
-        "league_id": int(tip_candidate.get("league_id", 0)),
-        "ev": float(tip_candidate.get("ev_pct", 0.0)),
-        "model_type": str(tip_candidate.get("model_type", "")),
-        # ... add as desired
-    }
-    if context and "recent_accuracy" in context:
-        features["recent_accuracy"] = float(context["recent_accuracy"])
-    return features
-
-# ───────── Profiling decorator ─────────
-def profile_op(name: str) -> Callable:
-    def decorator(fn: Callable) -> Callable:
-        def wrapper(*a, **k):
-            t0 = time.time()
-            try:
-                return fn(*a, **k)
-            finally:
-                duration = time.time() - t0
-                METRICS["job_duration_seconds"][name].append(duration)
-                if len(METRICS["job_duration_seconds"][name]) > 50:
-                    METRICS["job_duration_seconds"][name] = METRICS["job_duration_seconds"][name][-50:]
-        return wrapper
-    return decorator
+    except Exception:
+        pass
 
 # ───────── Required envs (fail fast) — ADDED ─────────
 def _require_env(name: str) -> str:
@@ -195,7 +127,6 @@ STALE_GUARD_ENABLE = os.getenv("STALE_GUARD_ENABLE", "1") not in ("0","false","F
 STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
 MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
 TIP_MAX_MINUTE_ENV = os.getenv("TIP_MAX_MINUTE", "")
-NEG_TTL_SEC = int(os.getenv("NEG_TTL_SEC", "600"))  # 10 minutes instead of 45s
 
 MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
 MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
@@ -337,71 +268,37 @@ def _db_ping() -> bool:
 
 # ───────── Settings cache (Redis-backed when available) ─────────
 class _KVCache:
-    def __init__(self, ttl: int):
-        self.ttl = ttl
-        self.data: Dict[str, Tuple[float, Optional[str]]] = {}
-
-    def get(self, k: str) -> Optional[str]:
-        # Prefer Redis if available (single-get fast path)
+    def __init__(self, ttl): self.ttl=ttl; self.data={}
+    def get(self, k): 
         if _redis:
             try:
                 v = _redis.get(f"gs:{k}")
-                if v is not None:
-                    return v.decode("utf-8")
+                return v.decode("utf-8") if v is not None else None
             except Exception:
                 pass
-        # Fallback in-memory with TTL
-        rec = self.data.get(k)
-        if not rec:
-            return None
-        ts, val = rec
-        if time.time() - ts > self.ttl:
-            self.data.pop(k, None)
-            return None
+        v=self.data.get(k); 
+        if not v: return None
+        ts,val=v
+        if time.time()-ts>self.ttl: self.data.pop(k,None); return None
         return val
-
-    def set(self, k: str, v: Optional[str]) -> None:
+    def set(self,k,v):
         if _redis:
             try:
                 _redis.setex(f"gs:{k}", self.ttl, v if v is not None else "")
                 return
             except Exception:
                 pass
-        self.data[k] = (time.time(), v)
-
-    def invalidate(self, k: Optional[str] = None) -> None:
+        self.data[k]=(time.time(),v)
+    def invalidate(self,k=None):
         if _redis and k:
             try:
                 _redis.delete(f"gs:{k}")
                 return
             except Exception:
                 pass
-        if k is None:
-            self.data.clear()
-        else:
-            self.data.pop(k, None)
+        self.data.clear() if k is None else self.data.pop(k,None)
 
 _SETTINGS_CACHE, _MODELS_CACHE = _KVCache(SETTINGS_TTL), _KVCache(MODELS_TTL)
-
-def redis_bulk_get(keys: List[str]) -> Dict[str, Optional[str]]:
-    """
-    Bulk get for Redis-backed caches: returns {key: value_or_None}.
-    Namespacing 'gs:' is applied automatically for K/V caches in this service.
-    Falls back to individual .get if Redis is not available.
-    """
-    out: Dict[str, Optional[str]] = {}
-    if _redis and keys:
-        try:
-            ns_keys = [f"gs:{k}" for k in keys]
-            vals = _redis.mget(ns_keys)
-            for k, v in zip(keys, vals or []):
-                out[k] = v.decode("utf-8") if v is not None else None
-            return out
-        except Exception as e:
-            log.warning("redis_bulk_get failed; falling back to single gets: %s", e)
-    for k in keys:
-        out[k] = _SETTINGS_CACHE.get(k)
-    return out
 
 # ───────── Settings helpers ─────────
 def get_setting(key: str) -> Optional[str]:
@@ -533,18 +430,6 @@ def _api_get(url: str, params: dict, timeout: int = 15):
             log.warning("[CB] API-Football opened due to exceptions")
         return None
 
-# ───────── Async fetches ─────────
-async def async_api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
-    if not API_KEY:
-        return None
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            r = await client.get(url, params=params, headers=HEADERS)
-            return r.json() if r.status_code == 200 else None
-        except Exception as e:
-            log.error("[ASYNC] GET %s failed: %s", url, e)
-            return None
-
 # ───────── League filter ─────────
 _BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
 def _blocked_league(league_obj: dict) -> bool:
@@ -647,6 +532,7 @@ def extract_features(m: dict) -> Dict[str,float]:
     sh = stats.get(home, {}) or {}
     sa = stats.get(away, {}) or {}
 
+    # Robust fallbacks for provider label drift
     xg_h = _num(sh.get("Expected Goals", 0))
     xg_a = _num(sa.get("Expected Goals", 0))
     sot_h = _num(sh.get("Shots on Target", sh.get("Shots on Goal", 0)))
@@ -670,20 +556,6 @@ def extract_features(m: dict) -> Dict[str,float]:
                 if t == home: red_h += 1
                 elif t == away: red_a += 1
 
-    # --- New: Rolling/momentum features ---
-    # Goals/cards in last 5 and 10 minutes, for home and away
-    goals_h_5 = _rolling_stat(m, "goal", 5, home=True)
-    goals_a_5 = _rolling_stat(m, "goal", 5, home=False)
-    goals_h_10 = _rolling_stat(m, "goal", 10, home=True)
-    goals_a_10 = _rolling_stat(m, "goal", 10, home=False)
-    cards_h_5 = _rolling_stat(m, "card", 5, home=True)
-    cards_a_5 = _rolling_stat(m, "card", 5, home=False)
-
-    xg_momentum_h = 0.0
-    xg_momentum_a = 0.0
-    shots_momentum_h = 0.0
-    shots_momentum_a = 0.0
-
     return {
         "minute": float(minute),
         "goals_h": float(gh), "goals_a": float(ga),
@@ -706,15 +578,7 @@ def extract_features(m: dict) -> Dict[str,float]:
         "red_h": float(red_h), "red_a": float(red_a),
         "red_sum": float(red_h + red_a),
 
-        "yellow_h": float(yellow_h), "yellow_a": float(yellow_a),
-
-        # --- New rolling and momentum features ---
-        "goals_h_last5": float(goals_h_5), "goals_a_last5": float(goals_a_5),
-        "goals_h_last10": float(goals_h_10), "goals_a_last10": float(goals_a_10),
-        "cards_h_last5": float(cards_h_5), "cards_a_last5": float(cards_a_5),
-        "xg_momentum_h": float(xg_momentum_h), "xg_momentum_a": float(xg_momentum_a),
-        "shots_momentum_h": float(shots_momentum_h), "shots_momentum_a": float(shots_momentum_a),
-        # Add more as you get richer event data
+        "yellow_h": float(yellow_h), "yellow_a": float(yellow_a)
     }
 
 # ───────── Prematch feature extraction ─────────
@@ -732,10 +596,8 @@ def extract_prematch_features(f: dict) -> Dict[str, float]:
 
     if recent_h:
         feat["avg_goals_h"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_h])
-        feat["form_h"] = sum(1 for m in recent_h if ((m.get("goals") or {}).get("home", 0) > (m.get("goals") or {}).get("away", 0)))
     if recent_a:
         feat["avg_goals_a"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_a])
-        feat["form_a"] = sum(1 for m in recent_a if ((m.get("goals") or {}).get("away", 0) > (m.get("goals") or {}).get("home", 0)))
     if h2h:
         feat["avg_goals_h2h"] = np.mean([(m.get("goals") or {}).get("home", 0) + (m.get("goals") or {}).get("away", 0) for m in h2h])
 
@@ -744,25 +606,8 @@ def extract_prematch_features(f: dict) -> Dict[str, float]:
         dts_a = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_a]
         if dts_h: feat["rest_days_h"] = (datetime.now(tz=TZ_UTC) - max(dts_h).astimezone(TZ_UTC)).days
         if dts_a: feat["rest_days_a"] = (datetime.now(tz=TZ_UTC) - max(dts_a).astimezone(TZ_UTC)).days
-    except Exception as e:
-        log.exception("Context info — failed because: %s", e)
-
-    # --- New: League position, ELO, advanced form features if available ---
-    lg = ((f.get("league") or {}) or {})
-    try:
-        # If API provides table/standings info, can add here. Placeholder for now.
-        # feat["league_pos_h"], feat["league_pos_a"] = ...
-        pass
     except Exception:
         pass
-
-    # Rolling avg goals for/against last 3/5 matches
-    if recent_h:
-        feat["ga_for_h_last3"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_h[:3]])
-        feat["ga_against_h_last3"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_h[:3]])
-    if recent_a:
-        feat["ga_for_a_last3"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_a[:3]])
-        feat["ga_against_a_last3"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_a[:3]])
 
     return feat
 
@@ -798,12 +643,6 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     if mdl is not None: _MODELS_CACHE.set(name, mdl)
     return mdl
 
-def load_ensemble_model(model_name: str):
-    path = f"models/{model_name}.joblib"
-    if os.path.exists(path):
-        return load(path)
-    return None
-
 # ───────── Logistic predict ─────────
 def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
     w=mdl.get("weights") or {}; s=mdl.get("intercept",0.0)
@@ -813,13 +652,6 @@ def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float
     if isinstance(cal,dict) and cal.get("method")=="sigmoid":
         a=cal.get("a",1.0); b=cal.get("b",0.0)
         prob=1/(1+np.exp(-(a*prob+b)))
-    return float(prob)
-
-def predict_ensemble(model, features: dict) -> float:
-    # Features must be in the same order as training
-    import numpy as np
-    X = np.array([[features.get(k, 0.0) for k in model.feature_names_in_]])
-    prob = model.predict_proba(X)[0, 1]  # probability for class 1
     return float(prob)
 
 # ───────── Odds fetch + aggregation (with negative cache) ─────────
@@ -866,40 +698,6 @@ def fetch_odds(fid: int) -> Dict[str, Dict[str, Any]]:
     ODDS_CACHE[fid] = (now, agg)
     if not agg: NEG_CACHE[k] = (now, True)
     return agg
-
-def save_tips(match: dict, tips: List[dict]) -> None:
-    if not tips:
-        return
-    fid = (match.get("fixture") or {}).get("id")
-    lid = (match.get("league") or {}).get("id")
-    league = (match.get("league") or {}).get("name")
-    home = (match.get("teams") or {}).get("home", {}).get("name")
-    away = (match.get("teams") or {}).get("away", {}).get("name")
-    gh, ga = (match.get("goals") or {}).get("home"), (match.get("goals") or {}).get("away")
-    minute = int(((match.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
-    created = int(time.time())
-
-    rows = []
-    for t in tips:
-        rows.append((
-            fid, lid, league, home, away,
-            t["market"], t["suggestion"],
-            t["confidence"], t["confidence_raw"],
-            f"{gh}-{ga}", minute, created,
-            t.get("odds"), t.get("book"), t.get("ev_pct"), 1
-        ))
-
-    with db_conn() as c:
-        try:
-            c.executemany(
-                "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT DO NOTHING",
-                rows
-            )
-            _metric_inc("tips_generated_total", n=len(rows))
-        except Exception as e:
-            log.exception("save_tips batch failed: %s", e)
 
 # ───────── Model scoring helpers (preserved) ─────────
 MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
@@ -973,8 +771,8 @@ def _parse_market_cutoffs(s: str) -> dict[str, int]:
         k, v = tok.split("=", 1)
         try:
             out[k.strip().upper()] = int(float(v.strip()))
-        except Exception as e:
-            log.exception("Context info — failed because: %s", e)
+        except Exception:
+            pass
     return out
 
 _MARKET_CUTOFFS = _parse_market_cutoffs(MARKET_CUTOFFS_RAW)
@@ -1015,28 +813,29 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
     return m <= int(cutoff)
 
-def _aggregate_price(odds_list: List[Tuple[float,str]], prob_hint: Optional[float]=None) -> Tuple[Optional[float],Optional[str]]:
-    xs = [o for o,_ in odds_list if o and o>0]
+def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+    if not vals:
+        return None, None
+    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
     if not xs:
         return None, None
-
-    # Tukey/IQR filtering
-    arr = np.array(sorted(xs), dtype=float)
-    q1, q3 = np.percentile(arr, 25), np.percentile(arr, 75)
-    iqr = max(1e-9, q3 - q1)
-    lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-    xs2 = [o for o in xs if lo <= o <= hi] or xs
-
-    # Cap odds relative to fair
-    if prob_hint and prob_hint > 0:
-        fair = 1.0 / max(prob_hint, 1e-6)
-        cap = fair * ODDS_FAIR_MAX_MULT
-        xs2 = [o for o in xs2 if o <= cap] or xs2
-
-    med = float(np.median(xs2))
-    tgt = med if ODDS_AGGREGATION == "median" else max(xs2)
-    pick = min(odds_list, key=lambda t: abs((t[0] or 0) - tgt) if t[0] else 999)
-    return pick
+    import statistics
+    med = statistics.median(xs)
+    cleaned = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
+    if not cleaned:
+        cleaned = vals
+    xs2 = sorted([o for (o, _) in cleaned])
+    med2 = statistics.median(xs2)
+    if prob_hint is not None and prob_hint > 0:
+        fair = 1.0 / max(1e-6, float(prob_hint))
+        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
+        cleaned = [(o, b) for (o, b) in cleaned if o <= cap] or cleaned
+    if ODDS_AGGREGATION == "best":
+        best = max(cleaned, key=lambda t: t[0])
+        return float(best[0]), str(best[1])
+    target = med2
+    pick = min(cleaned, key=lambda t: abs(t[0] - target))
+    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
 
 # Full aggregated odds map (overrides any earlier simplified version if present)
 def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
@@ -1083,8 +882,7 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
                                 by_market.setdefault("1X2", {}).setdefault("Away", []).append((float(v.get("odd") or 0), book_name))
                     elif mname == "OU":
                         for v in vals:
-                            val = v.get("value")
-                            lbl = str(val).lower() if val is not None else ""
+                            lbl = (v.get("value") or "").lower()
                             if ("over" in lbl) or ("under" in lbl):
                                 try:
                                     ln = float(lbl.split()[-1])
@@ -1093,8 +891,8 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
                                     by_market.setdefault(key, {}).setdefault(side, []).append((float(v.get("odd") or 0), book_name))
                                 except:
                                     pass
-    except Exception as e:
-        log.exception("Context info — failed because: %s", e)
+    except Exception:
+        pass
 
     out: dict[str, dict[str, dict]] = {}
     for mkey, side_map in by_market.items():
@@ -1198,61 +996,6 @@ def _get_market_threshold(m: str) -> float:
         v=get_setting_cached(_get_market_threshold_key(m)); return float(v) if v is not None else float(CONF_THRESHOLD)
     except: return float(CONF_THRESHOLD)
 def _get_market_threshold_pre(m: str) -> float: return _get_market_threshold(f"PRE {m}")
-
-# --- Market-specific knobs & helpers for O/U and BTTS (added) ---
-CONF_THRESHOLD_OU       = float(os.getenv("CONF_THRESHOLD_OU", "70"))   # confidence threshold specifically for Over/Under
-CONF_THRESHOLD_BTTS     = float(os.getenv("CONF_THRESHOLD_BTTS", "75")) # confidence threshold specifically for BTTS
-
-EDGE_MIN_BPS_OU         = int(os.getenv("EDGE_MIN_BPS_OU", "600"))      # 6% EV floor for O/U (bps = basis points * 100)
-EDGE_MIN_BPS_BTTS       = int(os.getenv("EDGE_MIN_BPS_BTTS", "700"))    # 7% EV floor for BTTS
-
-XG_OU_MIN               = float(os.getenv("XG_OU_MIN", "0.25"))         # minimum combined xG for Over suggestions
-SOT_BTTS_MIN            = int(os.getenv("SOT_BTTS_MIN", "2"))          # minimum combined shots-on-target for BTTS
-CORNERS_BTTS_MIN        = int(os.getenv("CORNERS_BTTS_MIN", "3"))      # minimum combined corners for BTTS
-
-def _get_market_threshold_dynamic(market: str) -> float:
-    try:
-        m = (market or "").upper()
-        if "OVER" in m or "UNDER" in m or m.startswith("OVER/UNDER"):
-            return float(CONF_THRESHOLD_OU)
-        if "BTTS" in m:
-            return float(CONF_THRESHOLD_BTTS)
-    except Exception:
-        pass
-    return float(CONF_THRESHOLD)
-
-def _edge_min_bps_for_market(market: str) -> int:
-    try:
-        m = (market or "").upper()
-        if "OVER" in m or "UNDER" in m or m.startswith("OVER/UNDER"):
-            return int(EDGE_MIN_BPS_OU)
-        if "BTTS" in m:
-            return int(EDGE_MIN_BPS_BTTS)
-    except Exception:
-        pass
-    return int(EDGE_MIN_BPS)
-
-def _market_attack_signals_ok(feat: Dict[str, Any], market: str) -> bool:
-    """
-    Extra sanity checks:
-      - For Over: require combined xG >= XG_OU_MIN
-      - For BTTS: require combined SOT or corners meet minimum
-    """
-    try:
-        mk = (market or "").upper()
-        if "OVER" in mk or "UNDER" in mk or mk.startswith("OVER/UNDER"):
-            xg_h = float(feat.get("xg_h", 0.0) or 0.0)
-            xg_a = float(feat.get("xg_a", 0.0) or 0.0)
-            return (xg_h + xg_a) >= float(XG_OU_MIN)
-        if "BTTS" in mk:
-            sot_h = int(feat.get("sot_h", 0) or 0)
-            sot_a = int(feat.get("sot_a", 0) or 0)
-            cor_h = int(feat.get("cor_h", 0) or 0)
-            cor_a = int(feat.get("cor_a", 0) or 0)
-            return (sot_h + sot_a) >= int(SOT_BTTS_MIN) or (cor_h + cor_a) >= int(CORNERS_BTTS_MIN)
-    except Exception:
-        return True
-    return True
 
 def _as_bool(s: str) -> bool:
     return str(s).strip() not in ("0","false","False","no","NO","")
@@ -1406,270 +1149,225 @@ def production_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
-        log.info("[PROD] No live matches, skipping scan and API calls")
+        log.info("[PROD] no live")
         return 0, 0
 
     saved = 0
     now_ts = int(time.time())
     per_league_counter: dict[int, int] = {}
 
-    for m in matches:
-        try:
-            fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-            if not fid:
-                continue
+    with db_conn() as c:
+        for m in matches:
+            try:
+                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                if not fid:
+                    continue
 
-            if DUP_COOLDOWN_MIN > 0:
-                cutoff = now_ts - DUP_COOLDOWN_MIN * 60
-                with db_conn() as c:
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - DUP_COOLDOWN_MIN * 60
                     if c.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
                         (fid, cutoff),
                     ).fetchone():
                         continue
 
-            feat = extract_features(m)
-            minute = int(feat.get("minute", 0))
-            if not stats_coverage_ok(feat, minute):
-                continue
-            if minute < TIP_MIN_MINUTE:
-                continue
-            if is_feed_stale(fid, m, minute):
-                continue
-
-            if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
-                try:
-                    save_snapshot_from_match(m, feat)
-                except Exception as e:
-                    log.exception("Context info — failed because: %s", e)
-
-            league_id, league = _league_name(m)
-            home, away = _teams(m)
-            score = _pretty_score(m)
-
-            candidates: List[Tuple[str, str, float]] = []
-
-            # OU
-            for line in OU_LINES:
-                mdl = _load_ou_model_for_line(line)
-                if not mdl:
+                feat = extract_features(m)
+                minute = int(feat.get("minute", 0))
+                if not stats_coverage_ok(feat, minute):
                     continue
-                mk = f"Over/Under {_fmt_line(line)}"
-                thr = _get_market_threshold(mk)
-
-                p_over = _score_prob(feat, mdl)
-                sug_over = f"Over {_fmt_line(line)} Goals"
-                if (
-                    p_over * 100.0 >= thr
-                    and _candidate_is_sane(sug_over, feat)
-                    and market_cutoff_ok(minute, mk, sug_over)
-                ):
-                    candidates.append((mk, sug_over, p_over))
-
-                p_under = 1.0 - p_over
-                sug_under = f"Under {_fmt_line(line)} Goals"
-                if (
-                    p_under * 100.0 >= thr
-                    and _candidate_is_sane(sug_under, feat)
-                    and market_cutoff_ok(minute, mk, sug_under)
-                ):
-                    candidates.append((mk, sug_under, p_under))
-
-            # BTTS
-            mdl_btts = load_model_from_settings("BTTS_YES")
-            mdl_xgb_btts = load_ensemble_model("xgb_BTTS")
-            if mdl_btts and mdl_xgb_btts:
-                prob_lr = _score_prob(feat, mdl_btts)
-                prob_xgb = predict_ensemble(mdl_xgb_btts, feat)
-                p_yes = (prob_lr + prob_xgb) / 2  # or use your preferred weighting
-            elif mdl_btts:
-                p_yes = _score_prob(feat, mdl_btts)
-            elif mdl_xgb_btts:
-                p_yes = predict_ensemble(mdl_xgb_btts, feat)
-            else:
-                p_yes = None
-
-            if p_yes is not None:
-                mk = "BTTS"
-                thr = _get_market_threshold(mk)
-                if p_yes * 100.0 >= thr and _candidate_is_sane("BTTS: Yes", feat) and market_cutoff_ok(minute, mk, "BTTS: Yes"):
-                    candidates.append((mk, "BTTS: Yes", p_yes))
-                q = 1.0 - p_yes
-                if q * 100.0 >= thr and _candidate_is_sane("BTTS: No", feat) and market_cutoff_ok(minute, mk, "BTTS: No"):
-                    candidates.append((mk, "BTTS: No", q))
-
-            # 1X2 (draw suppressed)
-            mh, md, ma = _load_wld_models()
-            if mh and md and ma:
-                mk = "1X2"
-                thr = _get_market_threshold(mk)
-                ph = _score_prob(feat, mh)
-                pd = _score_prob(feat, md)
-                pa = _score_prob(feat, ma)
-                s = max(EPS, ph + pd + pa)
-                ph, pa = ph / s, pa / s
-
-                if ph * 100.0 >= thr and market_cutoff_ok(minute, mk, "Home Win"):
-                    candidates.append((mk, "Home Win", ph))
-                if pa * 100.0 >= thr and market_cutoff_ok(minute, mk, "Away Win"):
-                    candidates.append((mk, "Away Win", pa))
-
-            if not candidates:
-                continue
-
-            odds_map = fetch_odds(fid) if API_KEY else {}
-            ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
-
-            # --- Candidate evaluation with market-specific thresholds and heuristics ---
-            for mk, sug, prob in candidates:
-                if sug not in ALLOWED_SUGGESTIONS:
+                if minute < TIP_MIN_MINUTE:
+                    continue
+                if is_feed_stale(fid, m, minute):
                     continue
 
-                # odds lookup (use aggregated map)
-                odds = None
-                book = None
-                if mk == "BTTS":
-                    d = odds_map.get("BTTS", {})
-                    tgt = "Yes" if sug.endswith("Yes") else "No"
-                    if tgt in d:
-                        odds, book = d[tgt]["odds"], d[tgt]["book"]
-                elif mk == "1X2":
-                    d = odds_map.get("1X2", {})
-                    tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
-                    if tgt and tgt in d:
-                        odds, book = d[tgt]["odds"], d[tgt]["book"]
-                elif mk.startswith("Over/Under") or mk.upper().startswith("OVER") or mk.upper().startswith("UNDER"):
-                    ln = _parse_ou_line_from_suggestion(sug)
-                    d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
-                    tgt = "Over" if sug.startswith("Over") else "Under"
-                    if tgt in d:
-                        odds, book = d[tgt]["odds"], d[tgt]["book"]
+                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
+                    try:
+                        save_snapshot_from_match(m, feat)
+                    except Exception:
+                        pass
 
-                # gate on presence (and floor/ceiling) + compute EV (but use market-specific thresholds)
-                pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
-                if not pass_odds:
+                league_id, league = _league_name(m)
+                home, away = _teams(m)
+                score = _pretty_score(m)
+
+                candidates: List[Tuple[str, str, float]] = []
+
+                # OU
+                for line in OU_LINES:
+                    mdl = _load_ou_model_for_line(line)
+                    if not mdl:
+                        continue
+                    mk = f"Over/Under {_fmt_line(line)}"
+                    thr = _get_market_threshold(mk)
+
+                    p_over = _score_prob(feat, mdl)
+                    sug_over = f"Over {_fmt_line(line)} Goals"
+                    if (
+                        p_over * 100.0 >= thr
+                        and _candidate_is_sane(sug_over, feat)
+                        and market_cutoff_ok(minute, mk, sug_over)
+                    ):
+                        candidates.append((mk, sug_over, p_over))
+
+                    p_under = 1.0 - p_over
+                    sug_under = f"Under {_fmt_line(line)} Goals"
+                    if (
+                        p_under * 100.0 >= thr
+                        and _candidate_is_sane(sug_under, feat)
+                        and market_cutoff_ok(minute, mk, sug_under)
+                    ):
+                        candidates.append((mk, sug_under, p_under))
+
+                # BTTS
+                mdl_btts = load_model_from_settings("BTTS_YES")
+                if mdl_btts:
+                    mk = "BTTS"
+                    thr = _get_market_threshold(mk)
+
+                    p_yes = _score_prob(feat, mdl_btts)
+                    if (
+                        p_yes * 100.0 >= thr
+                        and _candidate_is_sane("BTTS: Yes", feat)
+                        and market_cutoff_ok(minute, mk, "BTTS: Yes")
+                    ):
+                        candidates.append((mk, "BTTS: Yes", p_yes))
+
+                    p_no = 1.0 - p_yes
+                    if (
+                        p_no * 100.0 >= thr
+                        and _candidate_is_sane("BTTS: No", feat)
+                        and market_cutoff_ok(minute, mk, "BTTS: No")
+                    ):
+                        candidates.append((mk, "BTTS: No", p_no))
+
+                # 1X2 (draw suppressed)
+                mh, md, ma = _load_wld_models()
+                if mh and md and ma:
+                    mk = "1X2"
+                    thr = _get_market_threshold(mk)
+                    ph = _score_prob(feat, mh)
+                    pd = _score_prob(feat, md)
+                    pa = _score_prob(feat, ma)
+                    s = max(EPS, ph + pd + pa)
+                    ph, pa = ph / s, pa / s
+
+                    if ph * 100.0 >= thr and market_cutoff_ok(minute, mk, "Home Win"):
+                        candidates.append((mk, "Home Win", ph))
+                    if pa * 100.0 >= thr and market_cutoff_ok(minute, mk, "Away Win"):
+                        candidates.append((mk, "Away Win", pa))
+
+                if not candidates:
                     continue
-                if odds is None:
-                    odds = odds2
-                    book = book2
 
-                if odds is None:
-                    # odds still missing and ALLOW_TIPS_WITHOUT_ODDS disabled
-                    log.debug("[FILTER] fid=%s league=%s market=%s sug=%s -> missing odds after aggregation", fid, league, mk, sug)
-                    continue
+                odds_map = fetch_odds(fid) if API_KEY else {}
+                ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
 
-                edge = _ev(prob, float(odds))
-                ev_pct = round(edge * 100.0, 1)
-                ev_bps = int(round(edge * 10000))
-
-                thr = _get_market_threshold_dynamic(mk)
-                edge_bps_req = _edge_min_bps_for_market(mk)
-
-                # heuristic checks for O/U and BTTS
-                if ("OVER" in mk.upper()) or ("UNDER" in mk.upper()) or ("BTTS" in mk.upper()):
-                    if not _market_attack_signals_ok(feat, mk):
-                        log.info("[FILTER-H] fid=%s league_id=%s league=%s market=%s sug=%s prob=%.3f odds=%s ev=%+.2f bps=%d -> SKIP heuristic",
-                                 fid, league_id, league, mk, sug, prob, odds, ev_pct, ev_bps)
+                for mk, sug, prob in candidates:
+                    if sug not in ALLOWED_SUGGESTIONS:
                         continue
 
-                # confidence threshold (market-specific)
-                if prob * 100.0 < thr:
-                    log.debug("[FILTER] fid=%s market=%s sug=%s prob=%.2f < thr=%.2f -> SKIP low confidence", fid, mk, sug, prob*100.0, thr)
+                    # odds lookup (use aggregated map)
+                    odds = None
+                    book = None
+                    if mk == "BTTS":
+                        d = odds_map.get("BTTS", {})
+                        tgt = "Yes" if sug.endswith("Yes") else "No"
+                        if tgt in d:
+                            odds, book = d[tgt]["odds"], d[tgt]["book"]
+                    elif mk == "1X2":
+                        d = odds_map.get("1X2", {})
+                        tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
+                        if tgt and tgt in d:
+                            odds, book = d[tgt]["odds"], d[tgt]["book"]
+                    elif mk.startswith("Over/Under"):
+                        ln = _parse_ou_line_from_suggestion(sug)
+                        d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
+                        tgt = "Over" if sug.startswith("Over") else "Under"
+                        if tgt in d:
+                            odds, book = d[tgt]["odds"], d[tgt]["book"]
+
+                    # gate on presence (and floor/ceiling) + compute EV
+                    pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
+                    if not pass_odds:
+                        continue
+                    if odds is None:
+                        odds = odds2
+                        book = book2
+
+                    ev_pct = None
+                    if odds is not None:
+                        edge = _ev(prob, float(odds))
+                        ev_pct = round(edge * 100.0, 1)
+                        if int(round(edge * 10000)) < EDGE_MIN_BPS:
+                            continue
+                    else:
+                        continue  # odds mandatory by default
+
+                    rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0)
+                    ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score))
+
+                if not ranked:
                     continue
 
-                # EV / edge check (market-specific)
-                if ev_bps < edge_bps_req:
-                    log.info("[FILTER] fid=%s league_id=%s league=%s market=%s sug=%s prob=%.3f odds=%s ev_pct=%+.2f bps=%d -> SKIP edge too small (need %d)",
-                             fid, league_id, league, mk, sug, prob, odds, ev_pct, ev_bps, edge_bps_req)
-                    continue
+                ranked.sort(key=lambda x: x[6], reverse=True)
 
-                rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0)
-                ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score))
+                per_match = 0
+                base_now = int(time.time())
 
-            if not ranked:
+                for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank) in enumerate(ranked):
+                    if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
+                        continue
+
+                    created_ts = base_now + idx
+                    raw = float(prob)
+                    prob_pct = round(raw * 100.0, 1)
+
+                    try:
+                        with db_conn() as c2:
+                            c2.execute(
+                                "INSERT INTO tips("
+                                "match_id,league_id,league,home,away,market,suggestion,"
+                                "confidence,confidence_raw,score_at_tip,minute,created_ts,"
+                                "odds,book,ev_pct,sent_ok"
+                                ") VALUES ("
+                                "%s,%s,%s,%s,%s,%s,%s,"
+                                "%s,%s,%s,%s,%s,"
+                                "%s,%s,%s,%s"
+                                ")",
+                                (
+                                    fid, league_id, league, home, away,
+                                    market_txt, suggestion,
+                                    float(prob_pct), raw, score, minute, created_ts,
+                                    (float(odds) if odds is not None else None),
+                                    (book or None),
+                                    (float(ev_pct) if ev_pct is not None else None),
+                                    0,
+                                ),
+                             )
+
+                            sent = send_telegram(_format_tip_message(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct))
+                            if sent:
+                                c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
+                                _metric_inc("tips_sent_total", n=1)
+                    except Exception as e:
+                        log.exception("[PROD] insert/send failed: %s", e)
+                        continue
+
+                    saved += 1
+                    per_match += 1
+                    per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
+
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        break
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        break
+
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break
+
+            except Exception as e:
+                log.exception("[PROD] match loop failed: %s", e)
                 continue
-
-            ranked.sort(key=lambda x: x[6], reverse=True)
-
-            batched_rows = []
-            to_notify = []
-            per_match = 0
-            base_now = int(time.time())
-
-            for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank) in enumerate(ranked):
-                if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
-                    continue
-                created_ts = base_now + idx
-                raw = float(prob)
-                prob_pct = round(raw * 100.0, 1)
-
-                msg = _format_tip_message(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct)
-
-                batched_rows.append((
-                    fid, league_id, league, home, away,
-                    market_txt, suggestion,
-                    float(prob_pct), raw, score, minute, created_ts,
-                    (float(odds) if odds is not None else None),
-                    (book or None),
-                    (float(ev_pct) if ev_pct is not None else None),
-                    0,  # sent_ok = 0 initially
-                ))
-                to_notify.append((created_ts, msg))
-                per_match += 1
-                if MAX_TIPS_PER_SCAN and (saved + len(batched_rows)) >= MAX_TIPS_PER_SCAN:
-                    break
-                if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                    break
-
-            # batch insert then notify + update sent_ok
-            if batched_rows:
-                try:
-                    with db_conn() as c2:
-                        c2.cur.executemany(
-                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                            batched_rows
-                        )
-                    sent_ct = 0
-                    for created_ts, msg in to_notify:
-                        if send_telegram(msg):
-                            with db_conn() as c3:
-                                c3.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
-                            _metric_inc("tips_sent_total", n=1)
-                            sent_ct += 1
-                    saved += len(batched_rows)
-                    per_league_counter[league_id] = per_league_counter.get(league_id, 0) + len(batched_rows)
-                except Exception as e:
-                    log.exception("[PROD] insert/send failed: %s", e)
-                    continue
-
-            meta_model = load_meta_tipgate_model()
-            if meta_model:
-                tip_candidate = {
-                    "market": mk,  # e.g. "BTTS"
-                    "suggestion": sug,  # e.g. "YES"
-                    "confidence": prob * 100.0,
-                    "odds": odds,
-                    "minute": minute,
-                    "league_id": league_id,
-                    "ev_pct": ev_pct,
-                    "model_type": "ensemble" if mdl_xgb_btts else "logreg"
-                }
-                meta_features = extract_meta_features(tip_candidate, feat, context={
-                    "recent_accuracy": get_recent_accuracy(league_id, mk)
-                })
-                # Ensure order matches model.feature_names_in_
-                meta_X = [[meta_features.get(k, 0) for k in meta_model.feature_names_in_]]
-                meta_prob = meta_model.predict_proba(meta_X)[0, 1]
-                if meta_prob < 0.75:  # Set threshold as needed
-                    continue
-
-            if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                break
-
-        except Exception as e:
-            log.exception("[PROD] match loop failed: %s", e)
-            continue
 
     log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
     _metric_inc("tips_generated_total", n=saved)
@@ -1809,7 +1507,7 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     if updated: log.info("[RESULTS] backfilled %d", updated)
     return updated
 
-def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
+def daily_accuracy_digest(window_days: int = 7) -> Optional[str]:
     if not DAILY_ACCURACY_DIGEST_ENABLE: return None
     backfill_results_for_open_matches(400)
 
@@ -1950,8 +1648,8 @@ def prematch_scan_save() -> int:
 
         try:
             save_prematch_snapshot(fx, feat)
-        except Exception as e:
-            log.exception("Context info — failed because: %s", e)
+        except Exception:
+            pass
 
         candidates: List[Tuple[str, str, float]] = []
 
@@ -2349,7 +2047,7 @@ def _start_scheduler_once():
                       "interval", minutes=BACKFILL_EVERY_MIN, id="backfill", max_instances=1, coalesce=True)
 
         if DAILY_ACCURACY_DIGEST_ENABLE:
-            sched.add_job(lambda: _run_with_pg_lock(1003, lambda: daily_accuracy_digest(1)),
+            sched.add_job(lambda: _run_with_pg_lock(1003, daily_accuracy_digest),
                           CronTrigger(hour=int(os.getenv("DAILY_ACCURACY_HOUR", "3")),
                                       minute=int(os.getenv("DAILY_ACCURACY_MINUTE", "6")),
                                       timezone=BERLIN_TZ),
@@ -2434,7 +2132,7 @@ def http_train():
 def http_train_notify(): _require_admin(); auto_train_job(); return jsonify({"ok": True})
 
 @app.route("/admin/digest", methods=["POST","GET"])
-def http_digest(): _require_admin(); msg=daily_accuracy_digest(1); return jsonify({"ok": True, "sent": bool(msg)})
+def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
 def http_auto_tune(): _require_admin(); tuned=auto_tune_thresholds(14); return jsonify({"ok": True, "tuned": tuned})
