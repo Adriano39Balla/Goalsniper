@@ -260,12 +260,39 @@ except Exception as e:
 POOL: Optional[SimpleConnectionPool] = None
 
 class PooledConn:
-    def __init__(self, pool): self.pool=pool; self.conn=None; self.cur=None
-    def __enter__(self): self.conn=self.pool.getconn(); self.conn.autocommit=True; self.cur=self.conn.cursor(); return self
-    def __exit__(self, a,b,c): 
-        try: self.cur and self.cur.close()
-        finally: self.conn and self.pool.putconn(self.conn)
+    def __init__(self, pool): 
+        self.pool = pool
+        self.conn = None
+        self.cur = None
+        
+    def __enter__(self):
+        if shutdown_manager.is_shutdown_requested():
+            raise Exception("Database connection refused - shutdown in progress")
+        self.conn = self.pool.getconn()
+        self.conn.autocommit = True
+        self.cur = self.conn.cursor()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb): 
+        try: 
+            if self.cur:
+                self.cur.close()
+        except Exception as e:
+            log.warning("[DB] Error closing cursor: %s", e)
+        finally: 
+            if self.conn:
+                try:
+                    self.pool.putconn(self.conn)
+                except Exception as e:
+                    log.warning("[DB] Error returning connection to pool: %s", e)
+                    try:
+                        self.conn.close()
+                    except:
+                        pass
+    
     def execute(self, sql: str, params: tuple|list=()):
+        if shutdown_manager.is_shutdown_requested():
+            raise Exception("Database operation refused - shutdown in progress")
         try:
             self.cur.execute(sql, params or ())
             return self.cur
@@ -273,51 +300,48 @@ class PooledConn:
             _metric_inc("db_errors_total", n=1)
             log.error("DB execute failed: %s\nSQL: %s\nParams: %s", e, sql, params)
             raise
-
-def _init_pool():
-    global POOL
-    try:
-        if POOL:
-            try:
-                with db_conn() as c:
-                    c.execute("SELECT 1")
-                return  # Pool is still healthy
-            except Exception:
-                log.warning("[DB] Pool unhealthy, recreating...")
-                POOL = None
-        
-        dsn = DATABASE_URL
-        # Handle SSL mode more gracefully
-        if "sslmode=" not in DATABASE_URL:
-            connector = "&" if "?" in DATABASE_URL else "?"
-            dsn += f"{connector}sslmode=require"
-            
-        POOL = SimpleConnectionPool(
-            minconn=1, 
-            maxconn=int(os.getenv("DB_POOL_MAX", "10")), 
-            dsn=dsn
-        )
-        log.info("[DB] Pool initialized")
-    except Exception as e:
-        log.error("[DB] Pool init failed: %s", e)
-        raise
+    
+    def fetchone_safe(self):
+        """Safe fetchone that handles empty results"""
+        try:
+            row = self.cur.fetchone()
+            if row is None or len(row) == 0:
+                return None
+            return row
+        except Exception as e:
+            log.warning("[DB] fetchone_safe error: %s", e)
+            return None
+    
+    def fetchall_safe(self):
+        """Safe fetchall that handles empty results"""
+        try:
+            rows = self.cur.fetchall()
+            return rows if rows else []
+        except Exception as e:
+            log.warning("[DB] fetchall_safe error: %s", e)
+            return []
 
 def db_conn(): 
     if not POOL: _init_pool()
     return PooledConn(POOL)  # type: ignore
 
 def _db_ping() -> bool:
+    if shutdown_manager.is_shutdown_requested():
+        return False
     try:
         with db_conn() as c:
-            c.execute("SELECT 1")
-        return True
+            cursor = c.execute("SELECT 1")
+            row = cursor.fetchone()
+            # FIX: Just check if we can execute, don't rely on row access
+            return True
     except Exception:
         log.warning("[DB] ping failed, re-initializing pool")
         try:
             _init_pool()
             with db_conn() as c2:
-                c2.execute("SELECT 1")
-            return True
+                cursor = c2.execute("SELECT 1")
+                # Don't need to access row, just check if query executes
+                return True
         except Exception as e:
             _metric_inc("db_errors_total", n=1)
             log.error("[DB] reinit failed: %s", e)
@@ -360,8 +384,12 @@ _SETTINGS_CACHE, _MODELS_CACHE = _KVCache(SETTINGS_TTL), _KVCache(MODELS_TTL)
 # ───────── Settings helpers ─────────
 def get_setting(key: str) -> Optional[str]:
     with db_conn() as c:
-        r=c.execute("SELECT value FROM settings WHERE key=%s",(key,)).fetchone()
-        return r[0] if r else None
+        cursor = c.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = cursor.fetchone()
+        # FIX: Handle empty results
+        if row is None or len(row) == 0:
+            return None
+        return row[0] if row else None
 
 def set_setting(key: str, value: str) -> None:
     with db_conn() as c:
@@ -1063,10 +1091,13 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - DUP_COOLDOWN_MIN * 60
-                    if c.execute(
+                    cursor = c.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
                         (fid, cutoff),
-                    ).fetchone():
+                    )
+                    row = cursor.fetchone()
+                    # FIX: Check if any row exists
+                    if row is not None and len(row) > 0:
                         continue
 
                 # Enhanced feature extraction
@@ -1285,15 +1316,27 @@ def enhanced_production_scan() -> Tuple[int, int]:
     return saved, live_seen
 
 def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
-    """Get pre-match probability for Bayesian updates"""
+    """Get pre-match probability for Bayesian updates - FIXED VERSION"""
     try:
         with db_conn() as c:
-            row = c.execute(
+            cursor = c.execute(
                 "SELECT confidence_raw FROM tips WHERE match_id=%s AND market LIKE 'PRE %' AND created_ts > %s ORDER BY created_ts DESC LIMIT 1",
                 (fid, int(time.time()) - 3600)  # Last hour
-            ).fetchone()
-            return float(row[0]) if row and row[0] else None
-    except Exception:
+            )
+            row = cursor.fetchone()
+            
+            # FIX: Properly handle empty results
+            if row is None or len(row) == 0:
+                return None
+                
+            # Check if the first element exists and is not None
+            if row[0] is not None:
+                return float(row[0])
+            else:
+                return None
+                
+    except Exception as e:
+        log.warning("[PRE_MATCH_PROB] Error fetching pre-match probability for fid %s: %s", fid, e)
         return None
 
 def _calculate_prediction_confidence(features: Dict[str, float], market: str) -> float:
