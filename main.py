@@ -1577,55 +1577,104 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     if updated: log.info("[RESULTS] backfilled %d", updated)
     return updated
 
-def daily_accuracy_digest(window_days: int = 7) -> Optional[str]:
-    if not DAILY_ACCURACY_DIGEST_ENABLE: return None
-    backfill_results_for_open_matches(400)
+def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
+    """Daily accuracy digest for today's tips only"""
+    if not DAILY_ACCURACY_DIGEST_ENABLE: 
+        return None
+    
+    # Get today's date in Berlin timezone
+    today = datetime.now(BERLIN_TZ).date()
+    start_of_day = datetime.combine(today, datetime.min.time(), tzinfo=BERLIN_TZ)
+    start_ts = int(start_of_day.timestamp())
+    
+    log.info("[DIGEST] Generating daily digest for today (since %s)", start_of_day)
+    
+    # Backfill recent results
+    backfill_results_for_open_matches(200)
 
-    cutoff=int((datetime.now(BERLIN_TZ)-timedelta(days=window_days)).timestamp())
     with db_conn() as c:
-        rows=c.execute("""
+        rows = c.execute("""
             SELECT t.market, t.suggestion, t.confidence, t.confidence_raw, t.created_ts,
                    t.odds, r.final_goals_h, r.final_goals_a, r.btts_yes
             FROM tips t LEFT JOIN match_results r ON r.match_id=t.match_id
-            WHERE t.created_ts >= %s AND t.suggestion<>'HARVEST' AND t.sent_ok=1
-        """,(cutoff,)).fetchall()
+            WHERE t.created_ts >= %s 
+            AND t.suggestion<>'HARVEST' 
+            AND t.sent_ok=1
+            ORDER BY t.created_ts DESC
+        """, (start_ts,)).fetchall()
 
-    total=graded=wins=0
+    total = graded = wins = 0
     roi_by_market, by_market = {}, {}
+    recent_tips = []
 
     for (mkt, sugg, conf, conf_raw, cts, odds, gh, ga, btts) in rows:
-        res={"final_goals_h":gh,"final_goals_a":ga,"btts_yes":btts}
-        out=_tip_outcome_for_result(sugg,res)
-        if out is None: continue
+        res = {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts}
+        out = _tip_outcome_for_result(sugg, res)
+        
+        # Store tip info for recent tips list
+        tip_time = datetime.fromtimestamp(cts, BERLIN_TZ).strftime("%H:%M")
+        recent_tips.append(f"{sugg} ({conf:.1f}%) - {tip_time}")
+        
+        if out is None: 
+            continue
 
-        total+=1; graded+=1; wins+=1 if out==1 else 0
-        d=by_market.setdefault(mkt or "?",{"graded":0,"wins":0}); d["graded"]+=1; d["wins"]+=1 if out==1 else 0
+        total += 1
+        graded += 1
+        wins += 1 if out == 1 else 0
+        
+        d = by_market.setdefault(mkt or "?", {"graded": 0, "wins": 0})
+        d["graded"] += 1
+        d["wins"] += 1 if out == 1 else 0
 
         if odds:
-            roi_by_market.setdefault(mkt, {"stake":0,"pnl":0})
-            roi_by_market[mkt]["stake"]+=1
-            if out==1: roi_by_market[mkt]["pnl"]+=float(odds)-1
-            else: roi_by_market[mkt]["pnl"]-=1
+            roi_by_market.setdefault(mkt, {"stake": 0, "pnl": 0})
+            roi_by_market[mkt]["stake"] += 1
+            if out == 1: 
+                roi_by_market[mkt]["pnl"] += float(odds) - 1
+            else: 
+                roi_by_market[mkt]["pnl"] -= 1
 
-    if graded==0:
-        msg="📊 Accuracy Digest\nNo graded tips in window."
+    if graded == 0:
+        msg = f"📊 Daily Accuracy Digest for {today.strftime('%Y-%m-%d')}\nNo graded tips today."
+        
+        # Show pending tips if any
+        if rows:
+            pending = len([r for r in rows if r[5] is None or r[6] is None])  # No odds or no result
+            msg += f"\n⏳ {pending} tips still pending results."
+            
     else:
-        acc=100.0*wins/max(1,graded)
-        lines=[f"📊 <b>Accuracy Digest</b> (last {window_days}d)",
-               f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"]
+        acc = 100.0 * wins / max(1, graded)
+        lines = [
+            f"📊 <b>Daily Accuracy Digest</b> - {today.strftime('%Y-%m-%d')}",
+            f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"
+        ]
 
-        for mk,st in sorted(by_market.items()):
-            if st["graded"]==0: continue
-            a=100.0*st["wins"]/st["graded"]
-            roi=""
-            if mk in roi_by_market and roi_by_market[mk]["stake"]>0:
-                roi_val=100.0*roi_by_market[mk]["pnl"]/roi_by_market[mk]["stake"]
-                roi=f" • ROI {roi_val:+.1f}%"
+        # Add recent tips preview (last 3)
+        if recent_tips:
+            lines.append(f"\n🕒 Recent tips: {', '.join(recent_tips[:3])}")
+
+        for mk, st in sorted(by_market.items()):
+            if st["graded"] == 0: 
+                continue
+            a = 100.0 * st["wins"] / st["graded"]
+            roi = ""
+            if mk in roi_by_market and roi_by_market[mk]["stake"] > 0:
+                roi_val = 100.0 * roi_by_market[mk]["pnl"] / roi_by_market[mk]["stake"]
+                roi = f" • ROI {roi_val:+.1f}%"
             lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} ({a:.1f}%){roi}")
 
-        msg="\n".join(lines)
+        # Add Kelly bankroll status
+        current_bankroll = kelly.get_bankroll()
+        bankroll_change = current_bankroll - STARTING_BANKROLL
+        if bankroll_change != 0:
+            change_pct = (bankroll_change / STARTING_BANKROLL) * 100
+            lines.append(f"\n💰 Bankroll: ${current_bankroll:.2f} ({change_pct:+.1f}%)")
 
-    send_telegram(msg); return msg
+        msg = "\n".join(lines)
+
+    send_telegram(msg)
+    log.info("[DIGEST] Sent daily digest with %d tips, %d graded", total, graded)
+    return msg
 
 # ───────── Prematch pipeline (preserved) ─────────
 def _kickoff_berlin(utc_iso: str|None) -> str:
