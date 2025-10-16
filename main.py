@@ -2891,11 +2891,12 @@ def telegram_webhook(secret: str):
 def _on_boot():
     register_shutdown_handlers()
     validate_config()
-    _init_pool()
+    _init_pool()  # This should now work since the function is defined above
     init_db()
     set_setting("boot_ts", str(int(time.time())))
     _start_scheduler_once()
 
+# Call _on_boot() to initialize the application
 _on_boot()
 
 if __name__ == "__main__":
