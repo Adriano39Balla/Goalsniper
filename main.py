@@ -45,6 +45,18 @@ if REDIS_URL:
     except Exception:
         _redis = None  # fallback to in-memory TTL caches
 
+# ───────── Shutdown Manager ─────────
+class ShutdownManager:
+    _shutdown_requested = False
+    
+    @classmethod
+    def is_shutdown_requested(cls):
+        return cls._shutdown_requested
+    
+    @classmethod
+    def request_shutdown(cls):
+        cls._shutdown_requested = True
+
 # ───────── App / logging ─────────
 class CustomFormatter(logging.Formatter):
     def format(self, record):
@@ -259,6 +271,21 @@ except Exception as e:
 # ───────── DB pool & helpers ─────────
 POOL: Optional[SimpleConnectionPool] = None
 
+def _init_pool():
+    """Initialize the database connection pool"""
+    global POOL
+    if not POOL:
+        try:
+            POOL = SimpleConnectionPool(
+                minconn=1,
+                maxconn=10,
+                dsn=DATABASE_URL
+            )
+            log.info("[DB] Connection pool initialized")
+        except Exception as e:
+            log.error("[DB] Failed to initialize connection pool: %s", e)
+            raise
+
 class PooledConn:
     def __init__(self, pool): 
         self.pool = pool
@@ -266,7 +293,7 @@ class PooledConn:
         self.cur = None
         
     def __enter__(self):
-        if shutdown_manager.is_shutdown_requested():
+        if ShutdownManager.is_shutdown_requested():
             raise Exception("Database connection refused - shutdown in progress")
         self.conn = self.pool.getconn()
         self.conn.autocommit = True
@@ -291,7 +318,7 @@ class PooledConn:
                         pass
     
     def execute(self, sql: str, params: tuple|list=()):
-        if shutdown_manager.is_shutdown_requested():
+        if ShutdownManager.is_shutdown_requested():
             raise Exception("Database operation refused - shutdown in progress")
         try:
             self.cur.execute(sql, params or ())
@@ -326,7 +353,7 @@ def db_conn():
     return PooledConn(POOL)  # type: ignore
 
 def _db_ping() -> bool:
-    if shutdown_manager.is_shutdown_requested():
+    if ShutdownManager.is_shutdown_requested():
         return False
     try:
         with db_conn() as c:
@@ -573,10 +600,10 @@ def fetch_live_matches() -> List[dict]:
     matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
     out=[]
     for m in matches:
-        st=((m.get("fixture",{}) or {}).get("status",{}) or {})
+        st=((m.get("fixture") or {}).get("status") or {})
         elapsed=st.get("elapsed"); short=(st.get("short") or "").upper()
         if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES: continue
-        fid=(m.get("fixture",{}) or {}).get("id")
+        fid=(m.get("fixture") or {}).get("id")
         m["statistics"]=fetch_match_stats(fid); m["events"]=fetch_match_events(fid)
         out.append(m)
     return out
@@ -823,30 +850,18 @@ class AdvancedPredictor:
     def _xgb_predict(self, feat: Dict[str, float], market: str) -> Optional[float]:
         """XGBoost prediction for better non-linear relationships"""
         try:
-            model_key = f"xgb_{market}"
-            model_data = load_model_from_settings(model_key)
-            if not model_data:
-                return None
-                
-            # Convert features to XGBoost format
-            # This would integrate with actual XGBoost in production
-            # For now, return None if model not properly implemented
-            return None
-            
+            # For now, fall back to logistic regression since XGBoost isn't fully implemented
+            # In production, this would load and run actual XGBoost models
+            return self._logistic_predict(feat, market)
         except Exception:
             return None
 
     def _nn_predict(self, feat: Dict[str, float], market: str) -> Optional[float]:
         """Neural network prediction"""
         try:
-            model_key = f"nn_{market}"
-            model_data = load_model_from_settings(model_key)
-            if not model_data:
-                return None
-                
-            # This would integrate with actual neural network in production
-            return None
-            
+            # For now, fall back to logistic regression since neural networks aren't fully implemented
+            # In production, this would load and run actual neural networks
+            return self._logistic_predict(feat, market)
         except Exception:
             return None
 
@@ -1954,7 +1969,7 @@ def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     if minute < 10:
         st = _FEED_STATE.get(fid)
         fp = _match_fingerprint(m)
-        _FEED_STATE[fid] = {"fp": fp, "last_change": time.time(), "last_minute": minute}
+        _FEED_STATE[fid] = {"fp": fp, "last_change": now, "last_minute": minute}
         return False
 
     now = time.time()
@@ -2672,8 +2687,12 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
 # ───────── Shutdown Handlers ─────────
 def shutdown_handler(signum=None, frame=None):
     log.info("Received shutdown signal, cleaning up...")
+    ShutdownManager.request_shutdown()
     if POOL:
-        POOL.closeall()
+        try:
+            POOL.closeall()
+        except Exception as e:
+            log.warning("Error closing pool during shutdown: %s", e)
     sys.exit(0)
 
 def register_shutdown_handlers():
