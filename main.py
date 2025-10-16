@@ -2,7 +2,7 @@
 # Upgraded: circuit breaker, Redis-backed caches (optional), Prometheus-style metrics,
 # DB pool health checks, admin/webhook hardening, and auto-tune wiring fixes — without trimming logic.
 
-import os, json, time, logging, requests, psycopg2
+import os, json, time, logging, requests, psycopg2, sys, signal, atexit
 import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
@@ -47,8 +47,19 @@ if REDIS_URL:
         _redis = None  # fallback to in-memory TTL caches
 
 # ───────── App / logging ─────────
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
+class CustomFormatter(logging.Formatter):
+    def format(self, record):
+        if not hasattr(record, 'job_id'):
+            record.job_id = 'main'
+        return super().format(record)
+
+handler = logging.StreamHandler()
+formatter = CustomFormatter("[%(asctime)s] %(levelname)s [%(job_id)s] - %(message)s")
+handler.setFormatter(formatter)
 log = logging.getLogger("goalsniper")
+log.handlers = [handler]
+log.setLevel(logging.INFO)
+
 app = Flask(__name__)
 
 # ───────── Minimal Prometheus-style metrics ─────────
@@ -144,6 +155,29 @@ if not ADMIN_API_KEY:
 if not WEBHOOK_SECRET:
     log.warning("TELEGRAM_WEBHOOK_SECRET is not set — /telegram/webhook/<secret> would be unsafe if exposed.")
 
+# ───────── Configuration Validation ─────────
+def validate_config():
+    """Validate critical configuration at startup"""
+    required = {
+        'TELEGRAM_BOT_TOKEN': TELEGRAM_BOT_TOKEN,
+        'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID,
+        'API_KEY': API_KEY,
+        'DATABASE_URL': DATABASE_URL
+    }
+    
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        raise SystemExit(f"Missing required config: {missing}")
+    
+    # Validate numeric ranges
+    if not (0 <= CONF_THRESHOLD <= 100):
+        log.warning("CONF_THRESHOLD should be 0-100, got %s", CONF_THRESHOLD)
+    
+    if SCAN_INTERVAL_SEC < 30:
+        log.warning("SCAN_INTERVAL_SEC very low: %s", SCAN_INTERVAL_SEC)
+    
+    log.info("[CONFIG] Configuration validation passed")
+
 # ───────── Lines ─────────
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     out=[]
@@ -160,10 +194,10 @@ PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "1"))  # was 2 �
 PER_LEAGUE_CAP        = int(os.getenv("PER_LEAGUE_CAP", "2"))         # was 0 — cap league dominance by default
 
 # ───────── Odds/EV controls — UPDATED DEFAULTS ─────────
-MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU",   "1.50"))  # was 1.30
+MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU", "1.50"))  # was 1.30
 MIN_ODDS_BTTS = float(os.getenv("MIN_ODDS_BTTS", "1.50"))  # was 1.30
-MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2",  "1.50"))  # was 1.30
-MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL",  "20.0"))
+MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2", "1.50"))  # was 1.30
+MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL", "20.0"))
 EDGE_MIN_BPS  = int(os.getenv("EDGE_MIN_BPS", "600"))      # was 300 bps
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")  # optional API-Football book id
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","0") not in ("0","false","False","no","NO")  # default hardened to 0
@@ -208,7 +242,7 @@ NEG_CACHE: Dict[Tuple[str,int], Tuple[float, bool]] = {}
 NEG_TTL_SEC = int(os.getenv("NEG_TTL_SEC", "45"))
 
 # ───────── API circuit breaker / timeouts ─────────
-API_CB = {"failures": 0, "opened_until": 0.0}
+API_CB = {"failures": 0, "opened_until": 0.0, "last_success": 0.0}
 API_CB_THRESHOLD = int(os.getenv("API_CB_THRESHOLD", "8"))
 API_CB_COOLDOWN_SEC = int(os.getenv("API_CB_COOLDOWN_SEC", "90"))
 REQ_TIMEOUT_SEC = float(os.getenv("REQ_TIMEOUT_SEC", "8.0"))
@@ -225,6 +259,7 @@ except Exception as e:
 
 # ───────── DB pool & helpers ─────────
 POOL: Optional[SimpleConnectionPool] = None
+
 class PooledConn:
     def __init__(self, pool): self.pool=pool; self.conn=None; self.cur=None
     def __enter__(self): self.conn=self.pool.getconn(); self.conn.autocommit=True; self.cur=self.conn.cursor(); return self
@@ -242,8 +277,31 @@ class PooledConn:
 
 def _init_pool():
     global POOL
-    dsn = DATABASE_URL + (("&" if "?" in DATABASE_URL else "?") + "sslmode=require" if "sslmode=" not in DATABASE_URL else "")
-    POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
+    try:
+        if POOL:
+            try:
+                with db_conn() as c:
+                    c.execute("SELECT 1")
+                return  # Pool is still healthy
+            except Exception:
+                log.warning("[DB] Pool unhealthy, recreating...")
+                POOL = None
+        
+        dsn = DATABASE_URL
+        # Handle SSL mode more gracefully
+        if "sslmode=" not in DATABASE_URL:
+            connector = "&" if "?" in DATABASE_URL else "?"
+            dsn += f"{connector}sslmode=require"
+            
+        POOL = SimpleConnectionPool(
+            minconn=1, 
+            maxconn=int(os.getenv("DB_POOL_MAX", "10")), 
+            dsn=dsn
+        )
+        log.info("[DB] Pool initialized")
+    except Exception as e:
+        log.error("[DB] Pool init failed: %s", e)
+        raise
 
 def db_conn(): 
     if not POOL: _init_pool()
@@ -373,6 +431,12 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_snap_by_match ON tip_snapshots (match_id, created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_updated ON match_results (updated_ts DESC)")
+        
+        # Add performance indexes
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_league_ts ON tips (league_id, created_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_market_sent ON tips (market, sent_ok, created_ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_results_btts ON match_results (btts_yes)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON tip_snapshots (created_ts DESC)")
 
 # ───────── Telegram ─────────
 def send_telegram(text: str) -> bool:
@@ -394,7 +458,15 @@ def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY: return None
     now = time.time()
     if API_CB["opened_until"] > now:
+        log.warning("[CB] Circuit open, rejecting request to %s", url)
         return None
+        
+    # Reset circuit breaker after cooldown if we have successes
+    if API_CB["failures"] > 0 and now - API_CB.get("last_success", 0) > API_CB_COOLDOWN_SEC:
+        log.info("[CB] Resetting circuit breaker after quiet period")
+        API_CB["failures"] = 0
+        API_CB["opened_until"] = 0
+
     # simple endpoint label for metrics
     lbl = "unknown"
     try:
@@ -417,6 +489,7 @@ def _api_get(url: str, params: dict, timeout: int = 15):
             API_CB["failures"] += 1
         else:
             API_CB["failures"] = 0
+            API_CB["last_success"] = now
 
         if API_CB["failures"] >= API_CB_THRESHOLD:
             API_CB["opened_until"] = now + API_CB_COOLDOWN_SEC
@@ -655,198 +728,17 @@ def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float
     return float(prob)
 
 # ───────── Odds fetch + aggregation (with negative cache) ─────────
-def fetch_odds(fid: int) -> Dict[str, Dict[str, Any]]:
-    now=time.time()
-    k=("odds", fid)
-    ts_empty = NEG_CACHE.get(k, (0.0, False))
-    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return {}
-    if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: return ODDS_CACHE[fid][1]
-
-    markets=[]
-    if ODDS_SOURCE in ("auto","live"):
-        js=_api_get(f"{BASE_URL}/odds/live", {"fixture":fid}) or {}
-        markets.extend(js.get("response",[]) if isinstance(js,dict) else [])
-    if not markets and ODDS_SOURCE in ("auto","prematch"):
-        js=_api_get(f"{BASE_URL}/odds", {"fixture":fid}) or {}
-        markets.extend(js.get("response",[]) if isinstance(js,dict) else [])
-
-    out={}
-    for m in markets:
-        bkts=m.get("bookmakers") or []
-        for b in bkts:
-            bname=b.get("name",""); mids=b.get("bets") or []
-            for bet in mids:
-                mkt=bet.get("name"); 
-                if not mkt: continue
-                for val in bet.get("values") or []:
-                    sel=val.get("value"); odd=float(val.get("odd") or 0)
-                    if not sel or odd<=1.01: continue
-                    key=(mkt,sel)
-                    out.setdefault(key,[]).append((bname,odd))
-
-    # Aggregation: drop outliers, require min books
-    agg={}
-    for (mkt,sel), arr in out.items():
-        odds=[o for _,o in arr]
-        if not odds: continue
-        med=np.median(odds)
-        filtered=[o for o in odds if o <= med*ODDS_OUTLIER_MULT]
-        if len(filtered) < ODDS_REQUIRE_N_BOOKS: continue
-        if ODDS_AGGREGATION=="best": agg[(mkt,sel)] = max(filtered)
-        else: agg[(mkt,sel)] = float(np.median(filtered))
-
-    ODDS_CACHE[fid] = (now, agg)
-    if not agg: NEG_CACHE[k] = (now, True)
-    return agg
-
-# ───────── Model scoring helpers (preserved) ─────────
-MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
-EPS=1e-12
-def _sigmoid(x: float) -> float:
-    try:
-        if x<-50: return 1e-22
-        if x>50:  return 1-1e-22
-        import math; return 1/(1+math.exp(-x))
-    except: return 0.5
-
-def _logit(p: float) -> float:
-    import math; p=max(EPS,min(1-EPS,float(p))); return math.log(p/(1-p))
-
-def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) -> float:
-    s=float(intercept or 0.0)
-    for k,w in (weights or {}).items(): s += float(w or 0.0)*float(feat.get(k,0.0))
-    return s
-
-def _calibrate(p: float, cal: Dict[str,Any]) -> float:
-    method=(cal or {}).get("method","sigmoid"); a=float((cal or {}).get("a",1.0)); b=float((cal or {}).get("b",0.0))
-    if method.lower()=="platt": return _sigmoid(a*_logit(p)+b)
-    import math; p=max(EPS,min(1-EPS,float(p))); z=math.log(p/(1-p)); return _sigmoid(a*z+b)
-
-def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
-    p=_sigmoid(_linpred(feat, mdl.get("weights",{}), float(mdl.get("intercept",0.0))))
-    cal=mdl.get("calibration") or {}
-    try: 
-        if cal: p=_calibrate(p, cal)
-    except: pass
-    return max(0.0, min(1.0, float(p)))
-
-def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
-    name=f"OU_{_fmt_line(line)}"; mdl=load_model_from_settings(name)
-    return mdl or (load_model_from_settings("O25") if abs(line-2.5)<1e-6 else None)
-
-def _load_wld_models(): 
-    return (load_model_from_settings("WLD_HOME"), load_model_from_settings("WLD_DRAW"), load_model_from_settings("WLD_AWAY"))
-
-# ───────── Odds helpers (preserved & robust) ─────────
-def _ev(prob: float, odds: float) -> float:
-    """Return expected value as decimal (e.g. 0.05 = +5%)."""
-    return prob*max(0.0, float(odds)) - 1.0
-
-def _min_odds_for_market(market: str) -> float:
-    if market.startswith("Over/Under"): return MIN_ODDS_OU
-    if market == "BTTS": return MIN_ODDS_BTTS
-    if market == "1X2":  return MIN_ODDS_1X2
-    return 1.01
-
-def _odds_cache_get(fid: int) -> Optional[dict]:
-    rec=ODDS_CACHE.get(fid)
-    if not rec: return None
-    ts,data=rec
-    if time.time()-ts>120: ODDS_CACHE.pop(fid,None); return None
-    return data
-
-def _market_name_normalize(s: str) -> str:
-    s=(s or "").lower()
-    if "both teams" in s or "btts" in s: return "BTTS"
-    if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
-    if "over/under" in s or "total" in s or "goals" in s: return "OU"
-    return s
-
-def _parse_market_cutoffs(s: str) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for tok in (s or "").split(","):
-        tok = tok.strip()
-        if not tok or "=" not in tok:
-            continue
-        k, v = tok.split("=", 1)
-        try:
-            out[k.strip().upper()] = int(float(v.strip()))
-        except Exception:
-            pass
-    return out
-
-_MARKET_CUTOFFS = _parse_market_cutoffs(MARKET_CUTOFFS_RAW)
-try:
-    _TIP_MAX_MINUTE = int(float(TIP_MAX_MINUTE_ENV)) if TIP_MAX_MINUTE_ENV.strip() else None
-except Exception:
-    _TIP_MAX_MINUTE = None
-
-def _market_family(market_text: str, suggestion: str) -> str:
-    """Normalize to OU / BTTS / 1X2 (draw suppressed)."""
-    s = (market_text or "").upper()
-    if s.startswith("OVER/UNDER") or "OVER/UNDER" in s:
-        return "OU"
-    if s == "BTTS" or "BTTS" in s:
-        return "BTTS"
-    if s == "1X2" or "WINNER" in s or "MATCH WINNER" in s:
-        return "1X2"
-    if s.startswith("PRE "):
-        return _market_family(s[4:], suggestion)
-    return s
-
-def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
-    """
-    True if we are still within the minute cutoff for this market.
-    Falls back to TIP_MAX_MINUTE or (TOTAL_MATCH_MINUTES - 5).
-    """
-    fam = _market_family(market_text, suggestion)
-    if minute is None:
-        return True
-    try:
-        m = int(minute)
-    except Exception:
-        m = 0
-    cutoff = _MARKET_CUTOFFS.get(fam)
-    if cutoff is None:
-        cutoff = _TIP_MAX_MINUTE
-    if cutoff is None:
-        cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
-    return m <= int(cutoff)
-
-def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
-    if not vals:
-        return None, None
-    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
-    if not xs:
-        return None, None
-    import statistics
-    med = statistics.median(xs)
-    cleaned = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
-    if not cleaned:
-        cleaned = vals
-    xs2 = sorted([o for (o, _) in cleaned])
-    med2 = statistics.median(xs2)
-    if prob_hint is not None and prob_hint > 0:
-        fair = 1.0 / max(1e-6, float(prob_hint))
-        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-        cleaned = [(o, b) for (o, b) in cleaned if o <= cap] or cleaned
-    if ODDS_AGGREGATION == "best":
-        best = max(cleaned, key=lambda t: t[0])
-        return float(best[0]), str(best[1])
-    target = med2
-    pick = min(cleaned, key=lambda t: abs(t[0] - target))
-    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
-
-# Full aggregated odds map (overrides any earlier simplified version if present)
 def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     """
     Aggregated odds map:
       { "BTTS": {...}, "1X2": {...}, "OU_2.5": {...}, ... }
     Prefers /odds/live, falls back to /odds; aggregates across books with outlier & fair checks.
     """
-    cached = _odds_cache_get(fid)
-    if cached is not None:
-        return cached
+    now = time.time()
+    k=("odds", fid)
+    ts_empty = NEG_CACHE.get(k, (0.0, False))
+    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return {}
+    if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: return ODDS_CACHE[fid][1]
 
     def _fetch(path: str) -> dict:
         js = _api_get(f"{BASE_URL}/{path}", {"fixture": fid}) or {}
@@ -924,7 +816,146 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
                 out[mkey][side] = {"odds": float(ag), "book": label}
 
     ODDS_CACHE[fid] = (time.time(), out)
+    if not out: NEG_CACHE[k] = (now, True)
     return out
+
+def _market_name_normalize(s: str) -> str:
+    s=(s or "").lower()
+    if "both teams" in s or "btts" in s: return "BTTS"
+    if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
+    if "over/under" in s or "total" in s or "goals" in s: return "OU"
+    return s
+
+def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+    if not vals:
+        return None, None
+    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
+    if not xs:
+        return None, None
+    import statistics
+    med = statistics.median(xs)
+    filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
+    if not filtered:
+        filtered = vals
+    xs2 = sorted([o for (o, _) in filtered])
+    med2 = statistics.median(xs2)
+    if prob_hint is not None and prob_hint > 0:
+        fair = 1.0 / max(1e-6, float(prob_hint))
+        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
+        filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
+    if ODDS_AGGREGATION == "best":
+        best = max(filtered, key=lambda t: t[0])
+        return float(best[0]), str(best[1])
+    target = med2
+    pick = min(filtered, key=lambda t: abs(t[0] - target))
+    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
+
+# ───────── Model scoring helpers (preserved) ─────────
+MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
+EPS=1e-12
+def _sigmoid(x: float) -> float:
+    try:
+        if x<-50: return 1e-22
+        if x>50:  return 1-1e-22
+        import math; return 1/(1+math.exp(-x))
+    except: return 0.5
+
+def _logit(p: float) -> float:
+    import math; p=max(EPS,min(1-EPS,float(p))); return math.log(p/(1-p))
+
+def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) -> float:
+    s=float(intercept or 0.0)
+    for k,w in (weights or {}).items(): s += float(w or 0.0)*float(feat.get(k,0.0))
+    return s
+
+def _calibrate(p: float, cal: Dict[str,Any]) -> float:
+    method=(cal or {}).get("method","sigmoid"); a=float((cal or {}).get("a",1.0)); b=float((cal or {}).get("b",0.0))
+    if method.lower()=="platt": return _sigmoid(a*_logit(p)+b)
+    import math; p=max(EPS,min(1-EPS,float(p))); z=math.log(p/(1-p)); return _sigmoid(a*z+b)
+
+def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
+    p=_sigmoid(_linpred(feat, mdl.get("weights",{}), float(mdl.get("intercept",0.0))))
+    cal=mdl.get("calibration") or {}
+    try: 
+        if cal: p=_calibrate(p, cal)
+    except: pass
+    return max(0.0, min(1.0, float(p)))
+
+def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
+    name=f"OU_{_fmt_line(line)}"; mdl=load_model_from_settings(name)
+    return mdl or (load_model_from_settings("O25") if abs(line-2.5)<1e-6 else None)
+
+def _load_wld_models(): 
+    return (load_model_from_settings("WLD_HOME"), load_model_from_settings("WLD_DRAW"), load_model_from_settings("WLD_AWAY"))
+
+# ───────── Odds helpers (preserved & robust) ─────────
+def _ev(prob: float, odds: float) -> float:
+    """Return expected value as decimal (e.g. 0.05 = +5%)."""
+    return prob*max(0.0, float(odds)) - 1.0
+
+def _min_odds_for_market(market: str) -> float:
+    if market.startswith("Over/Under"): return MIN_ODDS_OU
+    if market == "BTTS": return MIN_ODDS_BTTS
+    if market == "1X2":  return MIN_ODDS_1X2
+    return 1.01
+
+def _odds_cache_get(fid: int) -> Optional[dict]:
+    rec=ODDS_CACHE.get(fid)
+    if not rec: return None
+    ts,data=rec
+    if time.time()-ts>120: ODDS_CACHE.pop(fid,None); return None
+    return data
+
+def _parse_market_cutoffs(s: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok or "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        try:
+            out[k.strip().upper()] = int(float(v.strip()))
+        except Exception:
+            pass
+    return out
+
+_MARKET_CUTOFFS = _parse_market_cutoffs(MARKET_CUTOFFS_RAW)
+try:
+    _TIP_MAX_MINUTE = int(float(TIP_MAX_MINUTE_ENV)) if TIP_MAX_MINUTE_ENV.strip() else None
+except Exception:
+    _TIP_MAX_MINUTE = None
+
+def _market_family(market_text: str, suggestion: str) -> str:
+    """Normalize to OU / BTTS / 1X2 (draw suppressed)."""
+    s = (market_text or "").upper()
+    if s.startswith("OVER/UNDER") or "OVER/UNDER" in s:
+        return "OU"
+    if s == "BTTS" or "BTTS" in s:
+        return "BTTS"
+    if s == "1X2" or "WINNER" in s or "MATCH WINNER" in s:
+        return "1X2"
+    if s.startswith("PRE "):
+        return _market_family(s[4:], suggestion)
+    return s
+
+def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
+    """
+    True if we are still within the minute cutoff for this market.
+    Falls back to TIP_MAX_MINUTE or (TOTAL_MATCH_MINUTES - 5).
+    """
+    fam = _market_family(market_text, suggestion)
+    if minute is None:
+        return True
+    try:
+        m = int(minute)
+    except Exception:
+        m = 0
+    cutoff = _MARKET_CUTOFFS.get(fam)
+    if cutoff is None:
+        cutoff = _TIP_MAX_MINUTE
+    if cutoff is None:
+        cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
+    return m <= int(cutoff)
 
 def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
@@ -998,7 +1029,7 @@ def _get_market_threshold(m: str) -> float:
 def _get_market_threshold_pre(m: str) -> float: return _get_market_threshold(f"PRE {m}")
 
 def _as_bool(s: str) -> bool:
-    return str(s).strip() not in ("0","false","False","no","NO","")
+    return str(s).strip() not in ("0","false","False","no","NO")
 
 def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct, feat, odds=None, book=None, ev_pct=None):
     stat=""
@@ -1021,6 +1052,47 @@ def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct,
             f"<b>Tip:</b> {escape(suggestion)}\n"
             f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}\n"
             f"🏆 <b>League:</b> {escape(league)}{stat}")
+
+# ───────── Parse helpers (OU, results) ─────────
+def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
+    """Extract the line value from Over/Under suggestions like 'Over 2.5 Goals'"""
+    try:
+        # Handle different formats
+        if "Over" in s or "Under" in s:
+            # Extract the number after Over/Under
+            import re
+            match = re.search(r'(\d+\.?\d*)', s)
+            if match:
+                return float(match.group(1))
+        return None
+    except Exception:
+        return None
+
+# ───────── Cache Cleanup ─────────
+def cleanup_caches():
+    """Clean up stale cache entries"""
+    now = time.time()
+    max_age = 3600  # 1 hour
+    
+    # Clean STATS_CACHE, EVENTS_CACHE, ODDS_CACHE
+    for cache in [STATS_CACHE, EVENTS_CACHE, ODDS_CACHE]:
+        stale = [k for k, (ts, _) in cache.items() if now - ts > max_age]
+        for k in stale:
+            cache.pop(k, None)
+    
+    # Clean NEG_CACHE
+    stale_neg = [k for k, (ts, _) in NEG_CACHE.items() if now - ts > NEG_TTL_SEC]
+    for k in stale_neg:
+        NEG_CACHE.pop(k, None)
+    
+    # Clean FEED_STATE
+    if STALE_GUARD_ENABLE:
+        stale_feeds = [fid for fid, state in _FEED_STATE.items() 
+                      if now - state.get('last_change', 0) > STALE_STATS_MAX_SEC * 2]
+        for fid in stale_feeds:
+            _FEED_STATE.pop(fid, None)
+    
+    log.info("[CACHE] Cleaned up stale entries")
 
 # ───────── Sanity checks & stale-feed guard (preserved) ─────────
 def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
@@ -1133,23 +1205,21 @@ def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
 
     return False
 
-# ───────── Parse helpers (OU, results) ─────────
-def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
-    try:
-        for tok in (s or "").split():
-            try: return float(tok)
-            except: pass
-    except: pass
-    return None
-
 # ───────── In-play production scan (full, preserved; adds metrics + CB benefits) ─────────
 def production_scan() -> Tuple[int, int]:
     if not _db_ping():
+        log.error("[PROD] Database unavailable")
         return (0, 0)
-    matches = fetch_live_matches()
+    
+    try:
+        matches = fetch_live_matches()
+    except Exception as e:
+        log.error("[PROD] Failed to fetch live matches: %s", e)
+        return (0, 0)
+    
     live_seen = len(matches)
     if live_seen == 0:
-        log.info("[PROD] no live")
+        log.info("[PROD] no live matches")
         return 0, 0
 
     saved = 0
@@ -2021,6 +2091,18 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
         log.info("[RETRY] resent %d", retried)
     return retried
 
+# ───────── Shutdown Handlers ─────────
+def shutdown_handler(signum=None, frame=None):
+    log.info("Received shutdown signal, cleaning up...")
+    if POOL:
+        POOL.closeall()
+    sys.exit(0)
+
+def register_shutdown_handlers():
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    atexit.register(shutdown_handler)
+
 # ───────── Scheduler (preserved; wiring fixed for auto-tune) ─────────
 _scheduler_started=False
 
@@ -2078,6 +2160,9 @@ def _start_scheduler_once():
         sched.add_job(lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
                       "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True)
 
+        # cache cleanup
+        sched.add_job(cleanup_caches, "interval", hours=1, id="cache_cleanup")
+
         sched.start()
         _scheduler_started = True
         send_telegram("🚀 goalsniper AI mode (in-play + prematch) started.")
@@ -2098,8 +2183,24 @@ def root(): return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI",
 def health():
     try:
         with db_conn() as c:
-            n=c.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
-        return jsonify({"ok": True, "db": "ok", "tips_count": int(n)})
+            n = c.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+        
+        # Check API connectivity
+        api_ok = False
+        try:
+            test_resp = _api_get(FOOTBALL_API_URL, {"live": "all"}, timeout=5)
+            api_ok = test_resp is not None
+        except:
+            pass
+            
+        return jsonify({
+            "ok": True, 
+            "db": "ok", 
+            "tips_count": int(n),
+            "api_connected": api_ok,
+            "scheduler_running": _scheduler_started,
+            "timestamp": time.time()
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -2191,6 +2292,8 @@ def telegram_webhook(secret: str):
 
 # ───────── Boot ─────────
 def _on_boot():
+    register_shutdown_handlers()
+    validate_config()
     _init_pool()
     init_db()
     set_setting("boot_ts", str(int(time.time())))
