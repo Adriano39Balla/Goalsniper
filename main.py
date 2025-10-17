@@ -3470,6 +3470,19 @@ def http_prematch_scan(): _require_admin(); saved=prematch_scan_save(); return j
 def http_motd():
     _require_admin(); ok = send_match_of_the_day(); return jsonify({"ok": bool(ok)})
 
+@app.route("/admin/motd-test", methods=["POST", "GET"])
+def http_motd_test():
+    """Test MOTD manually"""
+    _require_admin()
+    log.info("[MOTD-TEST] Manual MOTD trigger")
+    
+    try:
+        ok = send_match_of_the_day()
+        return jsonify({"ok": bool(ok), "message": "MOTD test completed"})
+    except Exception as e:
+        log.exception("[MOTD-TEST] Failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/settings/<key>", methods=["GET","POST"])
 def http_settings(key: str):
     _require_admin()
