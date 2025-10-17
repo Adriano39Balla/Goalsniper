@@ -1307,6 +1307,57 @@ class AdaptiveLearningSystem:
             
             self.feature_importance[feature_name]['market_specific'][market]['total_uses'] += 1
             self.feature_importance[feature_name]['market_specific'][market]['correct_uses'] += prediction_correct
+
+    # ───────── Prematch probability helper ─────────
+def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
+    """
+    Get pre-match probability for a fixture and market from prematch snapshots
+    Returns None if no pre-match data available
+    """
+    try:
+        with db_conn() as c:
+            cursor = c.execute(
+                "SELECT payload FROM prematch_snapshots WHERE match_id=%s ORDER BY created_ts DESC LIMIT 1",
+                (fid,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+                
+            snapshot = json.loads(row[0])
+            features = snapshot.get("feat", {})
+            
+            # Map live market to pre-match model
+            if market.startswith("OU_"):
+                line = market.split("_")[1]
+                model_name = f"PRE_OU_{line}"
+            elif market == "BTTS":
+                model_name = "PRE_BTTS_YES"
+            elif market == "1X2":
+                # For 1X2, we need to check both home and away
+                model_name_home = "PRE_WLD_HOME"
+                model_name_away = "PRE_WLD_AWAY"
+                
+                mdl_home = load_model_from_settings(model_name_home)
+                mdl_away = load_model_from_settings(model_name_away)
+                
+                if mdl_home and mdl_away:
+                    prob_h = _score_prob(features, mdl_home)
+                    prob_a = _score_prob(features, mdl_away)
+                    s = max(EPS, prob_h + prob_a)
+                    return prob_h / s, prob_a / s  # Return tuple for home/away
+                return None
+            else:
+                return None
+                
+            mdl = load_model_from_settings(model_name)
+            if mdl and features:
+                return _score_prob(features, mdl)
+                
+    except Exception as e:
+        log.warning("[PREMATCH_PROB] Failed to get pre-match probability for fid %s: %s", fid, e)
+        
+    return None
     
     def get_feature_weights(self, market: str) -> Dict[str, float]:
         """Get adaptive feature weights for specific market"""
@@ -1690,12 +1741,22 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 # Bayesian updates with pre-match probabilities
                 enhanced_candidates = []
                 for market, suggestion, prob, confidence in candidates:
-                    pre_match_prob = _get_pre_match_probability(fid, market)
-                    if pre_match_prob:
-                        enhanced_prob = bayesian_updater.update_probability(pre_match_prob, prob, minute)
+                    pre_match_data = _get_pre_match_probability(fid, market)
+    
+                    if pre_match_data is not None:
+                        if market == "1X2" and isinstance(pre_match_data, tuple):
+                            # Handle 1X2 case with home/away probabilities
+                            pre_match_prob_home, pre_match_prob_away = pre_match_data
+                            if suggestion == "Home Win":
+                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute)
+                            else:  # "Away Win"
+                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_away, prob, minute)
+                        else:
+                            # Standard case
+                            enhanced_prob = bayesian_updater.update_probability(pre_match_data, prob, minute)
                     else:
-                        enhanced_prob = prob
-                    
+                        enhanced_prob = prob  # Fallback to live probability
+    
                     enhanced_candidates.append((market, suggestion, enhanced_prob, confidence))
 
                 # Odds analysis and filtering
