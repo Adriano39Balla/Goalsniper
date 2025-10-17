@@ -2976,93 +2976,157 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, 
     )
 
 def send_match_of_the_day() -> bool:
-    if os.getenv("MOTD_PREDICT","1") in ("0","false","False","no","NO"):
+    """Send Match of the Day - Fixed version"""
+    if os.getenv("MOTD_PREDICT", "1") in ("0", "false", "False", "no", "NO"):
+        log.info("[MOTD] MOTD disabled by configuration")
         return send_telegram("🏅 MOTD disabled.")
+    
+    log.info("[MOTD] Starting Match of the Day selection...")
+    
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
-        return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
+        log.warning("[MOTD] No fixtures found for today")
+        return send_telegram("🏅 Match of the Day: no fixtures today.")
+    
+    log.info("[MOTD] Found %d fixtures for today", len(fixtures))
 
+    # Filter by league IDs if specified
     if MOTD_LEAGUE_IDS:
         fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
+        log.info("[MOTD] After league filtering: %d fixtures", len(fixtures))
         if not fixtures:
             return send_telegram("🏅 Match of the Day: no fixtures in configured leagues.")
 
-    best = None
+    best_candidate = None
+    best_score = 0.0
 
     for fx in fixtures:
-        fixture = fx.get("fixture") or {}
-        lg      = fx.get("league") or {}
-        teams   = fx.get("teams") or {}
-        fid     = int((fixture.get("id") or 0))
+        try:
+            fixture = fx.get("fixture") or {}
+            lg = fx.get("league") or {}
+            teams = fx.get("teams") or {}
+            fid = int((fixture.get("id") or 0))
 
-        home = (teams.get("home") or {}).get("name","")
-        away = (teams.get("away") or {}).get("name","")
-        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-        kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
-
-        feat = extract_prematch_features(fx)
-        if not feat:
-            continue
-
-        candidates: List[Tuple[str,str,float]] = []
-
-        for line in OU_LINES:
-            mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-            if not mdl: continue
-            p = _score_prob(feat, mdl)
-            mk = f"Over/Under {_fmt_line(line)}"
-            thr = _get_market_threshold_pre(mk)
-            if p*100.0 >= thr:   candidates.append((mk, f"Over {_fmt_line(line)} Goals", p))
-            q = 1.0 - p
-            if q*100.0 >= thr:   candidates.append((mk, f"Under {_fmt_line(line)} Goals", q))
-
-        mdl = load_model_from_settings("PRE_BTTS_YES")
-        if mdl:
-            p = _score_prob(feat, mdl); thr = _get_market_threshold_pre("BTTS")
-            if p*100.0 >= thr: candidates.append(("BTTS","BTTS: Yes", p))
-            q = 1.0 - p
-            if q*100.0 >= thr: candidates.append(("BTTS","BTTS: No",  q))
-
-        mh = load_model_from_settings("PRE_WLD_HOME")
-        ma = load_model_from_settings("PRE_WLD_AWAY")
-        if mh and ma:
-            ph = _score_prob(feat, mh); pa = _score_prob(feat, ma)
-            s = max(EPS, ph+pa); ph, pa = ph/s, pa/s
-            thr = _get_market_threshold_pre("1X2")
-            if ph*100.0 >= thr: candidates.append(("1X2","Home Win", ph))
-            if pa*100.0 >= thr: candidates.append(("1X2","Away Win", pa))
-
-        if not candidates:
-            continue
-
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        mk, sug, prob = candidates[0]
-        prob_pct = prob * 100.0
-        if prob_pct < max(MOTD_CONF_MIN, 75):
-            continue
-
-        pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
-        if not pass_odds:
-            continue
-
-        ev_pct = None
-        if odds is not None:
-            edge = _ev(prob, odds)
-            ev_bps = int(round(edge * 10000))
-            ev_pct = round(edge * 100.0, 1)
-            if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
+            if not fid:
                 continue
-        else:
+
+            home = (teams.get("home") or {}).get("name", "")
+            away = (teams.get("away") or {}).get("name", "")
+            league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+            kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
+
+            log.debug("[MOTD] Processing: %s vs %s (%s)", home, away, league)
+
+            # Extract pre-match features
+            feat = extract_prematch_features(fx)
+            if not feat:
+                log.debug("[MOTD] No features for %s vs %s", home, away)
+                continue
+
+            candidates = []
+
+            # PRE Over/Under markets
+            for line in OU_LINES:
+                mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
+                if not mdl: 
+                    continue
+                    
+                p = _score_prob(feat, mdl)
+                mk = f"Over/Under {_fmt_line(line)}"
+                thr = _get_market_threshold_pre(mk)
+                
+                # Over candidate
+                if p * 100.0 >= max(thr, MOTD_CONF_MIN):
+                    candidates.append((mk, f"Over {_fmt_line(line)} Goals", p, home, away, league, kickoff_txt, fid))
+                
+                # Under candidate  
+                q = 1.0 - p
+                if q * 100.0 >= max(thr, MOTD_CONF_MIN):
+                    candidates.append((mk, f"Under {_fmt_line(line)} Goals", q, home, away, league, kickoff_txt, fid))
+
+            # PRE BTTS
+            mdl = load_model_from_settings("PRE_BTTS_YES")
+            if mdl:
+                p = _score_prob(feat, mdl)
+                thr = _get_market_threshold_pre("BTTS")
+                if p * 100.0 >= max(thr, MOTD_CONF_MIN):
+                    candidates.append(("BTTS", "BTTS: Yes", p, home, away, league, kickoff_txt, fid))
+                q = 1.0 - p
+                if q * 100.0 >= max(thr, MOTD_CONF_MIN):
+                    candidates.append(("BTTS", "BTTS: No", q, home, away, league, kickoff_txt, fid))
+
+            # PRE 1X2 (draw suppressed)
+            mh = load_model_from_settings("PRE_WLD_HOME")
+            ma = load_model_from_settings("PRE_WLD_AWAY")
+            if mh and ma:
+                ph = _score_prob(feat, mh)
+                pa = _score_prob(feat, ma)
+                s = max(EPS, ph + pa)
+                ph, pa = ph / s, pa / s
+                thr = _get_market_threshold_pre("1X2")
+                if ph * 100.0 >= max(thr, MOTD_CONF_MIN):
+                    candidates.append(("1X2", "Home Win", ph, home, away, league, kickoff_txt, fid))
+                if pa * 100.0 >= max(thr, MOTD_CONF_MIN):
+                    candidates.append(("1X2", "Away Win", pa, home, away, league, kickoff_txt, fid))
+
+            if not candidates:
+                log.debug("[MOTD] No candidates for %s vs %s", home, away)
+                continue
+
+            # Evaluate each candidate
+            for mk, sug, prob, home, away, league, kickoff_txt, fid in candidates:
+                prob_pct = prob * 100.0
+                
+                # Check odds and EV
+                pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
+                if not pass_odds:
+                    log.debug("[MOTD] Odds gate failed for %s: %s", sug, home)
+                    continue
+
+                ev_pct = None
+                if odds is not None:
+                    edge = _ev(prob, odds)
+                    ev_bps = int(round(edge * 10000))
+                    ev_pct = round(edge * 100.0, 1)
+                    if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
+                        log.debug("[MOTD] EV too low for %s: %d bps", sug, ev_bps)
+                        continue
+                else:
+                    log.debug("[MOTD] No odds for %s: %s", sug, home)
+                    continue
+
+                # Score candidate (confidence + EV)
+                candidate_score = prob_pct + (ev_pct or 0)
+                
+                log.info("[MOTD] Candidate: %s - %s vs %s - %.1f%% confidence, %.1f%% EV, score: %.1f", 
+                        sug, home, away, prob_pct, ev_pct, candidate_score)
+
+                if best_candidate is None or candidate_score > best_score:
+                    best_candidate = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
+                    best_score = candidate_score
+
+        except Exception as e:
+            log.exception("[MOTD] Error processing fixture: %s", e)
             continue
 
-        item = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
-        if best is None or prob_pct > best[0]:
-            best = item
+    if not best_candidate:
+        log.info("[MOTD] No suitable match found for MOTD")
+        return send_telegram("🏅 Match of the Day: no prematch pick met thresholds today.")
 
-    if not best:
-        return send_telegram("🏅 Match of the Day: no prematch pick met thresholds.")
-    prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best
-    return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
+    # Send the best candidate
+    prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best_candidate
+    
+    log.info("[MOTD] Selected: %s vs %s - %s (%.1f%%)", home, away, sug, prob_pct)
+    
+    message = _format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct)
+    success = send_telegram(message)
+    
+    if success:
+        log.info("[MOTD] Successfully sent MOTD")
+    else:
+        log.error("[MOTD] Failed to send MOTD message")
+        
+    return success
 
 # ───────── Auto-train / Auto-tune (fix wiring) ─────────
 def auto_train_job():
