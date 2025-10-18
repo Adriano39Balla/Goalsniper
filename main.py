@@ -1795,7 +1795,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             prob_h /= total
                             prob_a /= total
                             
-                        1x2_predictions = {
+                        predictions_1X2 = {
                             "Home Win": prob_h,
                             "Away Win": prob_a
                         }
