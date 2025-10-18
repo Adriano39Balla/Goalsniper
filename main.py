@@ -1,5 +1,3 @@
-[file name]: main.py
-[file content begin]
 # goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate
 # UPGRADED: Advanced prediction capabilities with ensemble models, Bayesian updates, and game state intelligence
 # ENHANCED: Added advanced AI systems including ensemble learning, feature engineering, market-specific intelligence, and adaptive learning
@@ -1124,9 +1122,11 @@ class MarketSpecificPredictor:
         }
         self.market_feature_sets = self._initialize_market_features()
     
-    def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
-        """Market-specific prediction with advanced features"""
-        if market.startswith("OU_"):
+    def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Any:
+        """Market-specific prediction with advanced features - FIXED to handle different return types"""
+        if market == "1X2":
+            return self._predict_1x2_advanced(features, minute)
+        elif market.startswith("OU_"):
             return self._predict_ou_advanced(features, minute)
         elif market in self.market_strategies:
             return self.market_strategies[market](features, minute)
@@ -1679,6 +1679,12 @@ def extract_enhanced_features(m: dict) -> Dict[str, float]:
     
     return base_feat
 
+# ───────── Missing Function Implementation ─────────
+def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
+    """Get pre-match probability for Bayesian updates"""
+    # For now, return None - you can implement actual pre-match data lookup later
+    return None
+
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
     """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2"""
@@ -1786,26 +1792,28 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
                 # 3. 1X2 Market (Draw suppressed)
                 try:
-                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
+                    result_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
+                    if isinstance(result_1x2, tuple) and len(result_1x2) == 3:
+                        prob_h, prob_a, confidence_1x2 = result_1x2
                     
-                    if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
-                        # Normalize probabilities (suppress draw)
-                        total = prob_h + prob_a
-                        if total > 0:
-                            prob_h /= total
-                            prob_a /= total
+                        if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
+                            # Normalize probabilities (suppress draw)
+                            total = prob_h + prob_a
+                            if total > 0:
+                                prob_h /= total
+                                prob_a /= total
+                                
+                            predictions_1X2 = {
+                                "Home Win": prob_h,
+                                "Away Win": prob_a
+                            }
+                            adjusted_1x2 = game_state_analyzer.adjust_predictions(predictions_1X2, game_state)
                             
-                        predictions_1X2 = {
-                            "Home Win": prob_h,
-                            "Away Win": prob_a
-                        }
-                        adjusted_1x2 = game_state_analyzer.adjust_predictions(1x2_predictions, game_state)
-                        
-                        for suggestion, adj_prob in adjusted_1x2.items():
-                            threshold = _get_market_threshold("1X2")
-                            if adj_prob * 100 >= threshold:
-                                candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
-                                log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
+                            for suggestion, adj_prob in adjusted_1x2.items():
+                                threshold = _get_market_threshold("1X2")
+                                if adj_prob * 100 >= threshold:
+                                    candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
+                                    log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
                 except Exception as e:
                     log.warning(f"[1X2_PREDICT] Failed for {home} vs {away}: {e}")
 
@@ -2321,7 +2329,7 @@ def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) 
     if prob_hint is not None and prob_hint > 0:
         fair = 1.0 / max(1e-6, float(prob_hint))
         cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-        filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
+        filtered = [(o, b) for (o, b) in vals if o <= cap] or filtered
     if ODDS_AGGREGATION == "best":
         best = max(filtered, key=lambda t: t[0])
         return float(best[0]), str(best[1])
@@ -2340,7 +2348,7 @@ def _sigmoid(x: float) -> float:
     except: return 0.5
 
 def _logit(p: float) -> float:
-    import math; p=max(EPS,min(1-EPS,float(p))); return math.log(p/(1-p))
+    import math; p=max(EPS,min(1-EPS,float(p))); return math.log(p/(1-p)))
 
 def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) -> float:
     s=float(intercept or 0.0)
@@ -3584,7 +3592,7 @@ def http_backfill(): _require_admin(); n=backfill_results_for_open_matches(400);
 @app.route("/admin/train", methods=["POST","GET"])
 def http_train():
     _require_admin()
-    if not TRAIN_ENable: return jsonify({"ok": False, "reason": "training disabled"}), 400
+    if not TRAIN_ENABLE: return jsonify({"ok": False, "reason": "training disabled"}), 400
     try: out=train_models(); return jsonify({"ok": True, "result": out})
     except Exception as e:
         log.exception("train_models failed: %s", e); return jsonify({"ok": False, "error": str(e)}), 500
@@ -3677,4 +3685,3 @@ _on_boot()
 
 if __name__ == "__main__":
     app.run(host=os.getenv("HOST","0.0.0.0"), port=int(os.getenv("PORT","8080")))
-[file content end]
