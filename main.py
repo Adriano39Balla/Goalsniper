@@ -1,3 +1,5 @@
+[file name]: main.py
+[file content begin]
 # goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate
 # UPGRADED: Advanced prediction capabilities with ensemble models, Bayesian updates, and game state intelligence
 # ENHANCED: Added advanced AI systems including ensemble learning, feature engineering, market-specific intelligence, and adaptive learning
@@ -703,23 +705,35 @@ class AdvancedEnsemblePredictor:
             return self._momentum_based_predict(features, market, minute), 0.7
         return None, 0.0
     
-    # In AdvancedEnsemblePredictor._logistic_predict method:
     def _logistic_predict(self, features: Dict[str, float], market: str) -> float:
-    """Logistic regression prediction with OU fallback"""
-    mdl = load_model_from_settings(market)
-    
-    # OU model fallback
-    if not mdl and market.startswith("OU_"):
-        try:
-            line = float(market[3:])
-            if abs(line - 2.5) < 1e-6:
-                mdl = load_model_from_settings("O25")  # Fallback to old 2.5 model
-        except:
-            pass
+        """Logistic regression prediction with OU fallback"""
+        mdl = None
+        
+        # Handle OU markets specifically
+        if market.startswith("OU_"):
+            try:
+                line = float(market[3:])  # Extract line from "OU_2.5"
+                mdl = self._load_ou_model_for_line(line)
+            except Exception as e:
+                log.warning(f"[ENSEMBLE] Failed to parse OU line from {market}: {e}")
+                pass
+        else:
+            mdl = load_model_from_settings(market)
             
-    if not mdl:
-        return 0.0
-    return predict_from_model(mdl, features)
+        if not mdl:
+            return 0.0
+        return predict_from_model(mdl, features)
+    
+    def _load_ou_model_for_line(self, line: float) -> Optional[Dict[str, Any]]:
+        """Load OU model with fallback to legacy names"""
+        name = f"OU_{_fmt_line(line)}"
+        mdl = load_model_from_settings(name)
+        # Fallback to legacy model names
+        if not mdl and abs(line-2.5) < 1e-6:
+            mdl = load_model_from_settings("O25")
+        if not mdl and abs(line-3.5) < 1e-6:
+            mdl = load_model_from_settings("O35")
+        return mdl
     
     def _xgboost_predict(self, features: Dict[str, float], market: str) -> Optional[float]:
         """XGBoost prediction implementation"""
@@ -1110,16 +1124,15 @@ class MarketSpecificPredictor:
         }
         self.market_feature_sets = self._initialize_market_features()
     
-    # In MarketSpecificPredictor class, update predict_for_market method:
     def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
-    """Market-specific prediction with advanced features"""
-    if market.startswith("OU_"):
-        return self._predict_ou_advanced(features, minute)
-    elif market in self.market_strategies:
-        return self.market_strategies[market](features, minute)
-    else:
-        # Fallback to ensemble prediction
-        return ensemble_predictor.predict_ensemble(features, market, minute)
+        """Market-specific prediction with advanced features"""
+        if market.startswith("OU_"):
+            return self._predict_ou_advanced(features, minute)
+        elif market in self.market_strategies:
+            return self.market_strategies[market](features, minute)
+        else:
+            # Fallback to ensemble prediction
+            return ensemble_predictor.predict_ensemble(features, market, minute)
     
     def _predict_btts_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
         """Advanced BTTS prediction with defensive vulnerability analysis"""
@@ -1153,56 +1166,124 @@ class MarketSpecificPredictor:
         return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
     
     def _predict_ou_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
-    """Advanced Over/Under prediction with tempo analysis"""
-    # Try to get base probability from ensemble for the specific line
-    base_prob, base_conf = 0.0, 0.0
+        """Advanced Over/Under prediction with proper model loading"""
+        # Try multiple approaches to get base probability
+        base_prob, base_conf = 0.0, 0.0
+        
+        # Approach 1: Use ensemble prediction
+        try:
+            ensemble_prob, ensemble_conf = ensemble_predictor.predict_ensemble(features, "OU", minute)
+            if ensemble_prob > base_prob:
+                base_prob, base_conf = ensemble_prob, ensemble_conf
+        except Exception as e:
+            log.warning(f"[OU_PREDICT] Ensemble failed: {e}")
+        
+        # Approach 2: Fallback to direct model prediction
+        if base_prob <= 0:
+            for line in OU_LINES:
+                market_key = f"OU_{_fmt_line(line)}"
+                mdl = ensemble_predictor._load_ou_model_for_line(line)
+                if mdl:
+                    prob = predict_from_model(mdl, features)
+                    confidence = 0.8  # Base confidence for direct model
+                    if prob > base_prob:
+                        base_prob, base_conf = prob, confidence
+                    break  # Use first available model
+        
+        if base_prob <= 0:
+            return 0.0, 0.0
+        
+        # Apply OU-specific adjustments
+        adjustments = self._calculate_ou_adjustments(features, minute)
+        adjusted_prob = max(0.0, min(1.0, base_prob * (1 + adjustments)))
+        
+        # Adjust confidence based on game state
+        confidence_factor = self._calculate_ou_confidence_factor(features, minute)
+        final_confidence = max(0.0, min(1.0, base_conf * confidence_factor))
+        
+        return adjusted_prob, final_confidence
     
-    # Fallback to original logistic model if ensemble fails
-    for line in OU_LINES:
-        market_key = f"OU_{_fmt_line(line)}"
-        mdl = load_model_from_settings(market_key)
-        if not mdl and abs(line-2.5)<1e-6:
-            mdl = load_model_from_settings("O25")  # Fallback to old model name
-            
-        if mdl:
-            prob = predict_from_model(mdl, features)
-            if prob > base_prob:
-                base_prob = prob
-                base_conf = 0.8  # Default confidence
+    def _calculate_ou_adjustments(self, features: Dict[str, float], minute: int) -> float:
+        """Calculate OU-specific probability adjustments"""
+        adjustments = 0.0
+        
+        # Current game state analysis
+        current_goals = features.get("goals_sum", 0)
+        xg_sum = features.get("xg_sum", 0)
+        minute = max(1, features.get("minute", 1))
+        
+        # Expected goals per minute rate
+        xg_per_minute = xg_sum / minute
+        expected_remaining_goals = xg_per_minute * (90 - minute)
+        
+        # Tempo analysis - compare actual vs expected
+        expected_goals_by_now = (xg_per_minute * minute)
+        if expected_goals_by_now > 0:
+            tempo_ratio = current_goals / expected_goals_by_now
+            if tempo_ratio > 1.3:  # Scoring faster than expected
+                adjustments += 0.2
+            elif tempo_ratio < 0.7:  # Scoring slower than expected
+                adjustments -= 0.15
+        
+        # Pressure and attacking momentum
+        pressure_total = features.get("pressure_home", 0) + features.get("pressure_away", 0)
+        if pressure_total > 150:  # High pressure game
+            adjustments += 0.1
+        elif pressure_total < 80:  # Low pressure game
+            adjustments -= 0.1
+        
+        # Defensive stability impact
+        defensive_stability = features.get("defensive_stability", 0.5)
+        if defensive_stability < 0.3:  # Poor defense
+            adjustments += 0.15
+        elif defensive_stability > 0.7:  # Strong defense
+            adjustments -= 0.15
+        
+        # Time-based adjustments (late game factors)
+        if minute > 75:
+            # Late game urgency - teams push for goals
+            score_diff = abs(features.get("goals_h", 0) - features.get("goals_a", 0))
+            if score_diff <= 1:  # Close game
+                adjustments += 0.1
+            elif current_goals == 0:  # No goals yet
+                adjustments += 0.05
+        
+        # Recent momentum (last 15 minutes)
+        goals_last_15 = features.get("goals_last_15", 0)
+        if goals_last_15 >= 2:
+            adjustments += 0.1
+        elif goals_last_15 == 0 and minute > 30:
+            adjustments -= 0.05
+        
+        return adjustments
     
-    if base_prob <= 0:
-        return 0.0, 0.0
-    
-    # Rest of your existing adjustments...
-    adjustments = 0.0
-    
-    # Tempo analysis
-    current_goals = features.get("goals_sum", 0)
-    expected_tempo = features.get("xg_sum", 0) / max(1, minute) * 90
-    
-    # If current tempo exceeds expected, favor over
-    tempo_ratio = current_goals / max(0.1, expected_tempo / 90 * minute)
-    if tempo_ratio > 1.2:
-        adjustments += 0.15
-    elif tempo_ratio < 0.8:
-        adjustments -= 0.15
-    
-    # Defensive fatigue
-    defensive_fatigue = features.get("defensive_fatigue", 0)
-    adjustments += defensive_fatigue * 0.2
-    
-    # Attacking momentum
-    attacking_momentum = (features.get("pressure_home", 0) + features.get("pressure_away", 0)) / 200.0
-    adjustments += attacking_momentum * 0.1
-    
-    # Time pressure (late goals)
-    time_pressure = max(0, (minute - 70) / 20.0)
-    adjustments += time_pressure * 0.1
-    
-    adjusted_prob = base_prob * (1 + adjustments)
-    confidence = base_conf * 0.95
-    
-    return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
+    def _calculate_ou_confidence_factor(self, features: Dict[str, float], minute: int) -> float:
+        """Calculate confidence factor for OU predictions"""
+        confidence = 1.0
+        
+        # Data quality factors
+        xg_available = features.get("xg_sum", 0) > 0
+        pressure_available = features.get("pressure_home", 0) > 0 or features.get("pressure_away", 0) > 0
+        
+        if not xg_available:
+            confidence *= 0.7
+        if not pressure_available:
+            confidence *= 0.8
+        
+        # Game progression factor (more confidence as game progresses)
+        progression_factor = min(1.0, minute / 60.0)
+        confidence *= (0.5 + 0.5 * progression_factor)
+        
+        # Sample size factor (more events = more confidence)
+        total_events = (
+            features.get("sot_sum", 0) + 
+            features.get("cor_sum", 0) + 
+            features.get("goals_sum", 0)
+        )
+        if total_events < 5 and minute > 30:
+            confidence *= 0.8
+        
+        return confidence
     
     def _predict_1x2_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float, float]:
         """Advanced 1X2 prediction with momentum and psychological factors"""
@@ -1340,57 +1421,6 @@ class AdaptiveLearningSystem:
             self.feature_importance[feature_name]['market_specific'][market]['total_uses'] += 1
             self.feature_importance[feature_name]['market_specific'][market]['correct_uses'] += prediction_correct
 
-    # ───────── Prematch probability helper ─────────
-def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
-    """
-    Get pre-match probability for a fixture and market from prematch snapshots
-    Returns None if no pre-match data available
-    """
-    try:
-        with db_conn() as c:
-            cursor = c.execute(
-                "SELECT payload FROM prematch_snapshots WHERE match_id=%s ORDER BY created_ts DESC LIMIT 1",
-                (fid,)
-            )
-            row = cursor.fetchone()
-            if not row:
-                return None
-                
-            snapshot = json.loads(row[0])
-            features = snapshot.get("feat", {})
-            
-            # Map live market to pre-match model
-            if market.startswith("OU_"):
-                line = market.split("_")[1]
-                model_name = f"PRE_OU_{line}"
-            elif market == "BTTS":
-                model_name = "PRE_BTTS_YES"
-            elif market == "1X2":
-                # For 1X2, we need to check both home and away
-                model_name_home = "PRE_WLD_HOME"
-                model_name_away = "PRE_WLD_AWAY"
-                
-                mdl_home = load_model_from_settings(model_name_home)
-                mdl_away = load_model_from_settings(model_name_away)
-                
-                if mdl_home and mdl_away:
-                    prob_h = _score_prob(features, mdl_home)
-                    prob_a = _score_prob(features, mdl_away)
-                    s = max(EPS, prob_h + prob_a)
-                    return prob_h / s, prob_a / s  # Return tuple for home/away
-                return None
-            else:
-                return None
-                
-            mdl = load_model_from_settings(model_name)
-            if mdl and features:
-                return _score_prob(features, mdl)
-                
-    except Exception as e:
-        log.warning("[PREMATCH_PROB] Failed to get pre-match probability for fid %s: %s", fid, e)
-        
-    return None
-    
     def get_feature_weights(self, market: str) -> Dict[str, float]:
         """Get adaptive feature weights for specific market"""
         base_weights = {}
@@ -1651,7 +1681,7 @@ def extract_enhanced_features(m: dict) -> Dict[str, float]:
 
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
-    """Enhanced scan with advanced AI prediction capabilities"""
+    """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2"""
     if not _db_ping():
         log.error("[ENHANCED_PROD] Database unavailable")
         return (0, 0)
@@ -1671,10 +1701,6 @@ def enhanced_production_scan() -> Tuple[int, int]:
     now_ts = int(time.time())
     per_league_counter: dict[int, int] = {}
 
-    # Initialize enhanced prediction systems
-    game_state_analyzer = GameStateAnalyzer()
-    bayesian_updater = BayesianUpdater()
-
     with db_conn() as c:
         for m in matches:
             try:
@@ -1682,6 +1708,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 if not fid:
                     continue
 
+                # Duplicate check
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - DUP_COOLDOWN_MIN * 60
                     cursor = c.execute(
@@ -1696,6 +1723,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 feat = feature_engineer.extract_advanced_features(m)
                 minute = int(feat.get("minute", 0))
                 
+                # Validation checks
                 if not stats_coverage_ok(feat, minute):
                     continue
                 if minute < TIP_MIN_MINUTE:
@@ -1703,6 +1731,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 if is_feed_stale(fid, m, minute):
                     continue
 
+                # Harvest mode snapshot
                 if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
                     try:
                         save_snapshot_from_match(m, feat)
@@ -1710,90 +1739,103 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         pass
 
                 # Game state analysis
+                game_state_analyzer = GameStateAnalyzer()
                 game_state = game_state_analyzer.analyze_game_state(feat)
                 
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
                 score = _pretty_score(m)
 
-                candidates: List[Tuple[str, str, float, float]] = []  # Added confidence
+                candidates: List[Tuple[str, str, float, float]] = []
 
-                # Enhanced market predictions
-                for market_type in ["BTTS", "OU", "1X2"]:
-                    if market_type == "OU":
-                        for line in OU_LINES:
-                            market_key = f"OU_{_fmt_line(line)}"
-                            prob, confidence = market_predictor.predict_for_market(feat, market_key, minute)
-                            
-                            if prob > 0 and confidence > 0.6:  # Minimum confidence threshold
-                                market_predictions = {
-                                    f"Over {_fmt_line(line)} Goals": prob,
-                                    f"Under {_fmt_line(line)} Goals": 1 - prob
-                                }
-                                
-                                # Apply game state adjustments
-                                adjusted = game_state_analyzer.adjust_predictions(market_predictions, game_state)
-                                
-                                for suggestion, adj_prob in adjusted.items():
-                                    threshold = _get_market_threshold(f"Over/Under {_fmt_line(line)}")
-                                    if adj_prob * 100 >= threshold:
-                                        candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, confidence))
+                # PREDICT ALL MARKETS: BTTS, OU, 1X2
+                log.info(f"[MARKET_SCAN] Processing {home} vs {away} at minute {minute}")
+                
+                # 1. BTTS Market
+                btts_prob, btts_confidence = market_predictor.predict_for_market(feat, "BTTS", minute)
+                if btts_prob > 0 and btts_confidence > 0.5:
+                    btts_predictions = {
+                        "BTTS: Yes": btts_prob,
+                        "BTTS: No": 1 - btts_prob
+                    }
+                    adjusted_btts = game_state_analyzer.adjust_predictions(btts_predictions, game_state)
                     
-                    elif market_type == "BTTS":
-                        prob, confidence = market_predictor.predict_for_market(feat, "BTTS", minute)
-                        
-                        if prob > 0 and confidence > 0.6:
-                            market_predictions = {
-                                "BTTS: Yes": prob,
-                                "BTTS: No": 1 - prob
-                            }
-                            adjusted = game_state_analyzer.adjust_predictions(market_predictions, game_state)
-                            
-                            for suggestion, adj_prob in adjusted.items():
-                                if adj_prob * 100 >= _get_market_threshold("BTTS"):
-                                    candidates.append(("BTTS", suggestion, adj_prob, confidence))
+                    for suggestion, adj_prob in adjusted_btts.items():
+                        threshold = _get_market_threshold("BTTS")
+                        if adj_prob * 100 >= threshold:
+                            candidates.append(("BTTS", suggestion, adj_prob, btts_confidence))
+                            log.info(f"[BTTS_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {btts_confidence:.3f})")
+
+                # 2. Over/Under Markets
+                for line in OU_LINES:
+                    market_key = f"OU_{_fmt_line(line)}"
+                    ou_prob, ou_confidence = market_predictor.predict_for_market(feat, market_key, minute)
                     
-                    elif market_type == "1X2":
-                        prob_h, prob_a, confidence = market_predictor.predict_for_market(feat, "1X2", minute)
+                    if ou_prob > 0 and ou_confidence > 0.5:
+                        ou_predictions = {
+                            f"Over {_fmt_line(line)} Goals": ou_prob,
+                            f"Under {_fmt_line(line)} Goals": 1 - ou_prob
+                        }
+                        adjusted_ou = game_state_analyzer.adjust_predictions(ou_predictions, game_state)
                         
-                        if prob_h > 0 and prob_a > 0 and confidence > 0.6:
-                            market_predictions = {
-                                "Home Win": prob_h,
-                                "Away Win": prob_a
-                            }
-                            adjusted = game_state_analyzer.adjust_predictions(market_predictions, game_state)
+                        for suggestion, adj_prob in adjusted_ou.items():
+                            threshold = _get_market_threshold(f"Over/Under {_fmt_line(line)}")
+                            if adj_prob * 100 >= threshold:
+                                candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, ou_confidence))
+                                log.info(f"[OU_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {ou_confidence:.3f})")
+
+                # 3. 1X2 Market (Draw suppressed)
+                try:
+                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
+                    
+                    if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
+                        # Normalize probabilities (suppress draw)
+                        total = prob_h + prob_a
+                        if total > 0:
+                            prob_h /= total
+                            prob_a /= total
                             
-                            for suggestion, adj_prob in adjusted.items():
-                                if adj_prob * 100 >= _get_market_threshold("1X2"):
-                                    candidates.append(("1X2", suggestion, adj_prob, confidence))
+                        1x2_predictions = {
+                            "Home Win": prob_h,
+                            "Away Win": prob_a
+                        }
+                        adjusted_1x2 = game_state_analyzer.adjust_predictions(1x2_predictions, game_state)
+                        
+                        for suggestion, adj_prob in adjusted_1x2.items():
+                            threshold = _get_market_threshold("1X2")
+                            if adj_prob * 100 >= threshold:
+                                candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
+                                log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
+                except Exception as e:
+                    log.warning(f"[1X2_PREDICT] Failed for {home} vs {away}: {e}")
 
                 if not candidates:
+                    log.info(f"[NO_CANDIDATES] No qualified tips for {home} vs {away}")
                     continue
 
                 # Bayesian updates with pre-match probabilities
                 enhanced_candidates = []
                 for market, suggestion, prob, confidence in candidates:
                     pre_match_data = _get_pre_match_probability(fid, market)
-    
+                    
                     if pre_match_data is not None:
+                        bayesian_updater = BayesianUpdater()
                         if market == "1X2" and isinstance(pre_match_data, tuple):
-                            # Handle 1X2 case with home/away probabilities
                             pre_match_prob_home, pre_match_prob_away = pre_match_data
                             if suggestion == "Home Win":
                                 enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute)
                             else:  # "Away Win"
                                 enhanced_prob = bayesian_updater.update_probability(pre_match_prob_away, prob, minute)
                         else:
-                            # Standard case
                             enhanced_prob = bayesian_updater.update_probability(pre_match_data, prob, minute)
                     else:
-                        enhanced_prob = prob  # Fallback to live probability
-    
+                        enhanced_prob = prob
+
                     enhanced_candidates.append((market, suggestion, enhanced_prob, confidence))
 
                 # Odds analysis and filtering
                 odds_map = fetch_odds(fid) if API_KEY else {}
-                ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []  # Added confidence
+                ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
 
                 for mk, sug, prob, confidence in enhanced_candidates:
                     if sug not in ALLOWED_SUGGESTIONS:
@@ -1841,7 +1883,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         if int(round(edge * 10000)) < EDGE_MIN_BPS:
                             continue
                     else:
-                        continue
+                        if not ALLOW_TIPS_WITHOUT_ODDS:
+                            continue
 
                     # Enhanced ranking with confidence scoring
                     rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0) * confidence
@@ -1851,13 +1894,14 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     continue
 
                 ranked.sort(key=lambda x: x[6], reverse=True)  # Sort by rank score
+                log.info(f"[RANKED_TIPS] Found {len(ranked)} qualified tips for {home} vs {away}")
 
                 per_match = 0
                 base_now = int(time.time())
 
                 for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank, confidence) in enumerate(ranked):
                     if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
-                        continue
+                        break
 
                     created_ts = base_now + idx
                     raw = float(prob)
@@ -1895,6 +1939,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             if sent:
                                 c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
                                 _metric_inc("tips_sent_total", n=1)
+                                log.info(f"[TIP_SENT] {suggestion} for {home} vs {away} at {minute}'")
                     except Exception as e:
                         log.exception("[ENHANCED_PROD] insert/send failed: %s", e)
                         continue
@@ -3539,7 +3584,7 @@ def http_backfill(): _require_admin(); n=backfill_results_for_open_matches(400);
 @app.route("/admin/train", methods=["POST","GET"])
 def http_train():
     _require_admin()
-    if not TRAIN_ENABLE: return jsonify({"ok": False, "reason": "training disabled"}), 400
+    if not TRAIN_ENable: return jsonify({"ok": False, "reason": "training disabled"}), 400
     try: out=train_models(); return jsonify({"ok": True, "result": out})
     except Exception as e:
         log.exception("train_models failed: %s", e); return jsonify({"ok": False, "error": str(e)}), 500
@@ -3632,3 +3677,4 @@ _on_boot()
 
 if __name__ == "__main__":
     app.run(host=os.getenv("HOST","0.0.0.0"), port=int(os.getenv("PORT","8080")))
+[file content end]
