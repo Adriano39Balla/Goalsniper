@@ -71,6 +71,7 @@ handler.setFormatter(formatter)
 log = logging.getLogger("goalsniper")
 log.handlers = [handler]
 log.setLevel(logging.INFO)
+log.propagate = False
 
 app = Flask(__name__)
 
