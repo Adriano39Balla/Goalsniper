@@ -12,8 +12,6 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import accuracy_score, precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 import joblib
-import psycopg2
-from psycopg2.pool import SimpleConnectionPool
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
@@ -21,41 +19,45 @@ log = logging.getLogger("trainer")
 
 # Database connection (shared with main.py)
 DATABASE_URL = os.getenv("DATABASE_URL")
-_db_pool = None
-
-def get_db_connection():
-    """Get database connection using the same pool as main.py"""
-    global _db_pool
-    if not _db_pool:
-        _db_pool = SimpleConnectionPool(1, 5, DATABASE_URL)
-    return _db_pool.getconn()
-
-def release_db_connection(conn):
-    """Release connection back to pool"""
-    if _db_pool and conn:
-        _db_pool.putconn(conn)
 
 def db_execute(query: str, params: tuple = ()) -> list:
-    """Execute query and return results"""
-    conn = None
+    """
+    Execute query using main.py's connection pool
+    This avoids creating a separate connection pool
+    """
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute(query, params)
+        # Import from main to use the same connection pool
+        from main import db_conn
+        
+        with db_conn() as c:
+            cursor = c.execute(query, params)
             if query.strip().upper().startswith('SELECT'):
-                return cur.fetchall()
-            conn.commit()
-        return []
+                return cursor.fetchall()
+            return []
+    except ImportError:
+        # Fallback for standalone execution
+        log.warning("Could not import from main, using direct connection")
+        import psycopg2
+        conn = None
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                if query.strip().upper().startswith('SELECT'):
+                    return cur.fetchall()
+            return []
+        except Exception as e:
+            log.error("DB query failed: %s - %s", query, e)
+            raise
+        finally:
+            if conn:
+                conn.close()
     except Exception as e:
         log.error("DB query failed: %s - %s", query, e)
-        if conn:
-            conn.rollback()
         raise
-    finally:
-        if conn:
-            release_db_connection(conn)
 
-# Feature configuration
+# Feature configuration (keep your existing feature sets)
 FEATURE_SETS = {
     "BTTS": [
         "minute", "goals_h", "goals_a", "goals_sum", "goals_diff",
@@ -113,10 +115,23 @@ PREMATCH_FEATURE_SETS = {
     "PRE_WLD_AWAY": ["avg_goals_h", "avg_goals_a", "avg_goals_h2h", "rest_days_h", "rest_days_a"]
 }
 
+def test_integration():
+    """Test if train_models can connect to the database"""
+    try:
+        result = db_execute("SELECT 1 as test")
+        log.info("✅ train_models database connection successful")
+        return True
+    except Exception as e:
+        log.error("❌ train_models database connection failed: %s", e)
+        return False
+
 def load_training_data(days: int = 30) -> pd.DataFrame:
     """
     Load training data from snapshots and results
     """
+    if not test_integration():
+        return pd.DataFrame()
+        
     cutoff = int((datetime.now() - timedelta(days=days)).timestamp())
     
     query = """
@@ -187,6 +202,9 @@ def load_prematch_training_data(days: int = 90) -> pd.DataFrame:
     """
     Load prematch training data
     """
+    if not test_integration():
+        return pd.DataFrame()
+        
     cutoff = int((datetime.now() - timedelta(days=days)).timestamp())
     
     query = """
@@ -504,7 +522,13 @@ def train_models(retrain_all: bool = False, days_back: int = 30) -> Dict[str, An
     
     try:
         # Check database connection
-        db_execute("SELECT 1")
+        if not test_integration():
+            return {
+                "ok": False,
+                "reason": "Database connection failed",
+                "trained": {},
+                "duration": int(time.time() - start_time)
+            }
         
         # Load training data
         log.info("[TRAIN] Loading in-play training data...")
