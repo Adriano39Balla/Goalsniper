@@ -1122,11 +1122,9 @@ class MarketSpecificPredictor:
         }
         self.market_feature_sets = self._initialize_market_features()
     
-    def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Any:
-        """Market-specific prediction with advanced features - FIXED to handle different return types"""
-        if market == "1X2":
-            return self._predict_1x2_advanced(features, minute)
-        elif market.startswith("OU_"):
+    def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
+        """Market-specific prediction with advanced features"""
+        if market.startswith("OU_"):
             return self._predict_ou_advanced(features, minute)
         elif market in self.market_strategies:
             return self.market_strategies[market](features, minute)
@@ -1679,10 +1677,29 @@ def extract_enhanced_features(m: dict) -> Dict[str, float]:
     
     return base_feat
 
-# ───────── Missing Function Implementation ─────────
 def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
     """Get pre-match probability for Bayesian updates"""
-    # For now, return None - you can implement actual pre-match data lookup later
+    try:
+        # Try to get from pre-match models or historical data
+        if market == "BTTS":
+            mdl = load_model_from_settings("PRE_BTTS_YES")
+            if mdl:
+                # Would need match features, but return None for now
+                return None
+        elif market.startswith("OU"):
+            line = _parse_ou_line_from_suggestion(market)
+            if line:
+                mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
+                if mdl:
+                    return None
+        elif market == "1X2":
+            mdl_home = load_model_from_settings("PRE_WLD_HOME")
+            mdl_away = load_model_from_settings("PRE_WLD_AWAY")
+            if mdl_home and mdl_away:
+                # Return tuple for home/away probabilities
+                return (0.4, 0.4)  # Placeholder
+    except Exception as e:
+        log.warning(f"[PRE_MATCH_PROB] Failed for {market}: {e}")
     return None
 
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
@@ -1792,28 +1809,26 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
                 # 3. 1X2 Market (Draw suppressed)
                 try:
-                    result_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
-                    if isinstance(result_1x2, tuple) and len(result_1x2) == 3:
-                        prob_h, prob_a, confidence_1x2 = result_1x2
+                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
                     
-                        if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
-                            # Normalize probabilities (suppress draw)
-                            total = prob_h + prob_a
-                            if total > 0:
-                                prob_h /= total
-                                prob_a /= total
-                                
-                            predictions_1X2 = {
-                                "Home Win": prob_h,
-                                "Away Win": prob_a
-                            }
-                            adjusted_1x2 = game_state_analyzer.adjust_predictions(predictions_1X2, game_state)
+                    if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
+                        # Normalize probabilities (suppress draw)
+                        total = prob_h + prob_a
+                        if total > 0:
+                            prob_h /= total
+                            prob_a /= total
                             
-                            for suggestion, adj_prob in adjusted_1x2.items():
-                                threshold = _get_market_threshold("1X2")
-                                if adj_prob * 100 >= threshold:
-                                    candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
-                                    log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
+                        predictions_1X2 = {
+                            "Home Win": prob_h,
+                            "Away Win": prob_a
+                        }
+                        adjusted_1x2 = game_state_analyzer.adjust_predictions(predictions_1X2, game_state)
+                        
+                        for suggestion, adj_prob in adjusted_1x2.items():
+                            threshold = _get_market_threshold("1X2")
+                            if adj_prob * 100 >= threshold:
+                                candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
+                                log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
                 except Exception as e:
                     log.warning(f"[1X2_PREDICT] Failed for {home} vs {away}: {e}")
 
@@ -2329,7 +2344,7 @@ def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) 
     if prob_hint is not None and prob_hint > 0:
         fair = 1.0 / max(1e-6, float(prob_hint))
         cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-        filtered = [(o, b) for (o, b) in vals if o <= cap] or filtered
+        filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
     if ODDS_AGGREGATION == "best":
         best = max(filtered, key=lambda t: t[0])
         return float(best[0]), str(best[1])
@@ -2348,7 +2363,7 @@ def _sigmoid(x: float) -> float:
     except: return 0.5
 
 def _logit(p: float) -> float:
-    import math; p=max(EPS,min(1-EPS,float(p))); return math.log(p/(1-p)))
+    import math; p=max(EPS,min(1-EPS,float(p))); return math.log(p/(1-p))
 
 def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) -> float:
     s=float(intercept or 0.0)
@@ -2664,13 +2679,15 @@ def _match_fingerprint(m: dict) -> Tuple:
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     if not STALE_GUARD_ENABLE:
         return False
+        
+    now = time.time()
+    
     if minute < 10:
         st = _FEED_STATE.get(fid)
         fp = _match_fingerprint(m)
         _FEED_STATE[fid] = {"fp": fp, "last_change": now, "last_minute": minute}
         return False
 
-    now = time.time()
     fp = _match_fingerprint(m)
     st = _FEED_STATE.get(fid)
 
@@ -3592,10 +3609,14 @@ def http_backfill(): _require_admin(); n=backfill_results_for_open_matches(400);
 @app.route("/admin/train", methods=["POST","GET"])
 def http_train():
     _require_admin()
-    if not TRAIN_ENABLE: return jsonify({"ok": False, "reason": "training disabled"}), 400
-    try: out=train_models(); return jsonify({"ok": True, "result": out})
+    if not TRAIN_ENABLE: 
+        return jsonify({"ok": False, "reason": "training disabled"}), 400
+    try: 
+        out=train_models()
+        return jsonify({"ok": True, "result": out})
     except Exception as e:
-        log.exception("train_models failed: %s", e); return jsonify({"ok": False, "error": str(e)}), 500
+        log.exception("train_models failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/admin/train-notify", methods=["POST","GET"])
 def http_train_notify(): _require_admin(); auto_train_job(); return jsonify({"ok": True})
