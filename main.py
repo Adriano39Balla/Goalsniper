@@ -703,12 +703,23 @@ class AdvancedEnsemblePredictor:
             return self._momentum_based_predict(features, market, minute), 0.7
         return None, 0.0
     
+    # In AdvancedEnsemblePredictor._logistic_predict method:
     def _logistic_predict(self, features: Dict[str, float], market: str) -> float:
-        """Logistic regression prediction (existing functionality)"""
-        mdl = load_model_from_settings(market)
-        if not mdl:
-            return 0.0
-        return predict_from_model(mdl, features)
+    """Logistic regression prediction with OU fallback"""
+    mdl = load_model_from_settings(market)
+    
+    # OU model fallback
+    if not mdl and market.startswith("OU_"):
+        try:
+            line = float(market[3:])
+            if abs(line - 2.5) < 1e-6:
+                mdl = load_model_from_settings("O25")  # Fallback to old 2.5 model
+        except:
+            pass
+            
+    if not mdl:
+        return 0.0
+    return predict_from_model(mdl, features)
     
     def _xgboost_predict(self, features: Dict[str, float], market: str) -> Optional[float]:
         """XGBoost prediction implementation"""
@@ -1099,13 +1110,16 @@ class MarketSpecificPredictor:
         }
         self.market_feature_sets = self._initialize_market_features()
     
+    # In MarketSpecificPredictor class, update predict_for_market method:
     def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
-        """Market-specific prediction with advanced features"""
-        if market in self.market_strategies:
-            return self.market_strategies[market](features, minute)
-        else:
-            # Fallback to ensemble prediction
-            return ensemble_predictor.predict_ensemble(features, market, minute)
+    """Market-specific prediction with advanced features"""
+    if market.startswith("OU_"):
+        return self._predict_ou_advanced(features, minute)
+    elif market in self.market_strategies:
+        return self.market_strategies[market](features, minute)
+    else:
+        # Fallback to ensemble prediction
+        return ensemble_predictor.predict_ensemble(features, market, minute)
     
     def _predict_btts_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
         """Advanced BTTS prediction with defensive vulnerability analysis"""
@@ -1139,38 +1153,56 @@ class MarketSpecificPredictor:
         return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
     
     def _predict_ou_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
-        """Advanced Over/Under prediction with tempo analysis"""
-        base_prob, base_conf = ensemble_predictor.predict_ensemble(features, "OU", minute)
-        
-        adjustments = 0.0
-        
-        # Tempo analysis
-        current_goals = features.get("goals_sum", 0)
-        expected_tempo = features.get("xg_sum", 0) / max(1, minute) * 90
-        
-        # If current tempo exceeds expected, favor over
-        tempo_ratio = current_goals / max(0.1, expected_tempo / 90 * minute)
-        if tempo_ratio > 1.2:
-            adjustments += 0.15
-        elif tempo_ratio < 0.8:
-            adjustments -= 0.15
-        
-        # Defensive fatigue
-        defensive_fatigue = features.get("defensive_fatigue", 0)
-        adjustments += defensive_fatigue * 0.2
-        
-        # Attacking momentum
-        attacking_momentum = (features.get("pressure_home", 0) + features.get("pressure_away", 0)) / 200.0
-        adjustments += attacking_momentum * 0.1
-        
-        # Time pressure (late goals)
-        time_pressure = max(0, (minute - 70) / 20.0)
-        adjustments += time_pressure * 0.1
-        
-        adjusted_prob = base_prob * (1 + adjustments)
-        confidence = base_conf * 0.95
-        
-        return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
+    """Advanced Over/Under prediction with tempo analysis"""
+    # Try to get base probability from ensemble for the specific line
+    base_prob, base_conf = 0.0, 0.0
+    
+    # Fallback to original logistic model if ensemble fails
+    for line in OU_LINES:
+        market_key = f"OU_{_fmt_line(line)}"
+        mdl = load_model_from_settings(market_key)
+        if not mdl and abs(line-2.5)<1e-6:
+            mdl = load_model_from_settings("O25")  # Fallback to old model name
+            
+        if mdl:
+            prob = predict_from_model(mdl, features)
+            if prob > base_prob:
+                base_prob = prob
+                base_conf = 0.8  # Default confidence
+    
+    if base_prob <= 0:
+        return 0.0, 0.0
+    
+    # Rest of your existing adjustments...
+    adjustments = 0.0
+    
+    # Tempo analysis
+    current_goals = features.get("goals_sum", 0)
+    expected_tempo = features.get("xg_sum", 0) / max(1, minute) * 90
+    
+    # If current tempo exceeds expected, favor over
+    tempo_ratio = current_goals / max(0.1, expected_tempo / 90 * minute)
+    if tempo_ratio > 1.2:
+        adjustments += 0.15
+    elif tempo_ratio < 0.8:
+        adjustments -= 0.15
+    
+    # Defensive fatigue
+    defensive_fatigue = features.get("defensive_fatigue", 0)
+    adjustments += defensive_fatigue * 0.2
+    
+    # Attacking momentum
+    attacking_momentum = (features.get("pressure_home", 0) + features.get("pressure_away", 0)) / 200.0
+    adjustments += attacking_momentum * 0.1
+    
+    # Time pressure (late goals)
+    time_pressure = max(0, (minute - 70) / 20.0)
+    adjustments += time_pressure * 0.1
+    
+    adjusted_prob = base_prob * (1 + adjustments)
+    confidence = base_conf * 0.95
+    
+    return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
     
     def _predict_1x2_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float, float]:
         """Advanced 1X2 prediction with momentum and psychological factors"""
