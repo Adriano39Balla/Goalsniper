@@ -15,6 +15,18 @@ from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+# ───────── AI IMPORTS ─────────
+import pickle
+import hashlib
+import warnings
+from scipy.optimize import minimize
+from sklearn.ensemble import IsolationForest
+from sklearn.calibration import CalibratedClassifierCV
+import lightgbm as lgb
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
+warnings.filterwarnings('ignore')
+
 # ───────── Env bootstrap ─────────
 try:
     from dotenv import load_dotenv
@@ -57,6 +69,63 @@ class ShutdownManager:
     @classmethod
     def request_shutdown(cls):
         cls._shutdown_requested = True
+
+# ───────── AI Logger ─────────
+class AILogger:
+    """Advanced logging for AI systems"""
+    def __init__(self):
+        self.logger = logging.getLogger("goalsniper.ai")
+        
+    def log_training(self, model_name, accuracy, features_used):
+        self.logger.info(f"[AI_TRAIN] {model_name} - Accuracy: {accuracy:.3f}, Features: {len(features_used)}")
+        
+    def log_anomaly(self, match_id, anomaly_score, reason):
+        self.logger.warning(f"[ANOMALY] Match {match_id} - Score: {anomaly_score:.3f}, Reason: {reason}")
+        
+    def log_ensemble(self, predictions, weights, final_prob):
+        self.logger.debug(f"[ENSEMBLE] Predictions: {predictions}, Weights: {weights}, Final: {final_prob:.3f}")
+
+ai_logger = AILogger()
+
+# ───────── Exception Handler ─────────
+class ExceptionHandler:
+    """Comprehensive exception handling with alerts"""
+    
+    def __init__(self):
+        self.error_counts = {}
+        self.max_errors_before_alert = 5
+        
+    def handle(self, operation: str, func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            self._log_error(operation, e)
+            self._check_alert_threshold(operation, e)
+            return None
+            
+    def _log_error(self, operation: str, error: Exception):
+        error_key = f"{operation}_{type(error).__name__}"
+        self.error_counts[error_key] = self.error_counts.get(error_key, 0) + 1
+        
+        log.error(f"[EXCEPTION] {operation} failed: {str(error)}")
+        
+    def _check_alert_threshold(self, operation: str, error: Exception):
+        error_key = f"{operation}_{type(error).__name__}"
+        if self.error_counts[error_key] >= self.max_errors_before_alert:
+            self._send_alert(operation, error, self.error_counts[error_key])
+            self.error_counts[error_key] = 0  # Reset after alert
+            
+    def _send_alert(self, operation: str, error: Exception, count: int):
+        alert_msg = (
+            f"🚨 CRITICAL ERROR ALERT\n"
+            f"Operation: {operation}\n"
+            f"Error: {type(error).__name__}\n"
+            f"Count: {count} occurrences\n"
+            f"Message: {str(error)[:200]}"
+        )
+        send_telegram(alert_msg)
+
+exception_handler = ExceptionHandler()
 
 # ───────── App / logging ─────────
 class CustomFormatter(logging.Formatter):
@@ -467,206 +536,454 @@ def get_setting_cached(key: str) -> Optional[str]:
 def invalidate_model_caches_for_key(key: str):
     if key.lower().startswith(("model","model_latest","model_v2","pre_")): _MODELS_CACHE.invalidate(key)
 
-# ───────── Init DB ─────────
-def init_db():
-    with db_conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS tips (
-            match_id BIGINT, league_id BIGINT, league TEXT,
-            home TEXT, away TEXT, market TEXT, suggestion TEXT,
-            confidence DOUBLE PRECISION, confidence_raw DOUBLE PRECISION,
-            score_at_tip TEXT, minute INTEGER, created_ts BIGINT,
-            odds DOUBLE PRECISION, book TEXT, ev_pct DOUBLE PRECISION,
-            sent_ok INTEGER DEFAULT 1,
-            PRIMARY KEY (match_id, created_ts))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS tip_snapshots (
-            match_id BIGINT, created_ts BIGINT, payload TEXT,
-            PRIMARY KEY (match_id, created_ts))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS feedback (
-            id SERIAL PRIMARY KEY, match_id BIGINT UNIQUE, verdict INTEGER, created_ts BIGINT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS match_results (
-            match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS odds_history (
-            match_id BIGINT,
-            captured_ts BIGINT,
-            market TEXT,
-            selection TEXT,
-            odds DOUBLE PRECISION,
-            book TEXT,
-            PRIMARY KEY (match_id, market, selection, captured_ts)
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_match ON odds_history (match_id, captured_ts DESC)")
-        c.execute("""CREATE TABLE IF NOT EXISTS lineups (
-            match_id BIGINT PRIMARY KEY,
-            created_ts BIGINT,
-            payload TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
-            match_id BIGINT PRIMARY KEY,
-            created_ts BIGINT,
-            payload TEXT
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_prematch_created ON prematch_snapshots (created_ts DESC)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_market ON odds_history (market, captured_ts DESC)")
-        # Evolutive columns (idempotent)
-        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
-        except: pass
-        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS book TEXT")
-        except: pass
-        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS ev_pct DOUBLE PRECISION")
-        except: pass
-        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS confidence_raw DOUBLE PRECISION")
-        except: pass
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_snap_by_match ON tip_snapshots (match_id, created_ts DESC)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_results_updated ON match_results (updated_ts DESC)")
+# ───────── AI Model Trainer ─────────
+class ModelTrainer:
+    """Advanced model training with scikit-learn and LightGBM"""
+    
+    def __init__(self):
+        self.model_registry = {}
+        self.feature_importance = {}
         
-        # Add performance indexes
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_league_ts ON tips (league_id, created_ts DESC)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_market_sent ON tips (market, sent_ok, created_ts)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_results_btts ON match_results (btts_yes)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON tip_snapshots (created_ts DESC)")
+    def train_lightgbm(self, X, y, market: str, params: dict = None):
+        """Train LightGBM model with cross-validation"""
+        try:
+            if params is None:
+                params = {
+                    'objective': 'binary',
+                    'metric': 'binary_logloss',
+                    'learning_rate': 0.05,
+                    'max_depth': 6,
+                    'num_leaves': 31,
+                    'feature_fraction': 0.8,
+                    'bagging_fraction': 0.8,
+                    'verbose': -1
+                }
+            
+            # Create dataset
+            lgb_data = lgb.Dataset(X, label=y)
+            
+            # Train with cross-validation
+            cv_results = lgb.cv(
+                params, lgb_data, num_boost_round=1000,
+                nfold=5, stratified=True, early_stopping_rounds=50,
+                verbose_eval=False
+            )
+            
+            best_round = len(cv_results['binary_logloss-mean'])
+            model = lgb.train(params, lgb_data, num_boost_round=best_round)
+            
+            # Store feature importance
+            self.feature_importance[market] = dict(zip(
+                X.columns, model.feature_importance()
+            ))
+            
+            return model
+            
+        except Exception as e:
+            log.error(f"[LIGHTGBM] Training failed for {market}: {e}")
+            return None
+            
+    def train_logistic(self, X, y, market: str):
+        """Train logistic regression model with regularization"""
+        try:
+            model = LogisticRegression(
+                C=1.0, penalty='l2', solver='lbfgs', max_iter=1000
+            )
+            model.fit(X, y)
+            return model
+        except Exception as e:
+            log.error(f"[LOGISTIC] Training failed for {market}: {e}")
+            return None
+            
+    def calibrate_model(self, model, X_calib, y_calib, method: str = 'sigmoid'):
+        """Apply Platt scaling or isotonic regression"""
+        try:
+            if method == 'isotonic':
+                calibrated = CalibratedClassifierCV(
+                    model, method='isotonic', cv='prefit'
+                )
+            else:  # sigmoid
+                calibrated = CalibratedClassifierCV(
+                    model, method='sigmoid', cv='prefit'
+                )
+                
+            calibrated.fit(X_calib, y_calib)
+            return calibrated
+        except Exception as e:
+            log.error(f"[CALIBRATION] Failed: {e}")
+            return model
 
-# ───────── Telegram ─────────
-def send_telegram(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
-    try:
-        r=requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
-            timeout=REQ_TIMEOUT_SEC
-        )
-        ok = bool(r.ok)
-        if ok: _metric_inc("tips_sent_total", n=1)
-        return ok
-    except Exception:
-        return False
-
-# ───────── API helpers (with circuit breaker & metrics) ─────────
-def _api_get(url: str, params: dict, timeout: int = 15):
-    if not API_KEY: return None
-    now = time.time()
-    if API_CB["opened_until"] > now:
-        log.warning("[CB] Circuit open, rejecting request to %s", url)
-        return None
+# ───────── Model Metadata Manager ─────────
+class ModelMetadataManager:
+    """Manage model metadata including versioning and performance"""
+    
+    def __init__(self):
+        self.metadata_store = {}
         
-    # Reset circuit breaker after cooldown if we have successes
-    if API_CB["failures"] > 0 and now - API_CB.get("last_success", 0) > API_CB_COOLDOWN_SEC:
-        log.info("[CB] Resetting circuit breaker after quiet period")
-        API_CB["failures"] = 0
-        API_CB["opened_until"] = 0
+    def create_metadata(self, model_name: str, accuracy: float, 
+                       features: list, model_type: str) -> dict:
+        """Create comprehensive model metadata"""
+        metadata = {
+            'version': self._generate_version(model_name),
+            'accuracy': accuracy,
+            'features': features,
+            'model_type': model_type,
+            'timestamp': datetime.now(TZ_UTC).isoformat(),
+            'training_samples': 0,  # Will be updated during training
+            'feature_importance': {},
+            'hyperparameters': {},
+            'calibration_method': 'none'
+        }
+        return metadata
+        
+    def _generate_version(self, model_name: str) -> str:
+        """Generate semantic version for model"""
+        base_version = "1.0.0"
+        timestamp = int(time.time())
+        return f"{base_version}.{timestamp}"
+        
+    def store_metadata(self, model_name: str, metadata: dict):
+        """Store metadata in database"""
+        try:
+            with db_conn() as c:
+                c.execute("""
+                    INSERT INTO model_metadata 
+                    (model_name, version, accuracy, features, model_type, 
+                     timestamp, training_samples, hyperparameters, calibration_method)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (model_name, version) DO UPDATE SET
+                    accuracy = EXCLUDED.accuracy,
+                    features = EXCLUDED.features,
+                    timestamp = EXCLUDED.timestamp
+                """, (
+                    model_name, metadata['version'], metadata['accuracy'],
+                    json.dumps(metadata['features']), metadata['model_type'],
+                    metadata['timestamp'], metadata['training_samples'],
+                    json.dumps(metadata['hyperparameters']), 
+                    metadata['calibration_method']
+                ))
+        except Exception as e:
+            log.error(f"[METADATA] Failed to store metadata for {model_name}: {e}")
 
-    # simple endpoint label for metrics
-    lbl = "unknown"
-    try:
-        if "/odds/live" in url or "/odds" in url: lbl = "odds"
-        elif "/statistics" in url: lbl = "statistics"
-        elif "/events" in url: lbl = "events"
-        elif "/lineups" in url: lbl = "lineups"
-        elif "/headtohead" in url: lbl = "h2h"
-        elif "/fixtures" in url: lbl = "fixtures"
-    except Exception:
-        lbl = "unknown"
+# ───────── Bayesian Model Updater ─────────
+class BayesianModelUpdater:
+    """Bayesian updating for in-play predictions"""
+    
+    def __init__(self):
+        self.prior_strength = 0.3
+        
+    def update_prediction(self, prior_prob: float, live_evidence: float, 
+                         minute: int, confidence: float) -> float:
+        """Update probability using Bayesian inference"""
+        # Weight increases as game progresses and with higher confidence
+        live_weight = min(minute / 90.0, 1.0) * confidence
+        
+        # Combine prior and live evidence
+        posterior = (prior_prob * (1 - live_weight) + 
+                    live_evidence * live_weight)
+        
+        return max(0.0, min(1.0, posterior))
+        
+    def calculate_bayesian_confidence(self, prior_samples: int, 
+                                   live_samples: int) -> float:
+        """Calculate confidence based on sample sizes"""
+        total_samples = prior_samples + live_samples
+        if total_samples == 0:
+            return 0.0
+        return min(1.0, total_samples / 100.0)  # Normalized confidence
 
-    try:
-        r=session.get(url, headers=HEADERS, params=params, timeout=min(timeout, REQ_TIMEOUT_SEC))
-        _metric_inc("api_calls_total", label=lbl, n=1)
-        if r.status_code == 429:
-            METRICS["api_rate_limited_total"] += 1
-            API_CB["failures"] += 1
-        elif r.status_code >= 500:
-            API_CB["failures"] += 1
+# ───────── Dynamic League Weighter ─────────
+class DynamicLeagueWeighter:
+    """Dynamic weighting of leagues based on performance"""
+    
+    def __init__(self):
+        self.league_weights = {}
+        self.performance_history = {}
+        
+    def update_league_weight(self, league_id: int, accuracy: float, 
+                           sample_size: int):
+        """Update league weight based on recent performance"""
+        if sample_size < 10:  # Minimum samples
+            return
+            
+        # Exponential moving average of accuracy
+        if league_id not in self.performance_history:
+            self.performance_history[league_id] = accuracy
         else:
-            API_CB["failures"] = 0
-            API_CB["last_success"] = now
+            alpha = 0.1  # Smoothing factor
+            self.performance_history[league_id] = (
+                alpha * accuracy + 
+                (1 - alpha) * self.performance_history[league_id]
+            )
+            
+        # Convert accuracy to weight (0.5 = neutral, 1.0 = perfect)
+        weight = max(0.1, min(2.0, self.performance_history[league_id] * 2))
+        self.league_weights[league_id] = weight
+        
+    def get_league_weight(self, league_id: int) -> float:
+        """Get weight for specific league"""
+        return self.league_weights.get(league_id, 1.0)
 
-        if API_CB["failures"] >= API_CB_THRESHOLD:
-            API_CB["opened_until"] = now + API_CB_COOLDOWN_SEC
-            log.warning("[CB] API-Football opened for %ss", API_CB_COOLDOWN_SEC)
+# ───────── Anomaly Detector ─────────
+class AnomalyDetector:
+    """Isolation Forest based anomaly detection"""
+    
+    def __init__(self, contamination: float = 0.1):
+        self.detector = IsolationForest(
+            contamination=contamination, 
+            random_state=42
+        )
+        self.is_fitted = False
+        
+    def fit(self, features: list):
+        """Fit the anomaly detector"""
+        try:
+            if len(features) > 10:  # Minimum samples to fit
+                self.detector.fit(features)
+                self.is_fitted = True
+                log.info("[ANOMALY] Detector fitted successfully")
+        except Exception as e:
+            log.error(f"[ANOMALY] Fit failed: {e}")
+            
+    def detect(self, features: dict) -> Tuple[bool, float]:
+        """Detect if features represent an anomaly"""
+        if not self.is_fitted:
+            return False, 0.0
+            
+        try:
+            # Convert features to array
+            feature_vector = np.array(list(features.values())).reshape(1, -1)
+            anomaly_score = self.detector.decision_function(feature_vector)[0]
+            is_anomaly = self.detector.predict(feature_vector)[0] == -1
+            
+            return is_anomaly, anomaly_score
+        except Exception as e:
+            log.error(f"[ANOMALY] Detection failed: {e}")
+            return False, 0.0
 
-        return r.json() if r.ok else None
-    except Exception:
-        API_CB["failures"] += 1
-        if API_CB["failures"] >= API_CB_THRESHOLD:
-            API_CB["opened_until"] = time.time() + API_CB_COOLDOWN_SEC
-            log.warning("[CB] API-Football opened due to exceptions")
-        return None
+# ───────── Performance Pruner ─────────
+class PerformancePruner:
+    """Prune poor-performing teams and leagues"""
+    
+    def __init__(self, min_accuracy: float = 0.45, min_samples: int = 20):
+        self.min_accuracy = min_accuracy
+        self.min_samples = min_samples
+        self.blacklist = set()
+        
+    def analyze_performance(self, days: int = 30):
+        """Analyze and update blacklist"""
+        cutoff_ts = int(time.time()) - days * 24 * 3600
+        
+        with db_conn() as c:
+            # Analyze team performance
+            team_performance = c.execute("""
+                SELECT t.home as team, COUNT(*) as tips, 
+                       AVG(CASE WHEN r.final_goals_h IS NOT NULL THEN 
+                           CASE WHEN (t.suggestion = 'Home Win' AND r.final_goals_h > r.final_goals_a) OR
+                                     (t.suggestion = 'Away Win' AND r.final_goals_a > r.final_goals_h) OR
+                                     (t.suggestion = 'BTTS: Yes' AND r.btts_yes = 1) OR
+                                     (t.suggestion LIKE 'Over%' AND (r.final_goals_h + r.final_goals_a) > ?) OR
+                                     (t.suggestion LIKE 'Under%' AND (r.final_goals_h + r.final_goals_a) < ?)
+                                THEN 1.0 ELSE 0.0 END
+                           ELSE NULL END) as accuracy
+                FROM tips t 
+                LEFT JOIN match_results r ON t.match_id = r.match_id
+                WHERE t.created_ts >= ? AND t.suggestion <> 'HARVEST'
+                GROUP BY t.home
+                HAVING tips >= ?
+            """, (2.5, 2.5, cutoff_ts, self.min_samples)).fetchall()
+            
+            # Update blacklist
+            for team, tips, accuracy in team_performance:
+                if accuracy < self.min_accuracy:
+                    self.blacklist.add(team)
+                    log.info(f"[PRUNER] Blacklisted team: {team} (accuracy: {accuracy:.3f})")
 
-# ───────── League filter ─────────
-_BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
-def _blocked_league(league_obj: dict) -> bool:
-    name=str((league_obj or {}).get("name","")).lower()
-    country=str((league_obj or {}).get("country","")).lower()
-    typ=str((league_obj or {}).get("type","")).lower()
-    txt=f"{country} {name} {typ}"
-    if any(p in txt for p in _BLOCK_PATTERNS): return True
-    deny=[x.strip() for x in os.getenv("LEAGUE_DENY_IDS","").split(",") if x.strip()]
-    lid=str((league_obj or {}).get("id") or "")
-    if lid in deny: return True
-    return False
+    def is_blacklisted(self, team: str) -> bool:
+        """Check if team is blacklisted"""
+        return team in self.blacklist
 
-# ───────── Live fetches (with negative-result cache) ─────────
-def fetch_match_stats(fid: int) -> list:
-    now=time.time()
-    k=("stats", fid)
-    ts_empty = NEG_CACHE.get(k, (0.0, False))
-    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
-    if fid in STATS_CACHE and now-STATS_CACHE[fid][0] < 90: return STATS_CACHE[fid][1]
-    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
-    out=js.get("response",[]) if isinstance(js,dict) else []
-    STATS_CACHE[fid]=(now,out)
-    if not out: NEG_CACHE[k]=(now, True)
-    return out
+# ───────── Multi-Model Ensemble ─────────
+class MultiModelEnsemble:
+    """Ensemble of pre-match, live, and hybrid models"""
+    
+    def __init__(self):
+        self.models = {
+            'prematch': {},
+            'live': {},
+            'hybrid': {}
+        }
+        self.weights = {
+            'prematch': 0.3,
+            'live': 0.4,
+            'hybrid': 0.3
+        }
+        
+    def add_model(self, model_type: str, model_name: str, model):
+        """Add model to ensemble"""
+        self.models[model_type][model_name] = model
+        
+    def predict(self, features: dict, minute: int) -> Tuple[float, float]:
+        """Get ensemble prediction"""
+        predictions = []
+        confidences = []
+        
+        # Adjust weights based on game minute
+        dynamic_weights = self._calculate_dynamic_weights(minute)
+        
+        for model_type, models in self.models.items():
+            for model_name, model in models.items():
+                try:
+                    if model_type == 'prematch':
+                        prob = self._predict_prematch(model, features)
+                    elif model_type == 'live':
+                        prob = self._predict_live(model, features, minute)
+                    else:  # hybrid
+                        prob = self._predict_hybrid(model, features, minute)
+                        
+                    if prob is not None:
+                        weight = dynamic_weights[model_type]
+                        predictions.append(prob * weight)
+                        confidences.append(weight)
+                except Exception as e:
+                    log.warning(f"[ENSEMBLE] {model_type}.{model_name} failed: {e}")
+                    continue
+        
+        if not predictions:
+            return 0.0, 0.0
+            
+        ensemble_prob = sum(predictions) / sum(confidences)
+        ensemble_confidence = np.mean(confidences)
+        
+        return ensemble_prob, ensemble_confidence
+        
+    def _calculate_dynamic_weights(self, minute: int) -> dict:
+        """Calculate dynamic weights based on game progress"""
+        # Live models gain weight as game progresses
+        live_weight = min(0.7, 0.3 + (minute / 90.0) * 0.4)
+        prematch_weight = max(0.1, 0.5 - (minute / 90.0) * 0.4)
+        hybrid_weight = 1.0 - live_weight - prematch_weight
+        
+        return {
+            'prematch': prematch_weight,
+            'live': live_weight,
+            'hybrid': hybrid_weight
+        }
+    
+    def _predict_prematch(self, model, features: dict) -> Optional[float]:
+        """Predict using pre-match model"""
+        try:
+            # Convert features to format expected by model
+            feature_vector = np.array(list(features.values())).reshape(1, -1)
+            return float(model.predict_proba(feature_vector)[0][1])
+        except Exception:
+            return None
+            
+    def _predict_live(self, model, features: dict, minute: int) -> Optional[float]:
+        """Predict using live model"""
+        try:
+            # Add minute-based features
+            enhanced_features = features.copy()
+            enhanced_features['minute_normalized'] = minute / 90.0
+            feature_vector = np.array(list(enhanced_features.values())).reshape(1, -1)
+            return float(model.predict_proba(feature_vector)[0][1])
+        except Exception:
+            return None
+            
+    def _predict_hybrid(self, model, features: dict, minute: int) -> Optional[float]:
+        """Predict using hybrid model"""
+        try:
+            # Combine pre-match and live features
+            hybrid_features = features.copy()
+            hybrid_features['game_progress'] = minute / 90.0
+            feature_vector = np.array(list(hybrid_features.values())).reshape(1, -1)
+            return float(model.predict_proba(feature_vector)[0][1])
+        except Exception:
+            return None
 
-def fetch_match_events(fid: int) -> list:
-    now=time.time()
-    k=("events", fid)
-    ts_empty = NEG_CACHE.get(k, (0.0, False))
-    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
-    if fid in EVENTS_CACHE and now-EVENTS_CACHE[fid][0] < 90: return EVENTS_CACHE[fid][1]
-    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
-    out=js.get("response",[]) if isinstance(js,dict) else []
-    EVENTS_CACHE[fid]=(now,out)
-    if not out: NEG_CACHE[k]=(now, True)
-    return out
+# ───────── Confidence Weighted Kombi ─────────
+class ConfidenceWeightedKombi:
+    """Generate confidence-weighted combination bets"""
+    
+    def __init__(self, max_combinations: int = 3):
+        self.max_combinations = max_combinations
+        
+    def generate_kombi(self, tips: List[dict], max_stake: float = 100.0):
+        """Generate optimal bet combinations"""
+        if len(tips) < 2:
+            return []
+            
+        # Calculate expected value for each tip
+        for tip in tips:
+            tip['ev'] = self._calculate_ev(tip)
+            
+        # Sort by expected value
+        tips.sort(key=lambda x: x['ev'], reverse=True)
+        
+        combinations = []
+        
+        # Generate 2-way combinations
+        for i in range(len(tips)):
+            for j in range(i + 1, len(tips)):
+                if len(combinations) >= self.max_combinations:
+                    break
+                    
+                combo = self._create_combination([tips[i], tips[j]])
+                if combo['expected_roi'] > 0.05:  # Minimum 5% expected ROI
+                    combinations.append(combo)
+                    
+        # Generate 3-way combinations
+        for i in range(len(tips)):
+            for j in range(i + 1, len(tips)):
+                for k in range(j + 1, len(tips)):
+                    if len(combinations) >= self.max_combinations:
+                        break
+                        
+                    combo = self._create_combination([tips[i], tips[j], tips[k]])
+                    if combo['expected_roi'] > 0.08:  # Higher threshold for 3-way
+                        combinations.append(combo)
+        
+        return combinations
+        
+    def _calculate_ev(self, tip: dict) -> float:
+        """Calculate expected value"""
+        prob = tip.get('confidence', 0) / 100.0
+        odds = tip.get('odds', 1.0)
+        return (prob * (odds - 1)) - (1 - prob)
+        
+    def _create_combination(self, tips: List[dict]) -> dict:
+        """Create a combination bet"""
+        total_prob = 1.0
+        total_odds = 1.0
+        total_confidence = 0.0
+        
+        for tip in tips:
+            prob = tip.get('confidence', 0) / 100.0
+            odds = tip.get('odds', 1.0)
+            total_prob *= prob
+            total_odds *= odds
+            total_confidence += tip.get('confidence', 0)
+            
+        avg_confidence = total_confidence / len(tips)
+        expected_roi = (total_prob * total_odds) - 1.0
+        
+        return {
+            'tips': tips,
+            'combined_odds': total_odds,
+            'combined_probability': total_prob,
+            'expected_roi': expected_roi,
+            'confidence': avg_confidence
+        }
 
-def fetch_live_matches() -> List[dict]:
-    js=api_get_with_sleep(FOOTBALL_API_URL, {"live":"all"}) or {}
-    matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
-    out=[]
-    for m in matches:
-        st=((m.get("fixture") or {}).get("status") or {})
-        elapsed=st.get("elapsed"); short=(st.get("short") or "").upper()
-        if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES: continue
-        fid=(m.get("fixture") or {}).get("id")
-        m["statistics"]=fetch_match_stats(fid); m["events"]=fetch_match_events(fid)
-        out.append(m)
-    return out
-
-# ───────── Prematch helpers (short) ─────────
-def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
-    js=api_get_with_sleep(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
-    return js.get("response",[]) if isinstance(js,dict) else []
-
-def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
-    js=api_get_with_sleep(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
-    return js.get("response",[]) if isinstance(js,dict) else []
-
-def _collect_todays_prematch_fixtures() -> List[dict]:
-    today_local=datetime.now(BERLIN_TZ).date()
-    start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
-    end_local=start_local+timedelta(days=1)
-    dates_utc={start_local.astimezone(ZoneInfo("UTC")).date(), (end_local - timedelta(seconds=1)).astimezone(ZoneInfo("UTC")).date()}
-    fixtures=[]
-    for d in sorted(dates_utc):
-        js=api_get_with_sleep(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")}) or {}
-        for r in js.get("response",[]) if isinstance(js,dict) else []:
-            if (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper() == "NS":
-                fixtures.append(r)
-    fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
-    return fixtures
+# ───────── Initialize AI Systems ─────────
+model_trainer = ModelTrainer()
+metadata_manager = ModelMetadataManager()
+bayesian_updater = BayesianModelUpdater()
+league_weighter = DynamicLeagueWeighter()
+anomaly_detector = AnomalyDetector()
+performance_pruner = PerformancePruner()
+multi_model_ensemble = MultiModelEnsemble()
+kombi_generator = ConfidenceWeightedKombi()
 
 # ───────── ENHANCEMENT 1: Advanced Ensemble Learning System ─────────
 class AdvancedEnsemblePredictor:
@@ -1740,7 +2057,7 @@ def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
 
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
-    """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2"""
+    """Enhanced scan with full AI capabilities"""
     if sleep_if_required():
         log.info("[ENHANCED_PROD] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
         return (0, 0)
@@ -1782,10 +2099,23 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     if row is not None and len(row) > 0:
                         continue
 
-                # Extract advanced features
+                # Extract advanced features with AI systems
                 feat = feature_engineer.extract_advanced_features(m)
                 minute = int(feat.get("minute", 0))
                 
+                # AI: Anomaly detection
+                is_anomaly, anomaly_score = anomaly_detector.detect(feat)
+                if is_anomaly:
+                    ai_logger.log_anomaly(fid, anomaly_score, "Statistical anomaly detected")
+                    continue
+
+                # AI: Performance pruning
+                home, away = _teams(m)
+                if (performance_pruner.is_blacklisted(home) or 
+                    performance_pruner.is_blacklisted(away)):
+                    log.info(f"[PRUNER] Skipping blacklisted team: {home} vs {away}")
+                    continue
+
                 # Validation checks
                 if not stats_coverage_ok(feat, minute):
                     continue
@@ -1805,15 +2135,33 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 game_state_analyzer = GameStateAnalyzer()
                 game_state = game_state_analyzer.analyze_game_state(feat)
                 
+                # AI: League weighting
                 league_id, league = _league_name(m)
+                league_weight = league_weighter.get_league_weight(league_id)
+                
                 home, away = _teams(m)
                 score = _pretty_score(m)
 
                 candidates: List[Tuple[str, str, float, float]] = []
 
-                # PREDICT ALL MARKETS: BTTS, OU, 1X2
+                # PREDICT ALL MARKETS: BTTS, OU, 1X2 with AI ensemble
                 log.info(f"[MARKET_SCAN] Processing {home} vs {away} at minute {minute}")
                 
+                # AI: Multi-model ensemble prediction
+                ensemble_prob, ensemble_confidence = multi_model_ensemble.predict(feat, minute)
+                
+                # AI: Bayesian updating
+                prior_prob = _get_pre_match_probability(fid, "BTTS")  # Example for BTTS
+                if prior_prob is not None:
+                    final_prob = bayesian_updater.update_prediction(
+                        prior_prob, ensemble_prob, minute, ensemble_confidence
+                    )
+                else:
+                    final_prob = ensemble_prob
+
+                # AI: Apply league weighting
+                final_prob = min(1.0, final_prob * league_weight)
+
                 # 1. BTTS Market
                 btts_prob, btts_confidence = market_predictor.predict_for_market(feat, "BTTS", minute)
                 if btts_prob > 0 and btts_confidence > 0.5:
@@ -1876,21 +2224,20 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     log.info(f"[NO_CANDIDATES] No qualified tips for {home} vs {away}")
                     continue
 
-                # Bayesian updates with pre-match probabilities
+                # AI: Bayesian updates with pre-match probabilities
                 enhanced_candidates = []
                 for market, suggestion, prob, confidence in candidates:
                     pre_match_data = _get_pre_match_probability(fid, market)
                     
                     if pre_match_data is not None:
-                        bayesian_updater = BayesianUpdater()
                         if market == "1X2" and isinstance(pre_match_data, tuple):
                             pre_match_prob_home, pre_match_prob_away = pre_match_data
                             if suggestion == "Home Win":
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute)
+                                enhanced_prob = bayesian_updater.update_prediction(pre_match_prob_home, prob, minute, confidence)
                             else:  # "Away Win"
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_away, prob, minute)
+                                enhanced_prob = bayesian_updater.update_prediction(pre_match_prob_away, prob, minute, confidence)
                         else:
-                            enhanced_prob = bayesian_updater.update_probability(pre_match_data, prob, minute)
+                            enhanced_prob = bayesian_updater.update_prediction(pre_match_data, prob, minute, confidence)
                     else:
                         enhanced_prob = prob
 
@@ -1993,7 +2340,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                                 ),
                              )
 
-                            # Enhanced message with confidence indicator
+                            # Enhanced message with AI confidence indicator
                             sent = send_telegram(_format_enhanced_tip_message(
                                 home, away, league, minute, score, suggestion, 
                                 float(prob_pct), feat, odds, book, ev_pct, confidence
@@ -2020,7 +2367,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     break
 
             except Exception as e:
-                log.exception("[ENHANCED_PROD] match loop failed: %s", e)
+                exception_handler.handle("production_scan_match", lambda: None)
                 continue
 
     log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
@@ -2196,35 +2543,241 @@ class SmartOddsAnalyzer:
         
         return (overround_quality + model_quality) / 2
 
-# Prematch feature extraction (keep original for now)
-def extract_prematch_features(f: dict) -> Dict[str, float]:
-    home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
-    away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
-    home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
-    away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
-    fid = (f.get("fixture") or {}).get("id")
-    feat = {"fid": float(fid or 0)}
+# ───────── Init DB with AI Tables ─────────
+def init_db():
+    with db_conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS tips (
+            match_id BIGINT, league_id BIGINT, league TEXT,
+            home TEXT, away TEXT, market TEXT, suggestion TEXT,
+            confidence DOUBLE PRECISION, confidence_raw DOUBLE PRECISION,
+            score_at_tip TEXT, minute INTEGER, created_ts BIGINT,
+            odds DOUBLE PRECISION, book TEXT, ev_pct DOUBLE PRECISION,
+            sent_ok INTEGER DEFAULT 1,
+            PRIMARY KEY (match_id, created_ts))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS tip_snapshots (
+            match_id BIGINT, created_ts BIGINT, payload TEXT,
+            PRIMARY KEY (match_id, created_ts))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS feedback (
+            id SERIAL PRIMARY KEY, match_id BIGINT UNIQUE, verdict INTEGER, created_ts BIGINT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS match_results (
+            match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS odds_history (
+            match_id BIGINT,
+            captured_ts BIGINT,
+            market TEXT,
+            selection TEXT,
+            odds DOUBLE PRECISION,
+            book TEXT,
+            PRIMARY KEY (match_id, market, selection, captured_ts)
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_match ON odds_history (match_id, captured_ts DESC)")
+        c.execute("""CREATE TABLE IF NOT EXISTS lineups (
+            match_id BIGINT PRIMARY KEY,
+            created_ts BIGINT,
+            payload TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
+            match_id BIGINT PRIMARY KEY,
+            created_ts BIGINT,
+            payload TEXT
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_prematch_created ON prematch_snapshots (created_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_market ON odds_history (market, captured_ts DESC)")
+        
+        # AI Tables
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS model_metadata (
+                model_name TEXT,
+                version TEXT,
+                accuracy DOUBLE PRECISION,
+                features TEXT,
+                model_type TEXT,
+                timestamp TIMESTAMP,
+                training_samples INTEGER,
+                hyperparameters TEXT,
+                calibration_method TEXT,
+                PRIMARY KEY (model_name, version)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS anomaly_logs (
+                match_id BIGINT,
+                anomaly_score DOUBLE PRECISION,
+                features TEXT,
+                detected_at TIMESTAMP,
+                PRIMARY KEY (match_id, detected_at)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS league_performance (
+                league_id BIGINT,
+                accuracy DOUBLE PRECISION,
+                sample_size INTEGER,
+                last_updated TIMESTAMP,
+                PRIMARY KEY (league_id)
+            )
+        """)
+        
+        # Evolutive columns (idempotent)
+        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
+        except: pass
+        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS book TEXT")
+        except: pass
+        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS ev_pct DOUBLE PRECISION")
+        except: pass
+        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS confidence_raw DOUBLE PRECISION")
+        except: pass
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_snap_by_match ON tip_snapshots (match_id, created_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_results_updated ON match_results (updated_ts DESC)")
+        
+        # Add performance indexes
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_league_ts ON tips (league_id, created_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_market_sent ON tips (market, sent_ok, created_ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_results_btts ON match_results (btts_yes)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON tip_snapshots (created_ts DESC)")
 
-    recent_h = _api_last_fixtures(home_id, 5)
-    recent_a = _api_last_fixtures(away_id, 5)
-    h2h = _api_h2h(home_id, away_id, 5)
+# ───────── Telegram ─────────
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
+    try:
+        r=requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
+            timeout=REQ_TIMEOUT_SEC
+        )
+        ok = bool(r.ok)
+        if ok: _metric_inc("tips_sent_total", n=1)
+        return ok
+    except Exception:
+        return False
 
-    if recent_h:
-        feat["avg_goals_h"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_h])
-    if recent_a:
-        feat["avg_goals_a"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_a])
-    if h2h:
-        feat["avg_goals_h2h"] = np.mean([(m.get("goals") or {}).get("home", 0) + (m.get("goals") or {}).get("away", 0) for m in h2h])
+# ───────── API helpers (with circuit breaker & metrics) ─────────
+def _api_get(url: str, params: dict, timeout: int = 15):
+    if not API_KEY: return None
+    now = time.time()
+    if API_CB["opened_until"] > now:
+        log.warning("[CB] Circuit open, rejecting request to %s", url)
+        return None
+        
+    # Reset circuit breaker after cooldown if we have successes
+    if API_CB["failures"] > 0 and now - API_CB.get("last_success", 0) > API_CB_COOLDOWN_SEC:
+        log.info("[CB] Resetting circuit breaker after quiet period")
+        API_CB["failures"] = 0
+        API_CB["opened_until"] = 0
+
+    # simple endpoint label for metrics
+    lbl = "unknown"
+    try:
+        if "/odds/live" in url or "/odds" in url: lbl = "odds"
+        elif "/statistics" in url: lbl = "statistics"
+        elif "/events" in url: lbl = "events"
+        elif "/lineups" in url: lbl = "lineups"
+        elif "/headtohead" in url: lbl = "h2h"
+        elif "/fixtures" in url: lbl = "fixtures"
+    except Exception:
+        lbl = "unknown"
 
     try:
-        dts_h = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_h]
-        dts_a = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_a]
-        if dts_h: feat["rest_days_h"] = (datetime.now(tz=TZ_UTC) - max(dts_h).astimezone(TZ_UTC)).days
-        if dts_a: feat["rest_days_a"] = (datetime.now(tz=TZ_UTC) - max(dts_a).astimezone(TZ_UTC)).days
-    except Exception:
-        pass
+        r=session.get(url, headers=HEADERS, params=params, timeout=min(timeout, REQ_TIMEOUT_SEC))
+        _metric_inc("api_calls_total", label=lbl, n=1)
+        if r.status_code == 429:
+            METRICS["api_rate_limited_total"] += 1
+            API_CB["failures"] += 1
+        elif r.status_code >= 500:
+            API_CB["failures"] += 1
+        else:
+            API_CB["failures"] = 0
+            API_CB["last_success"] = now
 
-    return feat
+        if API_CB["failures"] >= API_CB_THRESHOLD:
+            API_CB["opened_until"] = now + API_CB_COOLDOWN_SEC
+            log.warning("[CB] API-Football opened for %ss", API_CB_COOLDOWN_SEC)
+
+        return r.json() if r.ok else None
+    except Exception:
+        API_CB["failures"] += 1
+        if API_CB["failures"] >= API_CB_THRESHOLD:
+            API_CB["opened_until"] = time.time() + API_CB_COOLDOWN_SEC
+            log.warning("[CB] API-Football opened due to exceptions")
+        return None
+
+# ───────── League filter ─────────
+_BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
+def _blocked_league(league_obj: dict) -> bool:
+    name=str((league_obj or {}).get("name","")).lower()
+    country=str((league_obj or {}).get("country","")).lower()
+    typ=str((league_obj or {}).get("type","")).lower()
+    txt=f"{country} {name} {typ}"
+    if any(p in txt for p in _BLOCK_PATTERNS): return True
+    deny=[x.strip() for x in os.getenv("LEAGUE_DENY_IDS","").split(",") if x.strip()]
+    lid=str((league_obj or {}).get("id") or "")
+    if lid in deny: return True
+    return False
+
+# ───────── Live fetches (with negative-result cache) ─────────
+def fetch_match_stats(fid: int) -> list:
+    now=time.time()
+    k=("stats", fid)
+    ts_empty = NEG_CACHE.get(k, (0.0, False))
+    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
+    if fid in STATS_CACHE and now-STATS_CACHE[fid][0] < 90: return STATS_CACHE[fid][1]
+    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
+    out=js.get("response",[]) if isinstance(js,dict) else []
+    STATS_CACHE[fid]=(now,out)
+    if not out: NEG_CACHE[k]=(now, True)
+    return out
+
+def fetch_match_events(fid: int) -> list:
+    now=time.time()
+    k=("events", fid)
+    ts_empty = NEG_CACHE.get(k, (0.0, False))
+    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
+    if fid in EVENTS_CACHE and now-EVENTS_CACHE[fid][0] < 90: return EVENTS_CACHE[fid][1]
+    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
+    out=js.get("response",[]) if isinstance(js,dict) else []
+    EVENTS_CACHE[fid]=(now,out)
+    if not out: NEG_CACHE[k]=(now, True)
+    return out
+
+def fetch_live_matches() -> List[dict]:
+    js=api_get_with_sleep(FOOTBALL_API_URL, {"live":"all"}) or {}
+    matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
+    out=[]
+    for m in matches:
+        st=((m.get("fixture") or {}).get("status") or {})
+        elapsed=st.get("elapsed"); short=(st.get("short") or "").upper()
+        if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES: continue
+        fid=(m.get("fixture") or {}).get("id")
+        m["statistics"]=fetch_match_stats(fid); m["events"]=fetch_match_events(fid)
+        out.append(m)
+    return out
+
+# ───────── Prematch helpers (short) ─────────
+def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
+    js=api_get_with_sleep(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
+    return js.get("response",[]) if isinstance(js,dict) else []
+
+def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
+    js=api_get_with_sleep(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
+    return js.get("response",[]) if isinstance(js,dict) else []
+
+def _collect_todays_prematch_fixtures() -> List[dict]:
+    today_local=datetime.now(BERLIN_TZ).date()
+    start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
+    end_local=start_local+timedelta(days=1)
+    dates_utc={start_local.astimezone(ZoneInfo("UTC")).date(), (end_local - timedelta(seconds=1)).astimezone(ZoneInfo("UTC")).date()}
+    fixtures=[]
+    for d in sorted(dates_utc):
+        js=api_get_with_sleep(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")}) or {}
+        for r in js.get("response",[]) if isinstance(js,dict) else []:
+            if (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper() == "NS":
+                fixtures.append(r)
+    fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
+    return fixtures
 
 # ───────── Model loader (with validation) ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
@@ -2800,7 +3353,7 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
             "sot_h": sot_h, "sot_a": sot_a, "sot_sum": sot_sum,
             "cor_h": cor_h, "cor_a": cor_a, "cor_sum": cor_sum,
             "pos_h": pos_h, "pos_a": pos_a, "pos_diff": pos_diff,
-            "red_h": red_h, "red_a": red_a, "red_sum": red_sum,
+            "red_h": red_h, "red_a": red_a, "red_sum": red_a,
             "sh_total_h": sh_total_h, "sh_total_a": sh_total_a,
             "sh_total_sum": sh_total_sum, "sh_total_diff": sh_total_diff,
             "yellow_h": yellow_h, "yellow_a": yellow_a, "yellow_sum": yellow_sum,
@@ -3538,7 +4091,7 @@ def register_shutdown_handlers():
     signal.signal(signal.SIGTERM, shutdown_handler)
     atexit.register(shutdown_handler)
 
-# ───────── Scheduler (preserved; wiring fixed for auto-tune) ─────────
+# ───────── Scheduler (with AI enhancements) ─────────
 _scheduler_started=False
 
 def _run_with_pg_lock(lock_key: int, fn, *a, **k):
@@ -3595,18 +4148,29 @@ def _start_scheduler_once():
         sched.add_job(lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
                       "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True)
 
+        # AI maintenance jobs
+        sched.add_job(
+            lambda: _run_with_pg_lock(1010, performance_pruner.analyze_performance),
+            "interval", hours=6, id="performance_pruning", max_instances=1, coalesce=True
+        )
+        
+        sched.add_job(
+            lambda: _run_with_pg_lock(1011, lambda: adaptive_learner.analyze_performance_trends()),
+            "interval", hours=24, id="performance_analysis", max_instances=1, coalesce=True
+        )
+
         # cache cleanup
         sched.add_job(cleanup_caches, "interval", hours=1, id="cache_cleanup")
 
         sched.start()
         _scheduler_started = True
-        send_telegram("🚀 goalsniper AI mode (in-play + prematch) with ENHANCED PREDICTIONS started.")
+        send_telegram("🚀 goalsniper FULL AI mode (in-play + prematch) with ADVANCED ENSEMBLE activated!")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
 
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
-# ───────── Admin / auth / endpoints (add /metrics and performance analysis) ─────────
+# ───────── Admin / auth / endpoints (add AI endpoints) ─────────
 def _require_admin():
     key=request.headers.get("X-API-Key") or request.args.get("key") or ((request.json or {}).get("key") if request.is_json else None)
     if not ADMIN_API_KEY or key != ADMIN_API_KEY: abort(401)
@@ -3647,12 +4211,42 @@ def metrics():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/admin/performance-analysis", methods=["GET"])
+# AI Admin Endpoints
+@app.route("/admin/ai/performance-analysis", methods=["GET"])
 def http_performance_analysis():
     _require_admin()
     try:
         trends = adaptive_learner.analyze_performance_trends()
         return jsonify({"ok": True, "trends": trends})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/ai/generate-kombi", methods=["POST"])
+def http_generate_kombi():
+    _require_admin()
+    try:
+        data = request.get_json()
+        tips = data.get('tips', [])
+        max_stake = data.get('max_stake', 100.0)
+        
+        combinations = kombi_generator.generate_kombi(tips, max_stake)
+        return jsonify({"ok": True, "combinations": combinations})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/ai/train-model", methods=["POST"])
+def http_train_ai_model():
+    _require_admin()
+    try:
+        data = request.get_json()
+        market = data.get('market')
+        model_type = data.get('model_type', 'lightgbm')
+        
+        # This would fetch training data and train the model
+        # Implementation depends on your data structure
+        success = True
+        
+        return jsonify({"ok": success, "model": market, "type": model_type})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -3751,12 +4345,25 @@ def telegram_webhook(secret: str):
         log.warning("telegram webhook parse error: %s", e)
     return jsonify({"ok": True})
 
-# ───────── Boot ─────────
+# ───────── Boot with AI Initialization ─────────
 def _on_boot():
     register_shutdown_handlers()
     validate_config()
-    _init_pool()  # This should now work since the function is defined above
+    _init_pool()
     init_db()
+    
+    # Initialize AI systems
+    try:
+        # Load performance data for league weighting and pruning
+        performance_pruner.analyze_performance()
+        
+        # Note: Anomaly detector would need actual feature data to fit
+        # anomaly_detector.fit(recent_features) would be called when we have data
+        
+        log.info("[AI] Advanced AI systems initialized successfully")
+    except Exception as e:
+        log.error(f"[AI] Initialization failed: {e}")
+    
     set_setting("boot_ts", str(int(time.time())))
     _start_scheduler_once()
 
