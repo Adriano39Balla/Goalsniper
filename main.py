@@ -250,6 +250,41 @@ MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC = ZoneInfo("UTC")
 BERLIN_TZ = ZoneInfo("Europe/Berlin")  # fixed (was Europe/Amsterdam)
 
+# ───────── Sleep Method for API-Football Rate Limiting ─────────
+def is_sleep_time() -> bool:
+    """
+    Check if current time is within sleep hours (22:00-08:00 Berlin time).
+    Returns True if we should sleep (pause API calls), False otherwise.
+    """
+    try:
+        now_berlin = datetime.now(BERLIN_TZ)
+        current_hour = now_berlin.hour
+        # Sleep between 22:00 (10 PM) and 08:00 (8 AM)
+        return current_hour >= 22 or current_hour < 8
+    except Exception as e:
+        log.warning("[SLEEP_TIME] Error checking sleep time: %s", e)
+        return False
+
+def sleep_if_required():
+    """
+    Sleep during specified hours (22:00-08:00 Berlin time) to avoid API rate limiting.
+    This function should be called before making API-Football calls.
+    """
+    if is_sleep_time():
+        log.info("[SLEEP] Sleeping during quiet hours (22:00-08:00 Berlin time) to avoid API rate limiting")
+        return True
+    return False
+
+def api_get_with_sleep(url: str, params: dict, timeout: int = 15):
+    """
+    Wrapper around _api_get that respects sleep hours.
+    Returns None during sleep hours to avoid API calls.
+    """
+    if sleep_if_required():
+        log.debug("[SLEEP] Skipping API call to %s during sleep hours", url)
+        return None
+    return _api_get(url, params, timeout)
+
 # ───────── Negative-result cache to avoid hammering same endpoints ─────────
 NEG_CACHE: Dict[Tuple[str,int], Tuple[float, bool]] = {}
 NEG_TTL_SEC = int(os.getenv("NEG_TTL_SEC", "45"))
@@ -579,7 +614,7 @@ def fetch_match_stats(fid: int) -> list:
     ts_empty = NEG_CACHE.get(k, (0.0, False))
     if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
     if fid in STATS_CACHE and now-STATS_CACHE[fid][0] < 90: return STATS_CACHE[fid][1]
-    js=_api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
+    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
     out=js.get("response",[]) if isinstance(js,dict) else []
     STATS_CACHE[fid]=(now,out)
     if not out: NEG_CACHE[k]=(now, True)
@@ -591,14 +626,14 @@ def fetch_match_events(fid: int) -> list:
     ts_empty = NEG_CACHE.get(k, (0.0, False))
     if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
     if fid in EVENTS_CACHE and now-EVENTS_CACHE[fid][0] < 90: return EVENTS_CACHE[fid][1]
-    js=_api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
+    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
     out=js.get("response",[]) if isinstance(js,dict) else []
     EVENTS_CACHE[fid]=(now,out)
     if not out: NEG_CACHE[k]=(now, True)
     return out
 
 def fetch_live_matches() -> List[dict]:
-    js=_api_get(FOOTBALL_API_URL, {"live":"all"}) or {}
+    js=api_get_with_sleep(FOOTBALL_API_URL, {"live":"all"}) or {}
     matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
     out=[]
     for m in matches:
@@ -612,11 +647,11 @@ def fetch_live_matches() -> List[dict]:
 
 # ───────── Prematch helpers (short) ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
-    js=_api_get(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
+    js=api_get_with_sleep(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
     return js.get("response",[]) if isinstance(js,dict) else []
 
 def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
-    js=_api_get(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
+    js=api_get_with_sleep(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
     return js.get("response",[]) if isinstance(js,dict) else []
 
 def _collect_todays_prematch_fixtures() -> List[dict]:
@@ -626,7 +661,7 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
     dates_utc={start_local.astimezone(ZoneInfo("UTC")).date(), (end_local - timedelta(seconds=1)).astimezone(ZoneInfo("UTC")).date()}
     fixtures=[]
     for d in sorted(dates_utc):
-        js=_api_get(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")}) or {}
+        js=api_get_with_sleep(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")}) or {}
         for r in js.get("response",[]) if isinstance(js,dict) else []:
             if (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper() == "NS":
                 fixtures.append(r)
@@ -1706,6 +1741,10 @@ def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
     """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2"""
+    if sleep_if_required():
+        log.info("[ENHANCED_PROD] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
+        return (0, 0)
+    
     if not _db_ping():
         log.error("[ENHANCED_PROD] Database unavailable")
         return (0, 0)
@@ -1728,7 +1767,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
     with db_conn() as c:
         for m in matches:
             try:
-                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                fid = int((m.get("fixture") or {}).get("id") or 0)
                 if not fid:
                     continue
 
@@ -2161,8 +2200,8 @@ class SmartOddsAnalyzer:
 def extract_prematch_features(f: dict) -> Dict[str, float]:
     home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
     away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
-    home = ((f.get("teams") or {}).get("home") or {}).get("name")
-    away = ((f.get("teams") or {}).get("away") or {}).get("name")
+    home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
+    away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
     fid = (f.get("fixture") or {}).get("id")
     feat = {"fid": float(fid or 0)}
 
@@ -2244,7 +2283,7 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: return ODDS_CACHE[fid][1]
 
     def _fetch(path: str) -> dict:
-        js = _api_get(f"{BASE_URL}/{path}", {"fixture": fid}) or {}
+        js = api_get_with_sleep(f"{BASE_URL}/{path}", {"fixture": fid}) or {}
         return js if isinstance(js, dict) else {}
 
     js = {}
@@ -2814,13 +2853,18 @@ def _tip_outcome_for_result(suggestion: str, res: Dict[str,Any]) -> Optional[int
     return None
 
 def _fixture_by_id(mid: int) -> Optional[dict]:
-    js=_api_get(FOOTBALL_API_URL, {"id": mid}) or {}
+    js=api_get_with_sleep(FOOTBALL_API_URL, {"id": mid}) or {}
     arr=js.get("response") or [] if isinstance(js,dict) else []
     return arr[0] if arr else None
 
 def _is_final(short: str) -> bool: return (short or "").upper() in {"FT","AET","PEN"}
 
 def backfill_results_for_open_matches(max_rows: int = 200) -> int:
+    """Backfill results with sleep time check"""
+    if sleep_if_required():
+        log.info("[BACKFILL] Skipping during sleep hours (22:00-08:00 Berlin time)")
+        return 0
+    
     now_ts=int(time.time()); cutoff=now_ts - BACKFILL_DAYS*24*3600; updated=0
     with db_conn() as c:
         rows=c.execute("""
@@ -2961,6 +3005,11 @@ def save_prematch_snapshot(fx: dict, feat: Dict[str, float]) -> None:
         )
 
 def snapshot_odds_for_fixtures(fixtures: List[int]) -> int:
+    """Odds snapshot with sleep time check"""
+    if sleep_if_required():
+        log.info("[ODDS_SNAPSHOT] Skipping during sleep hours (22:00-08:00 Berlin time)")
+        return 0
+    
     wrote = 0
     now = int(time.time())
     for fid in fixtures:
@@ -2992,7 +3041,7 @@ def _today_fixture_ids() -> List[int]:
     return [int(((fx.get('fixture') or {}).get('id') or 0)) for fx in fixtures if int(((fx.get('fixture') or {}).get('id') or 0))]
 
 def fetch_lineup_and_save(fid: int) -> bool:
-    js = _api_get(f"{BASE_URL}/fixtures/lineups", {"fixture": fid}) or {}
+    js = api_get_with_sleep(f"{BASE_URL}/fixtures/lineups", {"fixture": fid}) or {}
     arr = js.get("response") or []
     if not arr:
         return False
@@ -3005,6 +3054,11 @@ def fetch_lineup_and_save(fid: int) -> bool:
     return True
 
 def prematch_scan_save() -> int:
+    """Prematch scan with sleep time check"""
+    if sleep_if_required():
+        log.info("[PREMATCH] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
+        return 0
+    
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
         return 0
@@ -3140,7 +3194,11 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, 
     )
 
 def send_match_of_the_day() -> bool:
-    """Send Match of the Day - Fixed version"""
+    """Send Match of the Day with sleep time check"""
+    if sleep_if_required():
+        log.info("[MOTD] Skipping during sleep hours (22:00-08:00 Berlin time)")
+        return False
+    
     if os.getenv("MOTD_PREDICT", "1") in ("0", "false", "False", "no", "NO"):
         log.info("[MOTD] MOTD disabled by configuration")
         return send_telegram("🏅 MOTD disabled.")
@@ -3565,7 +3623,7 @@ def health():
         # Check API connectivity
         api_ok = False
         try:
-            test_resp = _api_get(FOOTBALL_API_URL, {"live": "all"}, timeout=5)
+            test_resp = api_get_with_sleep(FOOTBALL_API_URL, {"live": "all"}, timeout=5)
             api_ok = test_resp is not None
         except:
             pass
