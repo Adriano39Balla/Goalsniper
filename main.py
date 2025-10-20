@@ -1,6 +1,7 @@
 # goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate
 # UPGRADED: Advanced prediction capabilities with ensemble models, Bayesian updates, and game state intelligence
 # ENHANCED: Added advanced AI systems including ensemble learning, feature engineering, market-specific intelligence, and adaptive learning
+# NEW: Goal Timing Predictions and Pattern Recognition systems
 
 import os, json, time, logging, requests, psycopg2, sys, signal, atexit
 import numpy as np
@@ -975,7 +976,433 @@ class ConfidenceWeightedKombi:
             'confidence': avg_confidence
         }
 
-# ───────── Initialize AI Systems ─────────
+# ───────── GOAL TIMING PREDICTOR ─────────
+class GoalTimingPredictor:
+    """Predict goal timing based on match context and historical patterns"""
+    
+    def __init__(self):
+        self.timing_models = {}
+        self.period_weights = {
+            '0-15': 0.12, '16-30': 0.18, '31-45': 0.22,
+            '46-60': 0.18, '61-75': 0.16, '76-90': 0.14
+        }
+        
+    def predict_next_goal_timing(self, features: Dict[str, float], match_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Predict when the next goal is likely to occur"""
+        try:
+            minute = features.get("minute", 0)
+            current_goals = features.get("goals_sum", 0)
+            pressure_home = features.get("pressure_home", 0)
+            pressure_away = features.get("pressure_away", 0)
+            xg_sum = features.get("xg_sum", 0)
+            
+            # Calculate goal expectation based on current match state
+            goal_expectation = self._calculate_goal_expectation(
+                minute, current_goals, pressure_home + pressure_away, xg_sum
+            )
+            
+            # Adjust probabilities based on remaining time
+            timing_probs = self._calculate_timing_probabilities(minute, goal_expectation)
+            
+            # Consider match context (score, urgency, etc.)
+            context_adjusted = self._adjust_for_match_context(timing_probs, features, match_context)
+            
+            # Find most likely period
+            most_likely_period = max(context_adjusted.items(), key=lambda x: x[1])
+            
+            return {
+                'timing_probabilities': context_adjusted,
+                'most_likely_period': most_likely_period[0],
+                'confidence': most_likely_period[1],
+                'expected_goals_remaining': goal_expectation,
+                'high_alert': self._is_high_alert_period(context_adjusted)
+            }
+            
+        except Exception as e:
+            log.error(f"[GOAL_TIMING] Prediction failed: {e}")
+            return {'timing_probabilities': {}, 'most_likely_period': 'Unknown', 'confidence': 0.0}
+    
+    def _calculate_goal_expectation(self, minute: int, current_goals: float, 
+                                  total_pressure: float, xg_sum: float) -> float:
+        """Calculate expected number of goals in remaining time"""
+        if minute >= 90:
+            return 0.0
+            
+        remaining_time = 90 - minute
+        time_factor = remaining_time / 90.0
+        
+        # Base expectation from xG rate
+        if minute > 0:
+            xg_rate = xg_sum / minute
+        else:
+            xg_rate = 0.02  # Default pre-match rate
+            
+        xg_based = xg_rate * remaining_time
+        
+        # Pressure-based adjustment
+        pressure_factor = total_pressure / 200.0  # Normalize pressure
+        
+        # Combine factors
+        goal_expectation = xg_based * (1 + pressure_factor * 0.5)
+        
+        return max(0.0, min(3.0, goal_expectation))
+    
+    def _calculate_timing_probabilities(self, minute: int, goal_expectation: float) -> Dict[str, float]:
+        """Calculate probabilities for each time period"""
+        periods = {
+            '0-15': (0, 15), '16-30': (16, 30), '31-45': (31, 45),
+            '46-60': (46, 60), '61-75': (61, 75), '76-90': (76, 90),
+            '91-105': (91, 105), '106-120': (106, 120)
+        }
+        
+        # Filter out elapsed periods
+        relevant_periods = {
+            period: range_def for period, range_def in periods.items() 
+            if range_def[0] > minute
+        }
+        
+        if not relevant_periods:
+            return {'match_ended': 1.0}
+        
+        # Calculate weights based on remaining time and historical distribution
+        total_weight = sum(
+            self.period_weights.get(period, 0.1) 
+            for period in relevant_periods.keys() 
+            if period in self.period_weights
+        )
+        
+        # Adjust for goal expectation (more goals = more spread out probability)
+        goal_adjustment = min(2.0, max(0.5, goal_expectation))
+        
+        probabilities = {}
+        for period, (start, end) in relevant_periods.items():
+            base_weight = self.period_weights.get(period, 0.1)
+            period_duration = end - start + 1
+            
+            # Adjust weight based on period duration and goal expectation
+            adjusted_weight = base_weight * period_duration / 15.0 * goal_adjustment
+            
+            probabilities[period] = adjusted_weight
+        
+        # Normalize probabilities
+        total = sum(probabilities.values())
+        if total > 0:
+            probabilities = {k: v / total for k, v in probabilities.items()}
+        
+        return probabilities
+    
+    def _adjust_for_match_context(self, timing_probs: Dict[str, float], 
+                                features: Dict[str, float], match_context: Dict[str, Any]) -> Dict[str, float]:
+        """Adjust probabilities based on match-specific context"""
+        adjusted = timing_probs.copy()
+        
+        minute = features.get("minute", 0)
+        score_diff = features.get("goals_h", 0) - features.get("goals_a", 0)
+        pressure_total = features.get("pressure_home", 0) + features.get("pressure_away", 0)
+        
+        # Urgency factor - teams push harder when losing
+        urgency = abs(score_diff)
+        if minute > 75 and urgency > 0:
+            # Increase probability for late periods when score is not equal
+            for period in ['76-90', '91-105']:
+                if period in adjusted:
+                    adjusted[period] *= (1 + urgency * 0.3)
+        
+        # Pressure factor - high pressure games see more goals
+        if pressure_total > 150:
+            pressure_boost = (pressure_total - 150) / 100.0
+            for period in adjusted:
+                adjusted[period] *= (1 + pressure_boost * 0.2)
+        
+        # Recent goals momentum
+        goals_last_15 = features.get("goals_last_15", 0)
+        if goals_last_15 > 0:
+            momentum_boost = goals_last_15 * 0.15
+            for period in adjusted:
+                adjusted[period] *= (1 + momentum_boost)
+        
+        # Normalize again after adjustments
+        total = sum(adjusted.values())
+        if total > 0:
+            adjusted = {k: v / total for k, v in adjusted.items()}
+        
+        return adjusted
+    
+    def _is_high_alert_period(self, timing_probs: Dict[str, float], threshold: float = 0.3) -> bool:
+        """Check if we're in a high probability period for goals"""
+        if not timing_probs:
+            return False
+        
+        # Check if any period has probability above threshold
+        return any(prob > threshold for prob in timing_probs.values())
+
+# ───────── PATTERN RECOGNITION PREDICTOR ─────────
+class PatternRecognitionPredictor:
+    """Recognize patterns in match events and predict outcomes"""
+    
+    def __init__(self):
+        self.patterns_db = {}
+        self.event_sequences = {}
+        self.min_sequence_length = 3
+        
+    def analyze_match_patterns(self, match_data: Dict[str, Any], features: Dict[str, float]) -> Dict[str, Any]:
+        """Analyze match patterns and predict likely outcomes"""
+        try:
+            events = match_data.get("events", [])
+            minute = features.get("minute", 0)
+            
+            # Extract event sequences
+            sequences = self._extract_event_sequences(events, minute)
+            
+            # Analyze pressure patterns
+            pressure_patterns = self._analyze_pressure_patterns(features)
+            
+            # Detect momentum shifts
+            momentum_analysis = self._analyze_momentum(events, features)
+            
+            # Pattern-based predictions
+            pattern_predictions = self._generate_pattern_predictions(
+                sequences, pressure_patterns, momentum_analysis, features
+            )
+            
+            return {
+                'detected_patterns': pattern_predictions,
+                'pressure_analysis': pressure_patterns,
+                'momentum_analysis': momentum_analysis,
+                'event_sequences': sequences,
+                'pattern_confidence': self._calculate_pattern_confidence(sequences, pattern_predictions)
+            }
+            
+        except Exception as e:
+            log.error(f"[PATTERN_RECOGNITION] Analysis failed: {e}")
+            return {'detected_patterns': {}, 'pressure_analysis': {}, 'momentum_analysis': {}}
+    
+    def _extract_event_sequences(self, events: List[Dict], current_minute: int) -> Dict[str, List]:
+        """Extract meaningful event sequences from match events"""
+        sequences = {
+            'attacking_sequences': [],
+            'defensive_transitions': [],
+            'set_piece_sequences': [],
+            'goal_scoring_opportunities': []
+        }
+        
+        # Filter events to current match period
+        recent_events = [
+            event for event in events 
+            if event.get('time', {}).get('elapsed', 0) >= max(0, current_minute - 15)
+        ]
+        
+        if not recent_events:
+            return sequences
+        
+        # Group events by possession sequences
+        possession_sequences = self._group_by_possession(recent_events)
+        
+        # Analyze each sequence
+        for seq in possession_sequences:
+            sequence_type = self._classify_sequence(seq)
+            if sequence_type:
+                sequences[sequence_type].append(seq)
+        
+        return sequences
+    
+    def _group_by_possession(self, events: List[Dict]) -> List[List[Dict]]:
+        """Group events into possession sequences"""
+        if not events:
+            return []
+        
+        sequences = []
+        current_sequence = [events[0]]
+        
+        for i in range(1, len(events)):
+            current_event = events[i]
+            prev_event = events[i-1]
+            
+            # Check if same possession (simple heuristic based on time and type)
+            time_gap = current_event.get('time', {}).get('elapsed', 0) - prev_event.get('time', {}).get('elapsed', 0)
+            same_possession = time_gap <= 30  # 30 seconds between events
+            
+            if same_possession:
+                current_sequence.append(current_event)
+            else:
+                if len(current_sequence) >= 2:  # Only keep meaningful sequences
+                    sequences.append(current_sequence)
+                current_sequence = [current_event]
+        
+        if len(current_sequence) >= 2:
+            sequences.append(current_sequence)
+        
+        return sequences
+    
+    def _classify_sequence(self, sequence: List[Dict]) -> Optional[str]:
+        """Classify event sequence type"""
+        if not sequence:
+            return None
+        
+        event_types = [event.get('type', '') for event in sequence]
+        
+        # Attacking sequence: ends with shot or goal
+        if any(event in event_types for event in ['Shot on Target', 'Goal', 'Missed Shot']):
+            return 'attacking_sequences'
+        
+        # Defensive transition: cards, fouls, defensive actions
+        if any(event in event_types for event in ['Card', 'Foul', 'Offside']):
+            return 'defensive_transitions'
+        
+        # Set piece sequence: starts with corner/free kick
+        if sequence[0].get('type') in ['Corner', 'Free Kick']:
+            return 'set_piece_sequences'
+        
+        # Goal scoring opportunity: multiple shots in quick succession
+        shot_count = sum(1 for event_type in event_types if 'Shot' in event_type)
+        if shot_count >= 2:
+            return 'goal_scoring_opportunities'
+        
+        return None
+    
+    def _analyze_pressure_patterns(self, features: Dict[str, float]) -> Dict[str, Any]:
+        """Analyze team pressure patterns"""
+        pressure_home = features.get("pressure_home", 0)
+        pressure_away = features.get("pressure_away", 0)
+        pressure_total = pressure_home + pressure_away
+        
+        patterns = {
+            'dominance_ratio': pressure_home / max(1, pressure_away),
+            'total_pressure': pressure_total,
+            'pressure_balance': abs(pressure_home - pressure_away) / max(1, pressure_total),
+            'pressure_trend': self._calculate_pressure_trend(features)
+        }
+        
+        # Classify pressure pattern
+        if patterns['dominance_ratio'] > 2.0:
+            patterns['pattern_type'] = 'home_dominance'
+        elif patterns['dominance_ratio'] < 0.5:
+            patterns['pattern_type'] = 'away_dominance'
+        elif patterns['pressure_balance'] < 0.3:
+            patterns['pattern_type'] = 'balanced_pressure'
+        else:
+            patterns['pattern_type'] = 'unbalanced_pressure'
+        
+        return patterns
+    
+    def _calculate_pressure_trend(self, features: Dict[str, float]) -> str:
+        """Calculate pressure trend (increasing, decreasing, stable)"""
+        # This would typically use historical pressure data
+        # For now, use recent goals and shots as proxy
+        goals_last_15 = features.get("goals_last_15", 0)
+        shots_last_15 = features.get("shots_last_15", 0)
+        
+        if goals_last_15 > 1 or shots_last_15 > 5:
+            return 'increasing'
+        elif goals_last_15 == 0 and shots_last_15 < 2:
+            return 'decreasing'
+        else:
+            return 'stable'
+    
+    def _analyze_momentum(self, events: List[Dict], features: Dict[str, float]) -> Dict[str, Any]:
+        """Analyze match momentum"""
+        minute = features.get("minute", 0)
+        
+        if minute < 20:
+            return {'momentum': 'neutral', 'confidence': 0.5, 'swing_opportunity': False}
+        
+        # Calculate momentum based on recent events
+        recent_events = [
+            event for event in events 
+            if event.get('time', {}).get('elapsed', 0) >= minute - 10
+        ]
+        
+        home_events = [e for e in recent_events if e.get('team', {}).get('name', '') == features.get('home_team', '')]
+        away_events = [e for e in recent_events if e.get('team', {}).get('name', '') == features.get('away_team', '')]
+        
+        home_momentum = len([e for e in home_events if e.get('type') in ['Goal', 'Shot on Target', 'Corner']])
+        away_momentum = len([e for e in away_events if e.get('type') in ['Goal', 'Shot on Target', 'Corner']])
+        
+        momentum_diff = home_momentum - away_momentum
+        
+        if momentum_diff >= 3:
+            momentum = 'strong_home'
+            confidence = 0.8
+        elif momentum_diff >= 1:
+            momentum = 'home'
+            confidence = 0.6
+        elif momentum_diff <= -3:
+            momentum = 'strong_away'
+            confidence = 0.8
+        elif momentum_diff <= -1:
+            momentum = 'away'
+            confidence = 0.6
+        else:
+            momentum = 'neutral'
+            confidence = 0.5
+        
+        # Check for momentum swing opportunity
+        score_diff = features.get("goals_h", 0) - features.get("goals_a", 0)
+        swing_opportunity = (
+            abs(score_diff) == 1 and  # One goal difference
+            minute > 60 and  # Late game
+            momentum == 'neutral'  # No clear momentum
+        )
+        
+        return {
+            'momentum': momentum,
+            'confidence': confidence,
+            'swing_opportunity': swing_opportunity,
+            'home_momentum_score': home_momentum,
+            'away_momentum_score': away_momentum
+        }
+    
+    def _generate_pattern_predictions(self, sequences: Dict[str, List], 
+                                    pressure_patterns: Dict[str, Any],
+                                    momentum_analysis: Dict[str, Any],
+                                    features: Dict[str, float]) -> Dict[str, float]:
+        """Generate predictions based on detected patterns"""
+        predictions = {}
+        
+        minute = features.get("minute", 0)
+        current_goals = features.get("goals_sum", 0)
+        
+        # Pattern 1: High attacking sequences -> increased goal probability
+        attacking_sequences = len(sequences.get('attacking_sequences', []))
+        if attacking_sequences > 2:
+            predictions['increased_goal_likelihood'] = min(0.8, 0.3 + attacking_sequences * 0.1)
+        
+        # Pattern 2: Set piece opportunities -> specific market boosts
+        set_piece_sequences = len(sequences.get('set_piece_sequences', []))
+        if set_piece_sequences > 1:
+            predictions['set_piece_goal_opportunity'] = min(0.6, set_piece_sequences * 0.2)
+        
+        # Pattern 3: Momentum with pressure -> sustained attacking
+        if (momentum_analysis['momentum'] in ['strong_home', 'strong_away'] and 
+            pressure_patterns['total_pressure'] > 120):
+            predictions['sustained_attacking_pressure'] = 0.7
+        
+        # Pattern 4: Defensive fragility -> BTTS increase
+        defensive_transitions = len(sequences.get('defensive_transitions', []))
+        if defensive_transitions > 3 and minute > 30:
+            predictions['defensive_vulnerability'] = min(0.8, 0.4 + defensive_transitions * 0.1)
+        
+        # Pattern 5: Goal scoring opportunities without goals -> imminent goal
+        goal_opportunities = len(sequences.get('goal_scoring_opportunities', []))
+        if goal_opportunities > 0 and current_goals == 0:
+            predictions['breakthrough_goal_imminent'] = min(0.9, 0.5 + goal_opportunities * 0.2)
+        
+        return predictions
+    
+    def _calculate_pattern_confidence(self, sequences: Dict[str, List], 
+                                   predictions: Dict[str, float]) -> float:
+        """Calculate overall confidence in pattern recognition"""
+        if not predictions:
+            return 0.0
+        
+        # Base confidence on number and diversity of detected patterns
+        total_sequences = sum(len(seq_list) for seq_list in sequences.values())
+        pattern_diversity = len(predictions)
+        
+        confidence = min(1.0, total_sequences * 0.1 + pattern_diversity * 0.15)
+        return confidence
+
+# Initialize AI Systems
 model_trainer = ModelTrainer()
 metadata_manager = ModelMetadataManager()
 bayesian_updater = BayesianModelUpdater()
@@ -984,6 +1411,10 @@ anomaly_detector = AnomalyDetector()
 performance_pruner = PerformancePruner()
 multi_model_ensemble = MultiModelEnsemble()
 kombi_generator = ConfidenceWeightedKombi()
+
+# Initialize the new predictors
+goal_timing_predictor = GoalTimingPredictor()
+pattern_recognition_predictor = PatternRecognitionPredictor()
 
 # ───────── ENHANCEMENT 1: Advanced Ensemble Learning System ─────────
 class AdvancedEnsemblePredictor:
@@ -2057,7 +2488,7 @@ def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
 
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
-    """Enhanced scan with full AI capabilities"""
+    """Enhanced scan with full AI capabilities including goal timing and pattern recognition"""
     if sleep_if_required():
         log.info("[ENHANCED_PROD] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
         return (0, 0)
@@ -2103,6 +2534,21 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 feat = feature_engineer.extract_advanced_features(m)
                 minute = int(feat.get("minute", 0))
                 
+                # AI: Goal Timing Predictions
+                goal_timing_prediction = goal_timing_predictor.predict_next_goal_timing(feat, m)
+                
+                # AI: Pattern Recognition
+                pattern_analysis = pattern_recognition_predictor.analyze_match_patterns(m, feat)
+                
+                # Log pattern insights
+                if pattern_analysis.get('pattern_confidence', 0) > 0.5:
+                    log.info(f"[PATTERN_INSIGHT] Match {fid}: {pattern_analysis.get('detected_patterns', {})}")
+                
+                # Log goal timing insights
+                if goal_timing_prediction.get('confidence', 0) > 0.3:
+                    log.info(f"[GOAL_TIMING] Match {fid}: {goal_timing_prediction.get('most_likely_period')} "
+                           f"(conf: {goal_timing_prediction.get('confidence'):.2f})")
+
                 # AI: Anomaly detection
                 is_anomaly, anomaly_score = anomaly_detector.detect(feat)
                 if is_anomaly:
@@ -2149,6 +2595,10 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 
                 # AI: Multi-model ensemble prediction
                 ensemble_prob, ensemble_confidence = multi_model_ensemble.predict(feat, minute)
+                
+                # AI: Apply pattern-based adjustments
+                pattern_adjustments = pattern_analysis.get('detected_patterns', {})
+                ensemble_prob = _apply_pattern_adjustments(ensemble_prob, pattern_adjustments)
                 
                 # AI: Bayesian updating
                 prior_prob = _get_pre_match_probability(fid, "BTTS")  # Example for BTTS
@@ -2373,6 +2823,22 @@ def enhanced_production_scan() -> Tuple[int, int]:
     log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
     _metric_inc("tips_generated_total", n=saved)
     return saved, live_seen
+
+def _apply_pattern_adjustments(base_prob: float, pattern_adjustments: Dict[str, float]) -> float:
+    """Apply pattern-based adjustments to probabilities"""
+    adjusted_prob = base_prob
+    
+    # Apply positive adjustments
+    for pattern, adjustment in pattern_adjustments.items():
+        if 'increased' in pattern or 'opportunity' in pattern or 'imminent' in pattern:
+            adjusted_prob *= (1 + adjustment * 0.3)  # Cap at 30% increase per pattern
+    
+    # Apply negative adjustments  
+    for pattern, adjustment in pattern_adjustments.items():
+        if 'vulnerability' in pattern or 'decreased' in pattern:
+            adjusted_prob *= (1 - adjustment * 0.2)  # Cap at 20% decrease per pattern
+    
+    return max(0.0, min(1.0, adjusted_prob))
 
 def _format_enhanced_tip_message(home, away, league, minute, score, suggestion, 
                                prob_pct, feat, odds=None, book=None, ev_pct=None, confidence=None):
@@ -2616,6 +3082,35 @@ def init_db():
                 sample_size INTEGER,
                 last_updated TIMESTAMP,
                 PRIMARY KEY (league_id)
+            )
+        """)
+        
+        # New tables for goal timing and pattern recognition
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS goal_timing_predictions (
+                match_id BIGINT,
+                minute INTEGER,
+                timing_probabilities TEXT,
+                most_likely_period TEXT,
+                confidence DOUBLE PRECISION,
+                expected_goals_remaining DOUBLE PRECISION,
+                high_alert BOOLEAN,
+                created_ts BIGINT,
+                PRIMARY KEY (match_id, minute)
+            )
+        """)
+        
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pattern_analysis (
+                match_id BIGINT,
+                minute INTEGER,
+                detected_patterns TEXT,
+                pressure_analysis TEXT,
+                momentum_analysis TEXT,
+                event_sequences TEXT,
+                pattern_confidence DOUBLE PRECISION,
+                created_ts BIGINT,
+                PRIMARY KEY (match_id, minute)
             )
         """)
         
@@ -4159,12 +4654,15 @@ def _start_scheduler_once():
             "interval", hours=24, id="performance_analysis", max_instances=1, coalesce=True
         )
 
-        # cache cleanup
-        sched.add_job(cleanup_caches, "interval", hours=1, id="cache_cleanup")
+        # New goal timing and pattern recognition jobs
+        sched.add_job(
+            lambda: _run_with_pg_lock(1012, cleanup_caches),
+            "interval", hours=1, id="cache_cleanup", max_instances=1, coalesce=True
+        )
 
         sched.start()
         _scheduler_started = True
-        send_telegram("🚀 goalsniper FULL AI mode (in-play + prematch) with ADVANCED ENSEMBLE activated!")
+        send_telegram("🚀 goalsniper FULL AI mode (in-play + prematch) with ADVANCED ENSEMBLE, GOAL TIMING & PATTERN RECOGNITION activated!")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
 
     except Exception as e:
@@ -4248,6 +4746,91 @@ def http_train_ai_model():
         
         return jsonify({"ok": success, "model": market, "type": model_type})
     except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# NEW ADMIN ENDPOINTS FOR GOAL TIMING AND PATTERN RECOGNITION
+@app.route("/admin/ai/goal-timing/<int:match_id>", methods=["GET"])
+def http_goal_timing_prediction(match_id: int):
+    """Get goal timing prediction for a specific match"""
+    _require_admin()
+    try:
+        # Fetch match data
+        match_data = _fixture_by_id(match_id)
+        if not match_data:
+            return jsonify({"ok": False, "error": "Match not found"}), 404
+        
+        # Extract features
+        feat = extract_enhanced_features(match_data)
+        
+        # Get goal timing prediction
+        prediction = goal_timing_predictor.predict_next_goal_timing(feat, match_data)
+        
+        return jsonify({"ok": True, "match_id": match_id, "goal_timing_prediction": prediction})
+        
+    except Exception as e:
+        log.error(f"[GOAL_TIMING_API] Failed for match {match_id}: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/ai/pattern-analysis/<int:match_id>", methods=["GET"])
+def http_pattern_analysis(match_id: int):
+    """Get pattern analysis for a specific match"""
+    _require_admin()
+    try:
+        # Fetch match data
+        match_data = _fixture_by_id(match_id)
+        if not match_data:
+            return jsonify({"ok": False, "error": "Match not found"}), 404
+        
+        # Extract features
+        feat = extract_enhanced_features(match_data)
+        
+        # Get pattern analysis
+        analysis = pattern_recognition_predictor.analyze_match_patterns(match_data, feat)
+        
+        return jsonify({"ok": True, "match_id": match_id, "pattern_analysis": analysis})
+        
+    except Exception as e:
+        log.error(f"[PATTERN_ANALYSIS_API] Failed for match {match_id}: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/ai/advanced-insights/<int:match_id>", methods=["GET"])
+def http_advanced_insights(match_id: int):
+    """Get comprehensive AI insights for a match"""
+    _require_admin()
+    try:
+        # Fetch match data
+        match_data = _fixture_by_id(match_id)
+        if not match_data:
+            return jsonify({"ok": False, "error": "Match not found"}), 404
+        
+        # Extract features
+        feat = extract_enhanced_features(match_data)
+        
+        # Get all AI insights
+        goal_timing = goal_timing_predictor.predict_next_goal_timing(feat, match_data)
+        pattern_analysis = pattern_recognition_predictor.analyze_match_patterns(match_data, feat)
+        
+        # Get ensemble predictions for context
+        ensemble_prob, ensemble_conf = ensemble_predictor.predict_ensemble(feat, "BTTS", feat.get("minute", 0))
+        
+        insights = {
+            "goal_timing": goal_timing,
+            "pattern_analysis": pattern_analysis,
+            "ensemble_prediction": {
+                "probability": ensemble_prob,
+                "confidence": ensemble_conf
+            },
+            "match_context": {
+                "minute": feat.get("minute", 0),
+                "score": f"{feat.get('goals_h', 0)}-{feat.get('goals_a', 0)}",
+                "momentum": pattern_analysis.get('momentum_analysis', {}).get('momentum', 'neutral')
+            }
+        }
+        
+        return jsonify({"ok": True, "match_id": match_id, "advanced_insights": insights})
+        
+    except Exception as e:
+        log.error(f"[ADVANCED_INSIGHTS] Failed for match {match_id}: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/init-db", methods=["POST"])
