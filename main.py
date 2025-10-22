@@ -15,6 +15,9 @@ from collections import OrderedDict, deque
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import random
+import threading
+import queue
+from contextlib import contextmanager
 
 # ───────── Env bootstrap ─────────
 try:
@@ -324,6 +327,23 @@ def _init_pool():
             log.error("[DB] Failed to initialize connection pool: %s", e)
             raise
 
+@contextmanager
+def safe_db_conn():
+    """Wrapper around db_conn() ensuring clean closure even on errors or early returns."""
+    conn_ctx = None
+    try:
+        conn_ctx = db_conn()
+        yield conn_ctx
+    except Exception as e:
+        log.error("[DB] error inside safe_db_conn: %s", e)
+        raise
+    finally:
+        try:
+            if conn_ctx and hasattr(conn_ctx, "conn"):
+                conn_ctx.conn.close()
+        except Exception:
+            pass
+
 class PooledConn:
     def __init__(self, pool): 
         self.pool = pool
@@ -530,7 +550,25 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_btts ON match_results (btts_yes)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON tip_snapshots (created_ts DESC)")
 
-# ───────── Telegram ─────────
+# ───────── Async Telegram queue (patch) ─────────
+_telegram_q = queue.Queue()
+
+def telegram_worker():
+    while True:
+        msg = _telegram_q.get()
+        try:
+            send_telegram(msg)
+        except Exception as e:
+            log.error("[TG] send failed: %s", e)
+        finally:
+            _telegram_q.task_done()
+
+threading.Thread(target=telegram_worker, daemon=True).start()
+
+def queue_telegram(msg: str):
+    """Non-blocking Telegram enqueue."""
+    _telegram_q.put(msg)
+
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
     try:
@@ -1471,6 +1509,31 @@ prediction_validator = PredictionValidator()
 performance_monitor = RealTimePerformanceMonitor()
 confidence_calibrator = ConfidenceCalibrator()
 
+# ───────── Scheduler Safe Wrapper (patch) ─────────
+def _safe_job(fn):
+    """Ensures scheduled jobs never crash the scheduler thread."""
+    def _wrapped():
+        try:
+            return fn()
+        except Exception as e:
+            log.exception("[SCHED] job %s failed: %s", getattr(fn, "__name__", "lambda"), e)
+    return _wrapped
+
+# ───────── PG Lock Functionality ─────────
+def _run_with_pg_lock(lock_key: int, fn: callable) -> bool:
+    """Run function with PostgreSQL advisory lock to prevent overlapping executions."""
+    with db_conn() as c:
+        c.execute("SET lock_timeout='30s'")
+        got = c.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
+        if not got:
+            log.warning(f"[LOCK] Could not acquire advisory lock {lock_key}, skipping")
+            return False
+        try:
+            fn()
+            return True
+        finally:
+            c.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+
 # ───────── UPGRADED: Enhanced Production Scan with All Optimizations ─────────
 def enhanced_production_scan_with_upgrades() -> Tuple[int, int]:
     """Enhanced scan with all optimization upgrades"""
@@ -1929,9 +1992,77 @@ def _format_enhanced_tip_message(home, away, league, minute, score, suggestion,
             f"📈 <b>Confidence:</b> {prob_pct:.1f}%{ai_info}{money}\n"
             f"🏆 <b>League:</b> {escape(league)}{stat}")
 
-# ───────── [CONTINUE WITH ALL OTHER ORIGINAL FILE 2 FUNCTIONS...] ─────────
-# ... including fetch_odds, _price_gate, _ev, load_model_from_settings, predict_from_model,
-# ... and all the other original functions that remain unchanged
+# ───────── Probability and odds normalization (patch) ─────────
+def _ev(prob, odds):
+    """Calculate expected value with proper probability normalization"""
+    try:
+        prob_val = float(prob or 0.0)
+        odds_val = float(odds or 0.0)
+        # normalize to [0, 1]
+        if prob_val > 1.0:
+            prob_val /= 100.0
+        prob_val = max(0.0, min(1.0, prob_val))
+    except Exception:
+        return 0.0
+    return (prob_val * odds_val - 1.0)
+
+# ───────── Fixture batch fetching (patch) ─────────
+def _fixtures_by_ids(ids: list[int]) -> list[dict]:
+    if not ids:
+        return []
+    ids_param = ",".join(str(i) for i in ids)
+    js = api_get_with_sleep(FOOTBALL_API_URL, {"ids": ids_param}) or {}
+    return js.get("response", [])
+
+# ───────── Shutdown handler (patch) ─────────
+def shutdown_handler(signum=None, frame=None):
+    log.info("Received shutdown signal, cleaning up...")
+    try:
+        ShutdownManager.request_shutdown()
+    except Exception:
+        pass
+    if POOL:
+        try:
+            POOL.closeall()
+            log.info("Connection pool closed.")
+        except Exception as e:
+            log.warning("Error closing pool during shutdown: %s", e)
+    os._exit(0)
+
+def register_shutdown_handlers():
+    """Register shutdown signal handlers"""
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+# ───────── Scheduler setup ─────────
+sched = BackgroundScheduler()
+
+def _start_scheduler_once():
+    """Start the scheduler if not already running"""
+    if not RUN_SCHEDULER:
+        log.info("[SCHEDULER] Scheduler disabled by env")
+        return
+        
+    if sched.running:
+        return
+        
+    try:
+        # Production scan job with safe wrapper and PG lock
+        sched.add_job(
+            _safe_job(lambda: _run_with_pg_lock(1001, production_scan)),
+            'interval',
+            seconds=SCAN_INTERVAL_SEC,
+            id='production_scan',
+            max_instances=1,
+            replace_existing=True
+        )
+        
+        # Add other scheduled jobs here with _safe_job wrapper
+        
+        sched.start()
+        log.info("[SCHEDULER] Scheduler started")
+    except Exception as e:
+        log.error("[SCHEDULER] Failed to start scheduler: %s", e)
 
 # ───────── Updated boot sequence with upgraded components ─────────
 def _on_boot():
@@ -1946,5 +2077,6 @@ def _on_boot():
 # ───────── [REST OF ORIGINAL FILE 2 CODE REMAINS UNCHANGED] ─────────
 
 if __name__ == "__main__":
-    _on_boot()
-    app.run(host=os.getenv("HOST","0.0.0.0"), port=int(os.getenv("PORT","8080")))
+    register_shutdown_handlers()
+    _start_scheduler_once()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), use_reloader=False, threaded=False)
