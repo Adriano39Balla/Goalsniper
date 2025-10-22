@@ -1,4 +1,4 @@
-# goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate
+# goalsniper — FULL AI mode (in-play) with odds + EV gate
 # UPGRADED: Advanced prediction capabilities with ensemble models, Bayesian updates, and game state intelligence
 # ENHANCED: Added advanced AI systems including ensemble learning, feature engineering, market-specific intelligence, and adaptive learning
 
@@ -250,16 +250,15 @@ MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC = ZoneInfo("UTC")
 BERLIN_TZ = ZoneInfo("Europe/Berlin")  # fixed (was Europe/Amsterdam)
 
-# ───────── Sleep Method for API-Football Rate Limiting ─────────
+# ───────── Sleep Method for API-Football Rate Limiting (now flag-controlled) ─────────
+SLEEP_ENABLE = os.getenv("SLEEP_ENABLE", "1") not in ("0","false","False","no","NO")
 def is_sleep_time() -> bool:
     """
-    Check if current time is within sleep hours (22:00-08:00 Berlin time).
-    Returns True if we should sleep (pause API calls), False otherwise.
+    Quiet hours (22:00-08:00 Berlin time) to reduce API usage.
     """
     try:
         now_berlin = datetime.now(BERLIN_TZ)
         current_hour = now_berlin.hour
-        # Sleep between 22:00 (10 PM) and 08:00 (8 AM)
         return current_hour >= 22 or current_hour < 8
     except Exception as e:
         log.warning("[SLEEP_TIME] Error checking sleep time: %s", e)
@@ -267,23 +266,12 @@ def is_sleep_time() -> bool:
 
 def sleep_if_required():
     """
-    Sleep during specified hours (22:00-08:00 Berlin time) to avoid API rate limiting.
-    This function should be called before making API-Football calls.
+    Respect quiet hours only if SLEEP_ENABLE=1.
     """
-    if is_sleep_time():
-        log.info("[SLEEP] Sleeping during quiet hours (22:00-08:00 Berlin time) to avoid API rate limiting")
+    if SLEEP_ENABLE and is_sleep_time():
+        log.info("[SLEEP] Sleeping during quiet hours (22:00-08:00 Berlin)")
         return True
     return False
-
-def api_get_with_sleep(url: str, params: dict, timeout: int = 15):
-    """
-    Wrapper around _api_get that respects sleep hours.
-    Returns None during sleep hours to avoid API calls.
-    """
-    if sleep_if_required():
-        log.debug("[SLEEP] Skipping API call to %s during sleep hours", url)
-        return None
-    return _api_get(url, params, timeout)
 
 # ───────── Negative-result cache to avoid hammering same endpoints ─────────
 NEG_CACHE: Dict[Tuple[str,int], Tuple[float, bool]] = {}
@@ -394,38 +382,42 @@ def _db_ping() -> bool:
         return False
     try:
         with db_conn() as c:
-            cursor = c.execute("SELECT 1")
-            row = cursor.fetchone()
-            # FIX: Just check if we can execute, don't rely on row access
+            c.execute("SELECT 1")
             return True
     except Exception:
         log.warning("[DB] ping failed, re-initializing pool")
         try:
             _init_pool()
             with db_conn() as c2:
-                cursor = c2.execute("SELECT 1")
-                # Don't need to access row, just check if query executes
+                c2.execute("SELECT 1")
                 return True
         except Exception as e:
             _metric_inc("db_errors_total", n=1)
             log.error("[DB] reinit failed: %s", e)
             return False
 
-# ───────── Settings cache (Redis-backed when available) ─────────
+# ───────── Settings cache (Redis-backed when available) — THREAD-SAFE ─────────
+import threading
 class _KVCache:
-    def __init__(self, ttl): self.ttl=ttl; self.data={}
-    def get(self, k): 
+    def __init__(self, ttl):
+        self.ttl=ttl
+        self.data={}
+        self._lock=threading.RLock()
+    def get(self, k):
         if _redis:
             try:
                 v = _redis.get(f"gs:{k}")
                 return v.decode("utf-8") if v is not None else None
             except Exception:
                 pass
-        v=self.data.get(k); 
-        if not v: return None
-        ts,val=v
-        if time.time()-ts>self.ttl: self.data.pop(k,None); return None
-        return val
+        with self._lock:
+            v=self.data.get(k)
+            if not v: return None
+            ts,val=v
+            if time.time()-ts>self.ttl:
+                self.data.pop(k,None)
+                return None
+            return val
     def set(self,k,v):
         if _redis:
             try:
@@ -433,7 +425,8 @@ class _KVCache:
                 return
             except Exception:
                 pass
-        self.data[k]=(time.time(),v)
+        with self._lock:
+            self.data[k]=(time.time(),v)
     def invalidate(self,k=None):
         if _redis and k:
             try:
@@ -441,7 +434,8 @@ class _KVCache:
                 return
             except Exception:
                 pass
-        self.data.clear() if k is None else self.data.pop(k,None)
+        with self._lock:
+            self.data.clear() if k is None else self.data.pop(k,None)
 
 _SETTINGS_CACHE, _MODELS_CACHE = _KVCache(SETTINGS_TTL), _KVCache(MODELS_TTL)
 
@@ -533,14 +527,22 @@ def init_db():
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
     try:
-        r=requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
-            timeout=REQ_TIMEOUT_SEC
-        )
-        ok = bool(r.ok)
-        if ok: _metric_inc("tips_sent_total", n=1)
-        return ok
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        # Reuse global session + handle 429 politely
+        for attempt in range(2):
+            r = session.post(url, data=data, timeout=REQ_TIMEOUT_SEC)
+            if r.status_code == 429:
+                try:
+                    ra = int((r.json().get("parameters") or {}).get("retry_after", 1))
+                except Exception:
+                    ra = 1
+                time.sleep(min(ra, 5))
+                continue
+            ok = bool(r.ok)
+            if ok: _metric_inc("tips_sent_total", n=1)
+            return ok
+        return False
     except Exception:
         return False
 
@@ -633,19 +635,27 @@ def fetch_match_events(fid: int) -> list:
     return out
 
 def fetch_live_matches() -> List[dict]:
+    """
+    Light scan: only hydrate statistics/events when likely actionable to save calls.
+    """
     js=api_get_with_sleep(FOOTBALL_API_URL, {"live":"all"}) or {}
     matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
     out=[]
     for m in matches:
         st=((m.get("fixture") or {}).get("status") or {})
         elapsed=st.get("elapsed"); short=(st.get("short") or "").upper()
-        if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES: continue
+        if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES:
+            continue
+        if int(elapsed or 0) < TIP_MIN_MINUTE:
+            # Don’t fetch heavy stats/events yet
+            out.append(m)
+            continue
         fid=(m.get("fixture") or {}).get("id")
         m["statistics"]=fetch_match_stats(fid); m["events"]=fetch_match_events(fid)
         out.append(m)
     return out
 
-# ───────── Prematch helpers (short) ─────────
+# ───────── Prematch helpers (kept) ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
     js=api_get_with_sleep(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
     return js.get("response",[]) if isinstance(js,dict) else []
@@ -1167,6 +1177,10 @@ class MarketSpecificPredictor:
         else:
             # Fallback to ensemble prediction
             return ensemble_predictor.predict_ensemble(features, market, minute)
+
+    def predict_1x2(self, features: Dict[str, float], minute: int) -> Tuple[float, float, float]:
+        """Explicit triple for 1X2: (home_prob, away_prob, confidence)."""
+        return self._predict_1x2_advanced(features, minute)
     
     def _predict_btts_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
         """Advanced BTTS prediction with defensive vulnerability analysis"""
@@ -1714,13 +1728,11 @@ def extract_enhanced_features(m: dict) -> Dict[str, float]:
     return base_feat
 
 def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
-    """Get pre-match probability for Bayesian updates"""
+    """Get pre-match probability for Bayesian updates (kept; may return None)."""
     try:
-        # Try to get from pre-match models or historical data
         if market == "BTTS":
             mdl = load_model_from_settings("PRE_BTTS_YES")
             if mdl:
-                # Would need match features, but return None for now
                 return None
         elif market.startswith("OU"):
             line = _parse_ou_line_from_suggestion(market)
@@ -1732,7 +1744,6 @@ def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
             mdl_home = load_model_from_settings("PRE_WLD_HOME")
             mdl_away = load_model_from_settings("PRE_WLD_AWAY")
             if mdl_home and mdl_away:
-                # Return tuple for home/away probabilities
                 return (0.4, 0.4)  # Placeholder
     except Exception as e:
         log.warning(f"[PRE_MATCH_PROB] Failed for {market}: {e}")
@@ -1783,7 +1794,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         continue
 
                 # Extract advanced features
-                feat = feature_engineer.extract_advanced_features(m)
+                # If stats/events were not fetched yet (early minute), this will still compute basic features.
+                feat = feature_engineer.extract_advanced_features(m) if m.get("statistics") or int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0) >= TIP_MIN_MINUTE else extract_basic_features(m)
                 minute = int(feat.get("minute", 0))
                 
                 # Validation checks
@@ -1849,7 +1861,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
                 # 3. 1X2 Market (Draw suppressed)
                 try:
-                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
+                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_1x2(feat, minute)
                     
                     if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
                         # Normalize probabilities (suppress draw)
@@ -1911,33 +1923,13 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     if odds_quality < odds_analyzer.odds_quality_threshold:
                         continue
 
-                    # Odds lookup
-                    odds = None
-                    book = None
-                    if mk == "BTTS":
-                        d = odds_map.get("BTTS", {})
-                        tgt = "Yes" if sug.endswith("Yes") else "No"
-                        if tgt in d:
-                            odds, book = d[tgt]["odds"], d[tgt]["book"]
-                    elif mk == "1X2":
-                        d = odds_map.get("1X2", {})
-                        tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
-                        if tgt and tgt in d:
-                            odds, book = d[tgt]["odds"], d[tgt]["book"]
-                    elif mk.startswith("Over/Under"):
-                        ln = _parse_ou_line_from_suggestion(sug)
-                        d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
-                        tgt = "Over" if sug.startswith("Over") else "Under"
-                        if tgt in d:
-                            odds, book = d[tgt]["odds"], d[tgt]["book"]
-
-                    # Price gate and EV calculation
-                    pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
+                    # Odds lookup (without refetch)
+                    pass_odds, odds2, book2, _ = _price_gate_with_map(odds_map, mk, sug)
                     if not pass_odds:
                         continue
-                    if odds is None:
-                        odds = odds2
-                        book = book2
+
+                    odds = odds2
+                    book = book2
 
                     ev_pct = None
                     if odds is not None:
@@ -2196,7 +2188,7 @@ class SmartOddsAnalyzer:
         
         return (overround_quality + model_quality) / 2
 
-# Prematch feature extraction (keep original for now)
+# Prematch feature extraction (kept)
 def extract_prematch_features(f: dict) -> Dict[str, float]:
     home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
     away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
@@ -2393,7 +2385,6 @@ def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) 
     return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
 
 # ───────── Model scoring helpers (preserved) ─────────
-MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
 EPS=1e-12
 def _sigmoid(x: float) -> float:
     try:
@@ -2499,13 +2490,10 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
     return m <= int(cutoff)
 
-def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
+def _price_gate_with_map(odds_map: dict, market_text: str, suggestion: str) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
-    Return (pass, odds, book, ev_pct). Enforces consistent EV behavior:
-      - If odds missing and ALLOW_TIPS_WITHOUT_ODDS=0 => block.
-      - If odds present => must pass min/max odds and EV >= EDGE_MIN_BPS.
+    Same as _price_gate but uses a provided odds_map to avoid refetch per candidate.
     """
-    odds_map=fetch_odds(fid) if API_KEY else {}
     odds=None; book=None
 
     if market_text=="BTTS":
@@ -2533,6 +2521,13 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
 
     # EV checked later with actual prob
     return (True, odds, book, None)
+
+def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
+    """
+    Wrapper that fetches odds and then applies _price_gate_with_map.
+    """
+    odds_map = fetch_odds(fid) if API_KEY else {}
+    return _price_gate_with_map(odds_map, market_text, suggestion)
 
 # ───────── Data-quality & formatting helpers (preserved) ─────────
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
@@ -2980,7 +2975,7 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
     log.info("[DIGEST] Sent daily digest with %d tips, %d graded", total, graded)
     return msg
 
-# ───────── Prematch pipeline (preserved) ─────────
+# ───────── Prematch pipeline (kept) ─────────
 def _kickoff_berlin(utc_iso: str|None) -> str:
     try:
         if not utc_iso: return "TBD"
@@ -3174,7 +3169,7 @@ def prematch_scan_save() -> int:
     log.info("[PREMATCH] saved=%d", saved)
     return saved
 
-# ───────── MOTD (preserved) ─────────
+# ───────── MOTD (kept) ─────────
 MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
 
 def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, odds=None, book=None, ev_pct=None):
@@ -3591,7 +3586,7 @@ def _start_scheduler_once():
         sched.add_job(lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200),
                       "interval", minutes=10, id="retry", max_instances=1, coalesce=True)
 
-        # periodic odds snapshots
+        # periodic odds snapshots (prematch)
         sched.add_job(lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
                       "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True)
 
@@ -3600,7 +3595,7 @@ def _start_scheduler_once():
 
         sched.start()
         _scheduler_started = True
-        send_telegram("🚀 goalsniper AI mode (in-play + prematch) with ENHANCED PREDICTIONS started.")
+        send_telegram("🚀 goalsniper AI mode (in-play) with ENHANCED PREDICTIONS started.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
 
     except Exception as e:
@@ -3620,10 +3615,10 @@ def health():
         with db_conn() as c:
             n = c.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
         
-        # Check API connectivity
+        # Check API connectivity (bypass sleep to avoid false negatives)
         api_ok = False
         try:
-            test_resp = api_get_with_sleep(FOOTBALL_API_URL, {"live": "all"}, timeout=5)
+            test_resp = _api_get(FOOTBALL_API_URL, {"live": "all"}, timeout=5)
             api_ok = test_resp is not None
         except:
             pass
