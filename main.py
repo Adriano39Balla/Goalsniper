@@ -1,6 +1,6 @@
-# goalsniper — FULL AI mode (in-play) with odds + EV gate
-# UPGRADED: Advanced prediction capabilities with ensemble models, Bayesian updates, and game state intelligence
-# ENHANCED: Added advanced AI systems including ensemble learning, feature engineering, market-specific intelligence, and adaptive learning
+# goalsniper — IN-PLAY ONLY (OU, BTTS, 1X2 w/o draw) with odds + EV gate
+# Advanced prediction capabilities with ensemble models, Bayesian updates (live only), and game state intelligence
+# ENHANCED: Advanced AI systems including ensemble learning, feature engineering, market-specific intelligence, and adaptive learning
 
 import os, json, time, logging, requests, psycopg2, sys, signal, atexit
 import numpy as np
@@ -136,7 +136,7 @@ TRAIN_MIN_MINUTE   = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 
 BACKFILL_EVERY_MIN = int(os.getenv("BACKFILL_EVERY_MIN", "15"))
 BACKFILL_DAYS      = int(os.getenv("BACKFILL_DAYS", "14"))
-DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO")
+DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") not in ("0","false","False","no","NO"))
 DAILY_ACCURACY_HOUR   = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
 DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
@@ -152,21 +152,7 @@ STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
 MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
 TIP_MAX_MINUTE_ENV = os.getenv("TIP_MAX_MINUTE", "")
 
-MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
-MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
-MOTD_HOUR               = int(os.getenv("MOTD_HOUR", "19"))
-MOTD_MINUTE             = int(os.getenv("MOTD_MINUTE", "15"))
-MOTD_CONF_MIN           = float(os.getenv("MOTD_CONF_MIN", "70"))
-try:
-    MOTD_LEAGUE_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS","").split(",")) if x.strip().isdigit()]
-except Exception:
-    MOTD_LEAGUE_IDS = []
-
-# Optional-but-recommended warnings — ADDED
-if not ADMIN_API_KEY:
-    log.warning("ADMIN_API_KEY is not set — /admin/* endpoints are less protected.")
-if not WEBHOOK_SECRET:
-    log.warning("TELEGRAM_WEBHOOK_SECRET is not set — /telegram/webhook/<secret> would be unsafe if exposed.")
+# ───────── IN-PLAY ONLY: No prematch/MOTD envs ─────────
 
 # ───────── Configuration Validation ─────────
 def validate_config():
@@ -216,7 +202,7 @@ ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")  # optional API-Football book
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","0") not in ("0","false","False","no","NO")  # default hardened to 0
 
 # Aggregated odds controls (new)
-ODDS_SOURCE = os.getenv("ODDS_SOURCE", "auto").lower()            # auto|live|prematch
+ODDS_SOURCE = os.getenv("ODDS_SOURCE", "live").lower()            # ⬅ in-play only default
 ODDS_AGGREGATION = os.getenv("ODDS_AGGREGATION", "median").lower()# median|best
 ODDS_OUTLIER_MULT = float(os.getenv("ODDS_OUTLIER_MULT", "1.8"))  # drop books > x * median
 ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))# min distinct books per side
@@ -241,24 +227,25 @@ INPLAY_STATUSES = {"1H","HT","2H","ET","BT","P"}
 session = requests.Session()
 session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503,504], respect_retry_after_header=True)))
 
-# ───────── Caches & timezones — UPDATED TZ ─────────
+# ───────── Caches & timezones ─────────
 STATS_CACHE:  Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 ODDS_CACHE:   Dict[int, Tuple[float, dict]] = {}
 SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC = ZoneInfo("UTC")
-BERLIN_TZ = ZoneInfo("Europe/Berlin")  # fixed (was Europe/Amsterdam)
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
-# ───────── Sleep Method for API-Football Rate Limiting (now flag-controlled) ─────────
-SLEEP_ENABLE = os.getenv("SLEEP_ENABLE", "1") not in ("0","false","False","no","NO")
+# ───────── Sleep Method for API-Football Rate Limiting ─────────
 def is_sleep_time() -> bool:
     """
-    Quiet hours (22:00-08:00 Berlin time) to reduce API usage.
+    Check if current time is within sleep hours (22:00-08:00 Berlin time).
+    Returns True if we should sleep (pause API calls), False otherwise.
     """
     try:
         now_berlin = datetime.now(BERLIN_TZ)
         current_hour = now_berlin.hour
+        # Sleep between 22:00 (10 PM) and 08:00 (8 AM)
         return current_hour >= 22 or current_hour < 8
     except Exception as e:
         log.warning("[SLEEP_TIME] Error checking sleep time: %s", e)
@@ -266,12 +253,23 @@ def is_sleep_time() -> bool:
 
 def sleep_if_required():
     """
-    Respect quiet hours only if SLEEP_ENABLE=1.
+    Sleep during specified hours (22:00-08:00 Berlin time) to avoid API rate limiting.
+    This function should be called before making API-Football calls.
     """
-    if SLEEP_ENABLE and is_sleep_time():
-        log.info("[SLEEP] Sleeping during quiet hours (22:00-08:00 Berlin)")
+    if is_sleep_time():
+        log.info("[SLEEP] Sleeping during quiet hours (22:00-08:00 Berlin time) to avoid API rate limiting")
         return True
     return False
+
+def api_get_with_sleep(url: str, params: dict, timeout: int = 15):
+    """
+    Wrapper around _api_get that respects sleep hours.
+    Returns None during sleep hours to avoid API calls.
+    """
+    if sleep_if_required():
+        log.debug("[SLEEP] Skipping API call to %s during sleep hours", url)
+        return None
+    return _api_get(url, params, timeout)
 
 # ───────── Negative-result cache to avoid hammering same endpoints ─────────
 NEG_CACHE: Dict[Tuple[str,int], Tuple[float, bool]] = {}
@@ -382,42 +380,38 @@ def _db_ping() -> bool:
         return False
     try:
         with db_conn() as c:
-            c.execute("SELECT 1")
+            cursor = c.execute("SELECT 1")
+            row = cursor.fetchone()
+            # FIX: Just check if we can execute, don't rely on row access
             return True
     except Exception:
         log.warning("[DB] ping failed, re-initializing pool")
         try:
             _init_pool()
             with db_conn() as c2:
-                c2.execute("SELECT 1")
+                cursor = c2.execute("SELECT 1")
+                # Don't need to access row, just check if query executes
                 return True
         except Exception as e:
             _metric_inc("db_errors_total", n=1)
             log.error("[DB] reinit failed: %s", e)
             return False
 
-# ───────── Settings cache (Redis-backed when available) — THREAD-SAFE ─────────
-import threading
+# ───────── Settings cache (Redis-backed when available) ─────────
 class _KVCache:
-    def __init__(self, ttl):
-        self.ttl=ttl
-        self.data={}
-        self._lock=threading.RLock()
-    def get(self, k):
+    def __init__(self, ttl): self.ttl=ttl; self.data={}
+    def get(self, k): 
         if _redis:
             try:
                 v = _redis.get(f"gs:{k}")
                 return v.decode("utf-8") if v is not None else None
             except Exception:
                 pass
-        with self._lock:
-            v=self.data.get(k)
-            if not v: return None
-            ts,val=v
-            if time.time()-ts>self.ttl:
-                self.data.pop(k,None)
-                return None
-            return val
+        v=self.data.get(k); 
+        if not v: return None
+        ts,val=v
+        if time.time()-ts>self.ttl: self.data.pop(k,None); return None
+        return val
     def set(self,k,v):
         if _redis:
             try:
@@ -425,8 +419,7 @@ class _KVCache:
                 return
             except Exception:
                 pass
-        with self._lock:
-            self.data[k]=(time.time(),v)
+        self.data[k]=(time.time(),v)
     def invalidate(self,k=None):
         if _redis and k:
             try:
@@ -434,8 +427,7 @@ class _KVCache:
                 return
             except Exception:
                 pass
-        with self._lock:
-            self.data.clear() if k is None else self.data.pop(k,None)
+        self.data.clear() if k is None else self.data.pop(k,None)
 
 _SETTINGS_CACHE, _MODELS_CACHE = _KVCache(SETTINGS_TTL), _KVCache(MODELS_TTL)
 
@@ -490,17 +482,7 @@ def init_db():
             PRIMARY KEY (match_id, market, selection, captured_ts)
         )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_match ON odds_history (match_id, captured_ts DESC)")
-        c.execute("""CREATE TABLE IF NOT EXISTS lineups (
-            match_id BIGINT PRIMARY KEY,
-            created_ts BIGINT,
-            payload TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
-            match_id BIGINT PRIMARY KEY,
-            created_ts BIGINT,
-            payload TEXT
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_prematch_created ON prematch_snapshots (created_ts DESC)")
+        # Removed prematch_snapshots + lineups tables (strict in-play)
         c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_market ON odds_history (market, captured_ts DESC)")
         # Evolutive columns (idempotent)
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
@@ -527,22 +509,14 @@ def init_db():
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        # Reuse global session + handle 429 politely
-        for attempt in range(2):
-            r = session.post(url, data=data, timeout=REQ_TIMEOUT_SEC)
-            if r.status_code == 429:
-                try:
-                    ra = int((r.json().get("parameters") or {}).get("retry_after", 1))
-                except Exception:
-                    ra = 1
-                time.sleep(min(ra, 5))
-                continue
-            ok = bool(r.ok)
-            if ok: _metric_inc("tips_sent_total", n=1)
-            return ok
-        return False
+        r=requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
+            timeout=REQ_TIMEOUT_SEC
+        )
+        ok = bool(r.ok)
+        if ok: _metric_inc("tips_sent_total", n=1)
+        return ok
     except Exception:
         return False
 
@@ -635,48 +609,17 @@ def fetch_match_events(fid: int) -> list:
     return out
 
 def fetch_live_matches() -> List[dict]:
-    """
-    Light scan: only hydrate statistics/events when likely actionable to save calls.
-    """
     js=api_get_with_sleep(FOOTBALL_API_URL, {"live":"all"}) or {}
     matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
     out=[]
     for m in matches:
         st=((m.get("fixture") or {}).get("status") or {})
         elapsed=st.get("elapsed"); short=(st.get("short") or "").upper()
-        if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES:
-            continue
-        if int(elapsed or 0) < TIP_MIN_MINUTE:
-            # Don’t fetch heavy stats/events yet
-            out.append(m)
-            continue
+        if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES: continue
         fid=(m.get("fixture") or {}).get("id")
         m["statistics"]=fetch_match_stats(fid); m["events"]=fetch_match_events(fid)
         out.append(m)
     return out
-
-# ───────── Prematch helpers (kept) ─────────
-def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
-    js=api_get_with_sleep(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
-    return js.get("response",[]) if isinstance(js,dict) else []
-
-def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
-    js=api_get_with_sleep(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
-    return js.get("response",[]) if isinstance(js,dict) else []
-
-def _collect_todays_prematch_fixtures() -> List[dict]:
-    today_local=datetime.now(BERLIN_TZ).date()
-    start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
-    end_local=start_local+timedelta(days=1)
-    dates_utc={start_local.astimezone(ZoneInfo("UTC")).date(), (end_local - timedelta(seconds=1)).astimezone(ZoneInfo("UTC")).date()}
-    fixtures=[]
-    for d in sorted(dates_utc):
-        js=api_get_with_sleep(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")}) or {}
-        for r in js.get("response",[]) if isinstance(js,dict) else []:
-            if (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper() == "NS":
-                fixtures.append(r)
-    fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
-    return fixtures
 
 # ───────── ENHANCEMENT 1: Advanced Ensemble Learning System ─────────
 class AdvancedEnsemblePredictor:
@@ -813,9 +756,9 @@ class AdvancedEnsemblePredictor:
             return self._logistic_predict(features, market)
     
     def _bayesian_predict(self, features: Dict[str, float], market: str, minute: int) -> Optional[float]:
-        """Bayesian updating of probabilities"""
+        """Bayesian updating of probabilities (live data only)"""
         try:
-            prior_prob = self._get_prior_probability(features, market)
+            prior_prob = self._get_prior_probability(features, market)  # heuristic prior from live-derived features
             live_prob = self._logistic_predict(features, market)
             
             # Bayesian update: weight live data more as game progresses
@@ -882,15 +825,11 @@ class AdvancedEnsemblePredictor:
             return sum(non_linear_features) * 0.005
     
     def _get_prior_probability(self, features: Dict[str, float], market: str) -> float:
-        """Get prior probability based on historical data and team strengths"""
-        # This would typically come from pre-match models or historical averages
+        """Get prior probability based on current/historical-like live features only"""
         base_prior = 0.5
-        
-        # Adjust based on available features
         if "xg_sum" in features:
             xg_density = features["xg_sum"] / max(1, features.get("minute", 1))
             base_prior = min(0.8, max(0.2, xg_density * 10))
-        
         return base_prior
     
     def _calculate_momentum_factor(self, features: Dict[str, float], minute: int) -> float:
@@ -1177,10 +1116,6 @@ class MarketSpecificPredictor:
         else:
             # Fallback to ensemble prediction
             return ensemble_predictor.predict_ensemble(features, market, minute)
-
-    def predict_1x2(self, features: Dict[str, float], minute: int) -> Tuple[float, float, float]:
-        """Explicit triple for 1X2: (home_prob, away_prob, confidence)."""
-        return self._predict_1x2_advanced(features, minute)
     
     def _predict_btts_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
         """Advanced BTTS prediction with defensive vulnerability analysis"""
@@ -1622,10 +1557,8 @@ def _recent_xg_impact(feat: Dict[str, float], minute: int) -> float:
 
 def _defensive_stability(feat: Dict[str, float]) -> float:
     """Calculate defensive stability metric"""
-    goals_conceded_h = feat.get("goals_a", 0)
-    goals_conceded_a = feat.get("goals_h", 0)
-    xg_against_h = feat.get("xg_a", 0)
-    xg_against_a = feat.get("xg_h", 0)
+    goals_conceded_h = feat.get("goals_a", 0) + feat.get("goals_h", 0)
+    xg_against_h = feat.get("xg_a", 0) + feat.get("xg_h", 0)
     
     defensive_efficiency_h = 1 - (goals_conceded_h / max(1, xg_against_h)) if xg_against_h > 0 else 1.0
     defensive_efficiency_a = 1 - (goals_conceded_a / max(1, xg_against_a)) if xg_against_a > 0 else 1.0
@@ -1727,31 +1660,9 @@ def extract_enhanced_features(m: dict) -> Dict[str, float]:
     
     return base_feat
 
-def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
-    """Get pre-match probability for Bayesian updates (kept; may return None)."""
-    try:
-        if market == "BTTS":
-            mdl = load_model_from_settings("PRE_BTTS_YES")
-            if mdl:
-                return None
-        elif market.startswith("OU"):
-            line = _parse_ou_line_from_suggestion(market)
-            if line:
-                mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-                if mdl:
-                    return None
-        elif market == "1X2":
-            mdl_home = load_model_from_settings("PRE_WLD_HOME")
-            mdl_away = load_model_from_settings("PRE_WLD_AWAY")
-            if mdl_home and mdl_away:
-                return (0.4, 0.4)  # Placeholder
-    except Exception as e:
-        log.warning(f"[PRE_MATCH_PROB] Failed for {market}: {e}")
-    return None
-
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
-    """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2"""
+    """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2 (in-play only)"""
     if sleep_if_required():
         log.info("[ENHANCED_PROD] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
         return (0, 0)
@@ -1794,8 +1705,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         continue
 
                 # Extract advanced features
-                # If stats/events were not fetched yet (early minute), this will still compute basic features.
-                feat = feature_engineer.extract_advanced_features(m) if m.get("statistics") or int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0) >= TIP_MIN_MINUTE else extract_basic_features(m)
+                feat = feature_engineer.extract_advanced_features(m)
                 minute = int(feat.get("minute", 0))
                 
                 # Validation checks
@@ -1861,7 +1771,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
                 # 3. 1X2 Market (Draw suppressed)
                 try:
-                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_1x2(feat, minute)
+                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
                     
                     if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
                         # Normalize probabilities (suppress draw)
@@ -1888,27 +1798,10 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     log.info(f"[NO_CANDIDATES] No qualified tips for {home} vs {away}")
                     continue
 
-                # Bayesian updates with pre-match probabilities
-                enhanced_candidates = []
-                for market, suggestion, prob, confidence in candidates:
-                    pre_match_data = _get_pre_match_probability(fid, market)
-                    
-                    if pre_match_data is not None:
-                        bayesian_updater = BayesianUpdater()
-                        if market == "1X2" and isinstance(pre_match_data, tuple):
-                            pre_match_prob_home, pre_match_prob_away = pre_match_data
-                            if suggestion == "Home Win":
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute)
-                            else:  # "Away Win"
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_away, prob, minute)
-                        else:
-                            enhanced_prob = bayesian_updater.update_probability(pre_match_data, prob, minute)
-                    else:
-                        enhanced_prob = prob
+                # In-play only: keep candidates as-is (no prematch priors mixing)
+                enhanced_candidates = candidates[:]
 
-                    enhanced_candidates.append((market, suggestion, enhanced_prob, confidence))
-
-                # Odds analysis and filtering
+                # Odds analysis and filtering (live-only odds)
                 odds_map = fetch_odds(fid) if API_KEY else {}
                 ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
 
@@ -1923,13 +1816,33 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     if odds_quality < odds_analyzer.odds_quality_threshold:
                         continue
 
-                    # Odds lookup (without refetch)
-                    pass_odds, odds2, book2, _ = _price_gate_with_map(odds_map, mk, sug)
+                    # Odds lookup
+                    odds = None
+                    book = None
+                    if mk == "BTTS":
+                        d = odds_map.get("BTTS", {})
+                        tgt = "Yes" if sug.endswith("Yes") else "No"
+                        if tgt in d:
+                            odds, book = d[tgt]["odds"], d[tgt]["book"]
+                    elif mk == "1X2":
+                        d = odds_map.get("1X2", {})
+                        tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
+                        if tgt and tgt in d:
+                            odds, book = d[tgt]["odds"], d[tgt]["book"]
+                    elif mk.startswith("Over/Under"):
+                        ln = _parse_ou_line_from_suggestion(sug)
+                        d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
+                        tgt = "Over" if sug.startswith("Over") else "Under"
+                        if tgt in d:
+                            odds, book = d[tgt]["odds"], d[tgt]["book"]
+
+                    # Price gate and EV calculation
+                    pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
                     if not pass_odds:
                         continue
-
-                    odds = odds2
-                    book = book2
+                    if odds is None:
+                        odds = odds2
+                        book = book2
 
                     ev_pct = None
                     if odds is not None:
@@ -2074,7 +1987,7 @@ class BayesianUpdater:
         self.prior_strength = 0.3  # How much we weight prior vs live data
     
     def update_probability(self, prior_prob: float, live_prob: float, minute: int) -> float:
-        """Bayesian update combining pre-match prior with live evidence"""
+        """Bayesian update combining heuristic prior with live evidence (in-play only)"""
         # Weight live data more as game progresses
         live_weight = min(minute / 90.0, 1.0) * (1 - self.prior_strength)
         prior_weight = self.prior_strength * (1 - live_weight)
@@ -2188,36 +2101,6 @@ class SmartOddsAnalyzer:
         
         return (overround_quality + model_quality) / 2
 
-# Prematch feature extraction (kept)
-def extract_prematch_features(f: dict) -> Dict[str, float]:
-    home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
-    away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
-    home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
-    away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
-    fid = (f.get("fixture") or {}).get("id")
-    feat = {"fid": float(fid or 0)}
-
-    recent_h = _api_last_fixtures(home_id, 5)
-    recent_a = _api_last_fixtures(away_id, 5)
-    h2h = _api_h2h(home_id, away_id, 5)
-
-    if recent_h:
-        feat["avg_goals_h"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_h])
-    if recent_a:
-        feat["avg_goals_a"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_a])
-    if h2h:
-        feat["avg_goals_h2h"] = np.mean([(m.get("goals") or {}).get("home", 0) + (m.get("goals") or {}).get("away", 0) for m in h2h])
-
-    try:
-        dts_h = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_h]
-        dts_a = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_a]
-        if dts_h: feat["rest_days_h"] = (datetime.now(tz=TZ_UTC) - max(dts_h).astimezone(TZ_UTC)).days
-        if dts_a: feat["rest_days_a"] = (datetime.now(tz=TZ_UTC) - max(dts_a).astimezone(TZ_UTC)).days
-    except Exception:
-        pass
-
-    return feat
-
 # ───────── Model loader (with validation) ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
     if not isinstance(tmp, dict): return False
@@ -2261,12 +2144,12 @@ def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float
         prob=1/(1+np.exp(-(a*prob+b)))
     return float(prob)
 
-# ───────── Odds fetch + aggregation (with negative cache) ─────────
+# ───────── Odds fetch + aggregation (LIVE ONLY) ─────────
 def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     """
-    Aggregated odds map:
+    Live-only aggregated odds map:
       { "BTTS": {...}, "1X2": {...}, "OU_2.5": {...}, ... }
-    Prefers /odds/live, falls back to /odds; aggregates across books with outlier & fair checks.
+    Uses /odds/live exclusively to avoid any prematch influence.
     """
     now = time.time()
     k=("odds", fid)
@@ -2274,15 +2157,11 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return {}
     if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: return ODDS_CACHE[fid][1]
 
-    def _fetch(path: str) -> dict:
-        js = api_get_with_sleep(f"{BASE_URL}/{path}", {"fixture": fid}) or {}
+    def _fetch_live() -> dict:
+        js = api_get_with_sleep(f"{BASE_URL}/odds/live", {"fixture": fid}) or {}
         return js if isinstance(js, dict) else {}
 
-    js = {}
-    if ODDS_SOURCE in ("auto", "live"):
-        js = _fetch("odds/live")
-    if not (js.get("response") or []) and ODDS_SOURCE in ("auto", "prematch"):
-        js = _fetch("odds")
+    js = _fetch_live()
 
     by_market: dict[str, dict[str, list[tuple[float, str]]]] = {}
     try:
@@ -2385,6 +2264,7 @@ def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) 
     return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
 
 # ───────── Model scoring helpers (preserved) ─────────
+MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
 EPS=1e-12
 def _sigmoid(x: float) -> float:
     try:
@@ -2490,10 +2370,13 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
     return m <= int(cutoff)
 
-def _price_gate_with_map(odds_map: dict, market_text: str, suggestion: str) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
+def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
-    Same as _price_gate but uses a provided odds_map to avoid refetch per candidate.
+    Return (pass, odds, book, ev_pct). Enforces consistent EV behavior:
+      - If odds missing and ALLOW_TIPS_WITHOUT_ODDS=0 => block.
+      - If odds present => must pass min/max odds and EV >= EDGE_MIN_BPS.
     """
+    odds_map=fetch_odds(fid) if API_KEY else {}
     odds=None; book=None
 
     if market_text=="BTTS":
@@ -2521,13 +2404,6 @@ def _price_gate_with_map(odds_map: dict, market_text: str, suggestion: str) -> T
 
     # EV checked later with actual prob
     return (True, odds, book, None)
-
-def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
-    """
-    Wrapper that fetches odds and then applies _price_gate_with_map.
-    """
-    odds_map = fetch_odds(fid) if API_KEY else {}
-    return _price_gate_with_map(odds_map, market_text, suggestion)
 
 # ───────── Data-quality & formatting helpers (preserved) ─────────
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
@@ -2563,7 +2439,6 @@ def _get_market_threshold(m: str) -> float:
     try:
         v=get_setting_cached(_get_market_threshold_key(m)); return float(v) if v is not None else float(CONF_THRESHOLD)
     except: return float(CONF_THRESHOLD)
-def _get_market_threshold_pre(m: str) -> float: return _get_market_threshold(f"PRE {m}")
 
 def _as_bool(s: str) -> bool:
     return str(s).strip() not in ("0","false","False","no","NO")
@@ -2975,376 +2850,6 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
     log.info("[DIGEST] Sent daily digest with %d tips, %d graded", total, graded)
     return msg
 
-# ───────── Prematch pipeline (kept) ─────────
-def _kickoff_berlin(utc_iso: str|None) -> str:
-    try:
-        if not utc_iso: return "TBD"
-        dt=datetime.fromisoformat(utc_iso.replace("Z","+00:00"))
-        return dt.astimezone(BERLIN_TZ).strftime("%H:%M")
-    except: return "TBD"
-
-def save_prematch_snapshot(fx: dict, feat: Dict[str, float]) -> None:
-    fixture = fx.get("fixture") or {}
-    fid = int(fixture.get("id") or 0)
-    if not fid:
-        return
-    now = int(time.time())
-    payload = json.dumps({"feat": {k: float(feat.get(k, 0.0) or 0.0) for k in feat.keys()}},
-                         separators=(",", ":"), ensure_ascii=False)
-    with db_conn() as c:
-        c.execute(
-            "INSERT INTO prematch_snapshots(match_id, created_ts, payload) "
-            "VALUES (%s,%s,%s) "
-            "ON CONFLICT (match_id) DO UPDATE SET created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload",
-            (fid, now, payload)
-        )
-
-def snapshot_odds_for_fixtures(fixtures: List[int]) -> int:
-    """Odds snapshot with sleep time check"""
-    if sleep_if_required():
-        log.info("[ODDS_SNAPSHOT] Skipping during sleep hours (22:00-08:00 Berlin time)")
-        return 0
-    
-    wrote = 0
-    now = int(time.time())
-    for fid in fixtures:
-        try:
-            od = fetch_odds(fid)  # aggregated
-            rows = []
-            for mk, sides in (od or {}).items():
-                for sel, payload in (sides or {}).items():
-                    o = float((payload or {}).get("odds") or 0)
-                    b = (payload or {}).get("book") or "Book"
-                    if o <= 0: 
-                        continue
-                    rows.append((fid, now, mk, sel, o, b))
-            if not rows:
-                continue
-            with db_conn() as c:
-                c.cur.executemany(
-                    "INSERT INTO odds_history(match_id,captured_ts,market,selection,odds,book) "
-                    "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                    rows
-                )
-                wrote += len(rows)
-        except Exception:
-            continue
-    return wrote
-
-def _today_fixture_ids() -> List[int]:
-    fixtures = _collect_todays_prematch_fixtures()
-    return [int(((fx.get('fixture') or {}).get('id') or 0)) for fx in fixtures if int(((fx.get('fixture') or {}).get('id') or 0))]
-
-def fetch_lineup_and_save(fid: int) -> bool:
-    js = api_get_with_sleep(f"{BASE_URL}/fixtures/lineups", {"fixture": fid}) or {}
-    arr = js.get("response") or []
-    if not arr:
-        return False
-    with db_conn() as c:
-        c.execute(
-            "INSERT INTO lineups(match_id,created_ts,payload) VALUES (%s,%s,%s) "
-            "ON CONFLICT (match_id) DO UPDATE SET created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload",
-            (int(fid), int(time.time()), json.dumps(arr, separators=(",", ":")))
-        )
-    return True
-
-def prematch_scan_save() -> int:
-    """Prematch scan with sleep time check"""
-    if sleep_if_required():
-        log.info("[PREMATCH] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
-        return 0
-    
-    fixtures = _collect_todays_prematch_fixtures()
-    if not fixtures:
-        return 0
-
-    saved = 0
-    for fx in fixtures:
-        fixture = fx.get("fixture") or {}
-        lg = fx.get("league") or {}
-        teams = fx.get("teams") or {}
-
-        home = (teams.get("home") or {}).get("name", "")
-        away = (teams.get("away") or {}).get("name", "")
-        league_id = int(lg.get("id") or 0)
-        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-        fid = int(fixture.get("id") or 0)
-
-        feat = extract_prematch_features(fx)
-        if not fid or not feat:
-            continue
-
-        try:
-            save_prematch_snapshot(fx, feat)
-        except Exception:
-            pass
-
-        candidates: List[Tuple[str, str, float]] = []
-
-        # PRE OU
-        for line in OU_LINES:
-            mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-            if not mdl:
-                continue
-            p = _score_prob(feat, mdl)
-            mk = f"Over/Under {_fmt_line(line)}"
-            thr = _get_market_threshold_pre(mk)
-            if p * 100.0 >= thr:
-                candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p))
-            q = 1.0 - p
-            if q * 100.0 >= thr:
-                candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", q))
-
-        # PRE BTTS
-        mdl = load_model_from_settings("PRE_BTTS_YES")
-        if mdl:
-            p = _score_prob(feat, mdl)
-            thr = _get_market_threshold_pre("BTTS")
-            if p * 100.0 >= thr:
-                candidates.append(("PRE BTTS", "BTTS: Yes", p))
-            q = 1.0 - p
-            if q * 100.0 >= thr:
-                candidates.append(("PRE BTTS", "BTTS: No", q))
-
-        # PRE 1X2 (draw suppressed)
-        mh, ma = load_model_from_settings("PRE_WLD_HOME"), load_model_from_settings("PRE_WLD_AWAY")
-        if mh and ma:
-            ph = _score_prob(feat, mh)
-            pa = _score_prob(feat, ma)
-            s = max(EPS, ph + pa)
-            ph, pa = ph / s, pa / s
-            thr = _get_market_threshold_pre("1X2")
-            if ph * 100.0 >= thr:
-                candidates.append(("PRE 1X2", "Home Win", ph))
-            if pa * 100.0 >= thr:
-                candidates.append(("PRE 1X2", "Away Win", pa))
-
-        if not candidates:
-            continue
-
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        base_now = int(time.time())
-        per_match = 0
-
-        for idx, (mk, sug, prob) in enumerate(candidates):
-            if sug not in ALLOWED_SUGGESTIONS:
-                continue
-            if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                break
-
-            pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ", ""), sug, fid)
-            if not pass_odds:
-                continue
-
-            ev_pct = None
-            if odds is not None:
-                edge = _ev(prob, odds)
-                ev_bps = int(round(edge * 10000))
-                ev_pct = round(edge * 100.0, 1)
-                if int(round(edge * 10000)) < EDGE_MIN_BPS:
-                    continue
-            else:
-                continue  # odds mandatory by default
-
-            created_ts = base_now + idx
-            raw = float(prob)
-            pct = round(raw * 100.0, 1)
-
-            with db_conn() as c2:
-                c2.execute(
-                    "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,"
-                    "score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'0-0',0,%s,%s,%s,%s,0)",
-                    (
-                        fid, league_id, league, home, away, mk, sug,
-                        float(pct), raw, created_ts,
-                        (float(odds) if odds is not None else None),
-                        (book or None),
-                        (float(ev_pct) if ev_pct is not None else None),
-                    ),
-                )
-            saved += 1
-            per_match += 1
-
-    log.info("[PREMATCH] saved=%d", saved)
-    return saved
-
-# ───────── MOTD (kept) ─────────
-MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
-
-def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, odds=None, book=None, ev_pct=None):
-    money = ""
-    if odds:
-        if ev_pct is not None:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
-        else:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
-    return (
-        "🏅 <b>Match of the Day</b>\n"
-        f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
-        f"🏆 <b>League:</b> {escape(league)}\n"
-        f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
-        f"<b>Tip:</b> {escape(suggestion)}\n"
-        f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}"
-    )
-
-def send_match_of_the_day() -> bool:
-    """Send Match of the Day with sleep time check"""
-    if sleep_if_required():
-        log.info("[MOTD] Skipping during sleep hours (22:00-08:00 Berlin time)")
-        return False
-    
-    if os.getenv("MOTD_PREDICT", "1") in ("0", "false", "False", "no", "NO"):
-        log.info("[MOTD] MOTD disabled by configuration")
-        return send_telegram("🏅 MOTD disabled.")
-    
-    log.info("[MOTD] Starting Match of the Day selection...")
-    
-    fixtures = _collect_todays_prematch_fixtures()
-    if not fixtures:
-        log.warning("[MOTD] No fixtures found for today")
-        return send_telegram("🏅 Match of the Day: no fixtures today.")
-    
-    log.info("[MOTD] Found %d fixtures for today", len(fixtures))
-
-    # Filter by league IDs if specified
-    if MOTD_LEAGUE_IDS:
-        fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
-        log.info("[MOTD] After league filtering: %d fixtures", len(fixtures))
-        if not fixtures:
-            return send_telegram("🏅 Match of the Day: no fixtures in configured leagues.")
-
-    best_candidate = None
-    best_score = 0.0
-
-    for fx in fixtures:
-        try:
-            fixture = fx.get("fixture") or {}
-            lg = fx.get("league") or {}
-            teams = fx.get("teams") or {}
-            fid = int((fixture.get("id") or 0))
-
-            if not fid:
-                continue
-
-            home = (teams.get("home") or {}).get("name", "")
-            away = (teams.get("away") or {}).get("name", "")
-            league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-            kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
-
-            log.debug("[MOTD] Processing: %s vs %s (%s)", home, away, league)
-
-            # Extract pre-match features
-            feat = extract_prematch_features(fx)
-            if not feat:
-                log.debug("[MOTD] No features for %s vs %s", home, away)
-                continue
-
-            candidates = []
-
-            # PRE Over/Under markets
-            for line in OU_LINES:
-                mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-                if not mdl: 
-                    continue
-                    
-                p = _score_prob(feat, mdl)
-                mk = f"Over/Under {_fmt_line(line)}"
-                thr = _get_market_threshold_pre(mk)
-                
-                # Over candidate
-                if p * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append((mk, f"Over {_fmt_line(line)} Goals", p, home, away, league, kickoff_txt, fid))
-                
-                # Under candidate  
-                q = 1.0 - p
-                if q * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append((mk, f"Under {_fmt_line(line)} Goals", q, home, away, league, kickoff_txt, fid))
-
-            # PRE BTTS
-            mdl = load_model_from_settings("PRE_BTTS_YES")
-            if mdl:
-                p = _score_prob(feat, mdl)
-                thr = _get_market_threshold_pre("BTTS")
-                if p * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append(("BTTS", "BTTS: Yes", p, home, away, league, kickoff_txt, fid))
-                q = 1.0 - p
-                if q * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append(("BTTS", "BTTS: No", q, home, away, league, kickoff_txt, fid))
-
-            # PRE 1X2 (draw suppressed)
-            mh = load_model_from_settings("PRE_WLD_HOME")
-            ma = load_model_from_settings("PRE_WLD_AWAY")
-            if mh and ma:
-                ph = _score_prob(feat, mh)
-                pa = _score_prob(feat, ma)
-                s = max(EPS, ph + pa)
-                ph, pa = ph / s, pa / s
-                thr = _get_market_threshold_pre("1X2")
-                if ph * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append(("1X2", "Home Win", ph, home, away, league, kickoff_txt, fid))
-                if pa * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append(("1X2", "Away Win", pa, home, away, league, kickoff_txt, fid))
-
-            if not candidates:
-                log.debug("[MOTD] No candidates for %s vs %s", home, away)
-                continue
-
-            # Evaluate each candidate
-            for mk, sug, prob, home, away, league, kickoff_txt, fid in candidates:
-                prob_pct = prob * 100.0
-                
-                # Check odds and EV
-                pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
-                if not pass_odds:
-                    log.debug("[MOTD] Odds gate failed for %s: %s", sug, home)
-                    continue
-
-                ev_pct = None
-                if odds is not None:
-                    edge = _ev(prob, odds)
-                    ev_bps = int(round(edge * 10000))
-                    ev_pct = round(edge * 100.0, 1)
-                    if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
-                        log.debug("[MOTD] EV too low for %s: %d bps", sug, ev_bps)
-                        continue
-                else:
-                    log.debug("[MOTD] No odds for %s: %s", sug, home)
-                    continue
-
-                # Score candidate (confidence + EV)
-                candidate_score = prob_pct + (ev_pct or 0)
-                
-                log.info("[MOTD] Candidate: %s - %s vs %s - %.1f%% confidence, %.1f%% EV, score: %.1f", 
-                        sug, home, away, prob_pct, ev_pct, candidate_score)
-
-                if best_candidate is None or candidate_score > best_score:
-                    best_candidate = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
-                    best_score = candidate_score
-
-        except Exception as e:
-            log.exception("[MOTD] Error processing fixture: %s", e)
-            continue
-
-    if not best_candidate:
-        log.info("[MOTD] No suitable match found for MOTD")
-        return send_telegram("🏅 Match of the Day: no prematch pick met thresholds today.")
-
-    # Send the best candidate
-    prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best_candidate
-    
-    log.info("[MOTD] Selected: %s vs %s - %s (%.1f%%)", home, away, sug, prob_pct)
-    
-    message = _format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct)
-    success = send_telegram(message)
-    
-    if success:
-        log.info("[MOTD] Successfully sent MOTD")
-    else:
-        log.error("[MOTD] Failed to send MOTD message")
-        
-    return success
-
 # ───────── Auto-train / Auto-tune (fix wiring) ─────────
 def auto_train_job():
     if not TRAIN_ENABLE:
@@ -3359,8 +2864,7 @@ def auto_train_job():
 
         trained = [k for k, v in (res.get("trained") or {}).items() if v]
         keys = [
-            "BTTS", "Over/Under 2.5", "Over/Under 3.5", "1X2",
-            "PRE BTTS", "PRE Over/Under 2.5", "PRE Over/Under 3.5", "PRE 1X2",
+            "BTTS", "Over/Under 2.5", "Over/Under 3.5", "1X2"
         ]
         thr_lines = []
         for k in keys:
@@ -3533,7 +3037,7 @@ def register_shutdown_handlers():
     signal.signal(signal.SIGTERM, shutdown_handler)
     atexit.register(shutdown_handler)
 
-# ───────── Scheduler (preserved; wiring fixed for auto-tune) ─────────
+# ───────── Scheduler (in-play only) ─────────
 _scheduler_started=False
 
 def _run_with_pg_lock(lock_key: int, fn, *a, **k):
@@ -3552,7 +3056,7 @@ def _start_scheduler_once():
         return
     try:
         sched = BackgroundScheduler(timezone=TZ_UTC)
-        # core jobs
+        # core in-play jobs
         sched.add_job(lambda: _run_with_pg_lock(1001, production_scan),
                       "interval", seconds=SCAN_INTERVAL_SEC, id="scan", max_instances=1, coalesce=True)
         sched.add_job(lambda: _run_with_pg_lock(1002, backfill_results_for_open_matches, 400),
@@ -3564,13 +3068,6 @@ def _start_scheduler_once():
                                       minute=int(os.getenv("DAILY_ACCURACY_MINUTE", "6")),
                                       timezone=BERLIN_TZ),
                           id="digest", max_instances=1, coalesce=True)
-
-        if os.getenv("MOTD_PREDICT", "1") not in ("0", "false", "False", "no", "NO"):
-            sched.add_job(lambda: _run_with_pg_lock(1004, send_match_of_the_day),
-                          CronTrigger(hour=int(os.getenv("MOTD_HOUR", "19")),
-                                      minute=int(os.getenv("MOTD_MINUTE", "15")),
-                                      timezone=BERLIN_TZ),
-                          id="motd", max_instances=1, coalesce=True)
 
         if TRAIN_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1005, auto_train_job),
@@ -3586,28 +3083,24 @@ def _start_scheduler_once():
         sched.add_job(lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200),
                       "interval", minutes=10, id="retry", max_instances=1, coalesce=True)
 
-        # periodic odds snapshots (prematch)
-        sched.add_job(lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
-                      "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True)
-
         # cache cleanup
         sched.add_job(cleanup_caches, "interval", hours=1, id="cache_cleanup")
 
         sched.start()
         _scheduler_started = True
-        send_telegram("🚀 goalsniper AI mode (in-play) with ENHANCED PREDICTIONS started.")
-        log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
+        send_telegram("🚀 goalsniper AI mode started (IN-PLAY ONLY).")
+        log.info("[SCHED] started (scan=%ss, in-play only)", SCAN_INTERVAL_SEC)
 
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
-# ───────── Admin / auth / endpoints (add /metrics and performance analysis) ─────────
+# ───────── Admin / auth / endpoints (prematch/MOTD removed) ─────────
 def _require_admin():
     key=request.headers.get("X-API-Key") or request.args.get("key") or ((request.json or {}).get("key") if request.is_json else None)
     if not ADMIN_API_KEY or key != ADMIN_API_KEY: abort(401)
 
 @app.route("/")
-def root(): return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI_ENHANCED", "scheduler": RUN_SCHEDULER})
+def root(): return jsonify({"ok": True, "name": "goalsniper", "mode": "INPLAY_ONLY_ENHANCED", "scheduler": RUN_SCHEDULER})
 
 @app.route("/health")
 def health():
@@ -3615,10 +3108,10 @@ def health():
         with db_conn() as c:
             n = c.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
         
-        # Check API connectivity (bypass sleep to avoid false negatives)
+        # Check API connectivity
         api_ok = False
         try:
-            test_resp = _api_get(FOOTBALL_API_URL, {"live": "all"}, timeout=5)
+            test_resp = api_get_with_sleep(FOOTBALL_API_URL, {"live": "all"}, timeout=5)
             api_ok = test_resp is not None
         except:
             pass
@@ -3684,25 +3177,7 @@ def http_auto_tune(): _require_admin(); tuned=auto_tune_thresholds(14); return j
 @app.route("/admin/retry-unsent", methods=["POST","GET"])
 def http_retry_unsent(): _require_admin(); n=retry_unsent_tips(30,200); return jsonify({"ok": True, "resent": n})
 
-@app.route("/admin/prematch-scan", methods=["POST","GET"])
-def http_prematch_scan(): _require_admin(); saved=prematch_scan_save(); return jsonify({"ok": True, "saved": int(saved)})
-
-@app.route("/admin/motd", methods=["POST","GET"])
-def http_motd():
-    _require_admin(); ok = send_match_of_the_day(); return jsonify({"ok": bool(ok)})
-
-@app.route("/admin/motd-test", methods=["POST", "GET"])
-def http_motd_test():
-    """Test MOTD manually"""
-    _require_admin()
-    log.info("[MOTD-TEST] Manual MOTD trigger")
-    
-    try:
-        ok = send_match_of_the_day()
-        return jsonify({"ok": bool(ok), "message": "MOTD test completed"})
-    except Exception as e:
-        log.exception("[MOTD-TEST] Failed: %s", e)
-        return jsonify({"ok": False, "error": str(e)}), 500
+# (Prematch/MOTD routes removed)
 
 @app.route("/settings/<key>", methods=["GET","POST"])
 def http_settings(key: str):
@@ -3734,9 +3209,8 @@ def telegram_webhook(secret: str):
     update=request.get_json(silent=True) or {}
     try:
         msg=(update.get("message") or {}).get("text") or ""
-        if msg.startswith("/start"): send_telegram("👋 goalsniper bot (FULL AI ENHANCED mode) is online.")
+        if msg.startswith("/start"): send_telegram("👋 goalsniper bot (IN-PLAY ONLY ENHANCED) is online.")
         elif msg.startswith("/digest"): daily_accuracy_digest()
-        elif msg.startswith("/motd"): send_match_of_the_day()
         elif msg.startswith("/scan"):
             parts=msg.split()
             if len(parts)>1 and ADMIN_API_KEY and parts[1]==ADMIN_API_KEY:
