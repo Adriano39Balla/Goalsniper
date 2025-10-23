@@ -11,6 +11,7 @@ import psycopg2
 import pandas as pd
 from typing import Optional, Dict
 from datetime import datetime
+from dotenv import load_dotenv load_dotenv() 
 
 # Set up database connection (from environment variable)
 DATABASE_URL = os.getenv("DATABASE_URL")
