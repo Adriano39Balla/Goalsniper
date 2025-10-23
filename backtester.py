@@ -116,7 +116,11 @@ def summarize(df: pd.DataFrame, market: str):
 
 def main():
     conn = connect_db()
+    
+    print("Pulling tip snapshots from the database...")
     df_raw = get_tip_snapshots(conn)
+    print("Tip snapshots pulled:", len(df_raw))
+    
     thresholds = get_thresholds(conn)
 
     all_tips = []
