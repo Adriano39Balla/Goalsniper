@@ -243,6 +243,7 @@ class PooledConn:
 def _init_pool():
     global POOL
     dsn = DATABASE_URL + (("&" if "?" in DATABASE_URL else "?") + "sslmode=require" if "sslmode=" not in DATABASE_URL else "")
+    log.info(f"[DB] Using DSN: {dsn}")  # ADD THIS LINE
     POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
 
 def db_conn(): 
