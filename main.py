@@ -21,7 +21,7 @@ from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# >>> ADD: for IPv4 + DSN handling & backoff
+# >>> ADDED: for IPv4 resolution & DSN helpers
 import socket
 from urllib.parse import urlparse, parse_qsl
 # <<<
@@ -163,18 +163,39 @@ except Exception as e:
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
     
 # ───────── DB pool & helpers ─────────
-
-# >>> ADD: IPv4 resolver, conninfo builders, and backoff pool init
 def _resolve_ipv4(host: str, port: int) -> Optional[str]:
+    """
+    Prefer a local AF_INET resolve; if that fails, try DNS-over-HTTPS (Google/Cloudflare).
+    Returns the first IPv4 string or None.
+    """
     if not host:
         return None
+    # 1) Local resolver (A record)
     try:
         infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
         for _family, _socktype, _proto, _canonname, sockaddr in infos:
             ip, _p = sockaddr
             return ip
     except Exception as e:
-        log.warning("[DNS] IPv4 resolve failed for %s:%s: %s — using hostname fallback", host, port, e)
+        log.warning("[DNS] IPv4 resolve failed for %s:%s: %s — trying DoH fallback", host, port, e)
+    # 2) DoH fallback
+    try:
+        urls = [
+            f"https://dns.google/resolve?name={host}&type=A",
+            f"https://cloudflare-dns.com/dns-query?name={host}&type=A",
+        ]
+        for u in urls:
+            r = requests.get(u, headers={"accept": "application/dns-json"}, timeout=4)
+            if not r.ok:
+                continue
+            data = r.json() if isinstance(r.json, type(lambda: None)) else r.json()
+            for ans in (data or {}).get("Answer", []) or []:
+                ip = ans.get("data")
+                # quick sanity: dot-quad IPv4
+                if isinstance(ip, str) and ip.count(".") == 3:
+                    return ip
+    except Exception as e:
+        log.warning("[DNS] DoH fallback failed for %s: %s — using hostname fallback", host, e)
     return None
 
 def _parse_pg_url(url: str) -> Dict[str, Any]:
@@ -191,7 +212,6 @@ def _parse_pg_url(url: str) -> Dict[str, Any]:
     return {"user": user, "password": password, "host": host, "port": int(port), "dbname": dbname, "params": params}
 
 def _q(v: str) -> str:
-    """Quote conninfo values safely."""
     s = "" if v is None else str(v)
     if s == "" or all(ch not in s for ch in (" ", "'", "\\", "\t", "\n")):
         return s
@@ -209,35 +229,31 @@ def _make_conninfo(parts: Dict[str, Any], port: int, hostaddr: Optional[str]) ->
     if parts["password"]:
         base.append(f"password={_q(parts['password'])}")
     if hostaddr:
-        base.append(f"hostaddr={_q(hostaddr)}")  # prefer IPv4 socket; keep host for TLS/SNI
-    # enforce ssl
+        base.append(f"hostaddr={_q(hostaddr)}")  # force IPv4 socket, keep host for TLS/SNI
     base.append("sslmode=require")
     return " ".join(base)
 
 def _conninfo_candidates(url: str) -> List[str]:
     """
-    Prefer pooled port 6543 first, then fallback to the URL's port (often 5432).
-    For each port, try with IPv4 hostaddr (if available), then without.
+    Prefer pooled (6543) first, then original port (often 5432).
+    For each, try with IPv4 hostaddr (if we can resolve), then without.
+    Allow pinning via DB_HOSTADDR=<ipv4>.
     """
     parts = _parse_pg_url(url)
-    # env override for IPv4 hostaddr (optional)
     env_hostaddr = os.getenv("DB_HOSTADDR")
     prefer_pooled = os.getenv("DB_PREFER_POOLED", "1") not in ("0", "false", "False", "no", "NO")
 
-    ports = []
+    ports: List[int] = []
     if prefer_pooled:
         ports.append(6543)
     if parts["port"] not in ports:
         ports.append(parts["port"])
 
-    # resolve IPv4 for each port (resolution result should be the same, but we call per port for log clarity)
     cands: List[str] = []
     for p in ports:
         ipv4 = env_hostaddr or _resolve_ipv4(parts["host"], p)
-        # with hostaddr (IPv4)
         if ipv4:
             cands.append(_make_conninfo(parts, p, ipv4))
-        # without hostaddr (let libpq resolve)
         cands.append(_make_conninfo(parts, p, None))
     return cands
 
@@ -252,17 +268,23 @@ def _init_pool():
     candidates = _conninfo_candidates(DATABASE_URL)
 
     delay = 1.0
-    for attempt in range(6):  # ~1+2+4+8+16 (~31s) total
+    last = "unknown"
+    for attempt in range(6):  # ~1+2+4+8+16 (~31s)
         for dsn in candidates:
             try:
                 POOL = SimpleConnectionPool(minconn=1, maxconn=maxconn, dsn=dsn)
-                log.info("[DB] Connected (pool %d) using DSN: %s", maxconn, dsn.replace(parts_mask := "password=", f"{parts_mask}**** "))
+                masked = dsn.replace("password=", "password=**** ")
+                log.info("[DB] Connected (pool=%d) using DSN: %s", maxconn, masked)
                 return
             except psycopg2.OperationalError as e:
                 last = str(e)
                 continue
         if attempt == 5:
-            raise psycopg2.OperationalError(f"DB pool init failed after retries. Last error: {last if 'last' in locals() else 'unknown'}")
+            raise psycopg2.OperationalError(
+                "DB pool init failed after retries. "
+                f"Last error: {last}. "
+                "Hint: set DB_HOSTADDR=<your Supabase IPv4> to pin IPv4 if DNS A-records are flaky."
+            )
         time.sleep(delay)
         delay *= 2
 
@@ -273,7 +295,6 @@ class PooledConn:
         try:
             self.conn=self.pool.getconn()
         except Exception:
-            # one-time reinit if pool got broken
             global POOL
             POOL=None
             _init_pool()
@@ -295,7 +316,6 @@ class PooledConn:
 def db_conn(): 
     if not POOL: _init_pool()
     return PooledConn(POOL)  # type: ignore
-# <<< END added DB section
 
 # ───────── Settings cache ─────────
 class _TTLCache:
@@ -539,18 +559,17 @@ def calibrate_and_retune_from_tips(conn, target_precision: float,
     updates: Dict[str, float] = {}
     def _do(market_name: str, mask_market):
         sub = df[mask_market].copy()
-        if len(sub) < max(200, min_preds*3):  # need some mass
+        if len(sub) < max(200, min_preds*3):
             return
-        # Platt using tips
         p_raw = sub["prob"].to_numpy()
         y = sub["y"].to_numpy().astype(int)
         a, b = fit_platt(y, p_raw)
-        # store calibration blob update for the model key(s)
+
         key_map = {
             "BTTS":           "BTTS_YES",
             "Over/Under 2.5": "OU_2.5",
             "Over/Under 3.5": "OU_3.5",
-            "1X2":            None,  # handled by threshold only (composite)
+            "1X2":            None,
         }
         model_key = key_map.get(market_name)
         if model_key:
@@ -560,7 +579,6 @@ def calibrate_and_retune_from_tips(conn, target_precision: float,
                 for k in (f"model_latest:{model_key}", f"model:{model_key}"):
                     _set_setting(conn, k, json.dumps(blob))
 
-        # choose threshold to hit target precision
         z = _logit_vec(p_raw); p_cal = 1.0/(1.0+np.exp(-(a*z + b)))
         thr_prob = _pick_threshold_for_target_precision(
             y_true=y, p_cal=p_cal, target_precision=target_precision,
@@ -570,14 +588,13 @@ def calibrate_and_retune_from_tips(conn, target_precision: float,
         _set_setting(conn, f"conf_threshold:{market_name}", f"{thr_pct:.2f}")
         updates[market_name] = thr_pct
 
-    # Markets
     _do("BTTS",                 df["market"] == "BTTS")
     _do("Over/Under 2.5",      df["market"].eq("Over/Under 2.5"))
     _do("Over/Under 3.5",      df["market"].eq("Over/Under 3.5"))
     _do("1X2",                 df["market"] == "1X2")
 
     if updates:
-        log.info("Tips calibration/threshold updates: %s", updates)  # FIX: logger -> log
+        log.info("Tips calibration/threshold updates: %s", updates)
     return updates
 # ---- end optional block ----
 
@@ -586,7 +603,6 @@ def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
     require_fields = int(os.getenv("REQUIRE_DATA_FIELDS","2"))
     if minute < require_stats_minute:
         return True
-    # Allow shots/yellows to satisfy coverage when xG is missing
     fields = [
         feat.get("xg_sum", 0.0),
         feat.get("sot_sum", 0.0),
@@ -702,7 +718,6 @@ except Exception:
     _TIP_MAX_MINUTE = None
 
 def _market_family(market_text: str, suggestion: str) -> str:
-    """Normalize to OU / BTTS / 1X2 (draw suppressed)."""
     s = (market_text or "").upper()
     if s.startswith("OVER/UNDER") or "OVER/UNDER" in s:
         return "OU"
@@ -715,10 +730,6 @@ def _market_family(market_text: str, suggestion: str) -> str:
     return s
 
 def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
-    """
-    True if we are still within the minute cutoff for this market.
-    Falls back to TIP_MAX_MINUTE or (TOTAL_MATCH_MINUTES - 5).
-    """
     fam = _market_family(market_text, suggestion)
     if minute is None:
         return True
@@ -731,15 +742,10 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = _TIP_MAX_MINUTE
     if cutoff is None:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
-    cutoff = min(cutoff, 80)  # never tip beyond 80'
+    cutoff = min(cutoff, 80)
     return m <= int(cutoff)
 
 def fetch_odds(fid: int) -> dict:
-    """
-    Returns a dict like:
-      { "BTTS": {...}, "1X2": {...}, "OU_2.5": {...}, ... }
-    Best-effort parsing of API-Football /odds endpoint; tolerate missing data.
-    """
     cached=_odds_cache_get(fid)
     if cached is not None: return cached
     params={"fixture": fid}
@@ -786,10 +792,6 @@ def fetch_odds(fid: int) -> dict:
     return out
 
 def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
-    """
-    Return (pass, odds, book, ev_pct). If odds missing:
-      - pass if ALLOW_TIPS_WITHOUT_ODDS else block.
-    """
     odds_map=fetch_odds(fid) if API_KEY else {}
     odds=None; book=None
     if market_text=="BTTS":
@@ -891,7 +893,7 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
             (fid, league_id, league, home, away, f"{gh}-{ga}", minute, now)
         )
 
-# (… the rest of the file remains exactly as you posted …)
+# (rest of your logic unchanged — production_scan, prematch, scheduler, endpoints)
 
 # ───────── Boot ─────────
 def _on_boot():
