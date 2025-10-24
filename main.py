@@ -2711,20 +2711,66 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
     return retried
 
 # ───────── Shutdown Handlers (unchanged) ─────────
-def shutdown_handler(signum=None, frame=None):
-    log.info("Received shutdown signal, cleaning up...")
-    ShutdownManager.request_shutdown()
-    if POOL:
+def shutdown_handler(signum=None, frame=None, *, from_atexit: bool = False):
+    """Clean up once. Don't call sys.exit() when invoked by atexit."""
+    global _SHUTDOWN_RAN
+    if _SHUTDOWN_RAN:
+        return
+    _SHUTDOWN_RAN = True
+
+    try:
+        who = "atexit" if from_atexit else ("signal" if signum else "manual")
+        log.info("Received shutdown (%s), cleaning up...", who)
+    except Exception:
+        pass
+
+    try:
+        ShutdownManager.request_shutdown()
+    except Exception:
+        pass
+
+    # Stop scheduler if running
+    try:
+        if _SCHED is not None:
+            try:
+                _SCHED.shutdown(wait=False)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Close DB pool if open
+    try:
+        if POOL:
+            try:
+                POOL.closeall()
+            except Exception as e:
+                # harmless if it's already closed
+                log.warning("Error closing pool during shutdown: %s", e)
+    except Exception:
+        pass
+
+    # Only exit on signal path; atexit must never sys.exit()
+    if not from_atexit:
         try:
-            POOL.closeall()
-        except Exception as e:
-            log.warning("Error closing pool during shutdown: %s", e)
-    sys.exit(0)
+            sys.exit(0)
+        except SystemExit:
+            pass
 
 def register_shutdown_handlers():
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    atexit.register(shutdown_handler)
+    global _SHUTDOWN_HANDLERS_SET
+    if _SHUTDOWN_HANDLERS_SET:
+        return
+    _SHUTDOWN_HANDLERS_SET = True
+
+    import signal, atexit
+    # Wrap to mark the source
+    def _sig_wrapper(sig):
+        return lambda s, f: shutdown_handler(s, f, from_atexit=False)
+
+    signal.signal(signal.SIGINT,  _sig_wrapper(signal.SIGINT))
+    signal.signal(signal.SIGTERM, _sig_wrapper(signal.SIGTERM))
+    atexit.register(lambda: shutdown_handler(from_atexit=True))
 
 # ───────── Scheduler (unchanged wiring; one-shot start) ─────────
 _scheduler_started=False
@@ -2740,7 +2786,7 @@ def _run_with_pg_lock(lock_key: int, fn, *a, **k):
         log.exception("[LOCK %s] failed: %s", lock_key, e); return None
 
 def _start_scheduler_once():
-    global _scheduler_started
+    global _scheduler_started, _SCHED
     if _scheduler_started or not RUN_SCHEDULER:
         return
     try:
@@ -2787,9 +2833,12 @@ def _start_scheduler_once():
         sched.add_job(cleanup_caches, "interval", hours=1, id="cache_cleanup")
 
         sched.start()
+        _SCHED = sched  # <-- keep reference for shutdown
         _scheduler_started = True
         send_telegram("🚀 goalsniper AI mode (in-play + prematch) with ENHANCED PREDICTIONS started.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
+    except Exception as e:
+        log.exception("[SCHED] failed: %s", e)
 
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
