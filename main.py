@@ -1,9 +1,10 @@
 # goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate
-# UPGRADED: Advanced prediction capabilities with ensemble models, Bayesian updates, and game state intelligence
-# ENHANCED: Added advanced AI systems including ensemble learning, feature engineering, market-specific intelligence, and adaptive learning
+# UPGRADED & PATCHED: Robust Supabase connectivity (IPv4 + PgBouncer + SSL), fixed calibration math,
+# sanity + minute cutoffs, per-candidate odds quality, configurable sleep window, GET-enabled admin routes.
 
-import os, json, time, logging, requests, psycopg2, sys, signal, atexit
+import os, json, time, logging, requests, psycopg2, sys, signal, atexit, socket
 import numpy as np
+from urllib.parse import urlparse, parse_qsl
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
@@ -14,6 +15,7 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from collections import defaultdict
 
 # ───────── Env bootstrap ─────────
 try:
@@ -76,7 +78,6 @@ log.propagate = False
 app = Flask(__name__)
 
 # ───────── Minimal Prometheus-style metrics ─────────
-from collections import defaultdict
 METRICS = {
     "api_calls_total": defaultdict(int),      # label: endpoint key
     "api_rate_limited_total": 0,              # 429s
@@ -175,7 +176,7 @@ def validate_config():
         'TELEGRAM_BOT_TOKEN': TELEGRAM_BOT_TOKEN,
         'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID,
         'API_KEY': API_KEY,
-        'DATABASE_URL': DATABASE_URL
+        'DATABASE_URL': os.getenv("DATABASE_URL")  # evaluated at call time
     }
     
     missing = [k for k, v in required.items() if not v]
@@ -250,28 +251,33 @@ MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC = ZoneInfo("UTC")
 BERLIN_TZ = ZoneInfo("Europe/Berlin")  # fixed (was Europe/Amsterdam)
 
-# ───────── Sleep Method for API-Football Rate Limiting ─────────
+# ───────── Configurable sleep window (PATCHED) ─────────
+SLEEP_ENABLE = os.getenv("SLEEP_ENABLE", "1").lower() not in ("0","false","no")
+SLEEP_HOURS = os.getenv("SLEEP_HOURS", "22-08")  # "HH-HH" Berlin time
+
 def is_sleep_time() -> bool:
     """
-    Check if current time is within sleep hours (22:00-08:00 Berlin time).
-    Returns True if we should sleep (pause API calls), False otherwise.
+    Configurable sleep window (default 22:00–08:00 Berlin) to ease API rate limits.
+    Disable with SLEEP_ENABLE=0.
     """
     try:
+        if not SLEEP_ENABLE:
+            return False
         now_berlin = datetime.now(BERLIN_TZ)
-        current_hour = now_berlin.hour
-        # Sleep between 22:00 (10 PM) and 08:00 (8 AM)
-        return current_hour >= 22 or current_hour < 8
+        h = now_berlin.hour
+        start, end = (int(x) for x in SLEEP_HOURS.split("-", 1))
+        if start <= end:   # e.g., 01-06
+            return start <= h < end
+        else:              # e.g., 22-08 (wrap-around)
+            return (h >= start) or (h < end)
     except Exception as e:
         log.warning("[SLEEP_TIME] Error checking sleep time: %s", e)
         return False
 
 def sleep_if_required():
-    """
-    Sleep during specified hours (22:00-08:00 Berlin time) to avoid API rate limiting.
-    This function should be called before making API-Football calls.
-    """
+    """Return True if we are in sleep window (caller should skip API call)."""
     if is_sleep_time():
-        log.info("[SLEEP] Sleeping during quiet hours (22:00-08:00 Berlin time) to avoid API rate limiting")
+        log.info("[SLEEP] Sleeping during quiet hours to avoid API rate limiting")
         return True
     return False
 
@@ -305,23 +311,98 @@ except Exception as e:
         log.warning("train_models not available: %s", _IMPORT_ERR)
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
-# ───────── DB pool & helpers ─────────
+# ───────── DB pool & helpers (PATCHED: pooled+SSL+IPv4-aware) ─────────
 POOL: Optional[SimpleConnectionPool] = None
 
+def _parse_pg_url(url: str) -> dict:
+    pr = urlparse(url)
+    if pr.scheme not in ("postgresql", "postgres"):
+        raise SystemExit("DATABASE_URL must start with postgresql:// or postgres://")
+    params = dict(parse_qsl(pr.query))
+    params.setdefault("sslmode", "require")
+    return {
+        "user": pr.username or "",
+        "password": pr.password or "",
+        "host": pr.hostname or "",
+        "port": int(pr.port or 5432),
+        "dbname": (pr.path or "").lstrip("/") or "postgres",
+        "params": params,
+    }
+
+def _q(v: str) -> str:
+    s = "" if v is None else str(v)
+    if s == "" or all(ch not in s for ch in (" ", "'", "\\", "\t", "\n")):
+        return s
+    s = s.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{s}'"
+
+def _make_conninfo(parts: dict, port: int, hostaddr: Optional[str]) -> str:
+    base = [
+        f"host={_q(parts['host'])}",
+        f"port={port}",
+        f"dbname={_q(parts['dbname'])}",
+    ]
+    if parts["user"]:
+        base.append(f"user={_q(parts['user'])}")
+    if parts["password"]:
+        base.append(f"password={_q(parts['password'])}")
+    if hostaddr:
+        base.append(f"hostaddr={_q(hostaddr)}")  # force IPv4 socket, keep host for TLS/SNI
+    base.append("sslmode=require")
+    return " ".join(base)
+
+def _resolve_ipv4(host: str, port: int) -> Optional[str]:
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        for _family, _socktype, _proto, _canon, sockaddr in infos:
+            ip, _p = sockaddr
+            return ip
+    except Exception:
+        return None
+
+def _conninfo_candidates(url: str) -> list[str]:
+    parts = _parse_pg_url(url)
+    prefer_pooled = os.getenv("DB_PREFER_POOLED", "1").lower() not in ("0","false","no")
+    pinned = os.getenv("DB_HOSTADDR")  # optional pinned IPv4 (Supabase IPv4 addon)
+    ports: list[int] = []
+    if prefer_pooled:
+        ports.append(6543)
+    if parts["port"] not in ports:
+        ports.append(parts["port"])
+    cands: list[str] = []
+    for p in ports:
+        ip = pinned or _resolve_ipv4(parts["host"], p)
+        if ip:
+            cands.append(_make_conninfo(parts, p, ip))
+        cands.append(_make_conninfo(parts, p, None))
+    return cands
+
 def _init_pool():
-    """Initialize the database connection pool"""
+    """Initialize the database connection pool with retry/backoff."""
     global POOL
-    if not POOL:
-        try:
-            POOL = SimpleConnectionPool(
-                minconn=1,
-                maxconn=10,
-                dsn=DATABASE_URL
+    if POOL:
+        return
+    maxconn = int(os.getenv("DB_POOL_MAX", "5"))
+    candidates = _conninfo_candidates(DATABASE_URL)
+    delay = 1.0
+    last = "unknown"
+    for attempt in range(6):  # 1+2+4+8+16 (~31s)
+        for dsn in candidates:
+            try:
+                POOL = SimpleConnectionPool(minconn=1, maxconn=maxconn, dsn=dsn)
+                masked = dsn.replace("password=", "password=**** ")
+                log.info("[DB] Connected (pool=%d) using DSN: %s", maxconn, masked)
+                return
+            except psycopg2.OperationalError as e:
+                last = str(e)
+                continue
+        if attempt == 5:
+            raise psycopg2.OperationalError(
+                f"DB pool init failed after retries. Last error: {last}. "
+                "Hint: set DB_HOSTADDR=<IPv4> or enable Supabase IPv4 addon, and prefer 6543."
             )
-            log.info("[DB] Connection pool initialized")
-        except Exception as e:
-            log.error("[DB] Failed to initialize connection pool: %s", e)
-            raise
+        time.sleep(delay)
+        delay *= 2
 
 class PooledConn:
     def __init__(self, pool): 
@@ -332,7 +413,14 @@ class PooledConn:
     def __enter__(self):
         if ShutdownManager.is_shutdown_requested():
             raise Exception("Database connection refused - shutdown in progress")
-        self.conn = self.pool.getconn()
+        _init_pool()
+        try:
+            self.conn = self.pool.getconn()
+        except Exception:
+            global POOL
+            POOL = None
+            _init_pool()
+            self.conn = self.pool.getconn()
         self.conn.autocommit = True
         self.cur = self.conn.cursor()
         return self
@@ -394,17 +482,14 @@ def _db_ping() -> bool:
         return False
     try:
         with db_conn() as c:
-            cursor = c.execute("SELECT 1")
-            row = cursor.fetchone()
-            # FIX: Just check if we can execute, don't rely on row access
+            c.execute("SELECT 1")
             return True
     except Exception:
         log.warning("[DB] ping failed, re-initializing pool")
         try:
             _init_pool()
             with db_conn() as c2:
-                cursor = c2.execute("SELECT 1")
-                # Don't need to access row, just check if query executes
+                c2.execute("SELECT 1")
                 return True
         except Exception as e:
             _metric_inc("db_errors_total", n=1)
@@ -450,7 +535,6 @@ def get_setting(key: str) -> Optional[str]:
     with db_conn() as c:
         cursor = c.execute("SELECT value FROM settings WHERE key=%s", (key,))
         row = cursor.fetchone()
-        # FIX: Handle empty results
         if row is None or len(row) == 0:
             return None
         return row[0] if row else None
@@ -692,7 +776,6 @@ class AdvancedEnsemblePredictor:
         predictions = []
         confidences = []
         
-        # Get predictions from all model types
         for model_type in self.model_types:
             try:
                 prob, confidence = self._predict_single_model(features, market, minute, model_type)
@@ -706,7 +789,6 @@ class AdvancedEnsemblePredictor:
         if not predictions:
             return 0.0, 0.0
         
-        # Dynamic weighting based on model confidence and recent performance
         weighted_sum = 0.0
         total_weight = 0.0
         
@@ -714,19 +796,16 @@ class AdvancedEnsemblePredictor:
             base_weight = self.ensemble_weights.get(model_type, 0.1)
             recent_performance = self._get_recent_performance(model_type, market)
             time_weight = self._calculate_time_weight(minute, model_type)
-            
-            # Combined weight considering all factors
             final_weight = base_weight * confidence * recent_performance * time_weight
             weighted_sum += prob * final_weight
             total_weight += final_weight
         
         ensemble_prob = weighted_sum / total_weight if total_weight > 0 else 0.0
-        ensemble_confidence = np.mean(confidences) if confidences else 0.0
+        ensemble_confidence = float(np.mean(confidences)) if confidences else 0.0
         
         return ensemble_prob, ensemble_confidence
     
     def _predict_single_model(self, features: Dict[str, float], market: str, minute: int, model_type: str) -> Tuple[Optional[float], float]:
-        """Get prediction from individual model type"""
         if model_type == 'logistic':
             return self._logistic_predict(features, market), 0.8
         elif model_type == 'xgboost':
@@ -743,14 +822,12 @@ class AdvancedEnsemblePredictor:
         """Logistic regression prediction with OU fallback"""
         mdl = None
         
-        # Handle OU markets specifically
         if market.startswith("OU_"):
             try:
-                line = float(market[3:])  # Extract line from "OU_2.5"
+                line = float(market[3:])
                 mdl = self._load_ou_model_for_line(line)
             except Exception as e:
                 log.warning(f"[ENSEMBLE] Failed to parse OU line from {market}: {e}")
-                pass
         else:
             mdl = load_model_from_settings(market)
             
@@ -762,7 +839,6 @@ class AdvancedEnsemblePredictor:
         """Load OU model with fallback to legacy names"""
         name = f"OU_{_fmt_line(line)}"
         mdl = load_model_from_settings(name)
-        # Fallback to legacy model names
         if not mdl and abs(line-2.5) < 1e-6:
             mdl = load_model_from_settings("O25")
         if not mdl and abs(line-3.5) < 1e-6:
@@ -770,171 +846,112 @@ class AdvancedEnsemblePredictor:
         return mdl
     
     def _xgboost_predict(self, features: Dict[str, float], market: str) -> Optional[float]:
-        """XGBoost prediction implementation"""
         try:
-            # Feature importance-based prediction
-            market_features = self._get_market_specific_features_xgb(features, market)
-            
-            # Simulate XGBoost prediction (in production, load actual XGBoost model)
             base_prob = self._logistic_predict(features, market)
-            
-            # Apply XGBoost-style corrections based on feature interactions
             correction = self._calculate_xgb_correction(features, market)
             corrected_prob = base_prob * (1 + correction)
-            
             return max(0.0, min(1.0, corrected_prob))
         except Exception:
             return self._logistic_predict(features, market)
     
     def _neural_network_predict(self, features: Dict[str, float], market: str) -> Optional[float]:
-        """Neural network prediction implementation"""
         try:
-            # Simulate neural network prediction
             base_prob = self._logistic_predict(features, market)
-            
-            # Apply neural network-style non-linear transformations
             nn_correction = self._calculate_nn_correction(features, market)
             if base_prob <= 0.0 or base_prob >= 1.0:
                 return base_prob
             nn_prob = 1 / (1 + np.exp(-(np.log(base_prob / (1 - base_prob)) + nn_correction)))
-            
             return float(nn_prob)
         except Exception:
             return self._logistic_predict(features, market)
     
     def _bayesian_predict(self, features: Dict[str, float], market: str, minute: int) -> Optional[float]:
-        """Bayesian updating of probabilities"""
         try:
             prior_prob = self._get_prior_probability(features, market)
             live_prob = self._logistic_predict(features, market)
-            
-            # Bayesian update: weight live data more as game progresses
             prior_weight = max(0.1, 1.0 - (minute / 90.0))
             live_weight = min(0.9, minute / 90.0)
-            
             bayesian_prob = (prior_prob * prior_weight + live_prob * live_weight) / (prior_weight + live_weight)
             return bayesian_prob
         except Exception:
             return self._logistic_predict(features, market)
     
     def _momentum_based_predict(self, features: Dict[str, float], market: str, minute: int) -> Optional[float]:
-        """Momentum-based prediction adjustment"""
         try:
             base_prob = self._logistic_predict(features, market)
-            
-            # Calculate momentum factors
             momentum_factor = self._calculate_momentum_factor(features, minute)
             pressure_factor = self._calculate_pressure_factor(features)
-            
-            # Apply momentum correction
             momentum_correction = (momentum_factor + pressure_factor) * 0.1
             adjusted_prob = base_prob * (1 + momentum_correction)
-            
             return max(0.0, min(1.0, adjusted_prob))
         except Exception:
             return self._logistic_predict(features, market)
     
     def _calculate_xgb_correction(self, features: Dict[str, float], market: str) -> float:
-        """Calculate XGBoost-style feature interaction corrections"""
         correction = 0.0
-        
         if market == "BTTS":
-            # Feature interactions for BTTS
             pressure_product = features.get("pressure_home", 50) * features.get("pressure_away", 50) / 2500
             xg_synergy = features.get("xg_h", 0) * features.get("xg_a", 0)
             correction = pressure_product * 0.1 + xg_synergy * 0.05
-        
         elif market.startswith("OU"):
-            # Feature interactions for Over/Under
             attacking_pressure = (features.get("pressure_home", 0) + features.get("pressure_away", 0)) / 2
             defensive_weakness = 1.0 - features.get("defensive_stability", 0.5)
             correction = (attacking_pressure * defensive_weakness * 0.001) - 0.02
-        
         return correction
     
     def _calculate_nn_correction(self, features: Dict[str, float], market: str) -> float:
-        """Calculate neural network-style non-linear corrections"""
-        # Simulate neural network hidden layer transformations
         non_linear_features = []
-        
         for key, value in features.items():
             if "xg" in key:
-                non_linear_features.append(value ** 1.5)  # Non-linear transform
+                non_linear_features.append(value ** 1.5)
             elif "pressure" in key:
-                non_linear_features.append(np.tanh(value / 50))  # Activation function
+                non_linear_features.append(np.tanh(value / 50))
             else:
                 non_linear_features.append(value)
-        
-        # Simple weighted combination (simulating output layer)
         if market == "BTTS":
             return sum(non_linear_features) * 0.01
         else:
             return sum(non_linear_features) * 0.005
     
     def _get_prior_probability(self, features: Dict[str, float], market: str) -> float:
-        """Get prior probability based on historical data and team strengths"""
-        # This would typically come from pre-match models or historical averages
         base_prior = 0.5
-        
-        # Adjust based on available features
         if "xg_sum" in features:
             xg_density = features["xg_sum"] / max(1, features.get("minute", 1))
             base_prior = min(0.8, max(0.2, xg_density * 10))
-        
         return base_prior
     
     def _calculate_momentum_factor(self, features: Dict[str, float], minute: int) -> float:
-        """Calculate momentum factor based on recent game events"""
         if minute < 20:
             return 0.0
-        
         momentum = 0.0
-        
-        # Goals momentum
         goals_last_15 = features.get("goals_last_15", 0)
         momentum += goals_last_15 * 0.2
-        
-        # Shots momentum  
         shots_last_15 = features.get("shots_last_15", 0)
         momentum += shots_last_15 * 0.05
-        
-        # xG momentum
         recent_xg_impact = features.get("recent_xg_impact", 0)
         momentum += recent_xg_impact * 0.1
-        
         return momentum
     
     def _calculate_pressure_factor(self, features: Dict[str, float]) -> float:
-        """Calculate pressure factor based on game state"""
         pressure_diff = features.get("pressure_home", 0) - features.get("pressure_away", 0)
         score_advantage = features.get("goals_h", 0) - features.get("goals_a", 0)
-        
-        # High pressure when score is close or trailing team has high pressure
         if abs(score_advantage) <= 1:
             return abs(pressure_diff) * 0.01
         else:
             return pressure_diff * 0.005
     
     def _get_market_specific_features_xgb(self, features: Dict[str, float], market: str) -> Dict[str, float]:
-        """Get market-specific features optimized for XGBoost"""
         enhanced_features = features.copy()
-        
-        # Add interaction terms
         enhanced_features["pressure_product"] = features.get("pressure_home", 0) * features.get("pressure_away", 0)
         enhanced_features["xg_ratio"] = features.get("xg_h", 0.1) / max(0.1, features.get("xg_a", 0.1))
         enhanced_features["efficiency_ratio"] = features.get("goals_sum", 0) / max(0.1, features.get("xg_sum", 0.1))
-        
         return enhanced_features
     
     def _get_recent_performance(self, model_type: str, market: str) -> float:
-        """Get recent performance weight for model type"""
-        # Default performance
         return 0.9
     
     def _calculate_time_weight(self, minute: int, model_type: str) -> float:
-        """Calculate time-based weight for different model types"""
         if model_type in ['bayesian', 'momentum']:
-            # These models improve as game progresses
             return min(1.0, minute / 60.0)
         else:
             return 1.0
@@ -943,608 +960,7 @@ class AdvancedEnsemblePredictor:
 ensemble_predictor = AdvancedEnsemblePredictor()
 
 # ───────── ENHANCEMENT 2: Advanced Feature Engineering ─────────
-class AdvancedFeatureEngineer:
-    """Advanced feature engineering with temporal patterns and game context"""
-    
-    def __init__(self):
-        self.feature_cache = {}
-        self.temporal_patterns = {}
-    
-    def extract_advanced_features(self, m: dict) -> Dict[str, float]:
-        """Extract advanced features including temporal patterns and game context"""
-        base_features = extract_enhanced_features(m)
-        
-        # Add temporal pattern features
-        temporal_features = self._extract_temporal_patterns(m, base_features)
-        base_features.update(temporal_features)
-        
-        # Add game context features
-        context_features = self._extract_game_context(m, base_features)
-        base_features.update(context_features)
-        
-        # Add team strength features
-        strength_features = self._extract_team_strength_indicators(m, base_features)
-        base_features.update(strength_features)
-        
-        return base_features
-    
-    def _extract_temporal_patterns(self, m: dict, base_features: Dict[str, float]) -> Dict[str, float]:
-        """Extract temporal patterns and momentum indicators"""
-        minute = base_features.get("minute", 0)
-        events = m.get("events", [])
-        
-        temporal_features = {}
-        
-        # Rolling window statistics
-        for window in [10, 15, 20]:
-            temporal_features[f"goals_last_{window}"] = float(self._count_events_since(events, minute, window, 'Goal'))
-            temporal_features[f"shots_last_{window}"] = float(self._count_events_since(events, minute, window, {'Shot', 'Missed Shot', 'Shot on Target'}))
-            temporal_features[f"cards_last_{window}"] = float(self._count_events_since(events, minute, window, {'Card'}))
-        
-        # Acceleration features (rate of change)
-        if minute > 15:
-            goals_0_15 = temporal_features.get("goals_last_15", 0)
-            goals_15_30 = self._count_events_between(events, max(0, minute-30), minute-15, 'Goal')
-            temporal_features["goal_acceleration"] = goals_0_15 - goals_15_30
-        
-        # Time-decayed features
-        temporal_features["time_decayed_xg"] = self._calculate_time_decayed_xg(base_features, minute)
-        temporal_features["recent_pressure"] = self._calculate_recent_pressure(events, minute)
-        
-        return temporal_features
-    
-    def _extract_game_context(self, m: dict, base_features: Dict[str, float]) -> Dict[str, float]:
-        """Extract game context and situational features"""
-        context_features = {}
-        
-        minute = base_features.get("minute", 0)
-        score_diff = base_features.get("goals_h", 0) - base_features.get("goals_a", 0)
-        
-        # Game state classification
-        context_features["game_state"] = self._classify_game_state(score_diff, minute)
-        
-        # Urgency indicators
-        context_features["home_urgency"] = self._calculate_urgency(score_diff, minute, is_home=True)
-        context_features["away_urgency"] = self._calculate_urgency(-score_diff, minute, is_home=False)
-        
-        # Risk assessment
-        context_features["defensive_risk"] = self._calculate_defensive_risk(base_features, minute)
-        context_features["attacking_risk"] = self._calculate_attacking_risk(base_features, minute)
-        
-        # Match importance (simplified)
-        context_features["match_importance"] = self._estimate_match_importance(m)
-        
-        return context_features
-    
-    def _extract_team_strength_indicators(self, m: dict, base_features: Dict[str, float]) -> Dict[str, float]:
-        """Extract team strength and form indicators"""
-        strength_features = {}
-        
-        # Current match performance indicators
-        pressure_home = base_features.get("pressure_home", 1)
-        pressure_away = base_features.get("pressure_away", 1)
-        strength_features["home_dominance"] = pressure_home / max(1, pressure_away)
-        strength_features["away_resilience"] = 1.0 / max(0.1, strength_features["home_dominance"])
-        
-        # Efficiency metrics
-        xg_h = base_features.get("xg_h", 0.1)
-        xg_a = base_features.get("xg_a", 0.1)
-        goals_h = base_features.get("goals_h", 0)
-        goals_a = base_features.get("goals_a", 0)
-        
-        strength_features["home_efficiency"] = goals_h / max(0.1, xg_h)
-        strength_features["away_efficiency"] = goals_a / max(0.1, xg_a)
-        
-        # Defensive stability
-        strength_features["home_defensive_stability"] = 1.0 - (goals_a / max(0.1, xg_a))
-        strength_features["away_defensive_stability"] = 1.0 - (goals_h / max(0.1, xg_h))
-        
-        return strength_features
-    
-    def _count_events_since(self, events: List[dict], current_minute: int, window: int, event_types: any) -> int:
-        """Count events of specific types in the last N minutes"""
-        cutoff = current_minute - window
-        count = 0
-        
-        for event in events:
-            minute = event.get('time', {}).get('elapsed', 0)
-            if minute >= cutoff:
-                event_type = event.get('type')
-                if isinstance(event_types, str):
-                    if event_type == event_types:
-                        count += 1
-                else:
-                    if event_type in event_types:
-                        count += 1
-        
-        return count
-    
-    def _count_events_between(self, events: List[dict], start_minute: int, end_minute: int, event_type: str) -> int:
-        """Count events between two minute marks"""
-        count = 0
-        for event in events:
-            minute = event.get('time', {}).get('elapsed', 0)
-            if start_minute <= minute <= end_minute and event.get('type') == event_type:
-                count += 1
-        return count
-    
-    def _calculate_time_decayed_xg(self, features: Dict[str, float], minute: int) -> float:
-        """Calculate time-decayed xG (recent xG weighted more heavily)"""
-        if minute <= 0:
-            return 0.0
-        
-        xg_sum = features.get("xg_sum", 0)
-        # Recent xG weighted more heavily (exponential decay)
-        decay_factor = 0.9  # 10% decay per 10 minutes
-        recent_weight = decay_factor ** (minute / 10.0)
-        
-        return (xg_sum / minute) * recent_weight * 90  # Project to full match
-    
-    def _calculate_recent_pressure(self, events: List[dict], minute: int) -> float:
-        """Calculate recent pressure based on events in last 10 minutes"""
-        recent_events = self._count_events_since(events, minute, 10, 
-                                               {'Shot', 'Shot on Target', 'Corner', 'Dangerous Attack'})
-        return min(1.0, recent_events / 10.0)
-    
-    def _classify_game_state(self, score_diff: float, minute: int) -> float:
-        """Classify current game state"""
-        if minute < 30:
-            return 0.0  # Early game
-        elif abs(score_diff) >= 3:
-            return 1.0  # One-sided
-        elif abs(score_diff) == 2 and minute > 70:
-            return 0.8  # Comfortable lead late
-        elif abs(score_diff) == 1 and minute > 75:
-            return 0.9  # Close game late
-        elif score_diff == 0 and minute > 80:
-            return 0.7  # Draw late
-        else:
-            return 0.5  # Normal game state
-    
-    def _calculate_urgency(self, score_diff: float, minute: int, is_home: bool) -> float:
-        """Calculate team urgency based on score and time"""
-        if is_home:
-            urgency_score = -score_diff  # Negative means losing
-        else:
-            urgency_score = score_diff  # Positive means losing
-        
-        # Urgency increases when losing and time is running out
-        time_pressure = max(0, (minute - 60) / 30.0)  # Increases after 60 minutes
-        
-        return max(0.0, urgency_score * time_pressure)
-    
-    def _calculate_defensive_risk(self, features: Dict[str, float], minute: int) -> float:
-        """Calculate defensive risk (higher = more vulnerable)"""
-        goals_conceded = features.get("goals_a", 0) + features.get("goals_h", 0)
-        xg_against = features.get("xg_a", 0) + features.get("xg_h", 0)
-        
-        defensive_efficiency = goals_conceded / max(0.1, xg_against)
-        fatigue_factor = min(1.0, minute / 90.0)  # Risk increases with fatigue
-        
-        return defensive_efficiency * fatigue_factor
-    
-    def _calculate_attacking_risk(self, features: Dict[str, float], minute: int) -> float:
-        """Calculate attacking risk (higher = more aggressive)"""
-        pressure = (features.get("pressure_home", 0) + features.get("pressure_away", 0)) / 2
-        urgency = (features.get("home_urgency", 0) + features.get("away_urgency", 0)) / 2
-        
-        return (pressure / 100.0) * urgency
-    
-    def _estimate_match_importance(self, m: dict) -> float:
-        """Estimate match importance (simplified)"""
-        league = m.get("league", {})
-        league_name = (league.get("name", "") or "").lower()
-        
-        # Basic importance estimation
-        if any(comp in league_name for comp in ["champions league", "europa league", "premier league"]):
-            return 0.9
-        elif any(comp in league_name for comp in ["cup", "knockout", "playoff"]):
-            return 0.8
-        else:
-            return 0.5
-
-# Initialize global feature engineer
-feature_engineer = AdvancedFeatureEngineer()
-
-# ───────── ENHANCEMENT 3: Intelligent Market-Specific Prediction System ─────────
-class MarketSpecificPredictor:
-    """Advanced market-specific prediction with specialized models"""
-    
-    def __init__(self):
-        self.market_strategies = {
-            "BTTS": self._predict_btts_advanced,
-            "OU": self._predict_ou_advanced, 
-            "1X2": self._predict_1x2_advanced
-        }
-        self.market_feature_sets = self._initialize_market_features()
-    
-    def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
-        """Market-specific prediction with advanced features"""
-        if market.startswith("OU_"):
-            return self._predict_ou_advanced(features, minute)
-        elif market in self.market_strategies:
-            return self.market_strategies[market](features, minute)
-        else:
-            # Fallback to ensemble prediction
-            return ensemble_predictor.predict_ensemble(features, market, minute)
-    
-    def _predict_btts_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
-        """Advanced BTTS prediction with defensive vulnerability analysis"""
-        # Base probability from ensemble
-        base_prob, base_conf = ensemble_predictor.predict_ensemble(features, "BTTS", minute)
-        
-        # Advanced BTTS-specific adjustments
-        adjustments = 0.0
-        
-        # Defensive vulnerability factor
-        defensive_stability = features.get("defensive_stability", 0.5)
-        vulnerability = 1.0 - defensive_stability
-        adjustments += vulnerability * 0.2
-        
-        # Attacking pressure balance
-        pressure_balance = min(features.get("pressure_home", 0), features.get("pressure_away", 0)) / 100.0
-        adjustments += pressure_balance * 0.15
-        
-        # Recent goal momentum
-        goals_last_20 = features.get("goals_last_20", 0)
-        adjustments += min(0.3, goals_last_20 * 0.1)
-        
-        # Game state adjustment
-        game_state = features.get("game_state", 0.5)
-        if game_state > 0.7:  # High-stakes situation
-            adjustments += 0.1
-        
-        adjusted_prob = base_prob * (1 + adjustments)
-        confidence = base_conf * 0.9  # Slightly reduce confidence for complex market
-        
-        return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
-    
-    def _predict_ou_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
-        """Advanced Over/Under prediction with proper model loading"""
-        # Try multiple approaches to get base probability
-        base_prob, base_conf = 0.0, 0.0
-        
-        # Approach 1: Use ensemble prediction
-        try:
-            ensemble_prob, ensemble_conf = ensemble_predictor.predict_ensemble(features, "OU", minute)
-            if ensemble_prob > base_prob:
-                base_prob, base_conf = ensemble_prob, ensemble_conf
-        except Exception as e:
-            log.warning(f"[OU_PREDICT] Ensemble failed: {e}")
-        
-        # Approach 2: Fallback to direct model prediction
-        if base_prob <= 0:
-            for line in OU_LINES:
-                market_key = f"OU_{_fmt_line(line)}"
-                mdl = ensemble_predictor._load_ou_model_for_line(line)
-                if mdl:
-                    prob = predict_from_model(mdl, features)
-                    confidence = 0.8  # Base confidence for direct model
-                    if prob > base_prob:
-                        base_prob, base_conf = prob, confidence
-                    break  # Use first available model
-        
-        if base_prob <= 0:
-            return 0.0, 0.0
-        
-        # Apply OU-specific adjustments
-        adjustments = self._calculate_ou_adjustments(features, minute)
-        adjusted_prob = max(0.0, min(1.0, base_prob * (1 + adjustments)))
-        
-        # Adjust confidence based on game state
-        confidence_factor = self._calculate_ou_confidence_factor(features, minute)
-        final_confidence = max(0.0, min(1.0, base_conf * confidence_factor))
-        
-        return adjusted_prob, final_confidence
-    
-    def _calculate_ou_adjustments(self, features: Dict[str, float], minute: int) -> float:
-        """Calculate OU-specific probability adjustments"""
-        adjustments = 0.0
-        
-        # Current game state analysis
-        current_goals = features.get("goals_sum", 0)
-        xg_sum = features.get("xg_sum", 0)
-        minute = max(1, features.get("minute", 1))
-        
-        # Expected goals per minute rate
-        xg_per_minute = xg_sum / minute
-        expected_remaining_goals = xg_per_minute * (90 - minute)
-        
-        # Tempo analysis - compare actual vs expected
-        expected_goals_by_now = (xg_per_minute * minute)
-        if expected_goals_by_now > 0:
-            tempo_ratio = current_goals / expected_goals_by_now
-            if tempo_ratio > 1.3:  # Scoring faster than expected
-                adjustments += 0.2
-            elif tempo_ratio < 0.7:  # Scoring slower than expected
-                adjustments -= 0.15
-        
-        # Pressure and attacking momentum
-        pressure_total = features.get("pressure_home", 0) + features.get("pressure_away", 0)
-        if pressure_total > 150:  # High pressure game
-            adjustments += 0.1
-        elif pressure_total < 80:  # Low pressure game
-            adjustments -= 0.1
-        
-        # Defensive stability impact
-        defensive_stability = features.get("defensive_stability", 0.5)
-        if defensive_stability < 0.3:  # Poor defense
-            adjustments += 0.15
-        elif defensive_stability > 0.7:  # Strong defense
-            adjustments -= 0.15
-        
-        # Time-based adjustments (late game factors)
-        if minute > 75:
-            # Late game urgency - teams push for goals
-            score_diff = abs(features.get("goals_h", 0) - features.get("goals_a", 0))
-            if score_diff <= 1:  # Close game
-                adjustments += 0.1
-            elif current_goals == 0:  # No goals yet
-                adjustments += 0.05
-        
-        # Recent momentum (last 15 minutes)
-        goals_last_15 = features.get("goals_last_15", 0)
-        if goals_last_15 >= 2:
-            adjustments += 0.1
-        elif goals_last_15 == 0 and minute > 30:
-            adjustments -= 0.05
-        
-        return adjustments
-    
-    def _calculate_ou_confidence_factor(self, features: Dict[str, float], minute: int) -> float:
-        """Calculate confidence factor for OU predictions"""
-        confidence = 1.0
-        
-        # Data quality factors
-        xg_available = features.get("xg_sum", 0) > 0
-        pressure_available = features.get("pressure_home", 0) > 0 or features.get("pressure_away", 0) > 0
-        
-        if not xg_available:
-            confidence *= 0.7
-        if not pressure_available:
-            confidence *= 0.8
-        
-        # Game progression factor (more confidence as game progresses)
-        progression_factor = min(1.0, minute / 60.0)
-        confidence *= (0.5 + 0.5 * progression_factor)
-        
-        # Sample size factor (more events = more confidence)
-        total_events = (
-            features.get("sot_sum", 0) + 
-            features.get("cor_sum", 0) + 
-            features.get("goals_sum", 0)
-        )
-        if total_events < 5 and minute > 30:
-            confidence *= 0.8
-        
-        return confidence
-    
-    def _predict_1x2_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float, float]:
-        """Advanced 1X2 prediction with momentum and psychological factors"""
-        base_prob_h, conf_h = ensemble_predictor.predict_ensemble(features, "1X2_HOME", minute)
-        base_prob_a, conf_a = ensemble_predictor.predict_ensemble(features, "1X2_AWAY", minute)
-        
-        # Normalize probabilities (suppress draw)
-        total = base_prob_h + base_prob_a
-        if total > 0:
-            base_prob_h /= total
-            base_prob_a /= total
-        
-        # Advanced adjustments
-        prob_h = self._adjust_1x2_probability(base_prob_h, features, minute, is_home=True)
-        prob_a = self._adjust_1x2_probability(base_prob_a, features, minute, is_home=False)
-        
-        # Renormalize
-        total_adj = prob_h + prob_a
-        if total_adj > 0:
-            prob_h /= total_adj
-            prob_a /= total_adj
-        
-        confidence = (conf_h + conf_a) / 2
-        
-        return prob_h, prob_a, confidence
-    
-    def _adjust_1x2_probability(self, base_prob: float, features: Dict[str, float], 
-                              minute: int, is_home: bool) -> float:
-        """Adjust 1X2 probability based on advanced factors"""
-        adjustments = 0.0
-        
-        # Momentum factor
-        momentum_key = "pressure_home" if is_home else "pressure_away"
-        momentum = features.get(momentum_key, 0) / 100.0
-        adjustments += momentum * 0.15
-        
-        # Psychological factor (score advantage)
-        score_diff = features.get("goals_h", 0) - features.get("goals_a", 0)
-        if is_home:
-            psychological = score_diff * 0.1
-        else:
-            psychological = -score_diff * 0.1
-        adjustments += psychological
-        
-        # Urgency factor
-        urgency_key = "home_urgency" if is_home else "away_urgency"
-        urgency = features.get(urgency_key, 0)
-        adjustments += urgency * 0.08
-        
-        # Efficiency factor
-        efficiency_key = "home_efficiency" if is_home else "away_efficiency"
-        efficiency = features.get(efficiency_key, 1.0)
-        adjustments += (efficiency - 1.0) * 0.1
-        
-        adjusted_prob = base_prob * (1 + adjustments)
-        return max(0.0, min(1.0, adjusted_prob))
-    
-    def _initialize_market_features(self):
-        """Initialize market-specific feature sets"""
-        return {
-            "BTTS": [
-                "pressure_home", "pressure_away", "defensive_stability",
-                "goals_last_15", "xg_sum", "game_state", "defensive_risk"
-            ],
-            "OU": [
-                "xg_sum", "goals_sum", "attacking_momentum", "defensive_fatigue",
-                "tempo_ratio", "time_pressure", "recent_xg_impact"
-            ],
-            "1X2": [
-                "pressure_home", "pressure_away", "home_dominance", "away_resilience",
-                "home_efficiency", "away_efficiency", "urgency", "psychological_advantage"
-            ]
-        }
-
-# Initialize market predictor
-market_predictor = MarketSpecificPredictor()
-
-# ───────── ENHANCEMENT 4: Performance Monitoring and Adaptive Learning ─────────
-class AdaptiveLearningSystem:
-    """System for continuous learning and model adaptation"""
-    
-    def __init__(self):
-        self.performance_history = {}
-        self.feature_importance = {}
-        self.model_adjustments = {}
-        
-    def record_prediction_outcome(self, prediction_data: Dict[str, Any], outcome: Optional[int]):
-        """Record prediction outcome for continuous learning"""
-        if outcome is None:
-            return
-            
-        market = prediction_data.get("market", "")
-        features = prediction_data.get("features", {})
-        probability = prediction_data.get("probability", 0.0)
-        
-        # Update performance history
-        key = f"{market}_{outcome}"
-        self.performance_history[key] = self.performance_history.get(key, []) + [{
-            'timestamp': time.time(),
-            'probability': probability,
-            'outcome': outcome,
-            'features': features
-        }]
-        
-        # Keep only recent history (last 1000 predictions per type)
-        if len(self.performance_history[key]) > 1000:
-            self.performance_history[key] = self.performance_history[key][-1000:]
-        
-        # Update feature importance
-        self._update_feature_importance(features, outcome, probability, market)
-        
-    def _update_feature_importance(self, features: Dict[str, float], outcome: int, 
-                                 probability: float, market: str):
-        """Update feature importance based on prediction accuracy"""
-        prediction_correct = 1 if (probability > 0.5 and outcome == 1) or (probability <= 0.5 and outcome == 0) else 0
-        
-        for feature_name, feature_value in features.items():
-            if feature_name not in self.feature_importance:
-                self.feature_importance[feature_name] = {
-                    'total_uses': 0,
-                    'correct_uses': 0,
-                    'market_specific': {}
-                }
-            
-            self.feature_importance[feature_name]['total_uses'] += 1
-            self.feature_importance[feature_name]['correct_uses'] += prediction_correct
-            
-            # Market-specific importance
-            if market not in self.feature_importance[feature_name]['market_specific']:
-                self.feature_importance[feature_name]['market_specific'][market] = {
-                    'total_uses': 0,
-                    'correct_uses': 0
-                }
-            
-            self.feature_importance[feature_name]['market_specific'][market]['total_uses'] += 1
-            self.feature_importance[feature_name]['market_specific'][market]['correct_uses'] += prediction_correct
-
-    def get_feature_weights(self, market: str) -> Dict[str, float]:
-        """Get adaptive feature weights for specific market"""
-        base_weights = {}
-        
-        for feature_name, stats in self.feature_importance.items():
-            total_uses = stats['total_uses']
-            correct_uses = stats['correct_uses']
-            
-            if total_uses > 10:  # Minimum sample size
-                accuracy = correct_uses / total_uses
-                
-                # Market-specific accuracy if available
-                market_stats = stats['market_specific'].get(market, {})
-                if market_stats.get('total_uses', 0) > 5:
-                    market_accuracy = market_stats['correct_uses'] / market_stats['total_uses']
-                    accuracy = (accuracy + market_accuracy) / 2
-                
-                # Convert accuracy to weight (0.5 = neutral, 1.0 = perfect)
-                weight = max(0.1, min(2.0, (accuracy - 0.5) * 2 + 1.0))
-                base_weights[feature_name] = weight
-        
-        return base_weights
-    
-    def analyze_performance_trends(self) -> Dict[str, Any]:
-        """Analyze performance trends and suggest improvements"""
-        trends = {
-            'overall_accuracy': 0.0,
-            'market_performance': {},
-            'feature_effectiveness': {},
-            'recommendations': []
-        }
-        
-        # Calculate overall accuracy
-        total_predictions = 0
-        correct_predictions = 0
-        
-        for key, history in self.performance_history.items():
-            if history:
-                market = key.split('_')[0]
-                correct = sum(1 for h in history if h['outcome'] == 1)
-                total = len(history)
-                
-                trends['market_performance'][market] = {
-                    'accuracy': correct / total if total > 0 else 0.0,
-                    'total_predictions': total
-                }
-                
-                total_predictions += total
-                correct_predictions += correct
-        
-        if total_predictions > 0:
-            trends['overall_accuracy'] = correct_predictions / total_predictions
-        
-        # Feature effectiveness
-        for feature_name, stats in self.feature_importance.items():
-            if stats['total_uses'] > 0:
-                trends['feature_effectiveness'][feature_name] = {
-                    'accuracy': stats['correct_uses'] / stats['total_uses'],
-                    'usage_count': stats['total_uses']
-                }
-        
-        # Generate recommendations
-        self._generate_recommendations(trends)
-        
-        return trends
-    
-    def _generate_recommendations(self, trends: Dict[str, Any]):
-        """Generate improvement recommendations based on performance analysis"""
-        recommendations = []
-        
-        # Check market performance
-        for market, performance in trends['market_performance'].items():
-            if performance['accuracy'] < 0.55 and performance['total_predictions'] > 50:
-                recommendations.append(f"Consider reviewing {market} model - current accuracy: {performance['accuracy']:.1%}")
-        
-        # Check feature effectiveness
-        for feature_name, effectiveness in trends['feature_effectiveness'].items():
-            if effectiveness['accuracy'] < 0.48 and effectiveness['usage_count'] > 100:
-                recommendations.append(f"Feature '{feature_name}' may be counterproductive - accuracy: {effectiveness['accuracy']:.1%}")
-            elif effectiveness['accuracy'] > 0.65 and effectiveness['usage_count'] > 50:
-                recommendations.append(f"Feature '{feature_name}' is highly effective - consider increasing weight")
-        
-        trends['recommendations'] = recommendations
-
-# Initialize adaptive learning system
-adaptive_learner = AdaptiveLearningSystem()
-
-# ───────── Existing Feature Extraction Functions (keep original) ─────────
 def _count_goals_since(events: List[dict], current_minute: int, window: int) -> int:
-    """Count goals in the last N minutes"""
     cutoff = current_minute - window
     goals = 0
     for event in events:
@@ -1554,7 +970,6 @@ def _count_goals_since(events: List[dict], current_minute: int, window: int) -> 
     return goals
 
 def _count_shots_since(events: List[dict], current_minute: int, window: int) -> int:
-    """Count shots in the last N minutes"""
     cutoff = current_minute - window
     shots = 0
     shot_types = {'Shot', 'Missed Shot', 'Shot on Target', 'Saved Shot'}
@@ -1565,7 +980,6 @@ def _count_shots_since(events: List[dict], current_minute: int, window: int) -> 
     return shots
 
 def _count_cards_since(events: List[dict], current_minute: int, window: int) -> int:
-    """Count cards in the last N minutes"""
     cutoff = current_minute - window
     cards = 0
     for event in events:
@@ -1575,68 +989,60 @@ def _count_cards_since(events: List[dict], current_minute: int, window: int) -> 
     return cards
 
 def _calculate_pressure(feat: Dict[str, float], side: str) -> float:
-    """Calculate pressure metric based on possession, shots, and position"""
     suffix = "_h" if side == "home" else "_a"
     possession = feat.get(f"pos{suffix}", 50)
     shots = feat.get(f"sot{suffix}", 0)
     xg = feat.get(f"xg{suffix}", 0)
-    
-    # Normalize and weight factors
     possession_norm = possession / 100.0
-    shots_norm = min(shots / 10.0, 1.0)  # Cap at 10 shots
-    xg_norm = min(xg / 3.0, 1.0)  # Cap at 3 xG
-    
+    shots_norm = min(shots / 10.0, 1.0)
+    xg_norm = min(xg / 3.0, 1.0)
     return (possession_norm * 0.3 + shots_norm * 0.4 + xg_norm * 0.3) * 100
 
 def _calculate_xg_momentum(feat: Dict[str, float]) -> float:
-    """Calculate xG momentum (recent xG efficiency)"""
     total_xg = feat.get("xg_sum", 0)
     total_goals = feat.get("goals_sum", 0)
-    
     if total_xg <= 0:
         return 0.0
-    
-    # Goals above expected
     return (total_goals - total_xg) / max(1, total_xg)
 
 def _recent_xg_impact(feat: Dict[str, float], minute: int) -> float:
-    """Calculate impact of recent xG (weighted by time)"""
     if minute <= 0:
         return 0.0
     xg_per_minute = feat.get("xg_sum", 0) / minute
-    return xg_per_minute * 90  # Project to full match
+    return xg_per_minute * 90
 
 def _defensive_stability(feat: Dict[str, float]) -> float:
-    """Calculate defensive stability metric"""
     goals_conceded_h = feat.get("goals_a", 0)
     goals_conceded_a = feat.get("goals_h", 0)
     xg_against_h = feat.get("xg_a", 0)
     xg_against_a = feat.get("xg_h", 0)
-    
     defensive_efficiency_h = 1 - (goals_conceded_h / max(1, xg_against_h)) if xg_against_h > 0 else 1.0
     defensive_efficiency_a = 1 - (goals_conceded_a / max(1, xg_against_a)) if xg_against_a > 0 else 1.0
-    
     return (defensive_efficiency_h + defensive_efficiency_a) / 2
 
+def _num(v) -> float:
+    try:
+        if isinstance(v,str) and v.endswith("%"): return float(v[:-1])
+        return float(v or 0)
+    except: return 0.0
+
+def _pos_pct(v) -> float:
+    try: return float(str(v).replace("%","").strip() or 0)
+    except: return 0.0
+
 def extract_basic_features(m: dict) -> Dict[str,float]:
-    """Original feature extraction - renamed to basic"""
     home = m["teams"]["home"]["name"]
     away = m["teams"]["away"]["name"]
     gh = m["goals"]["home"] or 0
     ga = m["goals"]["away"] or 0
     minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
-
-    # Build quick lookup for statistics by team name
     stats = {}
     for s in (m.get("statistics") or []):
         t = (s.get("team") or {}).get("name")
         if t:
             stats[t] = { (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
-
     sh = stats.get(home, {}) or {}
     sa = stats.get(away, {}) or {}
-
-    # Robust fallbacks for provider label drift
     xg_h = _num(sh.get("Expected Goals", 0))
     xg_a = _num(sa.get("Expected Goals", 0))
     sot_h = _num(sh.get("Shots on Target", sh.get("Shots on Goal", 0)))
@@ -1686,545 +1092,21 @@ def extract_basic_features(m: dict) -> Dict[str,float]:
     }
 
 def extract_enhanced_features(m: dict) -> Dict[str, float]:
-    """Enhanced feature extraction with momentum and context"""
     base_feat = extract_basic_features(m)
     minute = base_feat.get("minute", 0)
     events = m.get("events", [])
-    
-    # Add momentum features
     base_feat.update({
-        # Recent momentum (last 15 minutes)
         "goals_last_15": float(_count_goals_since(events, minute, 15)),
         "shots_last_15": float(_count_shots_since(events, minute, 15)),
         "cards_last_15": float(_count_cards_since(events, minute, 15)),
-        
-        # Pressure indicators
         "pressure_home": _calculate_pressure(base_feat, "home"),
         "pressure_away": _calculate_pressure(base_feat, "away"),
-        
-        # Game state context
         "score_advantage": base_feat.get("goals_h", 0) - base_feat.get("goals_a", 0),
         "xg_momentum": _calculate_xg_momentum(base_feat),
-        
-        # Time-decayed features
         "recent_xg_impact": _recent_xg_impact(base_feat, minute),
         "defensive_stability": _defensive_stability(base_feat)
     })
-    
     return base_feat
-
-def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
-    """Get pre-match probability for Bayesian updates"""
-    try:
-        # Try to get from pre-match models or historical data
-        if market == "BTTS":
-            mdl = load_model_from_settings("PRE_BTTS_YES")
-            if mdl:
-                # Would need match features, but return None for now
-                return None
-        elif market.startswith("OU"):
-            line = _parse_ou_line_from_suggestion(market)
-            if line:
-                mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-                if mdl:
-                    return None
-        elif market == "1X2":
-            mdl_home = load_model_from_settings("PRE_WLD_HOME")
-            mdl_away = load_model_from_settings("PRE_WLD_AWAY")
-            if mdl_home and mdl_away:
-                # Return tuple for home/away probabilities
-                return (0.4, 0.4)  # Placeholder
-    except Exception as e:
-        log.warning(f"[PRE_MATCH_PROB] Failed for {market}: {e}")
-    return None
-
-# ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
-def enhanced_production_scan() -> Tuple[int, int]:
-    """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2"""
-    if sleep_if_required():
-        log.info("[ENHANCED_PROD] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
-        return (0, 0)
-    
-    if not _db_ping():
-        log.error("[ENHANCED_PROD] Database unavailable")
-        return (0, 0)
-    
-    try:
-        matches = fetch_live_matches()
-    except Exception as e:
-        log.error("[ENHANCED_PROD] Failed to fetch live matches: %s", e)
-        return (0, 0)
-    
-    live_seen = len(matches)
-    if live_seen == 0:
-        log.info("[ENHANCED_PROD] no live matches")
-        return 0, 0
-
-    saved = 0
-    now_ts = int(time.time())
-    per_league_counter: dict[int, int] = {}
-
-    with db_conn() as c:
-        for m in matches:
-            try:
-                fid = int((m.get("fixture") or {}).get("id") or 0)
-                if not fid:
-                    continue
-
-                # Duplicate check
-                if DUP_COOLDOWN_MIN > 0:
-                    cutoff = now_ts - DUP_COOLDOWN_MIN * 60
-                    cursor = c.execute(
-                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
-                        (fid, cutoff),
-                    )
-                    row = cursor.fetchone()
-                    if row is not None and len(row) > 0:
-                        continue
-
-                # Extract advanced features
-                feat = feature_engineer.extract_advanced_features(m)
-                minute = int(feat.get("minute", 0))
-                
-                # Validation checks
-                if not stats_coverage_ok(feat, minute):
-                    continue
-                if minute < TIP_MIN_MINUTE:
-                    continue
-                if is_feed_stale(fid, m, minute):
-                    continue
-
-                # Harvest mode snapshot
-                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
-                    try:
-                        save_snapshot_from_match(m, feat)
-                    except Exception:
-                        pass
-
-                # Game state analysis
-                game_state_analyzer = GameStateAnalyzer()
-                game_state = game_state_analyzer.analyze_game_state(feat)
-                
-                league_id, league = _league_name(m)
-                home, away = _teams(m)
-                score = _pretty_score(m)
-
-                candidates: List[Tuple[str, str, float, float]] = []
-
-                # PREDICT ALL MARKETS: BTTS, OU, 1X2
-                log.info(f"[MARKET_SCAN] Processing {home} vs {away} at minute {minute}")
-                
-                # 1. BTTS Market
-                btts_prob, btts_confidence = market_predictor.predict_for_market(feat, "BTTS", minute)
-                if btts_prob > 0 and btts_confidence > 0.5:
-                    btts_predictions = {
-                        "BTTS: Yes": btts_prob,
-                        "BTTS: No": 1 - btts_prob
-                    }
-                    adjusted_btts = game_state_analyzer.adjust_predictions(btts_predictions, game_state)
-                    
-                    for suggestion, adj_prob in adjusted_btts.items():
-                        threshold = _get_market_threshold("BTTS")
-                        if adj_prob * 100 >= threshold:
-                            candidates.append(("BTTS", suggestion, adj_prob, btts_confidence))
-                            log.info(f"[BTTS_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {btts_confidence:.3f})")
-
-                # 2. Over/Under Markets
-                for line in OU_LINES:
-                    market_key = f"OU_{_fmt_line(line)}"
-                    ou_prob, ou_confidence = market_predictor.predict_for_market(feat, market_key, minute)
-                    
-                    if ou_prob > 0 and ou_confidence > 0.5:
-                        ou_predictions = {
-                            f"Over {_fmt_line(line)} Goals": ou_prob,
-                            f"Under {_fmt_line(line)} Goals": 1 - ou_prob
-                        }
-                        adjusted_ou = game_state_analyzer.adjust_predictions(ou_predictions, game_state)
-                        
-                        for suggestion, adj_prob in adjusted_ou.items():
-                            threshold = _get_market_threshold(f"Over/Under {_fmt_line(line)}")
-                            if adj_prob * 100 >= threshold:
-                                candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, ou_confidence))
-                                log.info(f"[OU_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {ou_confidence:.3f})")
-
-                # 3. 1X2 Market (Draw suppressed)
-                try:
-                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
-                    
-                    if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
-                        # Normalize probabilities (suppress draw)
-                        total = prob_h + prob_a
-                        if total > 0:
-                            prob_h /= total
-                            prob_a /= total
-                            
-                        predictions_1X2 = {
-                            "Home Win": prob_h,
-                            "Away Win": prob_a
-                        }
-                        adjusted_1x2 = game_state_analyzer.adjust_predictions(predictions_1X2, game_state)
-                        
-                        for suggestion, adj_prob in adjusted_1x2.items():
-                            threshold = _get_market_threshold("1X2")
-                            if adj_prob * 100 >= threshold:
-                                candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
-                                log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
-                except Exception as e:
-                    log.warning(f"[1X2_PREDICT] Failed for {home} vs {away}: {e}")
-
-                if not candidates:
-                    log.info(f"[NO_CANDIDATES] No qualified tips for {home} vs {away}")
-                    continue
-
-                # Bayesian updates with pre-match probabilities
-                enhanced_candidates = []
-                for market, suggestion, prob, confidence in candidates:
-                    pre_match_data = _get_pre_match_probability(fid, market)
-                    
-                    if pre_match_data is not None:
-                        bayesian_updater = BayesianUpdater()
-                        if market == "1X2" and isinstance(pre_match_data, tuple):
-                            pre_match_prob_home, pre_match_prob_away = pre_match_data
-                            if suggestion == "Home Win":
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute)
-                            else:  # "Away Win"
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_away, prob, minute)
-                        else:
-                            enhanced_prob = bayesian_updater.update_probability(pre_match_data, prob, minute)
-                    else:
-                        enhanced_prob = prob
-
-                    enhanced_candidates.append((market, suggestion, enhanced_prob, confidence))
-
-                # Odds analysis and filtering
-                odds_map = fetch_odds(fid) if API_KEY else {}
-                ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
-
-                for mk, sug, prob, confidence in enhanced_candidates:
-                    if sug not in ALLOWED_SUGGESTIONS:
-                        continue
-
-                    # Enhanced odds analysis
-                    odds_analyzer = SmartOddsAnalyzer()
-                    odds_quality = odds_analyzer.analyze_odds_quality(odds_map, {mk: prob})
-                    
-                    if odds_quality < odds_analyzer.odds_quality_threshold:
-                        continue
-
-                    # Odds lookup
-                    odds = None
-                    book = None
-                    if mk == "BTTS":
-                        d = odds_map.get("BTTS", {})
-                        tgt = "Yes" if sug.endswith("Yes") else "No"
-                        if tgt in d:
-                            odds, book = d[tgt]["odds"], d[tgt]["book"]
-                    elif mk == "1X2":
-                        d = odds_map.get("1X2", {})
-                        tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
-                        if tgt and tgt in d:
-                            odds, book = d[tgt]["odds"], d[tgt]["book"]
-                    elif mk.startswith("Over/Under"):
-                        ln = _parse_ou_line_from_suggestion(sug)
-                        d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
-                        tgt = "Over" if sug.startswith("Over") else "Under"
-                        if tgt in d:
-                            odds, book = d[tgt]["odds"], d[tgt]["book"]
-
-                    # Price gate and EV calculation
-                    pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
-                    if not pass_odds:
-                        continue
-                    if odds is None:
-                        odds = odds2
-                        book = book2
-
-                    ev_pct = None
-                    if odds is not None:
-                        edge = _ev(prob, float(odds))
-                        ev_pct = round(edge * 100.0, 1)
-                        if int(round(edge * 10000)) < EDGE_MIN_BPS:
-                            continue
-                    else:
-                        if not ALLOW_TIPS_WITHOUT_ODDS:
-                            continue
-
-                    # Enhanced ranking with confidence scoring
-                    rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0) * confidence
-                    ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score, confidence))
-
-                if not ranked:
-                    continue
-
-                ranked.sort(key=lambda x: x[6], reverse=True)  # Sort by rank score
-                log.info(f"[RANKED_TIPS] Found {len(ranked)} qualified tips for {home} vs {away}")
-
-                per_match = 0
-                base_now = int(time.time())
-
-                for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank, confidence) in enumerate(ranked):
-                    if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
-                        break
-
-                    created_ts = base_now + idx
-                    raw = float(prob)
-                    prob_pct = round(raw * 100.0, 1)
-
-                    try:
-                        with db_conn() as c2:
-                            c2.execute(
-                                "INSERT INTO tips("
-                                "match_id,league_id,league,home,away,market,suggestion,"
-                                "confidence,confidence_raw,score_at_tip,minute,created_ts,"
-                                "odds,book,ev_pct,sent_ok"
-                                ") VALUES ("
-                                "%s,%s,%s,%s,%s,%s,%s,"
-                                "%s,%s,%s,%s,%s,"
-                                "%s,%s,%s,%s"
-                                ")",
-                                (
-                                    fid, league_id, league, home, away,
-                                    market_txt, suggestion,
-                                    float(prob_pct), raw, score, minute, created_ts,
-                                    (float(odds) if odds is not None else None),
-                                    (book or None),
-                                    (float(ev_pct) if ev_pct is not None else None),
-                                    0,
-                                ),
-                             )
-
-                            # Enhanced message with confidence indicator
-                            sent = send_telegram(_format_enhanced_tip_message(
-                                home, away, league, minute, score, suggestion, 
-                                float(prob_pct), feat, odds, book, ev_pct, confidence
-                            ))
-                            
-                            if sent:
-                                c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
-                                _metric_inc("tips_sent_total", n=1)
-                                log.info(f"[TIP_SENT] {suggestion} for {home} vs {away} at {minute}'")
-                    except Exception as e:
-                        log.exception("[ENHANCED_PROD] insert/send failed: %s", e)
-                        continue
-
-                    saved += 1
-                    per_match += 1
-                    per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
-
-                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                        break
-                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                        break
-
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
-
-            except Exception as e:
-                log.exception("[ENHANCED_PROD] match loop failed: %s", e)
-                continue
-
-    log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
-    _metric_inc("tips_generated_total", n=saved)
-    return saved, live_seen
-
-def _format_enhanced_tip_message(home, away, league, minute, score, suggestion, 
-                               prob_pct, feat, odds=None, book=None, ev_pct=None, confidence=None):
-    """Enhanced tip message with AI confidence indicators"""
-    stat = ""
-    if any([feat.get("xg_h",0),feat.get("xg_a",0),feat.get("sot_h",0),feat.get("sot_a",0),
-            feat.get("cor_h",0),feat.get("cor_a",0),feat.get("pos_h",0),feat.get("pos_a",0)]):
-        stat = (f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
-                f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
-                f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
-        if feat.get("pos_h",0) or feat.get("pos_a",0): 
-            stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
-    
-    # AI Confidence indicator
-    ai_info = ""
-    if confidence is not None:
-        confidence_level = "🟢 HIGH" if confidence > 0.8 else "🟡 MEDIUM" if confidence > 0.6 else "🔴 LOW"
-        ai_info = f"\n🤖 <b>AI Confidence:</b> {confidence_level} ({confidence:.1%})"
-    
-    money = ""
-    if odds:
-        if ev_pct is not None:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
-        else:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
-    
-    return ("⚽️ <b>🤖 AI ENHANCED TIP!</b>\n"
-            f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
-            f"🕒 <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score)}\n"
-            f"<b>Tip:</b> {escape(suggestion)}\n"
-            f"📈 <b>Confidence:</b> {prob_pct:.1f}%{ai_info}{money}\n"
-            f"🏆 <b>League:</b> {escape(league)}{stat}")
-
-# ───────── Continue with existing functions (updated to use enhanced features where appropriate) ─────────
-
-def _num(v) -> float:
-    try:
-        if isinstance(v,str) and v.endswith("%"): return float(v[:-1])
-        return float(v or 0)
-    except: return 0.0
-
-def _pos_pct(v) -> float:
-    try: return float(str(v).replace("%","").strip() or 0)
-    except: return 0.0
-
-# Update existing production_scan to use enhanced version by default
-def production_scan() -> Tuple[int, int]:
-    """Main production scan - now uses enhanced version"""
-    return enhanced_production_scan()
-
-# ───────── Existing Bayesian and Game State Classes ─────────
-class BayesianUpdater:
-    def __init__(self):
-        self.prior_strength = 0.3  # How much we weight prior vs live data
-    
-    def update_probability(self, prior_prob: float, live_prob: float, minute: int) -> float:
-        """Bayesian update combining pre-match prior with live evidence"""
-        # Weight live data more as game progresses
-        live_weight = min(minute / 90.0, 1.0) * (1 - self.prior_strength)
-        prior_weight = self.prior_strength * (1 - live_weight)
-        
-        return (prior_prob * prior_weight + live_prob * live_weight) / (prior_weight + live_weight)
-    
-    def calculate_confidence_interval(self, prob: float, sample_size: int) -> Tuple[float, float]:
-        """Calculate confidence interval for probability estimate"""
-        import math
-        z = 1.96  # 95% confidence
-        
-        if sample_size == 0:
-            return prob, prob
-            
-        margin = z * math.sqrt((prob * (1 - prob)) / sample_size)
-        return max(0, prob - margin), min(1, prob + margin)
-
-class GameStateAnalyzer:
-    def __init__(self):
-        self.critical_states = {
-            'equalizer_seek': 0.7,  # Team needs equalizer
-            'park_the_bus': 0.6,    # Team protecting lead
-            'goal_fest': 0.8,       # High-scoring game
-            'defensive_battle': 0.3  # Low-scoring game
-        }
-    
-    def analyze_game_state(self, feat: Dict[str, float]) -> Dict[str, float]:
-        """Analyze current game state and tendencies"""
-        state_scores = {}
-        
-        goal_diff = feat.get("goals_h", 0) - feat.get("goals_a", 0)
-        minute = feat.get("minute", 0)
-        total_goals = feat.get("goals_sum", 0)
-        
-        # Equalizer seeking (losing team pushing)
-        if abs(goal_diff) == 1 and minute > 60:
-            state_scores['equalizer_seek'] = 0.7 + (minute / 90.0) * 0.3
-        
-        # Park the bus (leading team defending)
-        if goal_diff >= 2 and minute > 70:
-            state_scores['park_the_bus'] = 0.6 + ((minute - 70) / 20.0) * 0.4
-        
-        # Goal fest (high scoring game)
-        if total_goals >= 3 and minute < 60:
-            state_scores['goal_fest'] = min(1.0, total_goals / 5.0)
-        
-        # Defensive battle
-        if total_goals == 0 and minute > 60:
-            state_scores['defensive_battle'] = 0.3 + (minute / 90.0) * 0.5
-        
-        return state_scores
-    
-    def adjust_predictions(self, predictions: dict, game_state: dict) -> dict:
-        """Adjust predictions based on game state"""
-        adjusted = predictions.copy()
-        
-        if game_state.get('equalizer_seek', 0) > 0.5:
-            # Increase BTTS and Over probabilities
-            if 'BTTS: Yes' in adjusted:
-                adjusted['BTTS: Yes'] *= (1 + game_state['equalizer_seek'] * 0.3)
-            # Increase relevant Over markets
-            for key in list(adjusted.keys()):
-                if key.startswith('Over'):
-                    adjusted[key] *= (1 + game_state['equalizer_seek'] * 0.2)
-        
-        if game_state.get('park_the_bus', 0) > 0.5:
-            # Decrease goal-related probabilities
-            for key in list(adjusted.keys()):
-                if key.startswith('Over'):
-                    adjusted[key] *= (1 - game_state['park_the_bus'] * 0.4)
-                elif key == 'BTTS: Yes':
-                    adjusted[key] *= (1 - game_state['park_the_bus'] * 0.3)
-        
-        return adjusted
-
-class SmartOddsAnalyzer:
-    def __init__(self):
-        self.odds_quality_threshold = 0.85  # Minimum quality score
-    
-    def analyze_odds_quality(self, odds_map: dict, prob_hints: dict) -> float:
-        """Analyze odds quality and reliability"""
-        if not odds_map:
-            return 0.0
-        
-        quality_metrics = []
-        
-        for market, sides in odds_map.items():
-            market_quality = self._market_odds_quality(sides, prob_hints.get(market, {}))
-            quality_metrics.append(market_quality)
-        
-        return sum(quality_metrics) / len(quality_metrics) if quality_metrics else 0.0
-    
-    def _market_odds_quality(self, sides: dict, prob_hint: float) -> float:
-        """Calculate quality for a specific market"""
-        if len(sides) < 2:
-            return 0.0
-        
-        # Check implied probabilities
-        total_implied = sum(1.0 / data['odds'] for data in sides.values())
-        overround = total_implied - 1.0
-        
-        # Quality decreases with higher overround
-        overround_quality = max(0, 1.0 - overround * 5)
-        
-        # Compare with model probabilities if available
-        model_quality = 1.0
-        if prob_hint:
-            best_side = max(sides.items(), key=lambda x: x[1]['odds'])
-            model_ev = _ev(prob_hint, best_side[1]['odds'])
-            model_quality = min(1.0, max(0.0, model_ev + 1.0))
-        
-        return (overround_quality + model_quality) / 2
-
-# Prematch feature extraction (keep original for now)
-def extract_prematch_features(f: dict) -> Dict[str, float]:
-    home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
-    away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
-    home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
-    away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
-    fid = (f.get("fixture") or {}).get("id")
-    feat = {"fid": float(fid or 0)}
-
-    recent_h = _api_last_fixtures(home_id, 5)
-    recent_a = _api_last_fixtures(away_id, 5)
-    h2h = _api_h2h(home_id, away_id, 5)
-
-    if recent_h:
-        feat["avg_goals_h"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_h])
-    if recent_a:
-        feat["avg_goals_a"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_a])
-    if h2h:
-        feat["avg_goals_h2h"] = np.mean([(m.get("goals") or {}).get("home", 0) + (m.get("goals") or {}).get("away", 0) for m in h2h])
-
-    try:
-        dts_h = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_h]
-        dts_a = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_a]
-        if dts_h: feat["rest_days_h"] = (datetime.now(tz=TZ_UTC) - max(dts_h).astimezone(TZ_UTC)).days
-        if dts_a: feat["rest_days_a"] = (datetime.now(tz=TZ_UTC) - max(dts_a).astimezone(TZ_UTC)).days
-    except Exception:
-        pass
-
-    return feat
 
 # ───────── Model loader (with validation) ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
@@ -2258,23 +1140,473 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     if mdl is not None: _MODELS_CACHE.set(name, mdl)
     return mdl
 
-# ───────── Logistic predict ─────────
+# ───────── Logistic predict (PATCHED calibration math) ─────────
 def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
-    w=mdl.get("weights") or {}; s=mdl.get("intercept",0.0)
-    for k,v in w.items(): s+=v*features.get(k,0.0)
-    prob=1/(1+np.exp(-s))
-    cal=mdl.get("calibration") or {}
-    if isinstance(cal,dict) and cal.get("method")=="sigmoid":
-        a=cal.get("a",1.0); b=cal.get("b",0.0)
-        prob=1/(1+np.exp(-(a*prob+b)))
-    return float(prob)
+    w = mdl.get("weights") or {}
+    s = float(mdl.get("intercept", 0.0) or 0.0)
+    for k, v in w.items():
+        s += float(v or 0.0) * float(features.get(k, 0.0))
+    # base prob from linear predictor
+    prob = 1.0 / (1.0 + np.exp(-s))
+    # apply calibration on LOGIT, not on prob directly
+    cal = mdl.get("calibration") or {}
+    try:
+        method = str(cal.get("method", "sigmoid")).lower()
+        a = float(cal.get("a", 1.0)); b = float(cal.get("b", 0.0))
+        if method in ("platt", "sigmoid"):
+            p = max(1e-12, min(1-1e-12, prob))
+            z = np.log(p/(1-p))
+            prob = 1.0 / (1.0 + np.exp(-(a*z + b)))
+    except Exception:
+        pass
+    return float(max(0.0, min(1.0, prob)))
 
-# ───────── Odds fetch + aggregation (with negative cache) ─────────
+# ───────── ENHANCEMENT 2: Advanced Feature Engineering (class) ─────────
+class AdvancedFeatureEngineer:
+    """Advanced feature engineering with temporal patterns and game context"""
+    
+    def __init__(self):
+        self.feature_cache = {}
+        self.temporal_patterns = {}
+    
+    def extract_advanced_features(self, m: dict) -> Dict[str, float]:
+        """Extract advanced features including temporal patterns and game context"""
+        base_features = extract_enhanced_features(m)
+        
+        temporal_features = self._extract_temporal_patterns(m, base_features)
+        base_features.update(temporal_features)
+        
+        context_features = self._extract_game_context(m, base_features)
+        base_features.update(context_features)
+        
+        strength_features = self._extract_team_strength_indicators(m, base_features)
+        base_features.update(strength_features)
+        
+        return base_features
+    
+    def _extract_temporal_patterns(self, m: dict, base_features: Dict[str, float]) -> Dict[str, float]:
+        minute = int(base_features.get("minute", 0))
+        events = m.get("events", []) or []
+        temporal_features: Dict[str, float] = {}
+        
+        for window in [10, 15, 20]:
+            temporal_features[f"goals_last_{window}"] = float(self._count_events_since(events, minute, window, 'Goal'))
+            temporal_features[f"shots_last_{window}"] = float(self._count_events_since(events, minute, window, {'Shot', 'Missed Shot', 'Shot on Target'}))
+            temporal_features[f"cards_last_{window}"] = float(self._count_events_since(events, minute, window, {'Card'}))
+        
+        if minute > 15:
+            goals_0_15 = temporal_features.get("goals_last_15", 0.0)
+            goals_15_30 = float(self._count_events_between(events, max(0, minute-30), minute-15, 'Goal'))
+            temporal_features["goal_acceleration"] = float(goals_0_15 - goals_15_30)
+        
+        temporal_features["time_decayed_xg"] = self._calculate_time_decayed_xg(base_features, minute)
+        temporal_features["recent_pressure"] = self._calculate_recent_pressure(events, minute)
+        return temporal_features
+    
+    def _extract_game_context(self, m: dict, base_features: Dict[str, float]) -> Dict[str, float]:
+        context_features: Dict[str, float] = {}
+        minute = int(base_features.get("minute", 0))
+        score_diff = float(base_features.get("goals_h", 0) - base_features.get("goals_a", 0))
+        context_features["game_state"] = self._classify_game_state(score_diff, minute)
+        context_features["home_urgency"] = self._calculate_urgency(score_diff, minute, is_home=True)
+        context_features["away_urgency"] = self._calculate_urgency(-score_diff, minute, is_home=False)
+        context_features["defensive_risk"] = self._calculate_defensive_risk(base_features, minute)
+        context_features["attacking_risk"] = self._calculate_attacking_risk(base_features, minute)
+        context_features["match_importance"] = self._estimate_match_importance(m)
+        return context_features
+    
+    def _extract_team_strength_indicators(self, m: dict, base_features: Dict[str, float]) -> Dict[str, float]:
+        strength_features: Dict[str, float] = {}
+        pressure_home = float(base_features.get("pressure_home", 1))
+        pressure_away = float(base_features.get("pressure_away", 1))
+        strength_features["home_dominance"] = pressure_home / max(1.0, pressure_away)
+        strength_features["away_resilience"] = 1.0 / max(0.1, strength_features["home_dominance"])
+        xg_h = float(base_features.get("xg_h", 0.1))
+        xg_a = float(base_features.get("xg_a", 0.1))
+        goals_h = float(base_features.get("goals_h", 0))
+        goals_a = float(base_features.get("goals_a", 0))
+        strength_features["home_efficiency"] = goals_h / max(0.1, xg_h)
+        strength_features["away_efficiency"] = goals_a / max(0.1, xg_a)
+        strength_features["home_defensive_stability"] = 1.0 - (goals_a / max(0.1, xg_a))
+        strength_features["away_defensive_stability"] = 1.0 - (goals_h / max(0.1, xg_h))
+        return strength_features
+    
+    def _count_events_since(self, events: List[dict], current_minute: int, window: int, event_types: any) -> int:
+        cutoff = current_minute - window
+        count = 0
+        for event in events:
+            minute = int((event.get('time', {}) or {}).get('elapsed', 0) or 0)
+            if minute >= cutoff:
+                et = event.get('type')
+                if isinstance(event_types, str):
+                    if et == event_types: count += 1
+                else:
+                    if et in event_types: count += 1
+        return count
+    
+    def _count_events_between(self, events: List[dict], start_minute: int, end_minute: int, event_type: str) -> int:
+        count = 0
+        for event in events:
+            minute = int((event.get('time', {}) or {}).get('elapsed', 0) or 0)
+            if start_minute <= minute <= end_minute and event.get('type') == event_type:
+                count += 1
+        return count
+    
+    def _calculate_time_decayed_xg(self, features: Dict[str, float], minute: int) -> float:
+        if minute <= 0:
+            return 0.0
+        xg_sum = float(features.get("xg_sum", 0))
+        decay_factor = 0.9
+        recent_weight = decay_factor ** (minute / 10.0)
+        return float((xg_sum / minute) * recent_weight * 90.0)
+    
+    def _calculate_recent_pressure(self, events: List[dict], minute: int) -> float:
+        recent_events = self._count_events_since(events, minute, 10, {'Shot', 'Shot on Target', 'Corner', 'Dangerous Attack'})
+        return float(min(1.0, recent_events / 10.0))
+    
+    def _classify_game_state(self, score_diff: float, minute: int) -> float:
+        if minute < 30: return 0.0
+        if abs(score_diff) >= 3: return 1.0
+        if abs(score_diff) == 2 and minute > 70: return 0.8
+        if abs(score_diff) == 1 and minute > 75: return 0.9
+        if score_diff == 0 and minute > 80: return 0.7
+        return 0.5
+    
+    def _calculate_urgency(self, score_diff: float, minute: int, is_home: bool) -> float:
+        urgency_score = -score_diff if is_home else score_diff
+        time_pressure = max(0.0, (minute - 60) / 30.0)
+        return float(max(0.0, urgency_score * time_pressure))
+    
+    def _calculate_defensive_risk(self, features: Dict[str, float], minute: int) -> float:
+        goals_conceded = float(features.get("goals_a", 0) + features.get("goals_h", 0))
+        xg_against = float(features.get("xg_a", 0) + features.get("xg_h", 0))
+        defensive_efficiency = goals_conceded / max(0.1, xg_against)
+        fatigue_factor = min(1.0, minute / 90.0)
+        return float(defensive_efficiency * fatigue_factor)
+    
+    def _calculate_attacking_risk(self, features: Dict[str, float], minute: int) -> float:
+        pressure = (float(features.get("pressure_home", 0)) + float(features.get("pressure_away", 0))) / 2.0
+        home_urgency = float(features.get("home_urgency", 0))
+        away_urgency = float(features.get("away_urgency", 0))
+        urgency = (home_urgency + away_urgency) / 2.0
+        return float((pressure / 100.0) * urgency)
+    
+    def _estimate_match_importance(self, m: dict) -> float:
+        league = m.get("league", {}) or {}
+        league_name = str(league.get("name", "") or "").lower()
+        if any(w in league_name for w in ["champions league", "europa league", "premier league"]):
+            return 0.9
+        if any(w in league_name for w in ["cup", "knockout", "playoff"]):
+            return 0.8
+        return 0.5
+
+# Initialize global feature engineer
+feature_engineer = AdvancedFeatureEngineer()
+
+# ───────── ENHANCEMENT 3: Intelligent Market-Specific Prediction System ─────────
+class MarketSpecificPredictor:
+    """Advanced market-specific prediction with specialized models"""
+    
+    def __init__(self):
+        self.market_strategies = {
+            "BTTS": self._predict_btts_advanced,
+            "OU": self._predict_ou_advanced, 
+            "1X2": self._predict_1x2_advanced
+        }
+        self.market_feature_sets = self._initialize_market_features()
+    
+    def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
+        if market.startswith("OU_"):
+            return self._predict_ou_advanced(features, minute)
+        elif market in self.market_strategies:
+            return self.market_strategies[market](features, minute)
+        else:
+            return ensemble_predictor.predict_ensemble(features, market, minute)
+    
+    def _predict_btts_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
+        base_prob, base_conf = ensemble_predictor.predict_ensemble(features, "BTTS", minute)
+        adjustments = 0.0
+        defensive_stability = float(features.get("defensive_stability", 0.5))
+        vulnerability = 1.0 - defensive_stability
+        adjustments += vulnerability * 0.2
+        pressure_balance = min(float(features.get("pressure_home", 0)), float(features.get("pressure_away", 0))) / 100.0
+        adjustments += pressure_balance * 0.15
+        goals_last_20 = float(features.get("goals_last_20", 0))
+        adjustments += min(0.3, goals_last_20 * 0.1)
+        game_state = float(features.get("game_state", 0.5))
+        if game_state > 0.7:
+            adjustments += 0.1
+        adjusted_prob = base_prob * (1 + adjustments)
+        confidence = base_conf * 0.9
+        return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
+    
+    def _predict_ou_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
+        base_prob, base_conf = 0.0, 0.0
+        try:
+            ensemble_prob, ensemble_conf = ensemble_predictor.predict_ensemble(features, "OU", minute)
+            if ensemble_prob > base_prob:
+                base_prob, base_conf = ensemble_prob, ensemble_conf
+        except Exception as e:
+            log.warning(f"[OU_PREDICT] Ensemble failed: {e}")
+        if base_prob <= 0:
+            for line in OU_LINES:
+                mdl = ensemble_predictor._load_ou_model_for_line(line)
+                if mdl:
+                    prob = predict_from_model(mdl, features)
+                    confidence = 0.8
+                    if prob > base_prob:
+                        base_prob, base_conf = prob, confidence
+                    break
+        if base_prob <= 0:
+            return 0.0, 0.0
+        adjustments = self._calculate_ou_adjustments(features, minute)
+        adjusted_prob = max(0.0, min(1.0, base_prob * (1 + adjustments)))
+        confidence_factor = self._calculate_ou_confidence_factor(features, minute)
+        final_confidence = max(0.0, min(1.0, base_conf * confidence_factor))
+        return adjusted_prob, final_confidence
+    
+    def _calculate_ou_adjustments(self, features: Dict[str, float], minute: int) -> float:
+        adjustments = 0.0
+        current_goals = float(features.get("goals_sum", 0))
+        xg_sum = float(features.get("xg_sum", 0))
+        minute = max(1, int(features.get("minute", 1)))
+        xg_per_minute = xg_sum / minute
+        expected_goals_by_now = (xg_per_minute * minute)
+        if expected_goals_by_now > 0:
+            tempo_ratio = current_goals / expected_goals_by_now
+            if tempo_ratio > 1.3:
+                adjustments += 0.2
+            elif tempo_ratio < 0.7:
+                adjustments -= 0.15
+        pressure_total = float(features.get("pressure_home", 0)) + float(features.get("pressure_away", 0))
+        if pressure_total > 150:
+            adjustments += 0.1
+        elif pressure_total < 80:
+            adjustments -= 0.1
+        defensive_stability = float(features.get("defensive_stability", 0.5))
+        if defensive_stability < 0.3:
+            adjustments += 0.15
+        elif defensive_stability > 0.7:
+            adjustments -= 0.15
+        if minute > 75:
+            score_diff = abs(float(features.get("goals_h", 0) - features.get("goals_a", 0)))
+            if score_diff <= 1:
+                adjustments += 0.1
+            elif current_goals == 0:
+                adjustments += 0.05
+        goals_last_15 = float(features.get("goals_last_15", 0))
+        if goals_last_15 >= 2:
+            adjustments += 0.1
+        elif goals_last_15 == 0 and minute > 30:
+            adjustments -= 0.05
+        return adjustments
+    
+    def _calculate_ou_confidence_factor(self, features: Dict[str, float], minute: int) -> float:
+        confidence = 1.0
+        xg_available = float(features.get("xg_sum", 0)) > 0
+        pressure_available = (float(features.get("pressure_home", 0)) > 0) or (float(features.get("pressure_away", 0)) > 0)
+        if not xg_available:
+            confidence *= 0.7
+        if not pressure_available:
+            confidence *= 0.8
+        progression_factor = min(1.0, int(features.get("minute", 0)) / 60.0)
+        confidence *= (0.5 + 0.5 * progression_factor)
+        total_events = float(features.get("sot_sum", 0) + features.get("cor_sum", 0) + features.get("goals_sum", 0))
+        if total_events < 5 and minute > 30:
+            confidence *= 0.8
+        return float(confidence)
+    
+    def _predict_1x2_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float, float]:
+        base_prob_h, conf_h = ensemble_predictor.predict_ensemble(features, "1X2_HOME", minute)
+        base_prob_a, conf_a = ensemble_predictor.predict_ensemble(features, "1X2_AWAY", minute)
+        total = base_prob_h + base_prob_a
+        if total > 0:
+            base_prob_h /= total
+            base_prob_a /= total
+        prob_h = self._adjust_1x2_probability(base_prob_h, features, minute, is_home=True)
+        prob_a = self._adjust_1x2_probability(base_prob_a, features, minute, is_home=False)
+        total_adj = prob_h + prob_a
+        if total_adj > 0:
+            prob_h /= total_adj
+            prob_a /= total_adj
+        confidence = (conf_h + conf_a) / 2.0
+        return float(prob_h), float(prob_a), float(confidence)
+    
+    def _adjust_1x2_probability(self, base_prob: float, features: Dict[str, float], 
+                              minute: int, is_home: bool) -> float:
+        adjustments = 0.0
+        momentum = (float(features.get("pressure_home", 0)) if is_home else float(features.get("pressure_away", 0))) / 100.0
+        adjustments += momentum * 0.15
+        score_diff = float(features.get("goals_h", 0) - features.get("goals_a", 0))
+        psychological = (score_diff * 0.1) if is_home else (-score_diff * 0.1)
+        adjustments += psychological
+        urgency = float(features.get("home_urgency", 0) if is_home else features.get("away_urgency", 0))
+        adjustments += urgency * 0.08
+        efficiency = float(features.get("home_efficiency", 1.0) if is_home else features.get("away_efficiency", 1.0))
+        adjustments += (efficiency - 1.0) * 0.1
+        adjusted_prob = base_prob * (1 + adjustments)
+        return max(0.0, min(1.0, float(adjusted_prob)))
+    
+    def _initialize_market_features(self):
+        return {
+            "BTTS": [
+                "pressure_home", "pressure_away", "defensive_stability",
+                "goals_last_15", "xg_sum", "game_state", "defensive_risk"
+            ],
+            "OU": [
+                "xg_sum", "goals_sum", "attacking_momentum", "defensive_fatigue",
+                "tempo_ratio", "time_pressure", "recent_xg_impact"
+            ],
+            "1X2": [
+                "pressure_home", "pressure_away", "home_dominance", "away_resilience",
+                "home_efficiency", "away_efficiency", "urgency", "psychological_advantage"
+            ]
+        }
+
+# Initialize market predictor
+market_predictor = MarketSpecificPredictor()
+
+# ───────── ENHANCEMENT 4: Adaptive Learning (kept API; storage in-memory) ─────────
+class AdaptiveLearningSystem:
+    def __init__(self):
+        self.performance_history: Dict[str, list] = {}
+        self.feature_importance: Dict[str, dict] = {}
+        self.model_adjustments: Dict[str, Any] = {}
+        
+    def record_prediction_outcome(self, prediction_data: Dict[str, Any], outcome: Optional[int]):
+        if outcome is None: return
+        market = prediction_data.get("market", "")
+        features = prediction_data.get("features", {})
+        probability = float(prediction_data.get("probability", 0.0))
+        key = f"{market}_{outcome}"
+        self.performance_history.setdefault(key, []).append({
+            'timestamp': time.time(),
+            'probability': probability,
+            'outcome': int(outcome),
+            'features': features
+        })
+        if len(self.performance_history[key]) > 1000:
+            self.performance_history[key] = self.performance_history[key][-1000:]
+        self._update_feature_importance(features, int(outcome), probability, market)
+        
+    def _update_feature_importance(self, features: Dict[str, float], outcome: int, prob: float, market: str):
+        prediction_correct = 1 if ((prob > 0.5 and outcome == 1) or (prob <= 0.5 and outcome == 0)) else 0
+        for feature_name, feature_value in features.items():
+            fi = self.feature_importance.setdefault(feature_name, {'total_uses': 0, 'correct_uses': 0, 'market_specific': {}})
+            fi['total_uses'] += 1
+            fi['correct_uses'] += prediction_correct
+            ms = fi['market_specific'].setdefault(market, {'total_uses': 0, 'correct_uses': 0})
+            ms['total_uses'] += 1
+            ms['correct_uses'] += prediction_correct
+
+    def get_feature_weights(self, market: str) -> Dict[str, float]:
+        base_weights: Dict[str, float] = {}
+        for feature_name, stats in self.feature_importance.items():
+            total_uses = int(stats['total_uses'])
+            correct_uses = int(stats['correct_uses'])
+            if total_uses > 10:
+                accuracy = correct_uses / total_uses
+                market_stats = stats['market_specific'].get(market, {})
+                if int(market_stats.get('total_uses', 0)) > 5:
+                    market_accuracy = market_stats['correct_uses'] / market_stats['total_uses']
+                    accuracy = (accuracy + market_accuracy) / 2.0
+                weight = max(0.1, min(2.0, (accuracy - 0.5) * 2 + 1.0))
+                base_weights[feature_name] = float(weight)
+        return base_weights
+    
+    def analyze_performance_trends(self) -> Dict[str, Any]:
+        trends: Dict[str, Any] = {'overall_accuracy': 0.0, 'market_performance': {}, 'feature_effectiveness': {}, 'recommendations': []}
+        total_predictions = 0
+        correct_predictions = 0
+        for key, history in self.performance_history.items():
+            if not history: continue
+            market = key.split('_')[0]
+            correct = sum(1 for h in history if h['outcome'] == 1)
+            total = len(history)
+            trends['market_performance'][market] = {'accuracy': (correct / total if total else 0.0), 'total_predictions': total}
+            total_predictions += total
+            correct_predictions += correct
+        if total_predictions > 0:
+            trends['overall_accuracy'] = correct_predictions / total_predictions
+        for feature_name, stats in self.feature_importance.items():
+            if int(stats['total_uses']) > 0:
+                trends['feature_effectiveness'][feature_name] = {
+                    'accuracy': stats['correct_uses'] / stats['total_uses'],
+                    'usage_count': stats['total_uses']
+                }
+        # recommendations
+        recs = []
+        for market, perf in trends['market_performance'].items():
+            if perf['accuracy'] < 0.55 and perf['total_predictions'] > 50:
+                recs.append(f"Consider reviewing {market} model - current accuracy: {perf['accuracy']:.1%}")
+        for fname, eff in trends['feature_effectiveness'].items():
+            if eff['accuracy'] < 0.48 and eff['usage_count'] > 100:
+                recs.append(f"Feature '{fname}' may be counterproductive - accuracy: {eff['accuracy']:.1%}")
+            elif eff['accuracy'] > 0.65 and eff['usage_count'] > 50:
+                recs.append(f"Feature '{fname}' is highly effective - consider increasing weight")
+        trends['recommendations'] = recs
+        return trends
+
+# Initialize adaptive learning system
+adaptive_learner = AdaptiveLearningSystem()
+
+# ───────── Odds helpers & aggregation ─────────
+def _ev(prob: float, odds: float) -> float:
+    """Return expected value as decimal (e.g. 0.05 = +5%)."""
+    try:
+        return float(prob) * max(0.0, float(odds)) - 1.0
+    except Exception:
+        return -1.0
+
+def _min_odds_for_market(market: str) -> float:
+    if market.startswith("Over/Under"): return MIN_ODDS_OU
+    if market == "BTTS": return MIN_ODDS_BTTS
+    if market == "1X2":  return MIN_ODDS_1X2
+    return 1.01
+
+def _odds_cache_get(fid: int) -> Optional[dict]:
+    rec=ODDS_CACHE.get(fid)
+    if not rec: return None
+    ts,data=rec
+    if time.time()-ts>120: ODDS_CACHE.pop(fid,None); return None
+    return data
+
+def _market_name_normalize(s: str) -> str:
+    s=(s or "").lower()
+    if "both teams" in s or "btts" in s: return "BTTS"
+    if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
+    if "over/under" in s or "total" in s or "goals" in s: return "OU"
+    return s
+
+def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+    if not vals:
+        return None, None
+    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
+    if not xs:
+        return None, None
+    import statistics
+    med = statistics.median(xs)
+    filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
+    if not filtered:
+        filtered = vals
+    xs2 = sorted([o for (o, _) in filtered])
+    med2 = statistics.median(xs2)
+    if prob_hint is not None and prob_hint > 0:
+        fair = 1.0 / max(1e-6, float(prob_hint))
+        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
+        filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
+    if ODDS_AGGREGATION == "best":
+        best = max(filtered, key=lambda t: t[0])
+        return float(best[0]), str(best[1])
+    target = med2
+    pick = min(filtered, key=lambda t: abs(t[0] - target))
+    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
+
 def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     """
     Aggregated odds map:
       { "BTTS": {...}, "1X2": {...}, "OU_2.5": {...}, ... }
-    Prefers /odds/live, falls back to /odds; aggregates across books with outlier & fair checks.
+    Prefers /odds/live, falls back to /odds; aggregates across books.
     """
     now = time.time()
     k=("odds", fid)
@@ -2361,93 +1693,91 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     if not out: NEG_CACHE[k] = (now, True)
     return out
 
-def _market_name_normalize(s: str) -> str:
-    s=(s or "").lower()
-    if "both teams" in s or "btts" in s: return "BTTS"
-    if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
-    if "over/under" in s or "total" in s or "goals" in s: return "OU"
-    return s
+# ───────── Bayesian & GameState & Odds Quality ─────────
+class BayesianUpdater:
+    def __init__(self):
+        self.prior_strength = 0.3
+    
+    def update_probability(self, prior_prob: float, live_prob: float, minute: int) -> float:
+        live_weight = min(minute / 90.0, 1.0) * (1 - self.prior_strength)
+        prior_weight = self.prior_strength * (1 - live_weight)
+        return float((prior_prob * prior_weight + live_prob * live_weight) / max(1e-9, (prior_weight + live_weight)))
+    
+    def calculate_confidence_interval(self, prob: float, sample_size: int) -> Tuple[float, float]:
+        import math
+        z = 1.96
+        if sample_size == 0:
+            return float(prob), float(prob)
+        margin = z * math.sqrt((prob * (1 - prob)) / sample_size)
+        return max(0.0, prob - margin), min(1.0, prob + margin)
 
-def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
-    if not vals:
-        return None, None
-    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
-    if not xs:
-        return None, None
-    import statistics
-    med = statistics.median(xs)
-    filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
-    if not filtered:
-        filtered = vals
-    xs2 = sorted([o for (o, _) in filtered])
-    med2 = statistics.median(xs2)
-    if prob_hint is not None and prob_hint > 0:
-        fair = 1.0 / max(1e-6, float(prob_hint))
-        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-        filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
-    if ODDS_AGGREGATION == "best":
-        best = max(filtered, key=lambda t: t[0])
-        return float(best[0]), str(best[1])
-    target = med2
-    pick = min(filtered, key=lambda t: abs(t[0] - target))
-    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
+class GameStateAnalyzer:
+    def __init__(self):
+        self.critical_states = {
+            'equalizer_seek': 0.7,
+            'park_the_bus': 0.6,
+            'goal_fest': 0.8,
+            'defensive_battle': 0.3
+        }
+    
+    def analyze_game_state(self, feat: Dict[str, float]) -> Dict[str, float]:
+        state_scores: Dict[str, float] = {}
+        goal_diff = float(feat.get("goals_h", 0) - feat.get("goals_a", 0))
+        minute = int(feat.get("minute", 0))
+        total_goals = float(feat.get("goals_sum", 0))
+        if abs(goal_diff) == 1 and minute > 60:
+            state_scores['equalizer_seek'] = 0.7 + (minute / 90.0) * 0.3
+        if goal_diff >= 2 and minute > 70:
+            state_scores['park_the_bus'] = 0.6 + ((minute - 70) / 20.0) * 0.4
+        if total_goals >= 3 and minute < 60:
+            state_scores['goal_fest'] = min(1.0, total_goals / 5.0)
+        if total_goals == 0 and minute > 60:
+            state_scores['defensive_battle'] = 0.3 + (minute / 90.0) * 0.5
+        return state_scores
+    
+    def adjust_predictions(self, predictions: dict, game_state: dict) -> dict:
+        adjusted = dict(predictions)
+        if game_state.get('equalizer_seek', 0) > 0.5:
+            if 'BTTS: Yes' in adjusted:
+                adjusted['BTTS: Yes'] *= (1 + game_state['equalizer_seek'] * 0.3)
+            for key in list(adjusted.keys()):
+                if key.startswith('Over'):
+                    adjusted[key] *= (1 + game_state['equalizer_seek'] * 0.2)
+        if game_state.get('park_the_bus', 0) > 0.5:
+            for key in list(adjusted.keys()):
+                if key.startswith('Over'):
+                    adjusted[key] *= (1 - game_state['park_the_bus'] * 0.4)
+                elif key == 'BTTS: Yes':
+                    adjusted[key] *= (1 - game_state['park_the_bus'] * 0.3)
+        return adjusted
 
-# ───────── Model scoring helpers (preserved) ─────────
-MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
-EPS=1e-12
-def _sigmoid(x: float) -> float:
-    try:
-        if x<-50: return 1e-22
-        if x>50:  return 1-1e-22
-        import math; return 1/(1+math.exp(-x))
-    except: return 0.5
+class SmartOddsAnalyzer:
+    def __init__(self):
+        self.odds_quality_threshold = 0.85
+    
+    def analyze_odds_quality(self, odds_map: dict, prob_hints: dict) -> float:
+        if not odds_map:
+            return 0.0
+        quality_metrics = []
+        for market, sides in odds_map.items():
+            market_quality = self._market_odds_quality(sides, prob_hints.get(market, {}))
+            quality_metrics.append(market_quality)
+        return sum(quality_metrics) / len(quality_metrics) if quality_metrics else 0.0
+    
+    def _market_odds_quality(self, sides: dict, prob_hint: float) -> float:
+        if len(sides) < 2:
+            return 0.0
+        total_implied = sum(1.0 / max(1e-9, data['odds']) for data in sides.values() if data.get('odds'))
+        overround = max(0.0, total_implied - 1.0)
+        overround_quality = max(0.0, 1.0 - overround * 5.0)
+        model_quality = 1.0
+        if prob_hint:
+            best_side = max(sides.items(), key=lambda x: x[1]['odds'])
+            model_ev = _ev(prob_hint, best_side[1]['odds'])
+            model_quality = min(1.0, max(0.0, model_ev + 1.0))
+        return (overround_quality + model_quality) / 2.0
 
-def _logit(p: float) -> float:
-    import math; p=max(EPS,min(1-EPS,float(p))); return math.log(p/(1-p))
-
-def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) -> float:
-    s=float(intercept or 0.0)
-    for k,w in (weights or {}).items(): s += float(w or 0.0)*float(feat.get(k,0.0))
-    return s
-
-def _calibrate(p: float, cal: Dict[str,Any]) -> float:
-    method=(cal or {}).get("method","sigmoid"); a=float((cal or {}).get("a",1.0)); b=float((cal or {}).get("b",0.0))
-    if method.lower()=="platt": return _sigmoid(a*_logit(p)+b)
-    import math; p=max(EPS,min(1-EPS,float(p))); z=math.log(p/(1-p)); return _sigmoid(a*z+b)
-
-def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
-    p=_sigmoid(_linpred(feat, mdl.get("weights",{}), float(mdl.get("intercept",0.0))))
-    cal=mdl.get("calibration") or {}
-    try: 
-        if cal: p=_calibrate(p, cal)
-    except: pass
-    return max(0.0, min(1.0, float(p)))
-
-def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
-    name=f"OU_{_fmt_line(line)}"; mdl=load_model_from_settings(name)
-    return mdl or (load_model_from_settings("O25") if abs(line-2.5)<1e-6 else None)
-
-def _load_wld_models(): 
-    return (load_model_from_settings("WLD_HOME"), load_model_from_settings("WLD_DRAW"), load_model_from_settings("WLD_AWAY"))
-
-# ───────── Odds helpers (preserved & robust) ─────────
-def _ev(prob: float, odds: float) -> float:
-    """Return expected value as decimal (e.g. 0.05 = +5%)."""
-    return prob*max(0.0, float(odds)) - 1.0
-
-def _min_odds_for_market(market: str) -> float:
-    if market.startswith("Over/Under"): return MIN_ODDS_OU
-    if market == "BTTS": return MIN_ODDS_BTTS
-    if market == "1X2":  return MIN_ODDS_1X2
-    return 1.01
-
-def _odds_cache_get(fid: int) -> Optional[dict]:
-    rec=ODDS_CACHE.get(fid)
-    if not rec: return None
-    ts,data=rec
-    if time.time()-ts>120: ODDS_CACHE.pop(fid,None); return None
-    return data
-
+# ───────── Market cutoff helpers (minutes) ─────────
 def _parse_market_cutoffs(s: str) -> dict[str, int]:
     out: dict[str, int] = {}
     for tok in (s or "").split(","):
@@ -2463,12 +1793,11 @@ def _parse_market_cutoffs(s: str) -> dict[str, int]:
 
 _MARKET_CUTOFFS = _parse_market_cutoffs(MARKET_CUTOFFS_RAW)
 try:
-    _TIP_MAX_MINUTE = int(float(TIP_MAX_MINUTE_ENV)) if TIP_MAX_MINUTE_ENV.strip() else None
+    _TIP_MAX_MINUTE = int(float(TIP_MAX_MINUTE_ENV)) if (TIP_MAX_MINUTE_ENV or "").strip() else None
 except Exception:
     _TIP_MAX_MINUTE = None
 
 def _market_family(market_text: str, suggestion: str) -> str:
-    """Normalize to OU / BTTS / 1X2 (draw suppressed)."""
     s = (market_text or "").upper()
     if s.startswith("OVER/UNDER") or "OVER/UNDER" in s:
         return "OU"
@@ -2480,11 +1809,7 @@ def _market_family(market_text: str, suggestion: str) -> str:
         return _market_family(s[4:], suggestion)
     return s
 
-def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
-    """
-    True if we are still within the minute cutoff for this market.
-    Falls back to TIP_MAX_MINUTE or (TOTAL_MATCH_MINUTES - 5).
-    """
+def market_cutoff_ok(minute: Optional[int], market_text: str, suggestion: str) -> bool:
     fam = _market_family(market_text, suggestion)
     if minute is None:
         return True
@@ -2499,15 +1824,23 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
     return m <= int(cutoff)
 
+def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
+    try:
+        if "Over" in s or "Under" in s:
+            import re
+            match = re.search(r'(\d+\.?\d*)', s)
+            if match:
+                return float(match.group(1))
+        return None
+    except Exception:
+        return None
+
 def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
-    Return (pass, odds, book, ev_pct). Enforces consistent EV behavior:
-      - If odds missing and ALLOW_TIPS_WITHOUT_ODDS=0 => block.
-      - If odds present => must pass min/max odds and EV >= EDGE_MIN_BPS.
+    Return (pass, odds, book, ev_pct). If odds missing and ALLOW_TIPS_WITHOUT_ODDS=0 => block.
     """
     odds_map=fetch_odds(fid) if API_KEY else {}
     odds=None; book=None
-
     if market_text=="BTTS":
         d=odds_map.get("BTTS",{})
         tgt="Yes" if suggestion.endswith("Yes") else "No"
@@ -2523,315 +1856,332 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
         if tgt in d:
             odds = d[tgt]["odds"]
             book = d[tgt]["book"]
-
     if odds is None:
         return (True, None, None, None) if ALLOW_TIPS_WITHOUT_ODDS else (False, None, None, None)
-
     min_odds=_min_odds_for_market(market_text)
     if not (min_odds <= odds <= MAX_ODDS_ALL):
         return (False, odds, book, None)
-
-    # EV checked later with actual prob
     return (True, odds, book, None)
 
-# ───────── Data-quality & formatting helpers (preserved) ─────────
-def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
-    require_stats_minute = int(os.getenv("REQUIRE_STATS_MINUTE","35"))
-    require_fields = int(os.getenv("REQUIRE_DATA_FIELDS","2"))
-    if minute < require_stats_minute:
-        return True
-    fields = [
-        feat.get("xg_sum", 0.0),
-        feat.get("sot_sum", 0.0),
-        feat.get("cor_sum", 0.0),
-        max(feat.get("pos_h", 0.0), feat.get("pos_a", 0.0)),
-        (feat.get("sh_total_h", 0.0) + feat.get("sh_total_a", 0.0)),
-        (feat.get("yellow_h", 0.0) + feat.get("yellow_a", 0.0)),
-    ]
-    nonzero = sum(1 for v in fields if (v or 0) > 0)
-    return nonzero >= max(0, require_fields)
-
-def _league_name(m: dict) -> Tuple[int,str]:
-    lg=(m.get("league") or {}) or {}
-    return int(lg.get("id") or 0), f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-
-def _teams(m: dict) -> Tuple[str,str]:
-    t=(m.get("teams") or {}) or {}
-    return (t.get("home",{}).get("name",""), t.get("away",{}).get("name",""))
-
-def _pretty_score(m: dict) -> str:
-    gh=(m.get("goals") or {}).get("home") or 0; ga=(m.get("goals") or {}).get("away") or 0
-    return f"{gh}-{ga}"
-
-def _get_market_threshold_key(m: str) -> str: return f"conf_threshold:{m}"
-def _get_market_threshold(m: str) -> float:
-    try:
-        v=get_setting_cached(_get_market_threshold_key(m)); return float(v) if v is not None else float(CONF_THRESHOLD)
-    except: return float(CONF_THRESHOLD)
-def _get_market_threshold_pre(m: str) -> float: return _get_market_threshold(f"PRE {m}")
-
-def _as_bool(s: str) -> bool:
-    return str(s).strip() not in ("0","false","False","no","NO")
-
-def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct, feat, odds=None, book=None, ev_pct=None):
-    stat=""
-    if any([feat.get("xg_h",0),feat.get("xg_a",0),feat.get("sot_h",0),feat.get("sot_a",0),feat.get("cor_h",0),feat.get("cor_a",0),
-            feat.get("pos_h",0),feat.get("pos_a",0),feat.get("red_h",0),feat.get("red_a",0)]):
-        stat=(f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
-              f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
-              f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
-        if feat.get("pos_h",0) or feat.get("pos_a",0): stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
-        if feat.get("red_h",0) or feat.get("red_a",0): stat += f" • RED {int(feat.get('red_h',0))}-{int(feat.get('red_a',0))}"
+# ───────── Formatting (enhanced tip) ─────────
+def _format_enhanced_tip_message(home, away, league, minute, score, suggestion, 
+                               prob_pct, feat, odds=None, book=None, ev_pct=None, confidence=None):
+    stat = ""
+    if any([feat.get("xg_h",0),feat.get("xg_a",0),feat.get("sot_h",0),feat.get("sot_a",0),
+            feat.get("cor_h",0),feat.get("cor_a",0),feat.get("pos_h",0),feat.get("pos_a",0)]):
+        stat = (f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
+                f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
+                f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
+        if feat.get("pos_h",0) or feat.get("pos_a",0): 
+            stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
+    ai_info = ""
+    if confidence is not None:
+        confidence_level = "🟢 HIGH" if confidence > 0.8 else "🟡 MEDIUM" if confidence > 0.6 else "🔴 LOW"
+        ai_info = f"\n🤖 <b>AI Confidence:</b> {confidence_level} ({confidence:.1%})"
     money = ""
     if odds:
         if ev_pct is not None:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
         else:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
-    return ("⚽️ <b>New Tip!</b>\n"
+    return ("⚽️ <b>🤖 AI ENHANCED TIP!</b>\n"
             f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
             f"🕒 <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score)}\n"
             f"<b>Tip:</b> {escape(suggestion)}\n"
-            f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}\n"
+            f"📈 <b>Confidence:</b> {prob_pct:.1f}%{ai_info}{money}\n"
             f"🏆 <b>League:</b> {escape(league)}{stat}")
 
-# ───────── Parse helpers (OU, results) ─────────
-def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
-    """Extract the line value from Over/Under suggestions like 'Over 2.5 Goals'"""
+# ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems (patched) ─────────
+def enhanced_production_scan() -> Tuple[int, int]:
+    """
+    Enhanced scan with fixed market prediction for BTTS, OU, and 1X2.
+    Patches:
+      • Adds market_cutoff_ok guard per-market.
+      • Uses _candidate_is_sane to avoid absurd lines (e.g., Under 2.5 when 3 goals already).
+      • Keeps EV/odds gate consistent and honors PER_LEAGUE_CAP / PREDICTIONS_PER_MATCH.
+    """
+    if sleep_if_required():
+        log.info("[ENHANCED_PROD] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
+        return (0, 0)
+    
+    if not _db_ping():
+        log.error("[ENHANCED_PROD] Database unavailable")
+        return (0, 0)
+    
     try:
-        # Handle different formats
-        if "Over" in s or "Under" in s:
-            # Extract the number after Over/Under
-            import re
-            match = re.search(r'(\d+\.?\d*)', s)
-            if match:
-                return float(match.group(1))
-        return None
-    except Exception:
-        return None
-
-# ───────── Cache Cleanup ─────────
-def cleanup_caches():
-    """Clean up stale cache entries"""
-    now = time.time()
-    max_age = 3600  # 1 hour
+        matches = fetch_live_matches()
+    except Exception as e:
+        log.error("[ENHANCED_PROD] Failed to fetch live matches: %s", e)
+        return (0, 0)
     
-    # Clean STATS_CACHE, EVENTS_CACHE, ODDS_CACHE
-    for cache in [STATS_CACHE, EVENTS_CACHE, ODDS_CACHE]:
-        stale = [k for k, (ts, _) in cache.items() if now - ts > max_age]
-        for k in stale:
-            cache.pop(k, None)
-    
-    # Clean NEG_CACHE
-    stale_neg = [k for k, (ts, _) in NEG_CACHE.items() if now - ts > NEG_TTL_SEC]
-    for k in stale_neg:
-        NEG_CACHE.pop(k, None)
-    
-    # Clean FEED_STATE
-    if STALE_GUARD_ENABLE:
-        stale_feeds = [fid for fid, state in _FEED_STATE.items() 
-                      if now - state.get('last_change', 0) > STALE_STATS_MAX_SEC * 2]
-        for fid in stale_feeds:
-            _FEED_STATE.pop(fid, None)
-    
-    log.info("[CACHE] Cleaned up stale entries")
+    live_seen = len(matches)
+    if live_seen == 0:
+        log.info("[ENHANCED_PROD] no live matches")
+        return 0, 0
 
-# ───────── Sanity checks & stale-feed guard (preserved) ─────────
-def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
-    gh = int(feat.get("goals_h", 0))
-    ga = int(feat.get("goals_a", 0))
-    total = gh + ga
-
-    if sug.startswith("Over"):
-        ln = _parse_ou_line_from_suggestion(sug)
-        return (ln is not None) and (total < ln)
-
-    if sug.startswith("Under"):
-        ln = _parse_ou_line_from_suggestion(sug)
-        return (ln is not None) and (total < ln)
-
-    if sug.startswith("BTTS") and (gh > 0 and ga > 0):
-        return False
-
-    return True
-
-_FEED_STATE: Dict[int, Dict[str, Any]] = {}
-
-def _safe_num(x) -> float:
-    try:
-        if isinstance(x, str) and x.endswith("%"):
-            return float(x[:-1])
-        return float(x or 0.0)
-    except Exception:
-        return 0.0
-
-def _match_fingerprint(m: dict) -> Tuple:
-    teams = (m.get("teams") or {})
-    home = (teams.get("home") or {}).get("name", "")
-    away = (teams.get("away") or {}).get("name", "")
-
-    stats_by_team = {}
-    for s in (m.get("statistics") or []):
-        tname = ((s.get("team") or {}).get("name") or "").strip()
-        if tname:
-            stats_by_team[tname] = {str((i.get("type") or "")).lower(): i.get("value") for i in (s.get("statistics") or [])}
-
-    sh = stats_by_team.get(home, {}) or {}
-    sa = stats_by_team.get(away, {}) or {}
-
-    def g(d: dict, key_variants: Tuple[str, ...]) -> float:
-        for k in key_variants:
-            if k in d:
-                return _safe_num(d[k])
-        return 0.0
-
-    xg_h = g(sh, ("expected goals",))
-    xg_a = g(sa, ("expected goals",))
-    sot_h = g(sh, ("shots on target", "shots on goal"))
-    sot_a = g(sa, ("shots on target", "shots on goal"))
-    sh_tot_h = g(sh, ("total shots", "shots total"))
-    sh_tot_a = g(sa, ("total shots", "shots total"))
-    cor_h = g(sh, ("corner kicks",))
-    cor_a = g(sa, ("corner kicks",))
-    pos_h = g(sh, ("ball possession",))
-    pos_a = g(sa, ("ball possession",))
-
-    ev = m.get("events") or []
-    n_events = len(ev)
-    n_cards = 0
-    for e in ev:
-        if str(e.get("type", "")).lower() == "card":
-            n_cards += 1
-
-    gh = int(((m.get("goals") or {}).get("home") or 0) or 0)
-    ga = int(((m.get("goals") or {}).get("away") or 0) or 0)
-
-    return (
-        round(xg_h + xg_a, 3),
-        int(sot_h + sot_a),
-        int(sh_tot_h + sh_tot_a),
-        int(cor_h + cor_a),
-        int(round(pos_h)), int(round(pos_a)),
-        gh, ga,
-        n_events, n_cards,
-    )
-
-def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
-    if not STALE_GUARD_ENABLE:
-        return False
-        
-    now = time.time()
-    
-    if minute < 10:
-        st = _FEED_STATE.get(fid)
-        fp = _match_fingerprint(m)
-        _FEED_STATE[fid] = {"fp": fp, "last_change": now, "last_minute": minute}
-        return False
-
-    fp = _match_fingerprint(m)
-    st = _FEED_STATE.get(fid)
-
-    if st is None:
-        _FEED_STATE[fid] = {"fp": fp, "last_change": now, "last_minute": minute}
-        return False
-
-    if fp != st.get("fp"):
-        st["fp"] = fp
-        st["last_change"] = now
-        st["last_minute"] = minute
-        return False
-
-    last_min = int(st.get("last_minute") or 0)
-    st["last_minute"] = minute
-
-    if minute > last_min and (now - float(st.get("last_change") or now)) >= STALE_STATS_MAX_SEC:
-        return True
-
-    return False
-
-# ───────── Snapshots (preserved) ─────────
-def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
-    fx = (m.get("fixture") or {})
-    lg = (m.get("league") or {})
-    teams = (m.get("teams") or {})
-
-    fid = int(fx.get("id") or 0)
-    if not fid:
-        return
-
-    league_id = int(lg.get("id") or 0)
-    league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-    home = (teams.get("home") or {}).get("name", "")
-    away = (teams.get("away") or {}).get("name", "")
-
-    gh = int((m.get("goals") or {}).get("home") or 0)
-    ga = int((m.get("goals") or {}).get("away") or 0)
-    minute = int(feat.get("minute", 0))
-
-    xg_h = float(feat.get("xg_h", 0.0));      xg_a = float(feat.get("xg_a", 0.0))
-    sot_h = float(feat.get("sot_h", 0.0));    sot_a = float(feat.get("sot_a", 0.0))
-    cor_h = float(feat.get("cor_h", 0.0));    cor_a = float(feat.get("cor_a", 0.0))
-    pos_h = float(feat.get("pos_h", 0.0));    pos_a = float(feat.get("pos_a", 0.0))
-    red_h = float(feat.get("red_h", 0.0));    red_a = float(feat.get("red_a", 0.0))
-
-    sh_total_h = float(feat.get("sh_total_h", 0.0))
-    sh_total_a = float(feat.get("sh_total_a", 0.0))
-    yellow_h   = float(feat.get("yellow_h", 0.0))
-    yellow_a   = float(feat.get("yellow_a", 0.0))
-
-    xg_sum = xg_h + xg_a;    xg_diff = xg_h - xg_a
-    sot_sum = sot_h + sot_a
-    cor_sum = cor_h + cor_a
-    pos_diff = pos_h - pos_a
-    red_sum = red_h + red_a
-    sh_total_sum = sh_total_h + sh_total_a
-    sh_total_diff = sh_total_h - sh_total_a
-    yellow_sum = yellow_h + yellow_a
-
-    snapshot = {
-        "minute": minute,
-        "gh": gh, "ga": ga,
-        "league_id": league_id,
-        "market": "HARVEST",
-        "suggestion": "HARVEST",
-        "confidence": 0,
-        "stat": {
-            "xg_h": xg_h, "xg_a": xg_a, "xg_sum": xg_sum, "xg_diff": xg_diff,
-            "sot_h": sot_h, "sot_a": sot_a, "sot_sum": sot_sum,
-            "cor_h": cor_h, "cor_a": cor_a, "cor_sum": cor_sum,
-            "pos_h": pos_h, "pos_a": pos_a, "pos_diff": pos_diff,
-            "red_h": red_h, "red_a": red_a, "red_sum": red_sum,
-            "sh_total_h": sh_total_h, "sh_total_a": sh_total_a,
-            "sh_total_sum": sh_total_sum, "sh_total_diff": sh_total_diff,
-            "yellow_h": yellow_h, "yellow_a": yellow_a, "yellow_sum": yellow_sum,
-        }
-    }
-
-    now = int(time.time())
-    payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)[:200000]
+    saved = 0
+    now_ts = int(time.time())
+    per_league_counter: dict[int, int] = {}
 
     with db_conn() as c:
-        c.execute(
-            "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
-            "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
-            (fid, now, payload)
-        )
-        c.execute(
-            "INSERT INTO tips("
-            "match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,sent_ok"
-            ") VALUES ("
-            "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s"
-            ")",
-            (
-                fid, league_id, league, home, away,
-                "HARVEST", "HARVEST",
-                0.0, 0.0,
-                f"{gh}-{ga}",
-                minute, now, 1
-            )
-        )
+        for m in matches:
+            try:
+                fid = int((m.get("fixture") or {}).get("id") or 0)
+                if not fid:
+                    continue
 
-# ───────── Outcomes/backfill/digest (preserved) ─────────
+                # Duplicate check
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - DUP_COOLDOWN_MIN * 60
+                    cursor = c.execute(
+                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
+                        (fid, cutoff),
+                    )
+                    row = cursor.fetchone()
+                    if row is not None and len(row) > 0:
+                        continue
+
+                # Extract advanced features
+                feat = feature_engineer.extract_advanced_features(m)
+                minute = int(feat.get("minute", 0))
+                
+                # Validation checks
+                if not stats_coverage_ok(feat, minute):
+                    continue
+                if minute < TIP_MIN_MINUTE:
+                    continue
+                if is_feed_stale(fid, m, minute):
+                    continue
+
+                # Harvest mode snapshot (every 3 minutes after TRAIN_MIN_MINUTE)
+                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
+                    try:
+                        save_snapshot_from_match(m, feat)
+                    except Exception:
+                        pass
+
+                # Game state analysis
+                game_state_analyzer = GameStateAnalyzer()
+                game_state = game_state_analyzer.analyze_game_state(feat)
+                
+                league_id, league = _league_name(m)
+                home, away = _teams(m)
+                score = _pretty_score(m)
+
+                candidates: List[Tuple[str, str, float, float]] = []
+
+                log.info(f"[MARKET_SCAN] Processing {home} vs {away} at minute {minute}")
+
+                # 1) BTTS
+                btts_prob, btts_confidence = market_predictor.predict_for_market(feat, "BTTS", minute)
+                if btts_prob > 0 and btts_confidence > 0.5:
+                    btts_predictions = {"BTTS: Yes": btts_prob, "BTTS: No": max(0.0, 1 - btts_prob)}
+                    adjusted_btts = game_state_analyzer.adjust_predictions(btts_predictions, game_state)
+                    for suggestion, adj_prob in adjusted_btts.items():
+                        if not market_cutoff_ok(minute, "BTTS", suggestion):
+                            continue
+                        if not _candidate_is_sane(suggestion, feat):
+                            continue
+                        threshold = _get_market_threshold("BTTS")
+                        if adj_prob * 100.0 >= threshold:
+                            candidates.append(("BTTS", suggestion, adj_prob, btts_confidence))
+                            log.info(f"[BTTS_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {btts_confidence:.3f})")
+
+                # 2) OU by configured lines
+                for line in OU_LINES:
+                    market_key = f"OU_{_fmt_line(line)}"
+                    ou_prob, ou_confidence = market_predictor.predict_for_market(feat, market_key, minute)
+                    if ou_prob <= 0 or ou_confidence <= 0.5:
+                        continue
+                    ou_predictions = {
+                        f"Over {_fmt_line(line)} Goals": ou_prob,
+                        f"Under {_fmt_line(line)} Goals": max(0.0, 1 - ou_prob),
+                    }
+                    adjusted_ou = game_state_analyzer.adjust_predictions(ou_predictions, game_state)
+                    for suggestion, adj_prob in adjusted_ou.items():
+                        if not market_cutoff_ok(minute, f"Over/Under {_fmt_line(line)}", suggestion):
+                            continue
+                        if not _candidate_is_sane(suggestion, feat):
+                            continue
+                        threshold = _get_market_threshold(f"Over/Under {_fmt_line(line)}")
+                        if adj_prob * 100.0 >= threshold:
+                            candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, ou_confidence))
+                            log.info(f"[OU_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {ou_confidence:.3f})")
+
+                # 3) 1X2 (draw suppressed)
+                try:
+                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
+                    if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
+                        total = prob_h + prob_a
+                        if total > 0:
+                            prob_h /= total
+                            prob_a /= total
+                        predictions_1X2 = {"Home Win": prob_h, "Away Win": prob_a}
+                        adjusted_1x2 = game_state_analyzer.adjust_predictions(predictions_1X2, game_state)
+                        for suggestion, adj_prob in adjusted_1x2.items():
+                            if not market_cutoff_ok(minute, "1X2", suggestion):
+                                continue
+                            threshold = _get_market_threshold("1X2")
+                            if adj_prob * 100.0 >= threshold:
+                                candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
+                                log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
+                except Exception as e:
+                    log.warning(f"[1X2_PREDICT] Failed for {home} vs {away}: {e}")
+
+                if not candidates:
+                    log.info(f"[NO_CANDIDATES] No qualified tips for {home} vs {away}")
+                    continue
+
+                # Bayesian updates using pre-match priors (when available)
+                enhanced_candidates = []
+                for market, suggestion, prob, confidence in candidates:
+                    pre_match_data = _get_pre_match_probability(fid, market)
+                    if pre_match_data is not None:
+                        bayesian_updater = BayesianUpdater()
+                        if market == "1X2" and isinstance(pre_match_data, tuple):
+                            pre_match_prob_home, pre_match_prob_away = pre_match_data
+                            if suggestion == "Home Win":
+                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute)
+                            else:
+                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_away, prob, minute)
+                        else:
+                            enhanced_prob = bayesian_updater.update_probability(float(pre_match_data), prob, minute)
+                    else:
+                        enhanced_prob = prob
+                    enhanced_candidates.append((market, suggestion, enhanced_prob, confidence))
+
+                # Odds analysis + EV filter
+                odds_map = fetch_odds(fid) if API_KEY else {}
+                ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
+
+                for mk, sug, prob, confidence in enhanced_candidates:
+                    if sug not in ALLOWED_SUGGESTIONS:
+                        continue
+
+                    # Odds quality (overround + hint EV)
+                    odds_analyzer = SmartOddsAnalyzer()
+                    odds_quality = odds_analyzer.analyze_odds_quality(odds_map, {mk: prob})
+                    if odds_quality < odds_analyzer.odds_quality_threshold:
+                        continue
+
+                    # Odds lookup
+                    odds = None
+                    book = None
+                    if mk == "BTTS":
+                        d = odds_map.get("BTTS", {})
+                        tgt = "Yes" if sug.endswith("Yes") else "No"
+                        if tgt in d:
+                            odds, book = d[tgt]["odds"], d[tgt]["book"]
+                    elif mk == "1X2":
+                        d = odds_map.get("1X2", {})
+                        tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
+                        if tgt and tgt in d:
+                            odds, book = d[tgt]["odds"], d[tgt]["book"]
+                    elif mk.startswith("Over/Under"):
+                        ln = _parse_ou_line_from_suggestion(sug)
+                        d = odds_map.get(f"OU_{_fmt_line(ln)}", {}) if ln is not None else {}
+                        tgt = "Over" if sug.startswith("Over") else "Under"
+                        if tgt in d:
+                            odds, book = d[tgt]["odds"], d[tgt]["book"]
+
+                    # Price gate
+                    pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
+                    if not pass_odds:
+                        continue
+                    if odds is None:
+                        odds, book = odds2, book2
+
+                    ev_pct = None
+                    if odds is not None:
+                        edge = _ev(prob, float(odds))
+                        ev_pct = round(edge * 100.0, 1)
+                        if int(round(edge * 10000)) < EDGE_MIN_BPS:
+                            continue
+                    else:
+                        if not ALLOW_TIPS_WITHOUT_ODDS:
+                            continue
+
+                    rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0) * max(0.0, confidence)
+                    ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score, confidence))
+
+                if not ranked:
+                    continue
+
+                ranked.sort(key=lambda x: x[6], reverse=True)  # by rank_score
+                log.info(f"[RANKED_TIPS] Found {len(ranked)} qualified tips for {home} vs {away}")
+
+                per_match = 0
+                base_now = int(time.time())
+
+                for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank, confidence) in enumerate(ranked):
+                    if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
+                        break
+
+                    created_ts = base_now + idx
+                    raw = float(prob)
+                    prob_pct = round(raw * 100.0, 1)
+
+                    try:
+                        with db_conn() as c2:
+                            c2.execute(
+                                "INSERT INTO tips("
+                                "match_id,league_id,league,home,away,market,suggestion,"
+                                "confidence,confidence_raw,score_at_tip,minute,created_ts,"
+                                "odds,book,ev_pct,sent_ok"
+                                ") VALUES ("
+                                "%s,%s,%s,%s,%s,%s,%s,"
+                                "%s,%s,%s,%s,%s,"
+                                "%s,%s,%s,%s"
+                                ")",
+                                (
+                                    fid, league_id, league, home, away,
+                                    market_txt, suggestion,
+                                    float(prob_pct), raw, score, minute, created_ts,
+                                    (float(odds) if odds is not None else None),
+                                    (book or None),
+                                    (float(ev_pct) if ev_pct is not None else None),
+                                    0,
+                                ),
+                             )
+
+                            sent = send_telegram(_format_enhanced_tip_message(
+                                home, away, league, minute, score, suggestion, 
+                                float(prob_pct), feat, odds, book, ev_pct, confidence
+                            ))
+                            
+                            if sent:
+                                c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
+                                _metric_inc("tips_sent_total", n=1)
+                                log.info(f"[TIP_SENT] {suggestion} for {home} vs {away} at {minute}'")
+                    except Exception as e:
+                        log.exception("[ENHANCED_PROD] insert/send failed: %s", e)
+                        continue
+
+                    saved += 1
+                    per_match += 1
+                    per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
+
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        break
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        break
+
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break
+
+            except Exception as e:
+                log.exception("[ENHANCED_PROD] match loop failed: %s", e)
+                continue
+
+    log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
+    _metric_inc("tips_generated_total", n=saved)
+    return saved, live_seen
+
+# Keep production_scan as alias
+def production_scan() -> Tuple[int, int]:
+    return enhanced_production_scan()
+
+# ───────── Outcomes/backfill/digest (minor safety tweaks preserved) ─────────
 def _tip_outcome_for_result(suggestion: str, res: Dict[str,Any]) -> Optional[int]:
     gh=int(res.get("final_goals_h") or 0); ga=int(res.get("final_goals_a") or 0)
     total=gh+ga; btts=int(res.get("btts_yes") or 0); s=(suggestion or "").strip()
@@ -2857,10 +2207,10 @@ def _fixture_by_id(mid: int) -> Optional[dict]:
     arr=js.get("response") or [] if isinstance(js,dict) else []
     return arr[0] if arr else None
 
-def _is_final(short: str) -> bool: return (short or "").upper() in {"FT","AET","PEN"}
+def _is_final(short: str) -> bool:
+    return (short or "").upper() in {"FT","AET","PEN"}
 
 def backfill_results_for_open_matches(max_rows: int = 200) -> int:
-    """Backfill results with sleep time check"""
     if sleep_if_required():
         log.info("[BACKFILL] Skipping during sleep hours (22:00-08:00 Berlin time)")
         return 0
@@ -2889,18 +2239,14 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     return updated
 
 def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
-    """Daily accuracy digest for today's tips only"""
     if not DAILY_ACCURACY_DIGEST_ENABLE: 
         return None
     
-    # Get today's date in Berlin timezone
     today = datetime.now(BERLIN_TZ).date()
     start_of_day = datetime.combine(today, datetime.min.time(), tzinfo=BERLIN_TZ)
     start_ts = int(start_of_day.timestamp())
-    
     log.info("[DIGEST] Generating daily digest for today (since %s)", start_of_day)
     
-    # Backfill recent results
     backfill_results_for_open_matches(200)
 
     with db_conn() as c:
@@ -2921,49 +2267,37 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
     for (mkt, sugg, conf, conf_raw, cts, odds, gh, ga, btts) in rows:
         res = {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts}
         out = _tip_outcome_for_result(sugg, res)
-        
-        # Store tip info for recent tips list
         tip_time = datetime.fromtimestamp(cts, BERLIN_TZ).strftime("%H:%M")
-        recent_tips.append(f"{sugg} ({conf:.1f}%) - {tip_time}")
-        
+        recent_tips.append(f"{sugg} ({(conf or 0):.1f}%) - {tip_time}")
         if out is None: 
             continue
-
         total += 1
         graded += 1
         wins += 1 if out == 1 else 0
-        
         d = by_market.setdefault(mkt or "?", {"graded": 0, "wins": 0})
         d["graded"] += 1
         d["wins"] += 1 if out == 1 else 0
-
         if odds:
-            roi_by_market.setdefault(mkt, {"stake": 0, "pnl": 0})
+            roi_by_market.setdefault(mkt, {"stake": 0, "pnl": 0.0})
             roi_by_market[mkt]["stake"] += 1
             if out == 1: 
-                roi_by_market[mkt]["pnl"] += float(odds) - 1
+                roi_by_market[mkt]["pnl"] += float(odds) - 1.0
             else: 
-                roi_by_market[mkt]["pnl"] -= 1
+                roi_by_market[mkt]["pnl"] -= 1.0
 
     if graded == 0:
         msg = f"📊 Daily Accuracy Digest for {today.strftime('%Y-%m-%d')}\nNo graded tips today."
-        
-        # Show pending tips if any
         if rows:
-            pending = len([r for r in rows if r[5] is None or r[6] is None])  # No odds or no result
+            pending = len([r for r in rows if r[5] is None or r[6] is None])
             msg += f"\n⏳ {pending} tips still pending results."
-            
     else:
         acc = 100.0 * wins / max(1, graded)
         lines = [
             f"📊 <b>Daily Accuracy Digest</b> - {today.strftime('%Y-%m-%d')}",
             f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"
         ]
-
-        # Add recent tips preview (last 3)
         if recent_tips:
             lines.append(f"\n🕒 Recent tips: {', '.join(recent_tips[:3])}")
-
         for mk, st in sorted(by_market.items()):
             if st["graded"] == 0: 
                 continue
@@ -2973,14 +2307,13 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
                 roi_val = 100.0 * roi_by_market[mk]["pnl"] / roi_by_market[mk]["stake"]
                 roi = f" • ROI {roi_val:+.1f}%"
             lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} ({a:.1f}%){roi}")
-
         msg = "\n".join(lines)
 
     send_telegram(msg)
     log.info("[DIGEST] Sent daily digest with %d tips, %d graded", total, graded)
     return msg
 
-# ───────── Prematch pipeline (preserved) ─────────
+# ───────── Prematch pipeline (kept; minor safety tweaks) ─────────
 def _kickoff_berlin(utc_iso: str|None) -> str:
     try:
         if not utc_iso: return "TBD"
@@ -3005,7 +2338,6 @@ def save_prematch_snapshot(fx: dict, feat: Dict[str, float]) -> None:
         )
 
 def snapshot_odds_for_fixtures(fixtures: List[int]) -> int:
-    """Odds snapshot with sleep time check"""
     if sleep_if_required():
         log.info("[ODDS_SNAPSHOT] Skipping during sleep hours (22:00-08:00 Berlin time)")
         return 0
@@ -3014,7 +2346,7 @@ def snapshot_odds_for_fixtures(fixtures: List[int]) -> int:
     now = int(time.time())
     for fid in fixtures:
         try:
-            od = fetch_odds(fid)  # aggregated
+            od = fetch_odds(fid)
             rows = []
             for mk, sides in (od or {}).items():
                 for sel, payload in (sides or {}).items():
@@ -3054,9 +2386,8 @@ def fetch_lineup_and_save(fid: int) -> bool:
     return True
 
 def prematch_scan_save() -> int:
-    """Prematch scan with sleep time check"""
     if sleep_if_required():
-        log.info("[PREMATCH] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
+        log.info("[PREMATCH] Skipping during sleep hours (22:00-08:00 Berlin time)")
         return 0
     
     fixtures = _collect_todays_prematch_fixtures()
@@ -3174,7 +2505,7 @@ def prematch_scan_save() -> int:
     log.info("[PREMATCH] saved=%d", saved)
     return saved
 
-# ───────── MOTD (preserved) ─────────
+# ───────── MOTD (kept) ─────────
 MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
 
 def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, odds=None, book=None, ev_pct=None):
@@ -3194,7 +2525,6 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, 
     )
 
 def send_match_of_the_day() -> bool:
-    """Send Match of the Day with sleep time check"""
     if sleep_if_required():
         log.info("[MOTD] Skipping during sleep hours (22:00-08:00 Berlin time)")
         return False
@@ -3212,7 +2542,6 @@ def send_match_of_the_day() -> bool:
     
     log.info("[MOTD] Found %d fixtures for today", len(fixtures))
 
-    # Filter by league IDs if specified
     if MOTD_LEAGUE_IDS:
         fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
         log.info("[MOTD] After league filtering: %d fixtures", len(fixtures))
@@ -3228,45 +2557,31 @@ def send_match_of_the_day() -> bool:
             lg = fx.get("league") or {}
             teams = fx.get("teams") or {}
             fid = int((fixture.get("id") or 0))
-
             if not fid:
                 continue
-
             home = (teams.get("home") or {}).get("name", "")
             away = (teams.get("away") or {}).get("name", "")
             league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
             kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
-
-            log.debug("[MOTD] Processing: %s vs %s (%s)", home, away, league)
-
-            # Extract pre-match features
             feat = extract_prematch_features(fx)
             if not feat:
-                log.debug("[MOTD] No features for %s vs %s", home, away)
                 continue
 
             candidates = []
 
-            # PRE Over/Under markets
             for line in OU_LINES:
                 mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
                 if not mdl: 
                     continue
-                    
                 p = _score_prob(feat, mdl)
                 mk = f"Over/Under {_fmt_line(line)}"
                 thr = _get_market_threshold_pre(mk)
-                
-                # Over candidate
                 if p * 100.0 >= max(thr, MOTD_CONF_MIN):
                     candidates.append((mk, f"Over {_fmt_line(line)} Goals", p, home, away, league, kickoff_txt, fid))
-                
-                # Under candidate  
                 q = 1.0 - p
                 if q * 100.0 >= max(thr, MOTD_CONF_MIN):
                     candidates.append((mk, f"Under {_fmt_line(line)} Goals", q, home, away, league, kickoff_txt, fid))
 
-            # PRE BTTS
             mdl = load_model_from_settings("PRE_BTTS_YES")
             if mdl:
                 p = _score_prob(feat, mdl)
@@ -3277,7 +2592,6 @@ def send_match_of_the_day() -> bool:
                 if q * 100.0 >= max(thr, MOTD_CONF_MIN):
                     candidates.append(("BTTS", "BTTS: No", q, home, away, league, kickoff_txt, fid))
 
-            # PRE 1X2 (draw suppressed)
             mh = load_model_from_settings("PRE_WLD_HOME")
             ma = load_model_from_settings("PRE_WLD_AWAY")
             if mh and ma:
@@ -3292,37 +2606,24 @@ def send_match_of_the_day() -> bool:
                     candidates.append(("1X2", "Away Win", pa, home, away, league, kickoff_txt, fid))
 
             if not candidates:
-                log.debug("[MOTD] No candidates for %s vs %s", home, away)
                 continue
 
-            # Evaluate each candidate
             for mk, sug, prob, home, away, league, kickoff_txt, fid in candidates:
                 prob_pct = prob * 100.0
-                
-                # Check odds and EV
                 pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
                 if not pass_odds:
-                    log.debug("[MOTD] Odds gate failed for %s: %s", sug, home)
                     continue
-
                 ev_pct = None
                 if odds is not None:
                     edge = _ev(prob, odds)
                     ev_bps = int(round(edge * 10000))
                     ev_pct = round(edge * 100.0, 1)
                     if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
-                        log.debug("[MOTD] EV too low for %s: %d bps", sug, ev_bps)
                         continue
                 else:
-                    log.debug("[MOTD] No odds for %s: %s", sug, home)
                     continue
 
-                # Score candidate (confidence + EV)
                 candidate_score = prob_pct + (ev_pct or 0)
-                
-                log.info("[MOTD] Candidate: %s - %s vs %s - %.1f%% confidence, %.1f%% EV, score: %.1f", 
-                        sug, home, away, prob_pct, ev_pct, candidate_score)
-
                 if best_candidate is None or candidate_score > best_score:
                     best_candidate = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
                     best_score = candidate_score
@@ -3335,22 +2636,17 @@ def send_match_of_the_day() -> bool:
         log.info("[MOTD] No suitable match found for MOTD")
         return send_telegram("🏅 Match of the Day: no prematch pick met thresholds today.")
 
-    # Send the best candidate
     prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best_candidate
-    
     log.info("[MOTD] Selected: %s vs %s - %s (%.1f%%)", home, away, sug, prob_pct)
-    
     message = _format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct)
     success = send_telegram(message)
-    
     if success:
         log.info("[MOTD] Successfully sent MOTD")
     else:
         log.error("[MOTD] Failed to send MOTD message")
-        
     return success
 
-# ───────── Auto-train / Auto-tune (fix wiring) ─────────
+# ───────── Auto-train / Auto-tune (unchanged) ─────────
 def auto_train_job():
     if not TRAIN_ENABLE:
         return send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
@@ -3386,123 +2682,10 @@ def auto_train_job():
         log.exception("[TRAIN] job failed: %s", e)
         send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
 
-def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
-    import numpy as np
-    y=np.asarray(y_true,dtype=int); p=np.asarray(y_prob,dtype=float)
-    best=default_pct/100.0
-    for t in np.arange(MIN_THRESH,MAX_THRESH+1e-9,1.0)/100.0:
-        pred=(p>=t).astype(int); n=int(pred.sum())
-        if n<min_preds: continue
-        tp=int(((pred==1)&(y==1)).sum()); prec=tp/max(1,n)
-        if prec>=target_precision: best=float(t); break
-    return best*100.0
-
-# The ROI-aware apply-tune from your original, exposed under a stable name
-def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:
-    # identical to your original logic (omitted inline comments for brevity), just kept as-is
-    PREC_TOL = float(os.getenv("APPLY_TUNE_PREC_TOL", "0.03"))
-    cutoff = int(time.time()) - days * 24 * 3600
-    with db_conn() as c:
-        rows = c.execute(
-            """
-            SELECT t.market,
-                   t.suggestion,
-                   COALESCE(t.confidence_raw, t.confidence/100.0) AS prob,
-                   t.odds,
-                   r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM tips t
-            JOIN match_results r ON r.match_id = t.match_id
-            WHERE t.created_ts >= %s
-              AND t.suggestion <> 'HARVEST'
-              AND t.sent_ok = 1
-              AND t.odds IS NOT NULL
-            """,
-            (cutoff,),
-        ).fetchall()
-    if not rows:
-        send_telegram("🔧 Apply-tune: no labeled tips with odds in window.")
-        return {}
-    by: dict[str, list[tuple[float, int, float]]] = {}
-    for (mk, sugg, prob, odds, gh, ga, btts) in rows:
-        try:
-            prob = float(prob or 0.0); odds = float(odds or 0.0)
-        except Exception: continue
-        res = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
-        if res is None: continue
-        y = int(res)
-        if not (1.01 <= odds <= MAX_ODDS_ALL): continue
-        by.setdefault(mk, []).append((prob, y, odds))
-    if not by:
-        send_telegram("🔧 Auto-tune: nothing to tune after filtering.")
-        return {}
-    target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
-    min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
-    min_thr = float(os.getenv("MIN_THRESH", "55"))
-    max_thr = float(os.getenv("MAX_THRESH", "85"))
-    tuned: Dict[str, float] = {}
-
-    def _eval_threshold(items: list[tuple[float, int, float]], thr_prob: float) -> tuple[int, float, float]:
-        sel = [(p, y, o) for (p, y, o) in items if p >= thr_prob]
-        n = len(sel)
-        if n == 0: return 0, 0.0, 0.0
-        wins = sum(y for (_, y, _) in sel); prec = wins / n
-        roi = sum((y * (odds - 1.0) - (1 - y)) for (_, y, odds) in sel) / n
-        return n, float(prec), float(roi)
-
-    for mk, items in by.items():
-        if len(items) < min_preds: continue
-        candidates_pct = list(np.arange(min_thr, max_thr + 1e-9, 1.0))
-        best = None
-        feasible_any = False
-        for thr_pct in candidates_pct:
-            thr_prob = float(thr_pct / 100.0)
-            n, prec, roi = _eval_threshold(items, thr_prob)
-            if n < min_preds: continue
-            if prec >= target_precision:
-                feasible_any = True
-                score = (roi, prec, n)
-                if (best is None) or (score > (best[0], best[1], best[2])):
-                    best = (roi, prec, n, thr_pct)
-        if not feasible_any:
-            for thr_pct in candidates_pct:
-                thr_prob = float(thr_pct / 100.0)
-                n, prec, roi = _eval_threshold(items, thr_prob)
-                if n < min_preds: continue
-                if (prec >= max(0.0, target_precision - PREC_TOL)) and (roi > 0.0):
-                    score = (roi, prec, n)
-                    if (best is None) or (score > (best[0], best[1], best[2])):
-                        best = (roi, prec, n, thr_pct)
-        if best is None:
-            fallback = None
-            for thr_pct in candidates_pct:
-                thr_prob = float(thr_pct / 100.0)
-                n, prec, roi = _eval_threshold(items, thr_prob)
-                if n < min_preds: continue
-                score = (prec, n, roi)
-                if (fallback is None) or (score > (fallback[0], fallback[1], fallback[2])):
-                    fallback = (prec, n, roi, thr_pct)
-            if fallback is not None:
-                tuned[mk] = float(fallback[3])
-        else:
-            tuned[mk] = float(best[3])
-
-    if tuned:
-        for mk, pct in tuned.items():
-            set_setting(f"conf_threshold:{mk}", f"{pct:.2f}")
-            _SETTINGS_CACHE.invalidate(f"conf_threshold:{mk}")
-        lines = ["🔧 Auto-tune (ROI-aware) updated thresholds:"]
-        for mk, pct in sorted(tuned.items()):
-            lines.append(f"• {mk}: {pct:.1f}%")
-        send_telegram("\n".join(lines))
-    else:
-        send_telegram("🔧 Auto-tune (ROI-aware): no markets met minimum data.")
-    return tuned
-
-# Backwards/endpoint-friendly name (fixes earlier NameError)
 def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
     return _apply_tune_thresholds(days)
 
-# ───────── Retry unsent tips (preserved) ─────────
+# ───────── Retry unsent tips (unchanged) ─────────
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
     cutoff = int(time.time()) - minutes*60
     retried = 0
@@ -3522,7 +2705,7 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
         log.info("[RETRY] resent %d", retried)
     return retried
 
-# ───────── Shutdown Handlers ─────────
+# ───────── Shutdown Handlers (unchanged) ─────────
 def shutdown_handler(signum=None, frame=None):
     log.info("Received shutdown signal, cleaning up...")
     ShutdownManager.request_shutdown()
@@ -3538,7 +2721,7 @@ def register_shutdown_handlers():
     signal.signal(signal.SIGTERM, shutdown_handler)
     atexit.register(shutdown_handler)
 
-# ───────── Scheduler (preserved; wiring fixed for auto-tune) ─────────
+# ───────── Scheduler (unchanged wiring; one-shot start) ─────────
 _scheduler_started=False
 
 def _run_with_pg_lock(lock_key: int, fn, *a, **k):
@@ -3606,28 +2789,26 @@ def _start_scheduler_once():
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
-# ───────── Admin / auth / endpoints (add /metrics and performance analysis) ─────────
+# ───────── Admin / auth / endpoints (ALL routes have GET now) ─────────
 def _require_admin():
     key=request.headers.get("X-API-Key") or request.args.get("key") or ((request.json or {}).get("key") if request.is_json else None)
     if not ADMIN_API_KEY or key != ADMIN_API_KEY: abort(401)
 
-@app.route("/")
-def root(): return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI_ENHANCED", "scheduler": RUN_SCHEDULER})
+@app.route("/", methods=["GET"])
+def root(): 
+    return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI_ENHANCED", "scheduler": RUN_SCHEDULER})
 
-@app.route("/health")
+@app.route("/health", methods=["GET"])
 def health():
     try:
         with db_conn() as c:
             n = c.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
-        
-        # Check API connectivity
         api_ok = False
         try:
             test_resp = api_get_with_sleep(FOOTBALL_API_URL, {"live": "all"}, timeout=5)
             api_ok = test_resp is not None
         except:
             pass
-            
         return jsonify({
             "ok": True, 
             "db": "ok", 
@@ -3639,9 +2820,8 @@ def health():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/metrics")
+@app.route("/metrics", methods=["GET"])
 def metrics():
-    # ultra-simple exposition to verify on Railway logs
     try:
         return jsonify({"ok": True, "metrics": METRICS})
     except Exception as e:
@@ -3656,14 +2836,23 @@ def http_performance_analysis():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/init-db", methods=["POST"])
-def http_init_db(): _require_admin(); init_db(); return jsonify({"ok": True})
+@app.route("/init-db", methods=["POST","GET"])
+def http_init_db():
+    _require_admin()
+    init_db()
+    return jsonify({"ok": True})
 
 @app.route("/admin/scan", methods=["POST","GET"])
-def http_scan(): _require_admin(); s,l=production_scan(); return jsonify({"ok": True, "saved": s, "live_seen": l})
+def http_scan():
+    _require_admin()
+    s,l=production_scan()
+    return jsonify({"ok": True, "saved": s, "live_seen": l})
 
 @app.route("/admin/backfill-results", methods=["POST","GET"])
-def http_backfill(): _require_admin(); n=backfill_results_for_open_matches(400); return jsonify({"ok": True, "updated": n})
+def http_backfill():
+    _require_admin()
+    n=backfill_results_for_open_matches(400)
+    return jsonify({"ok": True, "updated": n})
 
 @app.route("/admin/train", methods=["POST","GET"])
 def http_train():
@@ -3678,30 +2867,45 @@ def http_train():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/admin/train-notify", methods=["POST","GET"])
-def http_train_notify(): _require_admin(); auto_train_job(); return jsonify({"ok": True})
+def http_train_notify():
+    _require_admin()
+    auto_train_job()
+    return jsonify({"ok": True})
 
 @app.route("/admin/digest", methods=["POST","GET"])
-def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
+def http_digest():
+    _require_admin()
+    msg=daily_accuracy_digest()
+    return jsonify({"ok": True, "sent": bool(msg)})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
-def http_auto_tune(): _require_admin(); tuned=auto_tune_thresholds(14); return jsonify({"ok": True, "tuned": tuned})
+def http_auto_tune():
+    _require_admin()
+    tuned=auto_tune_thresholds(14)
+    return jsonify({"ok": True, "tuned": tuned})
 
 @app.route("/admin/retry-unsent", methods=["POST","GET"])
-def http_retry_unsent(): _require_admin(); n=retry_unsent_tips(30,200); return jsonify({"ok": True, "resent": n})
+def http_retry_unsent():
+    _require_admin()
+    n=retry_unsent_tips(30,200)
+    return jsonify({"ok": True, "resent": n})
 
 @app.route("/admin/prematch-scan", methods=["POST","GET"])
-def http_prematch_scan(): _require_admin(); saved=prematch_scan_save(); return jsonify({"ok": True, "saved": int(saved)})
+def http_prematch_scan():
+    _require_admin()
+    saved=prematch_scan_save()
+    return jsonify({"ok": True, "saved": int(saved)})
 
 @app.route("/admin/motd", methods=["POST","GET"])
 def http_motd():
-    _require_admin(); ok = send_match_of_the_day(); return jsonify({"ok": bool(ok)})
+    _require_admin()
+    ok = send_match_of_the_day()
+    return jsonify({"ok": bool(ok)})
 
-@app.route("/admin/motd-test", methods=["POST", "GET"])
+@app.route("/admin/motd-test", methods=["POST","GET"])
 def http_motd_test():
-    """Test MOTD manually"""
     _require_admin()
     log.info("[MOTD-TEST] Manual MOTD trigger")
-    
     try:
         ok = send_match_of_the_day()
         return jsonify({"ok": bool(ok), "message": "MOTD test completed"})
@@ -3719,7 +2923,7 @@ def http_settings(key: str):
     set_setting(key, str(val)); _SETTINGS_CACHE.invalidate(key); invalidate_model_caches_for_key(key)
     return jsonify({"ok": True})
 
-@app.route("/tips/latest")
+@app.route("/tips/latest", methods=["GET"])
 def http_latest():
     limit=int(request.args.get("limit","50"))
     with db_conn() as c:
@@ -3733,9 +2937,12 @@ def http_latest():
                      "odds": (float(r[11]) if r[11] is not None else None), "book": r[12], "ev_pct": (float(r[13]) if r[13] is not None else None)})
     return jsonify({"ok": True, "tips": tips})
 
-@app.route("/telegram/webhook/<secret>", methods=["POST"])
+@app.route("/telegram/webhook/<secret>", methods=["POST","GET"])
 def telegram_webhook(secret: str):
     if (WEBHOOK_SECRET or "") != secret: abort(403)
+    if request.method == "GET":
+        # Allow manual ping/diagnostics
+        return jsonify({"ok": True, "webhook": "ready"})
     update=request.get_json(silent=True) or {}
     try:
         msg=(update.get("message") or {}).get("text") or ""
@@ -3755,12 +2962,11 @@ def telegram_webhook(secret: str):
 def _on_boot():
     register_shutdown_handlers()
     validate_config()
-    _init_pool()  # This should now work since the function is defined above
+    _init_pool()
     init_db()
     set_setting("boot_ts", str(int(time.time())))
     _start_scheduler_once()
 
-# Call _on_boot() to initialize the application
 _on_boot()
 
 if __name__ == "__main__":
