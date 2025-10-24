@@ -14,7 +14,7 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-import socket  # ← added
+import socket, re
 
 # ───────── Env bootstrap ─────────
 try:
@@ -236,38 +236,58 @@ DB_PASS = os.getenv("PGPASSWORD") or os.getenv("SUPABASE_PASSWORD")  # you rotat
 if not DB_PASS:
     raise SystemExit("Missing required DB password: set PGPASSWORD or SUPABASE_PASSWORD")
 
-def _resolve_ipv4(host: str, port: int, attempts: int = 3, delay: float = 1.0) -> str:
-    """
-    Resolve an IPv4 A record (avoid IPv6 issues). Retry briefly so transient DNS
-    hiccups at boot don't kill the app.
-    """
-    last_err: Exception | None = None
-    for _ in range(max(1, attempts)):
-        try:
-            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-            if infos:
-                return infos[0][4][0]
-        except Exception as e:
-            last_err = e
-            time.sleep(delay)
-    raise OSError(f"IPv4 resolution failed for {host}:{port} ({last_err})")
+def _resolve_ipv4(host: str, port: int) -> Optional[str]:
+    """Best-effort IPv4 resolver. Returns None on failure (no exception)."""
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        # pick the first IPv4
+        return infos[0][4][0] if infos else None
+    except Exception as e:
+        log.warning("[DNS] IPv4 resolve failed for %s:%s: %s — using hostname fallback", host, port, e)
+        return None
 
 def _build_pg_dsn() -> str:
     """
-    Build a psycopg2 DSN that:
-      - keeps 'host' (for TLS/SNI) AND sets 'hostaddr' (forced IPv4),
-      - uses sslmode=require,
-      - adds fast connect_timeout and TCP keepalives.
+    Build a psycopg2 DSN with:
+      - hostaddr=<ipv4> when available (for IPv4-only egress),
+      - host=<hostname> always (for TLS SNI/cert validation),
+      - sslmode=require and system CA bundle.
     """
-    hostaddr = os.getenv("PGHOSTADDR")
-    if not hostaddr:
-        hostaddr = _resolve_ipv4(DB_HOST, DB_PORT)
-    return (
-        f"host={DB_HOST} hostaddr={hostaddr} port={DB_PORT} dbname={DB_NAME} "
-        f"user={DB_USER} password={DB_PASS} sslmode=require connect_timeout=5 "
-        f"keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=5"
-    )
-# ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+    host = os.getenv("DB_HOST", "db.fbjmtyfunjsgaxossuhj.supabase.co")
+    port = int(os.getenv("DB_PORT", "5432"))
+    dbname = os.getenv("DB_NAME", "postgres")
+    user = os.getenv("DB_USER", "postgres")
+    password = os.getenv("SUPABASE_PASSWORD") or os.getenv("DB_PASSWORD")
+    if not password:
+        raise SystemExit("Missing required DB password: set SUPABASE_PASSWORD or DB_PASSWORD")
+
+    hostaddr = _resolve_ipv4(host, port)
+
+    parts = [
+        f"dbname={dbname}",
+        f"user={user}",
+        f"password={password}",
+        f"port={port}",
+        "sslmode=require",
+        "sslrootcert=/etc/ssl/certs/ca-certificates.crt",
+        "application_name=goalsniper",
+    ]
+    if hostaddr:
+        parts.append(f"hostaddr={hostaddr}")  # connect via IPv4
+        parts.append(f"host={host}")          # keep SNI/cert hostname
+    else:
+        parts.append(f"host={host}")          # fallback: let libpq resolve
+
+    return " ".join(parts)
+
+def _init_pool():
+    """Initialize the global connection pool (best effort)."""
+    global POOL
+    dsn = _build_pg_dsn()
+    # log DSN without secrets
+    safe_dsn = re.sub(r'password=\S+', 'password=****', dsn)
+    log.info("[DB] Creating pool with DSN: %s", safe_dsn)
+    POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
 
 POOL: Optional[SimpleConnectionPool] = None
 class PooledConn:
@@ -2245,11 +2265,14 @@ def _on_boot():
     try:
         _init_pool()
         init_db()
-        set_setting("boot_ts", str(int(time.time())))
-        _start_scheduler_once()
     except Exception as e:
-        # App still starts; /health will show DB error until it recovers.
-        log.exception("[BOOT] DB init failed (will retry lazily on first use): %s", e)
+        # Don’t crash the app; DB-dependent endpoints will retry on first use.
+        log.error("[BOOT] DB init failed (will retry lazily): %s", e)
+    try:
+        set_setting("boot_ts", str(int(time.time())))
+    except Exception as e:
+        log.warning("[BOOT] set_setting failed (likely DB not ready yet): %s", e)
+    _start_scheduler_once()
 
 _on_boot()
 
