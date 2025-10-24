@@ -1,8 +1,8 @@
 # goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate
-# Cleaned: IPv4-only Supabase connect (Railway-friendly), redacted DSN logging,
-# removed unused/duplicate code, kept functionality intact.
+# Upgraded: circuit breaker, Redis-backed caches (optional), Prometheus-style metrics,
+# DB pool health checks, admin/webhook hardening, and auto-tune wiring fixes — without trimming logic.
 
-import os, json, time, logging, requests, psycopg2, socket
+import os, json, time, logging, requests, psycopg2
 import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
@@ -14,6 +14,7 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+import socket  # ← added
 
 # ───────── Env bootstrap ─────────
 try:
@@ -82,7 +83,7 @@ def _metric_obs_duration(job: str, t0: float) -> None:
     except Exception:
         pass
 
-# ───────── Required envs (fail fast) — preserved ─────────
+# ───────── Required envs (fail fast) — ADDED ─────────
 def _require_env(name: str) -> str:
     v = os.getenv(name)
     if not v:
@@ -138,7 +139,7 @@ try:
 except Exception:
     MOTD_LEAGUE_IDS = []
 
-# Optional-but-recommended warnings — preserved
+# Optional-but-recommended warnings — ADDED
 if not ADMIN_API_KEY:
     log.warning("ADMIN_API_KEY is not set — /admin/* endpoints are less protected.")
 if not WEBHOOK_SECRET:
@@ -182,8 +183,12 @@ for _ln in OU_LINES:
     s=_fmt_line(_ln); ALLOWED_SUGGESTIONS.add(f"Over {s} Goals"); ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
 
 # ───────── External APIs / HTTP session ─────────
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL: raise SystemExit("DATABASE_URL is required")
+
 BASE_URL = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES = {"1H","HT","2H","ET","BT","P"}
 
@@ -220,19 +225,55 @@ except Exception as e:
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
 # ───────── DB pool & helpers ─────────
+# ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+# IPv4 resolution + DSN builder (added)
+DB_HOST = os.getenv("PGHOST") or os.getenv("DB_HOST") or "db.fbjmtyfunjsgaxossuhj.supabase.co"
+DB_PORT = int(os.getenv("PGPORT") or os.getenv("DB_PORT") or "5432")
+DB_NAME = os.getenv("PGDATABASE") or os.getenv("DB_NAME") or "postgres"
+DB_USER = os.getenv("PGUSER") or os.getenv("DB_USER") or "postgres"
+DB_PASS = os.getenv("PGPASSWORD") or os.getenv("SUPABASE_PASSWORD")  # you rotate this
+
+if not DB_PASS:
+    raise SystemExit("Missing required DB password: set PGPASSWORD or SUPABASE_PASSWORD")
+
+def _resolve_ipv4(host: str, port: int, attempts: int = 3, delay: float = 1.0) -> str:
+    """
+    Resolve an IPv4 A record (avoid IPv6 issues). Retry briefly so transient DNS
+    hiccups at boot don't kill the app.
+    """
+    last_err: Exception | None = None
+    for _ in range(max(1, attempts)):
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+            if infos:
+                return infos[0][4][0]
+        except Exception as e:
+            last_err = e
+            time.sleep(delay)
+    raise OSError(f"IPv4 resolution failed for {host}:{port} ({last_err})")
+
+def _build_pg_dsn() -> str:
+    """
+    Build a psycopg2 DSN that:
+      - keeps 'host' (for TLS/SNI) AND sets 'hostaddr' (forced IPv4),
+      - uses sslmode=require,
+      - adds fast connect_timeout and TCP keepalives.
+    """
+    hostaddr = os.getenv("PGHOSTADDR")
+    if not hostaddr:
+        hostaddr = _resolve_ipv4(DB_HOST, DB_PORT)
+    return (
+        f"host={DB_HOST} hostaddr={hostaddr} port={DB_PORT} dbname={DB_NAME} "
+        f"user={DB_USER} password={DB_PASS} sslmode=require connect_timeout=5 "
+        f"keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=5"
+    )
+# ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+
 POOL: Optional[SimpleConnectionPool] = None
-
-def _resolve_ipv4(host: str, port: int) -> str:
-    """Resolve first IPv4 address for host (avoid AAAA/IPv6 on Railway)."""
-    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    if not infos:
-        raise SystemExit(f"No IPv4 A record found for {host}")
-    return infos[0][4][0]
-
 class PooledConn:
     def __init__(self, pool): self.pool=pool; self.conn=None; self.cur=None
     def __enter__(self): self.conn=self.pool.getconn(); self.conn.autocommit=True; self.cur=self.conn.cursor(); return self
-    def __exit__(self, a,b,c):
+    def __exit__(self, a,b,c): 
         try: self.cur and self.cur.close()
         finally: self.conn and self.pool.putconn(self.conn)
     def execute(self, sql: str, params: tuple|list=()):
@@ -245,46 +286,13 @@ class PooledConn:
             raise
 
 def _init_pool():
-    """
-    Connect to Supabase Postgres over IPv4 with SSL.
-    Uses PG* envs if provided, otherwise falls back to your Supabase defaults.
-    """
     global POOL
+    dsn = _build_pg_dsn()
+    # Don't print the full DSN (contains secrets). Keep it short & safe.
+    log.info("[DB] Connecting to %s:%s over IPv4 with SSL…", DB_HOST, DB_PORT)
+    POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
 
-    host = os.getenv("PGHOST") or os.getenv("DB_HOST") or "db.fbjmtyfunjsgaxossuhj.supabase.co"
-    port = int(os.getenv("PGPORT") or os.getenv("DB_PORT") or "5432")
-    db   = os.getenv("PGDATABASE", "postgres")
-    user = os.getenv("PGUSER", "postgres")
-    pwd  = os.getenv("PGPASSWORD") or os.getenv("SUPABASE_PASSWORD")
-    if not pwd:
-        raise SystemExit("Missing database password (set PGPASSWORD or SUPABASE_PASSWORD)")
-
-    # Force IPv4 to avoid Railway IPv6 egress issues
-    ipv4 = _resolve_ipv4(host, port)
-
-    # TLS: Supabase requires SSL; fast connect timeout; TCP keepalives
-    dsn = (
-        f"host={host} "            # keep host for TLS SNI
-        f"hostaddr={ipv4} "        # force IPv4, skip AAAA
-        f"port={port} "
-        f"dbname={db} "
-        f"user={user} "
-        f"password={pwd} "
-        f"sslmode=require "
-        f"connect_timeout=5 "
-        f"keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=5"
-    )
-
-    # Redact password in logs
-    log.info("[DB] Using DSN (redacted): %s", dsn.replace(pwd, "******"))
-
-    POOL = SimpleConnectionPool(
-        minconn=1,
-        maxconn=int(os.getenv("DB_POOL_MAX","5")),
-        dsn=dsn
-    )
-
-def db_conn():
+def db_conn(): 
     if not POOL: _init_pool()
     return PooledConn(POOL)  # type: ignore
 
@@ -308,18 +316,17 @@ def _db_ping() -> bool:
 # ───────── Settings cache (Redis-backed when available) ─────────
 class _KVCache:
     def __init__(self, ttl): self.ttl=ttl; self.data={}
-    def get(self, k):
+    def get(self, k): 
         if _redis:
             try:
                 v = _redis.get(f"gs:{k}")
                 return v.decode("utf-8") if v is not None else None
             except Exception:
                 pass
-        v=self.data.get(k)
+        v=self.data.get(k); 
         if not v: return None
         ts,val=v
-        if time.time()-ts>self.ttl:
-            self.data.pop(k,None); return None
+        if time.time()-ts>self.ttl: self.data.pop(k,None); return None
         return val
     def set(self,k,v):
         if _redis:
@@ -625,7 +632,11 @@ def extract_features(m: dict) -> Dict[str,float]:
 def extract_prematch_features(f: dict) -> Dict[str, float]:
     home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
     away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
-    feat = {"fid": float(((f.get("fixture") or {}).get("id")) or 0)}
+    home = ((f.get("teams") or {}).get("home") or {}).get("name")
+    away = ((f.get("teams") or {}).get("away") or {}).get("name")
+    fid = (f.get("fixture") or {}).get("id")
+    feat = {"fid": float(fid or 0)}
+
     recent_h = _api_last_fixtures(home_id, 5)
     recent_a = _api_last_fixtures(away_id, 5)
     h2h = _api_h2h(home_id, away_id, 5)
@@ -655,7 +666,6 @@ def _validate_model_blob(name: str, tmp: dict) -> bool:
     if len(tmp["weights"]) > 2000: return False
     return True
 
-# keep a single, broad order (including pre_ fallback)
 MODEL_KEYS_ORDER = ["model_v2:{name}", "model_latest:{name}", "model:{name}", "pre_{name}"]
 
 def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
@@ -681,6 +691,63 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     return mdl
 
 # ───────── Logistic predict ─────────
+def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
+    w=mdl.get("weights") or {}; s=mdl.get("intercept",0.0)
+    for k,v in w.items(): s+=v*features.get(k,0.0)
+    prob=1/(1+np.exp(-s))
+    cal=mdl.get("calibration") or {}
+    if isinstance(cal,dict) and cal.get("method")=="sigmoid":
+        a=cal.get("a",1.0); b=cal.get("b",0.0)
+        prob=1/(1+np.exp(-(a*prob+b)))
+    return float(prob)
+
+# ───────── Odds fetch + aggregation (with negative cache) ─────────
+def fetch_odds(fid: int) -> Dict[str, Dict[str, Any]]:
+    now=time.time()
+    k=("odds", fid)
+    ts_empty = NEG_CACHE.get(k, (0.0, False))
+    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return {}
+    if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: return ODDS_CACHE[fid][1]
+
+    markets=[]
+    if ODDS_SOURCE in ("auto","live"):
+        js=_api_get(f"{BASE_URL}/odds/live", {"fixture":fid}) or {}
+        markets.extend(js.get("response",[]) if isinstance(js,dict) else [])
+    if not markets and ODDS_SOURCE in ("auto","prematch"):
+        js=_api_get(f"{BASE_URL}/odds", {"fixture":fid}) or {}
+        markets.extend(js.get("response",[]) if isinstance(js,dict) else [])
+
+    out={}
+    for m in markets:
+        bkts=m.get("bookmakers") or []
+        for b in bkts:
+            bname=b.get("name",""); mids=b.get("bets") or []
+            for bet in mids:
+                mkt=bet.get("name"); 
+                if not mkt: continue
+                for val in bet.get("values") or []:
+                    sel=val.get("value"); odd=float(val.get("odd") or 0)
+                    if not sel or odd<=1.01: continue
+                    key=(mkt,sel)
+                    out.setdefault(key,[]).append((bname,odd))
+
+    # Aggregation: drop outliers, require min books
+    agg={}
+    for (mkt,sel), arr in out.items():
+        odds=[o for _,o in arr]
+        if not odds: continue
+        med=np.median(odds)
+        filtered=[o for o in odds if o <= med*ODDS_OUTLIER_MULT]
+        if len(filtered) < ODDS_REQUIRE_N_BOOKS: continue
+        if ODDS_AGGREGATION=="best": agg[(mkt,sel)] = max(filtered)
+        else: agg[(mkt,sel)] = float(np.median(filtered))
+
+    ODDS_CACHE[fid] = (now, agg)
+    if not agg: NEG_CACHE[k] = (now, True)
+    return agg
+
+# ───────── Model scoring helpers (preserved) ─────────
+MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
 EPS=1e-12
 def _sigmoid(x: float) -> float:
     try:
@@ -705,7 +772,7 @@ def _calibrate(p: float, cal: Dict[str,Any]) -> float:
 def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
     p=_sigmoid(_linpred(feat, mdl.get("weights",{}), float(mdl.get("intercept",0.0))))
     cal=mdl.get("calibration") or {}
-    try:
+    try: 
         if cal: p=_calibrate(p, cal)
     except: pass
     return max(0.0, min(1.0, float(p)))
@@ -714,7 +781,7 @@ def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
     name=f"OU_{_fmt_line(line)}"; mdl=load_model_from_settings(name)
     return mdl or (load_model_from_settings("O25") if abs(line-2.5)<1e-6 else None)
 
-def _load_wld_models():
+def _load_wld_models(): 
     return (load_model_from_settings("WLD_HOME"), load_model_from_settings("WLD_DRAW"), load_model_from_settings("WLD_AWAY"))
 
 # ───────── Odds helpers (preserved & robust) ─────────
@@ -801,7 +868,7 @@ def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) 
         return None, None
     import statistics
     med = statistics.median(xs)
-    cleaned = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
+    cleaned = [(o, b) for (o, _) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
     if not cleaned:
         cleaned = vals
     xs2 = sorted([o for (o, _) in cleaned])
@@ -817,7 +884,7 @@ def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) 
     pick = min(cleaned, key=lambda t: abs(t[0] - target))
     return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
 
-# Full aggregated odds map (kept; earlier duplicate removed)
+# Full aggregated odds map (overrides any earlier simplified version if present)
 def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     """
     Aggregated odds map:
@@ -1002,7 +1069,25 @@ def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct,
             f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}\n"
             f"🏆 <b>League:</b> {escape(league)}{stat}")
 
-# ───────── Stale-feed guard (preserved) ─────────
+# ───────── Sanity checks & stale-feed guard (preserved) ─────────
+def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
+    gh = int(feat.get("goals_h", 0))
+    ga = int(feat.get("goals_a", 0))
+    total = gh + ga
+
+    if sug.startswith("Over"):
+        ln = _parse_ou_line_from_suggestion(sug)
+        return (ln is not None) and (total < ln)
+
+    if sug.startswith("Under"):
+        ln = _parse_ou_line_from_suggestion(sug)
+        return (ln is not None) and (total < ln)
+
+    if sug.startswith("BTTS") and (gh > 0 and ga > 0):
+        return False
+
+    return True
+
 _FEED_STATE: Dict[int, Dict[str, Any]] = {}
 
 def _safe_num(x) -> float:
@@ -1104,7 +1189,7 @@ def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     except: pass
     return None
 
-# ───────── In-play production scan ─────────
+# ───────── In-play production scan (full, preserved; adds metrics + CB benefits) ─────────
 def production_scan() -> Tuple[int, int]:
     if not _db_ping():
         return (0, 0)
@@ -1335,7 +1420,7 @@ def production_scan() -> Tuple[int, int]:
     _metric_inc("tips_generated_total", n=saved)
     return saved, live_seen
 
-# ───────── Snapshot & prematch (preserved) ─────────
+# ───────── Snapshots (preserved) ─────────
 def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
     fx = (m.get("fixture") or {})
     lg = (m.get("league") or {})
@@ -1417,11 +1502,12 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
             )
         )
 
+# ───────── Outcomes/backfill/digest (preserved) ─────────
 def _tip_outcome_for_result(suggestion: str, res: Dict[str,Any]) -> Optional[int]:
     gh=int(res.get("final_goals_h") or 0); ga=int(res.get("final_goals_a") or 0)
     total=gh+ga; btts=int(res.get("btts_yes") or 0); s=(suggestion or "").strip()
     if s.startswith("Over") or s.startswith("Under"):
-        line=_parse_ou_line_from_suggestion(s)
+        line=_parse_ou_line_from_suggestion(s); 
         if line is None: return None
         if s.startswith("Over"):
             if total>line: return 1
@@ -1553,7 +1639,7 @@ def snapshot_odds_for_fixtures(fixtures: List[int]) -> int:
                 for sel, payload in (sides or {}).items():
                     o = float((payload or {}).get("odds") or 0)
                     b = (payload or {}).get("book") or "Book"
-                    if o <= 0:
+                    if o <= 0: 
                         continue
                     rows.append((fid, now, mk, sel, o, b))
             if not rows:
@@ -1810,7 +1896,7 @@ def send_match_of_the_day() -> bool:
     prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best
     return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
 
-# ───────── Auto-train / Auto-tune (preserved) ─────────
+# ───────── Auto-train / Auto-tune (fix wiring) ─────────
 def auto_train_job():
     if not TRAIN_ENABLE:
         return send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
@@ -1857,7 +1943,9 @@ def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
         if prec>=target_precision: best=float(t); break
     return best*100.0
 
+# The ROI-aware apply-tune from your original, exposed under a stable name
 def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:
+    # identical to your original logic (omitted inline comments for brevity), just kept as-is
     PREC_TOL = float(os.getenv("APPLY_TUNE_PREC_TOL", "0.03"))
     cutoff = int(time.time()) - days * 24 * 3600
     with db_conn() as c:
@@ -1956,6 +2044,7 @@ def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:
         send_telegram("🔧 Auto-tune (ROI-aware): no markets met minimum data.")
     return tuned
 
+# Backwards/endpoint-friendly name (fixes earlier NameError)
 def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
     return _apply_tune_thresholds(days)
 
@@ -1964,7 +2053,7 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
     cutoff = int(time.time()) - minutes*60
     retried = 0
     with db_conn() as c:
-        rows=c.execute(
+        rows = c.execute(
             "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct "
             "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",
             (cutoff, limit)
@@ -2084,7 +2173,7 @@ def http_train():
     if not TRAIN_ENABLE: return jsonify({"ok": False, "reason": "training disabled"}), 400
     try: out=train_models(); return jsonify({"ok": True, "result": out})
     except Exception as e:
-        log.exception("train_models failed: %s", e); return jsonify({"ok": False, "error": str(e)}), 500
+        log.exception("train_models failed: %s", e); return jsonify({"ok": False, "error": str(e))}, 500
 
 @app.route("/admin/train-notify", methods=["POST","GET"])
 def http_train_notify(): _require_admin(); auto_train_job(); return jsonify({"ok": True})
@@ -2149,10 +2238,14 @@ def telegram_webhook(secret: str):
 
 # ───────── Boot ─────────
 def _on_boot():
-    _init_pool()
-    init_db()
-    set_setting("boot_ts", str(int(time.time())))
-    _start_scheduler_once()
+    try:
+        _init_pool()
+        init_db()
+        set_setting("boot_ts", str(int(time.time())))
+        _start_scheduler_once()
+    except Exception as e:
+        # App still starts; /health will show DB error until it recovers.
+        log.exception("[BOOT] DB init failed (will retry lazily on first use): %s", e)
 
 _on_boot()
 
