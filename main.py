@@ -2,7 +2,7 @@
 # Upgraded: circuit breaker, Redis-backed caches (optional), Prometheus-style metrics,
 # DB pool health checks, admin/webhook hardening, and auto-tune wiring fixes — without trimming logic.
 
-import os, json, time, logging, requests, psycopg2
+import os, json, time, logging, requests, socket, psycopg2
 import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
@@ -242,15 +242,46 @@ class PooledConn:
 
 def _init_pool():
     global POOL
-    # ✅ Force psycopg2 to use TCP with SSL (no socket fallback)
+
+    host = "db.fbjmtyfunjsgaxossuhj.supabase.co"
+    port = int(os.getenv("DB_PORT", "5432"))
+    user = os.getenv("PGUSER", "postgres")
+    db   = os.getenv("PGDATABASE", "postgres")
+    pwd  = os.getenv("SUPABASE_PASSWORD")  # keep your existing env
+
+    if not pwd:
+        raise SystemExit("Missing required environment variable: SUPABASE_PASSWORD")
+
+    # Resolve IPv4 only (forces libpq to use IPv4 and skip IPv6)
+    try:
+        hostaddr = next(ai[4][0] for ai in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM))
+    except StopIteration:
+        raise SystemExit(f"No IPv4 A record found for {host}")
+
+    # Optional: use Supabase pooler (reduces connection churn); comment out if not desired
+    if os.getenv("DB_USE_POOLER", "0") not in ("0","false","False","no","NO"):
+        port = 6543  # Supabase connection pooler
+
     dsn = (
-        f"host=db.fbjmtyfunjsgaxossuhj.supabase.co "
-        f"port=5432 "
-        f"dbname=postgres "
-        f"user=postgres "
-        f"password={os.getenv('SUPABASE_PASSWORD')} "
-        f"sslmode=require "
-        f"sslrootcert=/etc/ssl/certs/ca-certificates.crt"
+        f"host={host} "            # keep host for servername/cert matching if you enable verify modes later
+        f"hostaddr={hostaddr} "    # forces IPv4
+        f"port={port} "
+        f"dbname={db} "
+        f"user={user} "
+        f"password={pwd} "
+        f"sslmode=require "        # Supabase requires SSL
+        f"connect_timeout=5 "
+        f"keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=5"
+    )
+
+    # Redact password in logs
+    safe_dsn = dsn.replace(pwd, "******")
+    log.info("[DB] Using DSN (redacted): %s", safe_dsn)
+
+    POOL = SimpleConnectionPool(
+        minconn=1,
+        maxconn=int(os.getenv("DB_POOL_MAX", "5")),
+        dsn=dsn
     )
     log.info(f"[DB] Using DSN: {dsn}")
     POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
