@@ -2170,10 +2170,14 @@ def http_backfill(): _require_admin(); n=backfill_results_for_open_matches(400);
 @app.route("/admin/train", methods=["POST","GET"])
 def http_train():
     _require_admin()
-    if not TRAIN_ENABLE: return jsonify({"ok": False, "reason": "training disabled"}), 400
-    try: out=train_models(); return jsonify({"ok": True, "result": out})
+    if not TRAIN_ENABLE:
+        return jsonify({"ok": False, "reason": "training disabled"}), 400
+    try:
+        out = train_models()
+        return jsonify({"ok": True, "result": out})
     except Exception as e:
-        log.exception("train_models failed: %s", e); return jsonify({"ok": False, "error": str(e))}, 500
+        log.exception("train_models failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/admin/train-notify", methods=["POST","GET"])
 def http_train_notify(): _require_admin(); auto_train_job(); return jsonify({"ok": True})
