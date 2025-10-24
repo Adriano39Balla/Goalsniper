@@ -1,4 +1,3 @@
-
 # file: main.py
 """
 goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate.
@@ -11,7 +10,7 @@ goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate.
 Safe to run on Railway/Render. Requires DATABASE_URL and API keys.
 """
 
-import os, json, time, logging, requests, psycopg2
+import os, json, time, logging, requests, psycopg2, socket
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
@@ -22,6 +21,7 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from urllib.parse import urlparse, unquote
 
 # ───────── Env bootstrap ─────────
 try:
@@ -129,12 +129,8 @@ for _ln in OU_LINES:
     s=_fmt_line(_ln); ALLOWED_SUGGESTIONS.add(f"Over {s} Goals"); ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
 
 # ───────── External APIs / HTTP session ─────────
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL: raise SystemExit("DATABASE_URL is required")
-
 BASE_URL = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES = {"1H","HT","2H","ET","BT","P"}
 
@@ -159,8 +155,70 @@ except Exception as e:
         log.warning("train_models not available: %s", _IMPORT_ERR)
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
     
-# ───────── DB pool & helpers ─────────
+# ───────── DB pool & helpers (IPv4-first, no pooler) ─────────
 POOL: Optional[SimpleConnectionPool] = None
+
+def _resolve_ipv4(host: str, port: int|str) -> Optional[str]:
+    try:
+        infos = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_STREAM)
+        for _family, _socktype, _proto, _canon, sockaddr in infos:
+            ip = sockaddr[0]
+            if ip:
+                return ip
+    except Exception as e:
+        log.warning("[DNS] IPv4 resolve failed for %s:%s: %s — using hostname fallback", host, port, e)
+    return None
+
+def _build_pg_dsn() -> str:
+    """
+    Build a libpq DSN that prefers IPv4 via hostaddr but keeps host for SNI.
+    Sources:
+      - DATABASE_URL (postgres:// or postgresql://)
+      - Optional overrides: DB_HOST, DB_HOSTADDR, DB_PORT, DB_NAME, DB_USER, SUPABASE_PASSWORD
+    """
+    url = os.getenv("DATABASE_URL", "")
+    if not url:
+        raise SystemExit("DATABASE_URL is required")
+
+    user = host = db = pwd = ""
+    port = 5432
+
+    if url.startswith(("postgres://", "postgresql://")):
+        u = urlparse(url)
+        user = unquote(u.username or "") or user
+        pwd  = unquote(u.password or "") or pwd
+        host = (u.hostname or "") or host
+        port = int(u.port or port)
+        db   = (u.path or "").lstrip("/") or db
+
+    # Allow explicit overrides (handy during transitions)
+    host = os.getenv("DB_HOST", host) or host
+    db   = os.getenv("DB_NAME", db) or db or "postgres"
+    user = os.getenv("DB_USER", user) or user or "postgres"
+    pwd  = os.getenv("SUPABASE_PASSWORD", pwd) or pwd
+    port = int(os.getenv("DB_PORT", str(port)) or port)
+
+    # Prefer IPv4 if we can get an A record (Railway usually has no IPv6)
+    hostaddr = os.getenv("DB_HOSTADDR") or _resolve_ipv4(host, port)
+
+    params = {
+        "host": host,                   # for SNI / TLS
+        "port": str(port),
+        "dbname": db,
+        "user": user,
+        "password": pwd,
+        "sslmode": "require",
+        "connect_timeout": os.getenv("PG_CONNECT_TIMEOUT", "10"),
+        "application_name": "goalsniper",
+        "target_session_attrs": "any",
+    }
+    if hostaddr:
+        params["hostaddr"] = hostaddr   # force IPv4 socket
+
+    # Compose DSN; skip empty values
+    dsn = " ".join(f"{k}={v}" for k, v in params.items() if v)
+    return dsn
+
 class PooledConn:
     def __init__(self, pool): self.pool=pool; self.conn=None; self.cur=None
     def __enter__(self): self.conn=self.pool.getconn(); self.conn.autocommit=True; self.cur=self.conn.cursor(); return self
@@ -177,11 +235,16 @@ class PooledConn:
 
 def _init_pool():
     global POOL
-    dsn = DATABASE_URL + (("&" if "?" in DATABASE_URL else "?") + "sslmode=require" if "sslmode=" not in DATABASE_URL else "")
+    if POOL:
+        return
+    dsn = _build_pg_dsn()
+    log.info("[DB] Initializing pool …")
     POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
+    log.info("[DB] Pool ready.")
 
 def db_conn(): 
-    if not POOL: _init_pool()
+    if not POOL:
+        _init_pool()
     return PooledConn(POOL)  # type: ignore
 
 # ───────── Settings cache ─────────
@@ -1746,7 +1809,16 @@ def telegram_webhook(secret: str):
 
 # ───────── Boot ─────────
 def _on_boot():
-    _init_pool(); init_db(); set_setting("boot_ts", str(int(time.time())))
+    # Be tolerant at boot; if DB is not IPv4-ready yet, we’ll connect lazily on first use.
+    try:
+        _init_pool()
+        init_db()
+        try:
+            set_setting("boot_ts", str(int(time.time())))
+        except Exception:
+            pass
+    except Exception as e:
+        log.error("[BOOT] DB init failed (will retry lazily): %s", e)
 
 _on_boot()
 
