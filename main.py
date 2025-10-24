@@ -16,6 +16,7 @@ from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from collections import defaultdict
+from contextlib import contextmanager
 
 # ───────── Env bootstrap ─────────
 try:
@@ -256,30 +257,34 @@ SLEEP_ENABLE = os.getenv("SLEEP_ENABLE", "1").lower() not in ("0","false","no")
 SLEEP_HOURS = os.getenv("SLEEP_HOURS", "22-08")  # "HH-HH" Berlin time
 
 def is_sleep_time() -> bool:
-    """
-    Configurable sleep window (default 22:00–08:00 Berlin) to ease API rate limits.
-    Disable with SLEEP_ENABLE=0.
-    """
     try:
-        if not SLEEP_ENABLE:
-            return False
         now_berlin = datetime.now(BERLIN_TZ)
-        h = now_berlin.hour
-        start, end = (int(x) for x in SLEEP_HOURS.split("-", 1))
-        if start <= end:   # e.g., 01-06
-            return start <= h < end
-        else:              # e.g., 22-08 (wrap-around)
-            return (h >= start) or (h < end)
+        current_hour = now_berlin.hour
+        return current_hour >= 22 or current_hour < 8
     except Exception as e:
         log.warning("[SLEEP_TIME] Error checking sleep time: %s", e)
         return False
 
-def sleep_if_required():
-    """Return True if we are in sleep window (caller should skip API call)."""
-    if is_sleep_time():
-        log.info("[SLEEP] Sleeping during quiet hours to avoid API rate limiting")
-        return True
-    return False
+def sleep_if_required() -> bool:
+    """Return True if we should sleep/skip work."""
+    # Global override via env or per-request flag
+    if os.getenv("DISABLE_SLEEP", "0") not in ("0","false","False","no","NO"):
+        return False
+    if os.getenv("_GS_FORCE_NO_SLEEP") == "1":
+        return False
+    return is_sleep_time()
+
+@contextmanager
+def _no_sleep_override():
+    old = os.environ.get("_GS_FORCE_NO_SLEEP")
+    os.environ["_GS_FORCE_NO_SLEEP"] = "1"
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("_GS_FORCE_NO_SLEEP", None)
+        else:
+            os.environ["_GS_FORCE_NO_SLEEP"] = old
 
 def api_get_with_sleep(url: str, params: dict, timeout: int = 15):
     """
@@ -2845,13 +2850,15 @@ def http_init_db():
 @app.route("/admin/scan", methods=["POST","GET"])
 def http_scan():
     _require_admin()
-    s,l=production_scan()
+    with _no_sleep_override():
+        s,l = production_scan()
     return jsonify({"ok": True, "saved": s, "live_seen": l})
 
 @app.route("/admin/backfill-results", methods=["POST","GET"])
 def http_backfill():
     _require_admin()
-    n=backfill_results_for_open_matches(400)
+    with _no_sleep_override():
+        n = backfill_results_for_open_matches(400)
     return jsonify({"ok": True, "updated": n})
 
 @app.route("/admin/train", methods=["POST","GET"])
@@ -2875,7 +2882,8 @@ def http_train_notify():
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest():
     _require_admin()
-    msg=daily_accuracy_digest()
+    with _no_sleep_override():
+        msg = daily_accuracy_digest()
     return jsonify({"ok": True, "sent": bool(msg)})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
@@ -2883,6 +2891,21 @@ def http_auto_tune():
     _require_admin()
     tuned=auto_tune_thresholds(14)
     return jsonify({"ok": True, "tuned": tuned})
+
+# Ensure _apply_tune_thresholds exists before the public wrapper
+try:
+    _apply_tune_thresholds  # type: ignore  # noqa: F401
+except NameError:
+    def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:  # type: ignore
+        log.warning("[AUTO-TUNE] _apply_tune_thresholds missing; no-op")
+        return {}
+
+def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
+    try:
+        return _apply_tune_thresholds(days)
+    except Exception as e:
+        log.exception("[AUTO-TUNE] failed: %s", e)
+        return {}
 
 @app.route("/admin/retry-unsent", methods=["POST","GET"])
 def http_retry_unsent():
@@ -2893,13 +2916,15 @@ def http_retry_unsent():
 @app.route("/admin/prematch-scan", methods=["POST","GET"])
 def http_prematch_scan():
     _require_admin()
-    saved=prematch_scan_save()
+    with _no_sleep_override():
+        saved = prematch_scan_save()
     return jsonify({"ok": True, "saved": int(saved)})
 
 @app.route("/admin/motd", methods=["POST","GET"])
 def http_motd():
     _require_admin()
-    ok = send_match_of_the_day()
+    with _no_sleep_override():
+        ok = send_match_of_the_day()
     return jsonify({"ok": bool(ok)})
 
 @app.route("/admin/motd-test", methods=["POST","GET"])
