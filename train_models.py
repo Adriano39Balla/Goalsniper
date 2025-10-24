@@ -1,7 +1,10 @@
-# file: train_models.py
+# train_models.py — cleaned & robust (aligned with main.py)
 
-
-import argparse, json, os, logging, math
+import argparse
+import json
+import os
+import logging
+import socket
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -23,7 +26,7 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger("trainer")
 
-# ───────────────────────── Feature sets (match main.py) ───────────────────────── #
+# ───────────────────────── Feature sets (must match main.py) ───────────────────────── #
 
 FEATURES: List[str] = [
     "minute",
@@ -37,17 +40,11 @@ FEATURES: List[str] = [
     "yellow_h","yellow_a",
 ]
 
-# Prematch snapshots (as saved by main.save_prematch_snapshot via extract_prematch_features)
+# Prematch snapshots saved by main.save_prematch_snapshot(extract_prematch_features)
+# In main.py these keys are: avg_goals_h, avg_goals_a, avg_goals_h2h, rest_days_h, rest_days_a
+# (We intentionally do NOT include "fid" in features.)
 PRE_FEATURES: List[str] = [
-    "pm_ov25_h","pm_ov35_h","pm_btts_h",
-    "pm_ov25_a","pm_ov35_a","pm_btts_a",
-    "pm_ov25_h2h","pm_ov35_h2h","pm_btts_h2h",
-    # live placeholders for shape-compat
-    "minute","goals_h","goals_a","goals_sum","goals_diff",
-    "xg_h","xg_a","xg_sum","xg_diff","sot_h","sot_a","sot_sum",
-    "sh_total_h","sh_total_a","cor_h","cor_a","cor_sum",
-    "pos_h","pos_a","pos_diff","red_h","red_a","red_sum",
-    "yellow_h","yellow_a",
+    "avg_goals_h","avg_goals_a","avg_goals_h2h","rest_days_h","rest_days_a"
 ]
 
 EPS = 1e-6
@@ -85,13 +82,63 @@ def _parse_ou_lines(raw: str) -> List[float]:
         except: pass
     return vals or [2.5, 3.5]
 
-# ─────────────────────── DB utils ─────────────────────── #
+# ─────────────────────── DB utils (IPv4, SSL, keepalives) ─────────────────────── #
 
-def _connect(db_url: str):
-    if not db_url: raise SystemExit("DATABASE_URL must be set.")
-    if "sslmode=" not in db_url:
-        db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
-    conn = psycopg2.connect(db_url); conn.autocommit = True
+def _resolve_ipv4(host: str, port: int) -> str:
+    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    if not infos:
+        raise SystemExit(f"No IPv4 A record found for {host}")
+    return infos[0][4][0]
+
+def _build_dsn_from_env() -> Optional[str]:
+    """
+    Prefer PG* envs (or SUPABASE_*) to construct a psycopg2 DSN with:
+      - host (for TLS SNI) + hostaddr (forced IPv4)
+      - sslmode=require
+      - connect_timeout + TCP keepalives
+    Falls back to DATABASE_URL if PG* not provided.
+    """
+    host = os.getenv("PGHOST") or os.getenv("DB_HOST") or "db.fbjmtyfunjsgaxossuhj.supabase.co"
+    port = int(os.getenv("PGPORT") or os.getenv("DB_PORT") or "5432")
+    db   = os.getenv("PGDATABASE") or os.getenv("DB_NAME") or "postgres"
+    user = os.getenv("PGUSER") or os.getenv("DB_USER") or "postgres"
+    pwd  = os.getenv("PGPASSWORD") or os.getenv("SUPABASE_PASSWORD") or os.getenv("DB_PASSWORD")
+
+    # If we have password, assume we can build a DSN; otherwise fallback to DATABASE_URL
+    if pwd:
+        ipv4 = _resolve_ipv4(host, port)
+        dsn = (
+            f"host={host} hostaddr={ipv4} port={port} dbname={db} user={user} password={pwd} "
+            f"sslmode=require connect_timeout=5 "
+            f"keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=5"
+        )
+        logger.info("[DB] Using DSN from PG* env (password redacted).")
+        return dsn
+    return None
+
+def _connect(db_url: Optional[str] = None):
+    """
+    Connection strategy:
+      1) Use PG* envs (preferred), with IPv4 hostaddr + SSL + keepalives.
+      2) Else, use DATABASE_URL (append sslmode=require if missing).
+    """
+    dsn = _build_dsn_from_env()
+    if dsn:
+        conn = psycopg2.connect(dsn)
+        conn.autocommit = True
+        return conn
+
+    url = db_url or os.getenv("DATABASE_URL") or ""
+    if not url:
+        raise SystemExit("Missing DB credentials: set PGPASSWORD (+ PGHOST/PGDATABASE/PGUSER) or DATABASE_URL.")
+    if "sslmode=" not in url:
+        url = url + ("&" if "?" in url else "?") + "sslmode=require"
+    # Add modest connect timeout via options if not present
+    if "connect_timeout=" not in url:
+        url = url + ("&" if "?" in url else "?") + "connect_timeout=5"
+    logger.info("[DB] Using DATABASE_URL (sslmode=require).")
+    conn = psycopg2.connect(url)
+    conn.autocommit = True
     return conn
 
 def _read_sql(conn, sql: str, params: Tuple = ()) -> pd.DataFrame:
@@ -107,6 +154,7 @@ def _set_setting(conn, key: str, value: str) -> None:
           (key, value))
 
 def _ensure_training_tables(conn) -> None:
+    # Lightweight: ensure the tables this script writes to exist.
     _exec(conn, "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     _exec(conn, """
         CREATE TABLE IF NOT EXISTS prematch_snapshots (
@@ -116,6 +164,24 @@ def _ensure_training_tables(conn) -> None:
         )
     """)
     _exec(conn, "CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
+    # The in-play loader reads tip_snapshots & match_results; create if absent (no-op if present).
+    _exec(conn, """
+        CREATE TABLE IF NOT EXISTS tip_snapshots (
+            match_id BIGINT,
+            created_ts BIGINT,
+            payload TEXT,
+            PRIMARY KEY (match_id, created_ts)
+        )
+    """)
+    _exec(conn, """
+        CREATE TABLE IF NOT EXISTS match_results (
+            match_id BIGINT PRIMARY KEY,
+            final_goals_h INTEGER,
+            final_goals_a INTEGER,
+            btts_yes INTEGER,
+            updated_ts BIGINT
+        )
+    """)
 
 def _get_setting_json(conn, key: str) -> Optional[dict]:
     try:
@@ -293,7 +359,7 @@ def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: s
         a,b = cal_obj
         blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
     else:
-        # keep serving simple: approximate isotonic in logit space
+        # Isotonic -> approximate in logit space for serving simplicity
         x = np.concatenate([
             np.linspace(0.01, 0.10, 30),
             np.linspace(0.10, 0.90, 120),
@@ -315,12 +381,9 @@ def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]
 
 def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray, features: List[str]) -> Tuple[float, Dict[str, float]]:
     """Convert weights learned on standardized X back to raw feature space."""
-    # model.coef_ is for standardized features => w_std
     w_std = model.coef_.ravel().astype(float)
     b_std = float(model.intercept_.ravel()[0])
-    # raw weights
     w_raw = (w_std / scale).astype(float)
-    # intercept shift: b_raw = b_std - sum_j (w_std_j * mean_j / scale_j)
     b_raw = float(b_std - np.sum(w_std * (mean / scale)))
     weights = {name: float(w) for name, w in zip(features, w_raw.tolist())}
     return b_raw, weights
@@ -420,7 +483,6 @@ def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, featu
     fidx = {f:i for i,f in enumerate(features)}
     keep = np.ones(len(y_all), dtype=bool)
 
-    # helpers
     def col(name): return X_all[:, fidx[name]] if name in fidx else np.zeros(len(X_all))
 
     goals_sum = col("goals_sum")
@@ -431,13 +493,9 @@ def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, featu
             ln = float(market_key.split("_", 1)[1].replace(",", "."))
         except Exception:
             ln = 2.5
-        # if goals_sum > line, Over is already guaranteed; drop that snapshot
         keep &= ~(goals_sum > ln)
     elif market_key == "BTTS_YES":
-        # both already scored -> BTTS is locked as True; drop
         keep &= ~((gh > 0) & (ga > 0))
-    # 1X2_* : no drop
-
     return keep
 
 def _train_binary_head(
@@ -460,14 +518,10 @@ def _train_binary_head(
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
     """
     Train one binary head (e.g., BTTS_YES, OU_2.5, WLD_HOME).
-
-    Changes vs. original:
-      - Standardize X on train fold (mean/std), then fold scaler back into weights
-        so serving code in main.py remains unchanged.
-      - Drop trivial/decided in-play snapshots for this head (focus on uncertain states).
-      - Deterministic LogisticRegression (random_state) + tunable C via LR_C.
+    - Standardize X (train fold), fit LR, calibrate on val fold.
+    - Fold scaler back into raw-space weights for serving compatibility.
+    - Drop trivially decided in-play snapshots for the specific head (train only).
     """
-    # sanity
     if len(np.unique(y_all)) < 2:
         return False, {}, None
 
@@ -487,31 +541,25 @@ def _train_binary_head(
             mask_tr = new_mask_tr
         else:
             logger.info("[TRAIN] %s: undecided filter removed all train rows; proceeding without it.", model_key)
-    except Exception as _:
-        # be permissive; training should still proceed
+    except Exception:
         pass
 
-    # Split to folds
     X_tr, X_te = X_all[mask_tr], X_all[mask_te]
     y_tr, y_te = y_all[mask_tr], y_all[mask_te]
     ts_tr      = ts_all[mask_tr]
 
-    # Standardize on train, apply to test
     X_tr_std, mu, sd = _standardize_fit(X_tr)
     X_te_std = (X_te - mu) / sd
 
-    # Fit LR with recency weights
     sw = recency_weights(ts_tr)
     model = fit_lr_safe(X_tr_std, y_tr, sample_weight=sw)
     if model is None:
         return False, {}, None
 
-    # Validate (calibration on validation fold)
     p_raw_te = model.predict_proba(X_te_std)[:, 1]
     cal_kind, cal_obj = _fit_calibration(y_te, p_raw_te)
     p_cal = _apply_calibration(p_raw_te, cal_kind, cal_obj)
 
-    # Metrics
     mets = {
         "brier": float(brier_score_loss(y_te, p_cal)),
         "auc": float(roc_auc_score(y_te, p_cal)) if len(np.unique(y_te)) > 1 else float("nan"),
@@ -525,12 +573,10 @@ def _train_binary_head(
     if metrics_name:
         logger.info("[METRICS] %s: %s", metrics_name, mets)
 
-    # Serialize model: fold scaler into raw-space weights so serving stays unchanged
     blob = build_model_blob(model, feature_names, cal_kind, cal_obj, mean=mu, scale=sd)
     for k in (f"model_latest:{model_key}", f"model:{model_key}"):
         _set_setting(conn, k, json.dumps(blob))
 
-    # Optional: derive/update per-market threshold from validation fold
     if threshold_label:
         thr_prob = _pick_threshold_for_target_precision(
             y_true=y_te,
@@ -554,7 +600,7 @@ def train_models(
     test_size: Optional[float] = None,
     min_rows: Optional[int] = None,
 ) -> Dict[str,Any]:
-    conn = _connect(db_url or os.getenv("DATABASE_URL"))
+    conn = _connect(db_url)
     _ensure_training_tables(conn)
 
     min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
@@ -602,6 +648,7 @@ def train_models(
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
+                    # Back-compat alias for 2.5 (O25) if used by main as fallback
                     if abs(line-2.5) < 1e-6:
                         blob = _get_setting_json(conn, f"model_latest:{name}")
                         if blob is not None:
@@ -744,13 +791,13 @@ def train_models(
 
 def _cli_main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db-url", help="Postgres DSN (or use env DATABASE_URL)")
+    ap.add_argument("--db-url", help="Postgres DSN (fallback if no PG* env)", default=None)
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=int(os.getenv("TRAIN_MIN_MINUTE", 15)))
     ap.add_argument("--test-size", type=float, default=float(os.getenv("TRAIN_TEST_SIZE", 0.25)))
     ap.add_argument("--min-rows", type=int, default=int(os.getenv("MIN_ROWS", 150)))
     args = ap.parse_args()
     res = train_models(
-        db_url=args.db_url or os.getenv("DATABASE_URL"),
+        db_url=args.db_url,
         min_minute=args.min_minute, test_size=args.test_size, min_rows=args.min_rows
     )
     print(json.dumps(res, indent=2))
