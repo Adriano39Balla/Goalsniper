@@ -7,10 +7,9 @@ import psycopg2
 from psycopg2 import OperationalError
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     brier_score_loss, accuracy_score, log_loss, precision_score,
-    roc_auc_score, precision_recall_curve
+    roc_auc_score
 )
 
 try:
@@ -61,7 +60,7 @@ EPS = 1e-6
 
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "120"))
 RECENCY_MONTHS         = int(os.getenv("RECENCY_MONTHS", "36"))
-MARKET_CUTOFFS_RAW     = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
+MARKET_CUTOFFS_RAW     = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88"))
 TIP_MAX_MINUTE_ENV     = os.getenv("TIP_MAX_MINUTE", "")
 OU_TRAIN_LINES_RAW     = os.getenv("OU_TRAIN_LINES", os.getenv("OU_LINES", "2.5,3.5"))
 TRAIN_MIN_MINUTE       = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
@@ -504,15 +503,22 @@ def train_market_model(X: np.ndarray, y: List[int], weights: np.ndarray,
         
         model.fit(X_train, y_train, sample_weight=w_train)
         
-        # Enhanced: Calibration using isotonic regression
+        # Enhanced: Calibration using Platt scaling (sigmoid) which is serializable
         train_probs = model.predict_proba(X_train)[:, 1]
         test_probs = model.predict_proba(X_test)[:, 1]
         
         # Only calibrate if we have enough samples
         if len(y_test) > 50:
-            calibrator = IsotonicRegression(out_of_bounds='clip')
-            calibrator.fit(train_probs, y_train)
-            calibrated_probs = calibrator.predict(test_probs)
+            from sklearn.linear_model import LogisticRegression as CalibrationLR
+            
+            # Use Platt scaling (sigmoid calibration) instead of isotonic
+            calibrator = CalibrationLR()
+            # Reshape for calibration
+            train_probs_2d = train_probs.reshape(-1, 1)
+            test_probs_2d = test_probs.reshape(-1, 1)
+            
+            calibrator.fit(train_probs_2d, y_train)
+            calibrated_probs = calibrator.predict_proba(test_probs_2d)[:, 1]
             
             # Use calibration if it improves Brier score
             original_brier = brier_score_loss(y_test, test_probs)
@@ -520,12 +526,11 @@ def train_market_model(X: np.ndarray, y: List[int], weights: np.ndarray,
             
             if calibrated_brier < original_brier:
                 calibration = {
-                    "method": "isotonic",
-                    "a": 1.0,  # Placeholder for sigmoid params
-                    "b": 0.0,
-                    "calibrator": calibrator
+                    "method": "sigmoid",
+                    "a": float(calibrator.coef_[0][0]),  # Serializable float
+                    "b": float(calibrator.intercept_[0])  # Serializable float
                 }
-                logger.info("Market %s: calibration improved Brier score from %.4f to %.4f", 
+                logger.info("Market %s: Platt calibration improved Brier score from %.4f to %.4f", 
                            market, original_brier, calibrated_brier)
             else:
                 calibration = {"method": "sigmoid", "a": 1.0, "b": 0.0}
