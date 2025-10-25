@@ -18,6 +18,12 @@ from apscheduler.triggers.cron import CronTrigger
 from collections import defaultdict
 from contextlib import contextmanager
 
+# ───────── Global Variables ─────────
+_SCHED = None
+_SHUTDOWN_RAN = False
+_SHUTDOWN_HANDLERS_SET = False
+EPS = 1e-9
+
 # ───────── Env bootstrap ─────────
 try:
     from dotenv import load_dotenv
@@ -260,6 +266,7 @@ def is_sleep_time() -> bool:
     try:
         now_berlin = datetime.now(BERLIN_TZ)
         current_hour = now_berlin.hour
+        # Fixed: sleep between 22:00 and 08:00 Berlin time
         return current_hour >= 22 or current_hour < 8
     except Exception as e:
         log.warning("[SLEEP_TIME] Error checking sleep time: %s", e)
@@ -1113,59 +1120,6 @@ def extract_enhanced_features(m: dict) -> Dict[str, float]:
     })
     return base_feat
 
-# ───────── Model loader (with validation) ─────────
-def _validate_model_blob(name: str, tmp: dict) -> bool:
-    if not isinstance(tmp, dict): return False
-    if "weights" not in tmp or "intercept" not in tmp: return False
-    if not isinstance(tmp["weights"], dict): return False
-    if len(tmp["weights"]) > 2000: return False
-    return True
-
-MODEL_KEYS_ORDER = ["model_v2:{name}", "model_latest:{name}", "model:{name}", "pre_{name}"]
-
-def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
-    cached=_MODELS_CACHE.get(name)
-    if cached is not None: return cached
-    mdl=None
-    for pat in MODEL_KEYS_ORDER:
-        raw=get_setting_cached(pat.format(name=name))
-        if not raw: continue
-        try:
-            tmp=json.loads(raw)
-            if not _validate_model_blob(name,tmp):
-                log.warning("[MODEL] invalid schema for %s", name); continue
-            tmp.setdefault("intercept",0.0); tmp.setdefault("weights",{})
-            cal=tmp.get("calibration") or {}
-            if isinstance(cal,dict):
-                cal.setdefault("method","sigmoid"); cal.setdefault("a",1.0); cal.setdefault("b",0.0)
-                tmp["calibration"]=cal
-            mdl=tmp; break
-        except Exception as e:
-            log.warning("[MODEL] parse %s failed: %s", name, e)
-    if mdl is not None: _MODELS_CACHE.set(name, mdl)
-    return mdl
-
-# ───────── Logistic predict (PATCHED calibration math) ─────────
-def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
-    w = mdl.get("weights") or {}
-    s = float(mdl.get("intercept", 0.0) or 0.0)
-    for k, v in w.items():
-        s += float(v or 0.0) * float(features.get(k, 0.0))
-    # base prob from linear predictor
-    prob = 1.0 / (1.0 + np.exp(-s))
-    # apply calibration on LOGIT, not on prob directly
-    cal = mdl.get("calibration") or {}
-    try:
-        method = str(cal.get("method", "sigmoid")).lower()
-        a = float(cal.get("a", 1.0)); b = float(cal.get("b", 0.0))
-        if method in ("platt", "sigmoid"):
-            p = max(1e-12, min(1-1e-12, prob))
-            z = np.log(p/(1-p))
-            prob = 1.0 / (1.0 + np.exp(-(a*z + b)))
-    except Exception:
-        pass
-    return float(max(0.0, min(1.0, prob)))
-
 # ───────── ENHANCEMENT 2: Advanced Feature Engineering (class) ─────────
 class AdvancedFeatureEngineer:
     """Advanced feature engineering with temporal patterns and game context"""
@@ -1315,8 +1269,8 @@ class MarketSpecificPredictor:
     def __init__(self):
         self.market_strategies = {
             "BTTS": self._predict_btts_advanced,
-            "OU": self._predict_ou_advanced, 
-            "1X2": self._predict_1x2_advanced
+            "OU": self._predict_ou_advanced
+            # Removed 1X2 from strategies since it returns 3 values
         }
         self.market_feature_sets = self._initialize_market_features()
     
@@ -1554,6 +1508,219 @@ class AdaptiveLearningSystem:
 
 # Initialize adaptive learning system
 adaptive_learner = AdaptiveLearningSystem()
+
+# ───────── Missing Function Implementations ─────────
+
+def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
+    """Check if we have sufficient statistical coverage"""
+    # Check if we have basic stats available
+    required_stats = ['xg_h', 'xg_a', 'sot_h', 'sot_a']
+    has_required = all(feat.get(stat, 0) > 0 for stat in required_stats)
+    
+    # For early minutes, require less coverage
+    if minute < 25:
+        return has_required or feat.get('pos_h', 0) > 0
+    else:
+        # For later minutes, require better coverage
+        return has_required and feat.get('pos_h', 0) > 0
+
+def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
+    """Check if the data feed is stale"""
+    if not STALE_GUARD_ENABLE:
+        return False
+    
+    # Check if events are recent
+    events = m.get("events", [])
+    if events:
+        latest_event_minute = max([ev.get('time', {}).get('elapsed', 0) for ev in events], default=0)
+        if minute - latest_event_minute > 10 and minute > 30:
+            return True
+    
+    # Check if stats are recent
+    cache_time = STATS_CACHE.get(fid, (0, []))[0]
+    if time.time() - cache_time > STALE_STATS_MAX_SEC:
+        return True
+        
+    return False
+
+def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
+    """Save snapshot for training data"""
+    try:
+        fid = int((m.get("fixture") or {}).get("id") or 0)
+        if not fid:
+            return
+            
+        now = int(time.time())
+        payload = json.dumps({
+            "match": m,
+            "features": feat,
+            "timestamp": now
+        }, separators=(",", ":"), ensure_ascii=False)
+        
+        with db_conn() as c:
+            c.execute(
+                "INSERT INTO tip_snapshots(match_id, created_ts, payload) "
+                "VALUES (%s,%s,%s) "
+                "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
+                (fid, now, payload)
+            )
+    except Exception as e:
+        log.warning("[SNAPSHOT] Failed to save snapshot: %s", e)
+
+def _league_name(m: dict) -> Tuple[int, str]:
+    """Extract league ID and name from match data"""
+    league = m.get("league", {}) or {}
+    league_id = int(league.get("id", 0))
+    country = league.get("country", "")
+    name = league.get("name", "")
+    league_name = f"{country} - {name}".strip(" -")
+    return league_id, league_name
+
+def _teams(m: dict) -> Tuple[str, str]:
+    """Extract team names from match data"""
+    teams = m.get("teams", {}) or {}
+    home = (teams.get("home") or {}).get("name", "")
+    away = (teams.get("away") or {}).get("name", "")
+    return home, away
+
+def _pretty_score(m: dict) -> str:
+    """Format score string"""
+    goals = m.get("goals", {}) or {}
+    home = goals.get("home") or 0
+    away = goals.get("away") or 0
+    return f"{home}-{away}"
+
+def _get_market_threshold(market: str) -> float:
+    """Get confidence threshold for a specific market"""
+    # Try market-specific threshold first
+    market_key = f"conf_threshold:{market}"
+    cached = get_setting_cached(market_key)
+    if cached:
+        try:
+            return float(cached)
+        except:
+            pass
+    
+    # Fall back to global threshold
+    return CONF_THRESHOLD
+
+def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
+    """Check if a prediction candidate makes sense given current match state"""
+    minute = int(feat.get("minute", 0))
+    goals_sum = feat.get("goals_sum", 0)
+    
+    # Check for absurd Over/Under predictions
+    if suggestion.startswith("Under"):
+        try:
+            line = _parse_ou_line_from_suggestion(suggestion)
+            if line and goals_sum > line:
+                return False  # Can't go under if already over
+        except:
+            pass
+            
+    # Check for absurd BTTS predictions
+    if suggestion == "BTTS: No" and goals_sum >= 2:
+        # If both teams have scored, BTTS: No doesn't make sense
+        goals_h = feat.get("goals_h", 0)
+        goals_a = feat.get("goals_a", 0)
+        if goals_h > 0 and goals_a > 0:
+            return False
+            
+    return True
+
+def _get_pre_match_probability(fid: int, market: str):
+    """Get pre-match probability for Bayesian updating"""
+    # This would typically query pre-match models or historical data
+    # For now, return None to indicate no pre-match data available
+    return None
+
+def extract_prematch_features(fx: dict) -> Dict[str, float]:
+    """Extract features for pre-match predictions"""
+    # Basic prematch features - would typically include:
+    # team form, H2H, missing players, etc.
+    feat = {}
+    
+    # Placeholder implementation
+    teams = fx.get("teams", {}) or {}
+    home_team = (teams.get("home") or {}).get("name", "")
+    away_team = (teams.get("away") or {}).get("name", "")
+    
+    # Add basic features (these would be populated from external data)
+    feat["home_team_strength"] = 0.5
+    feat["away_team_strength"] = 0.5
+    feat["form_differential"] = 0.0
+    feat["h2h_advantage"] = 0.0
+    
+    return feat
+
+def _score_prob(feat: Dict[str, float], mdl: Optional[Dict[str, Any]]) -> float:
+    """Score probability using a model"""
+    if not mdl:
+        return 0.0
+    return predict_from_model(mdl, feat)
+
+def _get_market_threshold_pre(market: str) -> float:
+    """Get confidence threshold for pre-match markets"""
+    # Pre-match markets might have different thresholds
+    market_key = f"conf_threshold_pre:{market}"
+    cached = get_setting_cached(market_key)
+    if cached:
+        try:
+            return float(cached)
+        except:
+            pass
+    
+    # Slightly higher threshold for pre-match by default
+    return CONF_THRESHOLD + 5.0
+
+def cleanup_caches():
+    """Clean up expired cache entries"""
+    now = time.time()
+    
+    # Clean STATS_CACHE
+    expired = [fid for fid, (ts, _) in STATS_CACHE.items() if now - ts > 300]
+    for fid in expired:
+        STATS_CACHE.pop(fid, None)
+    
+    # Clean EVENTS_CACHE
+    expired = [fid for fid, (ts, _) in EVENTS_CACHE.items() if now - ts > 300]
+    for fid in expired:
+        EVENTS_CACHE.pop(fid, None)
+        
+    # Clean ODDS_CACHE
+    expired = [fid for fid, (ts, _) in ODDS_CACHE.items() if now - ts > 300]
+    for fid in expired:
+        ODDS_CACHE.pop(fid, None)
+        
+    # Clean NEG_CACHE
+    expired = [key for key, (ts, _) in NEG_CACHE.items() if now - ts > NEG_TTL_SEC]
+    for key in expired:
+        NEG_CACHE.pop(key, None)
+
+def _format_tip_message(home, away, league, minute, score, suggestion, confidence, feat, odds=None, book=None, ev_pct=None):
+    """Format a tip message for Telegram (used in retry_unsent_tips)"""
+    stat = ""
+    if any([feat.get("xg_h",0),feat.get("xg_a",0),feat.get("sot_h",0),feat.get("sot_a",0),
+            feat.get("cor_h",0),feat.get("cor_a",0),feat.get("pos_h",0),feat.get("pos_a",0)]):
+        stat = (f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
+                f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
+                f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
+        if feat.get("pos_h",0) or feat.get("pos_a",0): 
+            stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
+    
+    money = ""
+    if odds:
+        if ev_pct is not None:
+            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
+        else:
+            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
+            
+    return ("⚽️ <b>AI TIP!</b>\n"
+            f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
+            f"🕒 <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score)}\n"
+            f"<b>Tip:</b> {escape(suggestion)}\n"
+            f"📈 <b>Confidence:</b> {confidence:.1f}%{money}\n"
+            f"🏆 <b>League:</b> {escape(league)}{stat}")
 
 # ───────── Odds helpers & aggregation ─────────
 def _ev(prob: float, odds: float) -> float:
@@ -2013,9 +2180,9 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, ou_confidence))
                             log.info(f"[OU_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {ou_confidence:.3f})")
 
-                # 3) 1X2 (draw suppressed)
+                # 3) 1X2 (draw suppressed) - use direct method call since it returns 3 values
                 try:
-                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
+                    prob_h, prob_a, confidence_1x2 = market_predictor._predict_1x2_advanced(feat, minute)
                     if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
                         total = prob_h + prob_a
                         if total > 0:
@@ -2185,6 +2352,59 @@ def enhanced_production_scan() -> Tuple[int, int]:
 # Keep production_scan as alias
 def production_scan() -> Tuple[int, int]:
     return enhanced_production_scan()
+
+# ───────── Model loader (with validation) ─────────
+def _validate_model_blob(name: str, tmp: dict) -> bool:
+    if not isinstance(tmp, dict): return False
+    if "weights" not in tmp or "intercept" not in tmp: return False
+    if not isinstance(tmp["weights"], dict): return False
+    if len(tmp["weights"]) > 2000: return False
+    return True
+
+MODEL_KEYS_ORDER = ["model_v2:{name}", "model_latest:{name}", "model:{name}", "pre_{name}"]
+
+def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
+    cached=_MODELS_CACHE.get(name)
+    if cached is not None: return cached
+    mdl=None
+    for pat in MODEL_KEYS_ORDER:
+        raw=get_setting_cached(pat.format(name=name))
+        if not raw: continue
+        try:
+            tmp=json.loads(raw)
+            if not _validate_model_blob(name,tmp):
+                log.warning("[MODEL] invalid schema for %s", name); continue
+            tmp.setdefault("intercept",0.0); tmp.setdefault("weights",{})
+            cal=tmp.get("calibration") or {}
+            if isinstance(cal,dict):
+                cal.setdefault("method","sigmoid"); cal.setdefault("a",1.0); cal.setdefault("b",0.0)
+                tmp["calibration"]=cal
+            mdl=tmp; break
+        except Exception as e:
+            log.warning("[MODEL] parse %s failed: %s", name, e)
+    if mdl is not None: _MODELS_CACHE.set(name, mdl)
+    return mdl
+
+# ───────── Logistic predict (PATCHED calibration math) ─────────
+def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
+    w = mdl.get("weights") or {}
+    s = float(mdl.get("intercept", 0.0) or 0.0)
+    for k, v in w.items():
+        s += float(v or 0.0) * float(features.get(k, 0.0))
+    # base prob from linear predictor
+    prob = 1.0 / (1.0 + np.exp(-s))
+    # apply calibration on LOGIT, not on prob directly
+    cal = mdl.get("calibration") or {}
+    try:
+        method = str(cal.get("method", "sigmoid")).lower()
+        a = float(cal.get("a", 1.0)); b = float(cal.get("b", 0.0))
+        if method in ("platt", "sigmoid"):
+            p = max(1e-12, min(1-1e-12, prob))
+            z = np.log(p/(1-p))
+            prob = 1.0 / (1.0 + np.exp(-(a*z + b)))
+    except Exception:
+        pass
+    return float(max(0.0, min(1.0, prob)))
 
 # ───────── Outcomes/backfill/digest (minor safety tweaks preserved) ─────────
 def _tip_outcome_for_result(suggestion: str, res: Dict[str,Any]) -> Optional[int]:
