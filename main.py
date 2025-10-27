@@ -2435,55 +2435,118 @@ def _fixture_by_id(mid: int) -> Optional[dict]:
 def _is_final(short: str) -> bool:
     return (short or "").upper() in {"FT","AET","PEN"}
 
-def backfill_results_for_open_matches(max_rows: int = 200) -> int:
-    if sleep_if_required():
+def backfill_results_for_open_matches(max_rows: int = 200, ignore_sleep: bool = False) -> int:
+    """Backfill results for open matches.
+    If ignore_sleep=True, bypasses the quiet-hours sleep guard (used by /admin/digest?force=1)."""
+    if sleep_if_required() and not ignore_sleep:
         log.info("[BACKFILL] Skipping during sleep hours (22:00-08:00 Berlin time)")
         return 0
     
-    now_ts=int(time.time()); cutoff=now_ts - BACKFILL_DAYS*24*3600; updated=0
-    with db_conn() as c:
-        rows=c.execute("""
-            WITH last AS (SELECT match_id, MAX(created_ts) last_ts FROM tips WHERE created_ts >= %s GROUP BY match_id)
-            SELECT l.match_id FROM last l LEFT JOIN match_results r ON r.match_id=l.match_id
-            WHERE r.match_id IS NULL ORDER BY l.last_ts DESC LIMIT %s
-        """,(cutoff, max_rows)).fetchall()
-    for (mid,) in rows:
-        fx=_fixture_by_id(int(mid))
-        if not fx: continue
-        st=(((fx.get("fixture") or {}).get("status") or {}).get("short") or "")
-        if not _is_final(st): continue
-        g=fx.get("goals") or {}; gh=int(g.get("home") or 0); ga=int(g.get("away") or 0)
-        btts=1 if (gh>0 and ga>0) else 0
-        with db_conn() as c2:
-            c2.execute("INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
-                       "VALUES(%s,%s,%s,%s,%s) ON CONFLICT(match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
-                       "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
-                       (int(mid), gh, ga, btts, int(time.time())))
-        updated+=1
-    if updated: log.info("[RESULTS] backfilled %d", updated)
-    return updated
-
-def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
-    if not DAILY_ACCURACY_DIGEST_ENABLE: 
-        return None
-    
-    today = datetime.now(BERLIN_TZ).date()
-    start_of_day = datetime.combine(today, datetime.min.time(), tzinfo=BERLIN_TZ)
-    start_ts = int(start_of_day.timestamp())
-    log.info("[DIGEST] Generating daily digest for today (since %s)", start_of_day)
-    
-    backfill_results_for_open_matches(200)
-
+    now_ts = int(time.time())
+    cutoff = now_ts - BACKFILL_DAYS * 24 * 3600
+    updated = 0
     with db_conn() as c:
         rows = c.execute("""
+            WITH last AS (
+                SELECT match_id, MAX(created_ts) last_ts
+                FROM tips
+                WHERE created_ts >= %s
+                GROUP BY match_id
+            )
+            SELECT l.match_id
+            FROM last l
+            LEFT JOIN match_results r ON r.match_id = l.match_id
+            WHERE r.match_id IS NULL
+            ORDER BY l.last_ts DESC
+            LIMIT %s
+        """, (cutoff, max_rows)).fetchall()
+    for (mid,) in rows:
+        fx = _fixture_by_id(int(mid))
+        if not fx:
+            continue
+        st = (((fx.get("fixture") or {}).get("status") or {}).get("short") or "")
+        if not _is_final(st):
+            continue
+        g = fx.get("goals") or {}
+        gh = int(g.get("home") or 0)
+        ga = int(g.get("away") or 0)
+        btts = 1 if (gh > 0 and ga > 0) else 0
+        with db_conn() as c2:
+            c2.execute(
+                "INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
+                "VALUES(%s,%s,%s,%s,%s) "
+                "ON CONFLICT(match_id) DO UPDATE SET "
+                "final_goals_h=EXCLUDED.final_goals_h, "
+                "final_goals_a=EXCLUDED.final_goals_a, "
+                "btts_yes=EXCLUDED.btts_yes, "
+                "updated_ts=EXCLUDED.updated_ts",
+                (int(mid), gh, ga, btts, int(time.time()))
+            )
+        updated += 1
+    if updated:
+        log.info("[RESULTS] backfilled %d", updated)
+    return updated
+
+def _digest_day_range(day: str) -> Tuple[int, Optional[int], str]:
+    """
+    Returns (start_ts, end_ts, label) in Berlin time.
+    day: "today", "yesterday", or "YYYY-MM-DD"
+    end_ts is exclusive; if None, means 'open-ended to now'.
+    """
+    now_bln = datetime.now(BERLIN_TZ)
+    label = "today"
+    if (day or "").lower() == "yesterday":
+        target = (now_bln - timedelta(days=1)).date()
+        start = datetime.combine(target, datetime.min.time(), tzinfo=BERLIN_TZ)
+        end   = start + timedelta(days=1)
+        label = "yesterday"
+        return int(start.timestamp()), int(end.timestamp()), label
+    # YYYY-MM-DD support
+    try:
+        target = datetime.strptime(day, "%Y-%m-%d").date()
+        start = datetime.combine(target, datetime.min.time(), tzinfo=BERLIN_TZ)
+        end   = start + timedelta(days=1)
+        label = day
+        return int(start.timestamp()), int(end.timestamp()), label
+    except Exception:
+        pass
+    # default: today
+    start = datetime.combine(now_bln.date(), datetime.min.time(), tzinfo=BERLIN_TZ)
+    return int(start.timestamp()), None, "today"
+
+def daily_accuracy_digest(day: str = "today", force_backfill: bool = False) -> Optional[str]:
+    """
+    Daily accuracy digest.
+    - day: "today", "yesterday", or "YYYY-MM-DD"
+    - force_backfill: if True, run backfill even during quiet hours
+    """
+    if not DAILY_ACCURACY_DIGEST_ENABLE:
+        return None
+
+    start_ts, end_ts, label = _digest_day_range(day)
+    log.info("[DIGEST] Generating digest for %s (start_ts=%s end_ts=%s)", label, start_ts, end_ts or "now")
+
+    # Backfill first (force if requested)
+    try:
+        backfill_results_for_open_matches(400, ignore_sleep=bool(force_backfill))
+    except Exception as e:
+        log.warning("[DIGEST] backfill skipped/failed: %s", e)
+
+    # Build query with optional end bound
+    where_end = " AND t.created_ts < %s" if end_ts is not None else ""
+    params = (start_ts,) + ((end_ts,) if end_ts is not None else ())
+
+    with db_conn() as c:
+        rows = c.execute(f"""
             SELECT t.market, t.suggestion, t.confidence, t.confidence_raw, t.created_ts,
                    t.odds, r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM tips t LEFT JOIN match_results r ON r.match_id=t.match_id
-            WHERE t.created_ts >= %s 
-            AND t.suggestion<>'HARVEST' 
-            AND t.sent_ok=1
+            FROM tips t
+            LEFT JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts >= %s {where_end}
+              AND t.suggestion <> 'HARVEST'
+              AND t.sent_ok = 1
             ORDER BY t.created_ts DESC
-        """, (start_ts,)).fetchall()
+        """, params).fetchall()
 
     total = graded = wins = 0
     roi_by_market, by_market = {}, {}
@@ -2492,39 +2555,41 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
     for (mkt, sugg, conf, conf_raw, cts, odds, gh, ga, btts) in rows:
         res = {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts}
         out = _tip_outcome_for_result(sugg, res)
+
         tip_time = datetime.fromtimestamp(cts, BERLIN_TZ).strftime("%H:%M")
         recent_tips.append(f"{sugg} ({(conf or 0):.1f}%) - {tip_time}")
-        if out is None: 
+
+        if out is None:
             continue
         total += 1
         graded += 1
         wins += 1 if out == 1 else 0
+
         d = by_market.setdefault(mkt or "?", {"graded": 0, "wins": 0})
         d["graded"] += 1
         d["wins"] += 1 if out == 1 else 0
+
         if odds:
-            roi_by_market.setdefault(mkt, {"stake": 0, "pnl": 0.0})
+            roi_by_market.setdefault(mkt, {"stake": 0, "pnl": 0})
             roi_by_market[mkt]["stake"] += 1
-            if out == 1: 
-                roi_by_market[mkt]["pnl"] += float(odds) - 1.0
-            else: 
-                roi_by_market[mkt]["pnl"] -= 1.0
+            roi_by_market[mkt]["pnl"] += (float(odds) - 1) if out == 1 else -1
 
     if graded == 0:
-        msg = f"📊 Daily Accuracy Digest for {today.strftime('%Y-%m-%d')}\nNo graded tips today."
+        msg = f"📊 Daily Accuracy Digest for {label}\nNo graded tips for this window."
         if rows:
-            pending = len([r for r in rows if r[5] is None or r[6] is None])
-            msg += f"\n⏳ {pending} tips still pending results."
+            pending = len([r for r in rows if r[6] is None or r[7] is None])  # no result yet
+            if pending:
+                msg += f"\n⏳ {pending} tips still pending results."
     else:
         acc = 100.0 * wins / max(1, graded)
         lines = [
-            f"📊 <b>Daily Accuracy Digest</b> - {today.strftime('%Y-%m-%d')}",
+            f"📊 <b>Daily Accuracy Digest</b> - {label}",
             f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"
         ]
         if recent_tips:
             lines.append(f"\n🕒 Recent tips: {', '.join(recent_tips[:3])}")
         for mk, st in sorted(by_market.items()):
-            if st["graded"] == 0: 
+            if st["graded"] == 0:
                 continue
             a = 100.0 * st["wins"] / st["graded"]
             roi = ""
@@ -2535,7 +2600,7 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
         msg = "\n".join(lines)
 
     send_telegram(msg)
-    log.info("[DIGEST] Sent daily digest with %d tips, %d graded", total, graded)
+    log.info("[DIGEST] Sent daily digest (%s) with %d tips, %d graded", label, total, graded)
     return msg
 
 # ───────── Prematch pipeline (kept; minor safety tweaks) ─────────
@@ -3151,9 +3216,11 @@ def http_train_notify():
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest():
     _require_admin()
-    with _no_sleep_override():
-        msg = daily_accuracy_digest()
-    return jsonify({"ok": True, "sent": bool(msg)})
+    day = (request.args.get("day") or "today").strip()
+    force = request.args.get("force", "0")
+    force_backfill = force not in ("0", "false", "False", "no", "NO")
+    msg = daily_accuracy_digest(day=day, force_backfill=force_backfill)
+    return jsonify({"ok": True, "sent": bool(msg), "day": day, "forced_backfill": bool(force_backfill)})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
 def http_auto_tune():
