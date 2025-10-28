@@ -1,3 +1,4 @@
+# train_models.py
 import argparse, json, os, logging, time, socket
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -125,7 +126,10 @@ def _defensive_stability(feat: Dict[str, float]) -> float:
 
 # ─────────────────────── DB utils (IPv4 pin if needed) ─────────────────────── #
 
-import requests  # used only for DoH fallback
+try:
+    import requests  # used only for DoH fallback
+except Exception:
+    requests = None
 
 def _resolve_ipv4(host: str, port: int) -> Optional[str]:
     if not host:
@@ -137,6 +141,8 @@ def _resolve_ipv4(host: str, port: int) -> Optional[str]:
             return ip
     except Exception as e:
         logger.warning("[DNS] IPv4 resolve failed for %s:%s: %s — trying DoH fallback", host, port, e)
+    if not requests:
+        return None
     try:
         urls = [
             f"https://dns.google/resolve?name={host}&type=A",
