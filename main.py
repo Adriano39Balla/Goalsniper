@@ -7,6 +7,7 @@ import numpy as np
 from urllib.parse import urlparse, parse_qsl
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
+from xgboost import Booster
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
@@ -1870,10 +1871,14 @@ class BayesianUpdater:
     def __init__(self):
         self.prior_strength = 0.3
     
-    def update_probability(self, prior_prob: float, live_prob: float, minute: int) -> float:
-        live_weight = min(minute / 90.0, 1.0) * (1 - self.prior_strength)
-        prior_weight = self.prior_strength * (1 - live_weight)
-        return float((prior_prob * prior_weight + live_prob * live_weight) / max(1e-9, (prior_weight + live_weight)))
+    def update_probability(self, prior_prob: float, live_prob: float, minute: int, conf_prior: float = 0.7, conf_live: float = 0.8) -> float:
+        """
+        Confidence-weighted Bayesian blending.
+        Live influence grows with time; confidence controls relative strength.
+        """
+        live_weight = min(minute / 90.0, 1.0) * conf_live
+        prior_weight = (1 - min(minute / 90.0, 1.0)) * conf_prior
+        return float((prior_prob * prior_weight + live_prob * live_weight) / max(1e-6, prior_weight + live_weight))
     
     def calculate_confidence_interval(self, prob: float, sample_size: int) -> Tuple[float, float]:
         import math
@@ -1883,45 +1888,250 @@ class BayesianUpdater:
         margin = z * math.sqrt((prob * (1 - prob)) / sample_size)
         return max(0.0, prob - margin), min(1.0, prob + margin)
 
-class GameStateAnalyzer:
-    def __init__(self):
-        self.critical_states = {
-            'equalizer_seek': 0.7,
-            'park_the_bus': 0.6,
-            'goal_fest': 0.8,
-            'defensive_battle': 0.3
-        }
-    
+class GameStateAnalyzerV2:
+    """
+    V2 game-state analyzer.
+    - Tries per-state logistic models from settings:
+        model_v2:GS_EQUALIZER
+        model_v2:GS_PARK
+        model_v2:GS_GOALFEST
+        model_v2:GS_DEFENSIVE
+      (You can also store them under model_latest:GS_* or model:GS_*; loader already searches.)
+    - Falls back to rule-based heuristics if a given model is missing.
+    - Can optionally log features to DB for future retraining.
+    """
+
+    MODEL_KEYS = {
+        "equalizer_seek": ["GS_EQUALIZER"],
+        "park_the_bus":  ["GS_PARK"],
+        "goal_fest":     ["GS_GOALFEST"],
+        "defensive_battle": ["GS_DEFENSIVE"],
+    }
+
+    def __init__(self, enable_db_logging: bool = True):
+        self.enable_db_logging = enable_db_logging
+        self.models: dict[str, dict] = self._load_models()
+        # lazy table creation (no-op if it already exists)
+        if self.enable_db_logging:
+            try:
+                self._ensure_log_table()
+            except Exception:
+                pass
+
+    # ---------- Public API (keeps old signatures) ----------
     def analyze_game_state(self, feat: Dict[str, float]) -> Dict[str, float]:
-        state_scores: Dict[str, float] = {}
-        goal_diff = float(feat.get("goals_h", 0) - feat.get("goals_a", 0))
-        minute = int(feat.get("minute", 0))
-        total_goals = float(feat.get("goals_sum", 0))
-        if abs(goal_diff) == 1 and minute > 60:
-            state_scores['equalizer_seek'] = 0.7 + (minute / 90.0) * 0.3
-        if goal_diff >= 2 and minute > 70:
-            state_scores['park_the_bus'] = 0.6 + ((minute - 70) / 20.0) * 0.4
-        if total_goals >= 3 and minute < 60:
-            state_scores['goal_fest'] = min(1.0, total_goals / 5.0)
-        if total_goals == 0 and minute > 60:
-            state_scores['defensive_battle'] = 0.3 + (minute / 90.0) * 0.5
-        return state_scores
-    
+        """
+        Return dict of state -> intensity in [0,1].
+        Uses models when available; for any missing model, falls back to rules.
+        """
+        minute = float(feat.get("minute", 0.0) or 0.0)
+
+        # Model pass (per-state). If a model not present, value remains None to be filled by rules.
+        scores: dict[str, Optional[float]] = {
+            "equalizer_seek": None,
+            "park_the_bus": None,
+            "goal_fest": None,
+            "defensive_battle": None,
+        }
+
+        for state, keys in self.MODEL_KEYS.items():
+            mdl = self._first_model(keys)
+            if mdl is not None:
+                try:
+                    p = predict_from_model(mdl, feat)
+                    # Light time-weighting for states that make more sense late
+                    if state in ("equalizer_seek", "park_the_bus", "defensive_battle"):
+                        tw = min(1.0, minute / 60.0)
+                        p = float(p) * (0.5 + 0.5 * tw)
+                    scores[state] = float(max(0.0, min(1.0, p)))
+                except Exception:
+                    scores[state] = None  # fallback to rules
+
+        # Fill any missing scores via rules
+        rb = self._rule_based_scores(feat)
+        for k, v in scores.items():
+            if v is None:
+                scores[k] = rb.get(k, 0.0)
+
+        # Normalize softly to [0,1] without forcing them to sum to 1
+        for k in list(scores.keys()):
+            try:
+                scores[k] = float(max(0.0, min(1.0, scores[k] or 0.0)))
+            except Exception:
+                scores[k] = 0.0
+
+        return scores  # dict[str, float]
+
     def adjust_predictions(self, predictions: dict, game_state: dict) -> dict:
-        adjusted = dict(predictions)
-        if game_state.get('equalizer_seek', 0) > 0.5:
+        """
+        Same contract as v1: scale market predictions using game-state intensities.
+        """
+        adjusted = predictions.copy()
+
+        eq = float(game_state.get('equalizer_seek', 0.0) or 0.0)
+        park = float(game_state.get('park_the_bus', 0.0) or 0.0)
+        fest = float(game_state.get('goal_fest', 0.0) or 0.0)
+        defb = float(game_state.get('defensive_battle', 0.0) or 0.0)
+
+        # Push for goals: equalizer + goal-fest raise goaly outcomes
+        if eq > 0.05:
             if 'BTTS: Yes' in adjusted:
-                adjusted['BTTS: Yes'] *= (1 + game_state['equalizer_seek'] * 0.3)
+                adjusted['BTTS: Yes'] *= (1.0 + 0.25 * eq)
             for key in list(adjusted.keys()):
                 if key.startswith('Over'):
-                    adjusted[key] *= (1 + game_state['equalizer_seek'] * 0.2)
-        if game_state.get('park_the_bus', 0) > 0.5:
+                    adjusted[key] *= (1.0 + 0.20 * eq)
+
+        if fest > 0.05:
             for key in list(adjusted.keys()):
                 if key.startswith('Over'):
-                    adjusted[key] *= (1 - game_state['park_the_bus'] * 0.4)
-                elif key == 'BTTS: Yes':
-                    adjusted[key] *= (1 - game_state['park_the_bus'] * 0.3)
+                    adjusted[key] *= (1.0 + 0.30 * fest)
+            if 'BTTS: Yes' in adjusted:
+                adjusted['BTTS: Yes'] *= (1.0 + 0.20 * fest)
+
+        # Parking bus / defensive battle reduce goaly outcomes
+        if park > 0.05:
+            for key in list(adjusted.keys()):
+                if key.startswith('Over'):
+                    adjusted[key] *= max(0.0, (1.0 - 0.35 * park))
+            if 'BTTS: Yes' in adjusted:
+                adjusted['BTTS: Yes'] *= max(0.0, (1.0 - 0.30 * park))
+
+        if defb > 0.05:
+            for key in list(adjusted.keys()):
+                if key.startswith('Over'):
+                    adjusted[key] *= max(0.0, (1.0 - 0.25 * defb))
+            if 'BTTS: Yes' in adjusted:
+                adjusted['BTTS: Yes'] *= max(0.0, (1.0 - 0.20 * defb))
+
         return adjusted
+
+    # ---------- DB hooks for future retraining ----------
+    def log_snapshot(self, match_id: int, feat: Dict[str, float], inferred: Dict[str, float], label: Optional[Dict[str, int]] = None) -> None:
+        """
+        Store a raw snapshot of features + inferred state scores (and optional human/derived labels).
+        Safe to call on every scan; it rate-limits implicitly by primary key (match_id, created_ts).
+        """
+        if not self.enable_db_logging:
+            return
+        try:
+            now_ts = int(time.time())
+            minute = int(feat.get("minute", 0) or 0)
+            payload_feat = json.dumps({k: float(feat.get(k, 0.0) or 0.0) for k in feat.keys()}, separators=(",", ":"))
+            payload_inf = json.dumps({k: float(inferred.get(k, 0.0) or 0.0) for k in inferred.keys()}, separators=(",", ":"))
+            payload_lbl = json.dumps(label, separators=(",", ":")) if label is not None else None
+            with db_conn() as c:
+                c.execute(
+                    "INSERT INTO game_state_log(match_id,created_ts,minute,features,inferred,label) "
+                    "VALUES (%s,%s,%s,%s,%s,%s)",
+                    (int(match_id), now_ts, minute, payload_feat, payload_inf, payload_lbl)
+                )
+        except Exception as e:
+            # non-fatal
+            try: log.debug("[GS_LOG] insert failed: %s", e)
+            except Exception: pass
+
+    def log_outcome(self, match_id: int, final_label: Dict[str, int]) -> None:
+        """
+        Optional: after result is known you can log a final label row (no features).
+        """
+        if not self.enable_db_logging:
+            return
+        try:
+            now_ts = int(time.time())
+            with db_conn() as c:
+                c.execute(
+                    "INSERT INTO game_state_log(match_id,created_ts,minute,features,inferred,label) "
+                    "VALUES (%s,%s,%s,%s,%s,%s)",
+                    (int(match_id), now_ts, None, None, None, json.dumps(final_label, separators=(",", ":")))
+                )
+        except Exception as e:
+            try: log.debug("[GS_LOG] outcome insert failed: %s", e)
+            except Exception: pass
+
+    # ---------- Internals ----------
+    def _load_models(self) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for state, names in self.MODEL_KEYS.items():
+            mdl = self._first_model(names)
+            if mdl: out[state] = mdl
+        return out
+
+    def _first_model(self, candidates: List[str]) -> Optional[dict]:
+        for name in candidates:
+            try:
+                mdl = load_model_from_settings(name)
+                if mdl:
+                    return mdl
+            except Exception:
+                continue
+        return None
+
+    def _rule_based_scores(self, feat: Dict[str, float]) -> Dict[str, float]:
+        """
+        Heuristic fallback aligned with your v1 but a bit richer.
+        Returns intensities ∈ [0,1].
+        """
+        minute = float(feat.get("minute", 0.0) or 0.0)
+        gh = int(feat.get("goals_h", 0) or 0)
+        ga = int(feat.get("goals_a", 0) or 0)
+        total = gh + ga
+        diff = gh - ga
+        xg_sum = float(feat.get("xg_sum", 0.0) or 0.0)
+        shots15 = float(feat.get("shots_last_15", 0.0) or 0.0)
+        goals15 = float(feat.get("goals_last_15", 0.0) or 0.0)
+        press_h = float(feat.get("pressure_home", 0.0) or 0.0)
+        press_a = float(feat.get("pressure_away", 0.0) or 0.0)
+        def_stab = float(feat.get("defensive_stability", 0.5) or 0.5)
+
+        # Equalizer pressure: one-goal game, late, losing team pressure high
+        eq = 0.0
+        if abs(diff) == 1 and minute >= 55:
+            losing_press = press_a if diff > 0 else press_h  # trailing side
+            eq = min(1.0, 0.4 + 0.006 * losing_press + 0.02 * max(0.0, minute - 55))
+            eq += 0.08 * goals15 + 0.02 * shots15
+            eq = max(0.0, min(1.0, eq))
+
+        # Park-the-bus: leading team, later minutes, defensive stability decent, low combined pressure
+        park = 0.0
+        if (diff >= 2 and minute >= 65) or (diff == 1 and minute >= 75):
+            avg_press = 0.5 * (press_h + press_a)
+            park = min(1.0, 0.2 + 0.01 * (minute - 60) + 0.3 * max(0.0, def_stab - 0.5) - 0.002 * avg_press)
+            park = max(0.0, min(1.0, park))
+
+        # Goal-fest: many early goals or sustained high chance creation
+        fest = 0.0
+        if (total >= 3 and minute <= 60) or (xg_sum >= 2.2 and minute <= 55):
+            fest = min(1.0, 0.3 + 0.1 * total + 0.15 * (xg_sum / max(0.1, minute/30.0)))
+            fest += 0.05 * goals15 + 0.02 * shots15
+            fest = max(0.0, min(1.0, fest))
+
+        # Defensive battle: 0–0 late with low xG and low shots/pressure
+        defb = 0.0
+        avg_press = 0.5 * (press_h + press_a)
+        if total == 0 and minute >= 60 and xg_sum < 1.2 and shots15 <= 4 and avg_press < 85:
+            defb = min(1.0, 0.3 + 0.007 * (minute - 60) + 0.2 * max(0.0, 0.7 - def_stab))
+            defb = max(0.0, min(1.0, defb))
+
+        return {
+            "equalizer_seek": float(eq),
+            "park_the_bus": float(park),
+            "goal_fest": float(fest),
+            "defensive_battle": float(defb),
+        }
+
+    def _ensure_log_table(self) -> None:
+        with db_conn() as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS game_state_log (
+                    match_id   BIGINT,
+                    created_ts BIGINT,
+                    minute     INTEGER NULL,
+                    features   JSONB NULL,
+                    inferred   JSONB NULL,
+                    label      JSONB NULL,
+                    PRIMARY KEY (match_id, created_ts)
+                )
+            """)
 
 class SmartOddsAnalyzer:
     def __init__(self):
@@ -2064,6 +2274,21 @@ def _format_enhanced_tip_message(home, away, league, minute, score, suggestion,
             f"🏆 <b>League:</b> {escape(league)}{stat}")
 
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems (patched) ─────────
+def enhanced_production_scan() -> Tuple[int, int]:
+    # ...
+    today = datetime.now(BERLIN_TZ).date()
+    with db_conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*) FROM tips WHERE DATE(FROM_UNIXTIME(created_ts, 'Europe/Berlin')) = %s",
+            (today,)
+        ).fetchone()
+        tips_today = row[0] if row else 0
+
+    DAILY_TIPS_TARGET = 20
+    if tips_today >= DAILY_TIPS_TARGET:
+        log.info("[ENHANCED_PROD] Tip target reached for today (%d)", tips_today)
+        return (0, 0)
+        
 def enhanced_production_scan() -> Tuple[int, int]:
     """
     Enhanced scan with fixed market prediction for BTTS, OU, and 1X2.
@@ -2213,11 +2438,11 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         if market == "1X2" and isinstance(pre_match_data, tuple):
                             pre_match_prob_home, pre_match_prob_away = pre_match_data
                             if suggestion == "Home Win":
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute)
+                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute, btts_confidence, ou_confidence)
                             else:
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_away, prob, minute)
+                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute, btts_confidence, ou_confidence)
                         else:
-                            enhanced_prob = bayesian_updater.update_probability(float(pre_match_data), prob, minute)
+                            enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute, btts_confidence, ou_confidence)
                     else:
                         enhanced_prob = prob
                     enhanced_candidates.append((market, suggestion, enhanced_prob, confidence))
@@ -2267,8 +2492,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     if odds is not None:
                         edge = _ev(prob, float(odds))
                         ev_pct = round(edge * 100.0, 1)
-                        if int(round(edge * 10000)) < EDGE_MIN_BPS:
-                            continue
+                        edge_score = max(0.0, 1.0 + edge)
+                        prob *= edge_score  # slightly boost/decrease prob based on EV
                     else:
                         if not ALLOW_TIPS_WITHOUT_ODDS:
                             continue
@@ -2386,22 +2611,31 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     return mdl
 
 # ───────── Logistic predict (PATCHED calibration math) ─────────
-def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
+def predict_from_model(mdl: dict, features: dict[str, float]) -> float:
+    """
+    Replaces logistic model with an ensemble (XGBoost-compatible).
+    If model is logistic JSON, fallback to old logic.
+    """
+    if mdl.get("type") == "xgboost":
+        # Load from booster JSON
+        booster = Booster()
+        booster.load_model(mdl["path"])
+        feats = np.array([features.get(k, 0.0) for k in mdl["feature_order"]], dtype=np.float32).reshape(1, -1)
+        pred = float(booster.inplace_predict(feats)[0])
+        return max(0.0, min(1.0, pred))
+
+    # Fallback (old logistic model)
     w = mdl.get("weights") or {}
-    s = float(mdl.get("intercept", 0.0) or 0.0)
+    s = float(mdl.get("intercept", 0.0))
     for k, v in w.items():
         s += float(v or 0.0) * float(features.get(k, 0.0))
-    # base prob from linear predictor
     prob = 1.0 / (1.0 + np.exp(-s))
-    # apply calibration on LOGIT, not on prob directly
     cal = mdl.get("calibration") or {}
     try:
-        method = str(cal.get("method", "sigmoid")).lower()
-        a = float(cal.get("a", 1.0)); b = float(cal.get("b", 0.0))
-        if method in ("platt", "sigmoid"):
-            p = max(1e-12, min(1-1e-12, prob))
-            z = np.log(p/(1-p))
-            prob = 1.0 / (1.0 + np.exp(-(a*z + b)))
+        a, b = float(cal.get("a", 1.0)), float(cal.get("b", 0.0))
+        p = max(1e-12, min(1 - 1e-12, prob))
+        z = np.log(p / (1 - p))
+        prob = 1.0 / (1.0 + np.exp(-(a * z + b)))
     except Exception:
         pass
     return float(max(0.0, min(1.0, prob)))
@@ -2972,8 +3206,41 @@ def auto_train_job():
         log.exception("[TRAIN] job failed: %s", e)
         send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
 
-def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
-    return _apply_tune_thresholds(days)
+def _apply_tune_thresholds(days: int = 14) -> dict[str, float]:
+    """
+    Dynamically tunes thresholds per market using recent accuracy.
+    If accuracy < 75%, threshold increases by 1–2%.
+    If accuracy > 80%, threshold decreases by 1%.
+    """
+    start_ts = int(time.time()) - days * 24 * 3600
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT market, COUNT(*) total, SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) wins
+            FROM tips
+            WHERE created_ts >= %s AND outcome IS NOT NULL
+            GROUP BY market
+        """, (start_ts,)).fetchall()
+
+    tuned = {}
+    for mkt, total, wins in rows:
+        if total < 10:
+            continue
+        acc = 100.0 * wins / max(1, total)
+        key = f"conf_threshold:{mkt}"
+        cur_thr = float(get_setting_cached(key) or 75.0)
+
+        if acc < 75.0:
+            new_thr = min(90.0, cur_thr + 1.5)
+        elif acc > 80.0:
+            new_thr = max(60.0, cur_thr - 1.0)
+        else:
+            new_thr = cur_thr
+
+        set_setting(key, str(round(new_thr, 1)))
+        tuned[mkt] = new_thr
+
+    log.info("[AUTO-TUNE] Adjusted thresholds: %s", tuned)
+    return tuned
 
 # ───────── Retry unsent tips (unchanged) ─────────
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
