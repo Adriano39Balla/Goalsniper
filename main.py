@@ -276,6 +276,8 @@ def is_sleep_time() -> bool:
 def sleep_if_required() -> bool:
     """Return True if we should sleep/skip work."""
     # Global override via env or per-request flag
+    if not SLEEP_ENABLE:
+        return False
     if os.getenv("DISABLE_SLEEP", "0") not in ("0","false","False","no","NO"):
         return False
     if os.getenv("_GS_FORCE_NO_SLEEP") == "1":
@@ -614,6 +616,8 @@ def init_db():
         except: pass
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS confidence_raw DOUBLE PRECISION")
         except: pass
+        # PATCH: outcome column to store graded result
+        c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS outcome INTEGER NULL")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
@@ -1637,21 +1641,14 @@ def _get_pre_match_probability(fid: int, market: str):
 
 def extract_prematch_features(fx: dict) -> Dict[str, float]:
     """Extract features for pre-match predictions"""
-    # Basic prematch features - would typically include:
-    # team form, H2H, missing players, etc.
     feat = {}
-    
-    # Placeholder implementation
     teams = fx.get("teams", {}) or {}
-    home_team = (teams.get("home") or {}).get("name", "")
-    away_team = (teams.get("away") or {}).get("name", "")
-    
-    # Add basic features (these would be populated from external data)
+    _ = (teams.get("home") or {}).get("name", "")
+    _ = (teams.get("away") or {}).get("name", "")
     feat["home_team_strength"] = 0.5
     feat["away_team_strength"] = 0.5
     feat["form_differential"] = 0.0
     feat["h2h_advantage"] = 0.0
-    
     return feat
 
 def _score_prob(feat: Dict[str, float], mdl: Optional[Dict[str, Any]]) -> float:
@@ -1662,7 +1659,6 @@ def _score_prob(feat: Dict[str, float], mdl: Optional[Dict[str, Any]]) -> float:
 
 def _get_market_threshold_pre(market: str) -> float:
     """Get confidence threshold for pre-match markets"""
-    # Pre-match markets might have different thresholds
     market_key = f"conf_threshold_pre:{market}"
     cached = get_setting_cached(market_key)
     if cached:
@@ -1670,8 +1666,6 @@ def _get_market_threshold_pre(market: str) -> float:
             return float(cached)
         except:
             pass
-    
-    # Slightly higher threshold for pre-match by default
     return CONF_THRESHOLD + 5.0
 
 def cleanup_caches():
@@ -2275,21 +2269,6 @@ def _format_enhanced_tip_message(home, away, league, minute, score, suggestion,
 
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems (patched) ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
-    # ...
-    today = datetime.now(BERLIN_TZ).date()
-    with db_conn() as c:
-        row = c.execute(
-            "SELECT COUNT(*) FROM tips WHERE DATE(FROM_UNIXTIME(created_ts, 'Europe/Berlin')) = %s",
-            (today,)
-        ).fetchone()
-        tips_today = row[0] if row else 0
-
-    DAILY_TIPS_TARGET = 20
-    if tips_today >= DAILY_TIPS_TARGET:
-        log.info("[ENHANCED_PROD] Tip target reached for today (%d)", tips_today)
-        return (0, 0)
-        
-def enhanced_production_scan() -> Tuple[int, int]:
     """
     Enhanced scan with fixed market prediction for BTTS, OU, and 1X2.
     Patches:
@@ -2297,6 +2276,22 @@ def enhanced_production_scan() -> Tuple[int, int]:
       • Uses _candidate_is_sane to avoid absurd lines (e.g., Under 2.5 when 3 goals already).
       • Keeps EV/odds gate consistent and honors PER_LEAGUE_CAP / PREDICTIONS_PER_MATCH.
     """
+    # Daily tip cap (Berlin local date, PostgreSQL-safe)
+    try:
+        with db_conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) FROM tips "
+                "WHERE (to_timestamp(created_ts) AT TIME ZONE 'Europe/Berlin')::date = "
+                "(now() AT TIME ZONE 'Europe/Berlin')::date"
+            ).fetchone()
+            tips_today = int(row[0] if row else 0)
+        DAILY_TIPS_TARGET = 20
+        if tips_today >= DAILY_TIPS_TARGET:
+            log.info("[ENHANCED_PROD] Tip target reached for today (%d)", tips_today)
+            return (0, 0)
+    except Exception as e:
+        log.warning("[ENHANCED_PROD] tip cap check failed: %s", e)
+
     if sleep_if_required():
         log.info("[ENHANCED_PROD] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
         return (0, 0)
@@ -2358,7 +2353,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         pass
 
                 # Game state analysis
-                game_state_analyzer = GameStateAnalyzer()
+                game_state_analyzer = GameStateAnalyzerV2()
                 game_state = game_state_analyzer.analyze_game_state(feat)
                 
                 league_id, league = _league_name(m)
@@ -2433,19 +2428,28 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 enhanced_candidates = []
                 for market, suggestion, prob, confidence in candidates:
                     pre_match_data = _get_pre_match_probability(fid, market)
-                    if pre_match_data is not None:
-                        bayesian_updater = BayesianUpdater()
-                        if market == "1X2" and isinstance(pre_match_data, tuple):
-                            pre_match_prob_home, pre_match_prob_away = pre_match_data
-                            if suggestion == "Home Win":
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute, btts_confidence, ou_confidence)
+                    enhanced_prob = prob
+                    try:
+                        if pre_match_data is not None:
+                            bayes = BayesianUpdater()
+                            if market == "1X2" and isinstance(pre_match_data, tuple):
+                                ph, pa = pre_match_data
+                                prior = ph if suggestion == "Home Win" else pa
+                            elif isinstance(pre_match_data, (int, float)):
+                                prior = float(pre_match_data)
                             else:
-                                enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute, btts_confidence, ou_confidence)
-                        else:
-                            enhanced_prob = bayesian_updater.update_probability(pre_match_prob_home, prob, minute, btts_confidence, ou_confidence)
-                    else:
-                        enhanced_prob = prob
-                    enhanced_candidates.append((market, suggestion, enhanced_prob, confidence))
+                                prior = None
+                            if prior is not None:
+                                enhanced_prob = bayes.update_probability(
+                                    prior_prob=prior,
+                                    live_prob=prob,
+                                    minute=minute,
+                                    conf_prior=0.7,
+                                    conf_live=float(confidence)
+                                )
+                    except Exception as e:
+                        log.debug("[BAYES] fallback due to %s", e)
+                    enhanced_candidates.append((market, suggestion, float(enhanced_prob), confidence))
 
                 # Odds analysis + EV filter
                 odds_map = fetch_odds(fid) if API_KEY else {}
@@ -2610,16 +2614,22 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     if mdl is not None: _MODELS_CACHE.set(name, mdl)
     return mdl
 
-# ───────── Logistic predict (PATCHED calibration math) ─────────
+# ───────── Logistic predict (PATCHED calibration math + XGB cache) ─────────
+# Cache for loaded XGBoost boosters
+_XGB_CACHE = {}
+
 def predict_from_model(mdl: dict, features: dict[str, float]) -> float:
     """
     Replaces logistic model with an ensemble (XGBoost-compatible).
     If model is logistic JSON, fallback to old logic.
     """
     if mdl.get("type") == "xgboost":
-        # Load from booster JSON
-        booster = Booster()
-        booster.load_model(mdl["path"])
+        path = mdl["path"]
+        booster = _XGB_CACHE.get(path)
+        if booster is None:
+            booster = Booster()
+            booster.load_model(path)
+            _XGB_CACHE[path] = booster
         feats = np.array([features.get(k, 0.0) for k in mdl["feature_order"]], dtype=np.float32).reshape(1, -1)
         pred = float(booster.inplace_predict(feats)[0])
         return max(0.0, min(1.0, pred))
@@ -2716,6 +2726,17 @@ def backfill_results_for_open_matches(max_rows: int = 200, ignore_sleep: bool = 
                 "updated_ts=EXCLUDED.updated_ts",
                 (int(mid), gh, ga, btts, int(time.time()))
             )
+            # Grade all tips for this match and store outcome (0/1/NULL)
+            tips = c2.execute(
+                "SELECT suggestion, created_ts FROM tips WHERE match_id=%s",
+                (int(mid),)
+            ).fetchall()
+            for sugg, cts in tips or []:
+                out = _tip_outcome_for_result(str(sugg or ""), {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
+                c2.execute(
+                    "UPDATE tips SET outcome=%s WHERE match_id=%s AND created_ts=%s",
+                    (out, int(mid), int(cts))
+                )
         updated += 1
     if updated:
         log.info("[RESULTS] backfilled %d", updated)
@@ -3215,9 +3236,12 @@ def _apply_tune_thresholds(days: int = 14) -> dict[str, float]:
     start_ts = int(time.time()) - days * 24 * 3600
     with db_conn() as c:
         rows = c.execute("""
-            SELECT market, COUNT(*) total, SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) wins
+            SELECT market,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS wins
             FROM tips
-            WHERE created_ts >= %s AND outcome IS NOT NULL
+            WHERE created_ts >= %s
+              AND outcome IS NOT NULL
             GROUP BY market
         """, (start_ts,)).fetchall()
 
@@ -3392,9 +3416,6 @@ def _start_scheduler_once():
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
-    except Exception as e:
-        log.exception("[SCHED] failed: %s", e)
-
 # ───────── Admin / auth / endpoints (ALL routes have GET now) ─────────
 def _require_admin():
     key=request.headers.get("X-API-Key") or request.args.get("key") or ((request.json or {}).get("key") if request.is_json else None)
@@ -3421,7 +3442,8 @@ def health():
             "tips_count": int(n),
             "api_connected": api_ok,
             "scheduler_running": _scheduler_started,
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "sleep_mode": bool(sleep_if_required())
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
