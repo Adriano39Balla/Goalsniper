@@ -740,6 +740,17 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
     fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
     return fixtures
 
+def _odds_key_for_market(market_txt: str, suggestion: str) -> str | None:
+    """Map our market/suggestion to the odds_map key."""
+    if market_txt == "BTTS":
+        return "BTTS"
+    if market_txt == "1X2":
+        return "1X2"
+    if market_txt.startswith("Over/Under"):
+        ln = _parse_ou_line_from_suggestion(suggestion)
+        return f"OU_{_fmt_line(ln)}" if ln is not None else None
+    return None
+
 # ───────── ENHANCEMENT 1: Advanced Ensemble Learning System ─────────
 class AdvancedEnsemblePredictor:
     """Advanced ensemble system combining multiple model types with dynamic weighting"""
@@ -1963,42 +1974,58 @@ class GameStateAnalyzer:
 class SmartOddsAnalyzer:
     def __init__(self):
         self.odds_quality_threshold = 0.85
-    
-    def analyze_odds_quality(self, odds_map: dict, prob_hints: dict[str, float]) -> float:
+
+    def analyze_odds_quality(self, odds_map: dict, prob_hints: dict[str, float], target_market_key: str | None = None) -> float:
+        """
+        Compute quality ONLY for the target market if provided; otherwise fall back to averaging all.
+        This prevents unrelated thin markets from dragging the quality down.
+        """
         if not odds_map:
             return 0.0
-        quality_metrics: list[float] = []
-        for market_key, sides in odds_map.items():
-            hint_prob = self._resolve_hint_prob(market_key, prob_hints)
-            market_quality = self._market_odds_quality(sides, hint_prob)
-            quality_metrics.append(market_quality)
-        return sum(quality_metrics) / len(quality_metrics) if quality_metrics else 0.0
-    
-    def _resolve_hint_prob(self, odds_market_key: str, hints: dict[str, float]) -> Optional[float]:
-        if odds_market_key == "BTTS":
+
+        def _market_odds_quality(sides: dict, prob_hint: float | None) -> float:
+            if not sides or len(sides) < 1:
+                return 0.0
+            # Overround (lower is better)
+            total_implied = sum(1.0 / max(1e-9, d.get("odds") or 0.0) for d in sides.values() if (d or {}).get("odds"))
+            overround = max(0.0, total_implied - 1.0)
+            overround_quality = max(0.0, 1.0 - overround * 5.0)
+
+            # Model alignment (optional)
+            model_quality = 1.0
+            if prob_hint is not None:
+                best_side = max(sides.items(), key=lambda x: (x[1] or {}).get("odds", 0.0))
+                best_odds = (best_side[1] or {}).get("odds") or 0.0
+                if best_odds > 0:
+                    edge = prob_hint * best_odds - 1.0
+                    model_quality = min(1.0, max(0.0, edge + 1.0))
+            return (overround_quality + model_quality) / 2.0
+
+        # If a specific market is given, compute for that only
+        if target_market_key and target_market_key in odds_map:
+            sides = odds_map.get(target_market_key) or {}
+            hint = self._resolve_hint_for_specific(prob_hints, target_market_key)
+            return _market_odds_quality(sides, hint)
+
+        # Else, average all (legacy behavior)
+        qualities = []
+        for mk, sides in odds_map.items():
+            hint = self._resolve_hint_for_specific(prob_hints, mk)
+            qualities.append(_market_odds_quality(sides, hint))
+        return sum(qualities) / len(qualities) if qualities else 0.0
+
+    def _resolve_hint_for_specific(self, hints: dict[str, float], market_key: str) -> float | None:
+        if market_key == "BTTS":
             return hints.get("BTTS")
-        if odds_market_key == "1X2":
+        if market_key == "1X2":
             return hints.get("1X2")
-        if odds_market_key.startswith("OU_"):
+        if market_key.startswith("OU_"):
             try:
-                line_txt = odds_market_key.split("_", 1)[1]
+                line_txt = market_key.split("_", 1)[1]
                 return hints.get(f"Over/Under {line_txt}") or hints.get(f"OU_{line_txt}")
             except Exception:
                 return None
         return None
-
-    def _market_odds_quality(self, sides: dict, prob_hint: Optional[float]) -> float:
-        if len(sides) < 2:
-            return 0.0
-        total_implied = sum(1.0 / max(1e-9, data['odds']) for data in sides.values() if data.get('odds'))
-        overround = max(0.0, total_implied - 1.0)
-        overround_quality = max(0.0, 1.0 - overround * 5.0)
-        model_quality = 1.0
-        if prob_hint:
-            best_side = max(sides.items(), key=lambda x: x[1]['odds'])
-            model_ev = _ev(prob_hint, best_side[1]['odds'])
-            model_quality = min(1.0, max(0.0, model_ev + 1.0))
-        return (overround_quality + model_quality) / 2.0
 
 # ───────── Market cutoff helpers (minutes) ─────────
 def _parse_market_cutoffs(s: str) -> dict[str, int]:
@@ -2279,7 +2306,11 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
                     # Odds quality (overround + hint EV)
                     odds_analyzer = SmartOddsAnalyzer()
-                    odds_quality = odds_analyzer.analyze_odds_quality(odds_map, {mk: prob})
+                    odds_quality = odds_analyzer.analyze_odds_quality(
+                        odds_map,
+                        {mk: prob},
+                        target_market_key=_odds_key_for_market(mk, sug)
+                    )
                     if odds_quality < odds_analyzer.odds_quality_threshold:
                         continue
 
