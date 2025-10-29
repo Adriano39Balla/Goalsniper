@@ -157,9 +157,6 @@ THRESH_MIN_PREDICTIONS  = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
 MIN_THRESH              = float(os.getenv("MIN_THRESH", "55"))
 MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
-# xG proxy enable (new)
-XG_PROXY_ENABLE         = os.getenv("XG_PROXY_ENABLE","1") not in ("0","false","False","no","NO")
-
 STALE_GUARD_ENABLE = os.getenv("STALE_GUARD_ENABLE", "1") not in ("0","false","False","no","NO")
 STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
 MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
@@ -237,12 +234,15 @@ ODDS_AGGREGATION = os.getenv("ODDS_AGGREGATION", "median").lower()# median|best
 ODDS_OUTLIER_MULT = float(os.getenv("ODDS_OUTLIER_MULT", "1.8"))  # drop books > x * median
 ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))# min distinct books per side
 ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))# cap vs fair (1/p)
-ODDS_BLACKLIST_BOOKS = os.getenv("ODDS_BLACKLIST_BOOKS", "")
-ODDS_BLACKLIST = {b.strip().lower() for b in ODDS_BLACKLIST_BOOKS.split(",") if b.strip()}
 
 # ───────── Markets allow-list (draw suppressed) ─────────
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
 def _fmt_line(line: float) -> str: return f"{line}".rstrip("0").rstrip(".")
+def _clamp_prob(p: float) -> float:
+    """Keep probabilities away from 0/1 to avoid overconfident cascades."""
+    eps = float(os.getenv("PROB_CLAMP_EPS", "0.005"))
+    return min(1.0 - eps, max(eps, float(p)))
+
 for _ln in OU_LINES:
     s=_fmt_line(_ln); ALLOWED_SUGGESTIONS.add(f"Over {s} Goals"); ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
 
@@ -460,11 +460,6 @@ class PooledConn:
         except Exception as e:
             log.warning("[DB] fetchall_safe error: %s", e)
             return []
-
-def _clamp_prob(p: float) -> float:
-    """Keep probabilities away from 0/1 to avoid overconfident cascades."""
-    eps = float(os.getenv("PROB_CLAMP_EPS", "0.005"))
-    return min(1.0 - eps, max(eps, float(p)))
 
 def db_conn(): 
     if not POOL: _init_pool()
@@ -748,27 +743,27 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
 # ───────── ENHANCEMENT 1: Advanced Ensemble Learning System ─────────
 class AdvancedEnsemblePredictor:
     """Advanced ensemble system combining multiple model types with dynamic weighting"""
-    
+
     def __init__(self):
         self.model_types = ['logistic', 'xgboost', 'neural', 'bayesian', 'momentum']
         self.ensemble_weights = self._initialize_adaptive_weights()
         self.performance_tracker = {}
-        
+
     def _initialize_adaptive_weights(self):
         """Initialize weights based on historical performance"""
         return {
             'logistic': 0.25,
-            'xgboost': 0.30, 
+            'xgboost': 0.30,
             'neural': 0.20,
             'bayesian': 0.15,
             'momentum': 0.10
         }
-    
+
     def predict_ensemble(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
         """Enhanced ensemble prediction with confidence scoring"""
         predictions = []
         confidences = []
-        
+
         for model_type in self.model_types:
             try:
                 prob, confidence = self._predict_single_model(features, market, minute, model_type)
@@ -778,13 +773,13 @@ class AdvancedEnsemblePredictor:
             except Exception as e:
                 log.warning(f"[ENSEMBLE] {model_type} model failed: %s", e)
                 continue
-        
+
         if not predictions:
             return 0.0, 0.0
-        
+
         weighted_sum = 0.0
         total_weight = 0.0
-        
+
         for model_type, prob, confidence in predictions:
             base_weight = self.ensemble_weights.get(model_type, 0.1)
             recent_performance = self._get_recent_performance(model_type, market)
@@ -792,12 +787,12 @@ class AdvancedEnsemblePredictor:
             final_weight = base_weight * confidence * recent_performance * time_weight
             weighted_sum += prob * final_weight
             total_weight += final_weight
-        
+
         ensemble_prob = weighted_sum / total_weight if total_weight > 0 else 0.0
         ensemble_confidence = float(np.mean(confidences)) if confidences else 0.0
-        
+
         return ensemble_prob, ensemble_confidence
-    
+
     def _predict_single_model(self, features: Dict[str, float], market: str, minute: int, model_type: str) -> Tuple[Optional[float], float]:
         if model_type == 'logistic':
             return self._logistic_predict(features, market), 0.8
@@ -810,7 +805,7 @@ class AdvancedEnsemblePredictor:
         elif model_type == 'momentum':
             return self._momentum_based_predict(features, market, minute), 0.7
         return None, 0.0
-    
+
     def _logistic_predict(self, features: Dict[str, float], market: str) -> float:
         """Load the exact model name (segmented by minute) and score it."""
         minute = float(features.get("minute", 0.0))
@@ -828,17 +823,17 @@ class AdvancedEnsemblePredictor:
         # try segmented model first, then fallback
         mdl = load_model_from_settings(f"{name}@{seg}") or load_model_from_settings(name)
         return predict_from_model(mdl, features) if mdl else 0.0
-    
+
     def _load_ou_model_for_line(self, line: float) -> Optional[Dict[str, Any]]:
         """Load OU model with fallback to legacy names"""
         name = f"OU_{_fmt_line(line)}"
         mdl = load_model_from_settings(name)
-        if not mdl and abs(line-2.5) < 1e-6:
+        if not mdl and abs(line - 2.5) < 1e-6:
             mdl = load_model_from_settings("O25")
-        if not mdl and abs(line-3.5) < 1e-6:
+        if not mdl and abs(line - 3.5) < 1e-6:
             mdl = load_model_from_settings("O35")
         return mdl
-    
+
     def _xgboost_predict(self, features: Dict[str, float], market: str) -> Optional[float]:
         try:
             base_prob = self._logistic_predict(features, market)
@@ -847,7 +842,7 @@ class AdvancedEnsemblePredictor:
             return max(0.0, min(1.0, corrected_prob))
         except Exception:
             return self._logistic_predict(features, market)
-    
+
     def _neural_network_predict(self, features: Dict[str, float], market: str) -> Optional[float]:
         try:
             base_prob = self._logistic_predict(features, market)
@@ -858,7 +853,7 @@ class AdvancedEnsemblePredictor:
             return float(nn_prob)
         except Exception:
             return self._logistic_predict(features, market)
-    
+
     def _bayesian_predict(self, features: Dict[str, float], market: str, minute: int) -> Optional[float]:
         try:
             prior_prob = self._get_prior_probability(features, market)
@@ -869,7 +864,7 @@ class AdvancedEnsemblePredictor:
             return bayesian_prob
         except Exception:
             return self._logistic_predict(features, market)
-    
+
     def _momentum_based_predict(self, features: Dict[str, float], market: str, minute: int) -> Optional[float]:
         try:
             base_prob = self._logistic_predict(features, market)
@@ -880,7 +875,7 @@ class AdvancedEnsemblePredictor:
             return max(0.0, min(1.0, adjusted_prob))
         except Exception:
             return self._logistic_predict(features, market)
-    
+
     def _calculate_xgb_correction(self, features: Dict[str, float], market: str) -> float:
         correction = 0.0
         if market == "BTTS":
@@ -892,7 +887,7 @@ class AdvancedEnsemblePredictor:
             defensive_weakness = 1.0 - features.get("defensive_stability", 0.5)
             correction = (attacking_pressure * defensive_weakness * 0.001) - 0.02
         return correction
-    
+
     def _calculate_nn_correction(self, features: Dict[str, float], market: str) -> float:
         non_linear_features = []
         for key, value in features.items():
@@ -906,14 +901,14 @@ class AdvancedEnsemblePredictor:
             return sum(non_linear_features) * 0.01
         else:
             return sum(non_linear_features) * 0.005
-    
+
     def _get_prior_probability(self, features: Dict[str, float], market: str) -> float:
         base_prior = 0.5
         if "xg_sum" in features:
             xg_density = features["xg_sum"] / max(1, features.get("minute", 1))
             base_prior = min(0.8, max(0.2, xg_density * 10))
         return base_prior
-    
+
     def _calculate_momentum_factor(self, features: Dict[str, float], minute: int) -> float:
         if minute < 20:
             return 0.0
@@ -925,7 +920,7 @@ class AdvancedEnsemblePredictor:
         recent_xg_impact = features.get("recent_xg_impact", 0)
         momentum += recent_xg_impact * 0.1
         return momentum
-    
+
     def _calculate_pressure_factor(self, features: Dict[str, float]) -> float:
         pressure_diff = features.get("pressure_home", 0) - features.get("pressure_away", 0)
         score_advantage = features.get("goals_h", 0) - features.get("goals_a", 0)
@@ -933,17 +928,17 @@ class AdvancedEnsemblePredictor:
             return abs(pressure_diff) * 0.01
         else:
             return pressure_diff * 0.005
-    
+
     def _get_market_specific_features_xgb(self, features: Dict[str, float], market: str) -> Dict[str, float]:
         enhanced_features = features.copy()
         enhanced_features["pressure_product"] = features.get("pressure_home", 0) * features.get("pressure_away", 0)
         enhanced_features["xg_ratio"] = features.get("xg_h", 0.1) / max(0.1, features.get("xg_a", 0.1))
         enhanced_features["efficiency_ratio"] = features.get("goals_sum", 0) / max(0.1, features.get("xg_sum", 0.1))
         return enhanced_features
-    
+
     def _get_recent_performance(self, model_type: str, market: str) -> float:
         return 0.9
-    
+
     def _calculate_time_weight(self, minute: int, model_type: str) -> float:
         if model_type in ['bayesian', 'momentum']:
             return min(1.0, minute / 60.0)
@@ -1059,13 +1054,6 @@ def extract_basic_features(m: dict) -> Dict[str,float]:
             if "red" in d or "second yellow" in d:
                 if t == home: red_h += 1
                 elif t == away: red_a += 1
-
-    # xG proxy fallback when vendor xG is missing (env-controlled)
-    if XG_PROXY_ENABLE:
-        if xg_h <= 0 and (sot_h > 0 or sh_total_h > 0):
-            xg_h = 0.12 * float(sot_h) + 0.03 * max(0.0, float(sh_total_h) - float(sot_h))
-        if xg_a <= 0 and (sot_a > 0 or sh_total_a > 0):
-            xg_a = 0.12 * float(sot_a) + 0.03 * max(0.0, float(sh_total_a) - float(sot_a))
 
     return {
         "minute": float(minute),
@@ -1272,12 +1260,10 @@ class MarketSpecificPredictor:
             except Exception:
                 pass
             return self._predict_ou_advanced(features, minute, line=line, market_key=market)
-
         elif market in self.market_strategies:
             return self.market_strategies[market](features, minute)
-
-        # Fallback to ensemble for anything else
-        return ensemble_predictor.predict_ensemble(features, market, minute)
+        else:
+            return ensemble_predictor.predict_ensemble(features, market, minute)
     
     def _predict_btts_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
         base_prob, base_conf = ensemble_predictor.predict_ensemble(features, "BTTS", minute)
@@ -1294,7 +1280,7 @@ class MarketSpecificPredictor:
             adjustments += 0.1
         adjusted_prob = base_prob * (1 + adjustments)
         confidence = base_conf * 0.9
-        return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
+        return _clamp_prob(adjusted_prob), max(0.0, min(1.0, confidence))
     
     def _predict_ou_advanced(
         self,
@@ -1389,7 +1375,7 @@ class MarketSpecificPredictor:
             confidence *= 0.8
         progression_factor = min(1.0, int(features.get("minute", 0)) / 60.0)
         confidence *= (0.5 + 0.5 * progression_factor)
-        total_events = float(features.get("sot_sum", 0) + float(features.get("cor_sum", 0)) + float(features.get("goals_sum", 0)))
+        total_events = float(features.get("sot_sum", 0) + features.get("cor_sum", 0) + features.get("goals_sum", 0))
         if total_events < 5 and minute > 30:
             confidence *= 0.8
         return float(confidence)
@@ -1851,9 +1837,7 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     try:
         for r in js.get("response", []) or []:
             for bk in (r.get("bookmakers") or []):
-                book_name = (bk.get("name") or "Book").strip()
-                if book_name.lower() in ODDS_BLACKLIST:
-                    continue
+                book_name = bk.get("name") or "Book"
                 for mkt in (bk.get("bets") or []):
                     mname = _market_name_normalize(mkt.get("name", ""))
                     vals = mkt.get("values") or []
@@ -2138,7 +2122,6 @@ def enhanced_production_scan() -> Tuple[int, int]:
       • Adds market_cutoff_ok guard per-market.
       • Uses _candidate_is_sane to avoid absurd lines (e.g., Under 2.5 when 3 goals already).
       • Keeps EV/odds gate consistent and honors PER_LEAGUE_CAP / PREDICTIONS_PER_MATCH.
-      • EV-aware threshold discount at final gating (lets strong EV pass).
     """
     if not _db_ping():
         log.error("[ENHANCED_PROD] Database unavailable")
@@ -2218,9 +2201,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             continue
                         if not _candidate_is_sane(suggestion, feat):
                             continue
-                        # prefilter: allow slightly below market threshold to reach EV gate
-                        pre_thr = max(MIN_THRESH, _get_market_threshold("BTTS") - 10.0)
-                        if adj_prob * 100.0 >= pre_thr:
+                        threshold = _get_market_threshold("BTTS")
+                        if adj_prob * 100.0 >= threshold:
                             candidates.append(("BTTS", suggestion, adj_prob, btts_confidence))
                             log.info(f"[BTTS_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {btts_confidence:.3f})")
 
@@ -2240,8 +2222,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             continue
                         if not _candidate_is_sane(suggestion, feat):
                             continue
-                        pre_thr = max(MIN_THRESH, _get_market_threshold(f"Over/Under {_fmt_line(line)}") - 10.0)
-                        if adj_prob * 100.0 >= pre_thr:
+                        threshold = _get_market_threshold(f"Over/Under {_fmt_line(line)}")
+                        if adj_prob * 100.0 >= threshold:
                             candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, ou_confidence))
                             log.info(f"[OU_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {ou_confidence:.3f})")
 
@@ -2258,8 +2240,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         for suggestion, adj_prob in adjusted_1x2.items():
                             if not market_cutoff_ok(minute, "1X2", suggestion):
                                 continue
-                            pre_thr = max(MIN_THRESH, _get_market_threshold("1X2") - 10.0)
-                            if adj_prob * 100.0 >= pre_thr:
+                            threshold = _get_market_threshold("1X2")
+                            if adj_prob * 100.0 >= threshold:
                                 candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
                                 log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
                 except Exception as e:
@@ -2337,15 +2319,6 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     else:
                         if not ALLOW_TIPS_WITHOUT_ODDS:
                             continue
-
-                    # EV-aware threshold discount at final gate
-                    threshold = _get_market_threshold(mk)
-                    thr_discount = 0.0
-                    if ev_pct is not None:
-                        thr_discount = max(0.0, min(8.0, 0.4 * max(0.0, ev_pct)))  # up to 8pp discount for strong EV
-                    effective_thr = max(MIN_THRESH, threshold - thr_discount)
-                    if prob * 100.0 < effective_thr:
-                        continue
 
                     rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0) * max(0.0, confidence)
                     ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score, confidence))
