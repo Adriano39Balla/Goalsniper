@@ -812,22 +812,22 @@ class AdvancedEnsemblePredictor:
         return None, 0.0
     
     def _logistic_predict(self, features: Dict[str, float], market: str) -> float:
-    """Load the exact model name (segmented by minute) and score it."""
-    minute = float(features.get("minute", 0.0))
-    seg = "early" if minute <= 35 else ("mid" if minute <= 70 else "late")
+        """Load the exact model name (segmented by minute) and score it."""
+        minute = float(features.get("minute", 0.0))
+        seg = "early" if minute <= 35 else ("mid" if minute <= 70 else "late")
 
-    name = market
-    # Normalize OU market names like "OU_2.5" to the canonical key
-    if market.startswith("OU_"):
-        try:
-            ln = float(market.split("_", 1)[1])
-            name = f"OU_{_fmt_line(ln)}"
-        except Exception:
-            pass
+        name = market
+        # Normalize OU market names like "OU_2.5" to the canonical key
+        if market.startswith("OU_"):
+            try:
+                ln = float(market.split("_", 1)[1])
+                name = f"OU_{_fmt_line(ln)}"
+            except Exception:
+                pass
 
-    # try segmented model first, then fallback
-    mdl = load_model_from_settings(f"{name}@{seg}") or load_model_from_settings(name)
-    return predict_from_model(mdl, features) if mdl else 0.0
+        # try segmented model first, then fallback
+        mdl = load_model_from_settings(f"{name}@{seg}") or load_model_from_settings(name)
+        return predict_from_model(mdl, features) if mdl else 0.0
     
     def _load_ou_model_for_line(self, line: float) -> Optional[Dict[str, Any]]:
         """Load OU model with fallback to legacy names"""
