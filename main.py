@@ -461,6 +461,11 @@ class PooledConn:
             log.warning("[DB] fetchall_safe error: %s", e)
             return []
 
+def _clamp_prob(p: float) -> float:
+    """Keep probabilities away from 0/1 to avoid overconfident cascades."""
+    eps = float(os.getenv("PROB_CLAMP_EPS", "0.005"))
+    return min(1.0 - eps, max(eps, float(p)))
+
 def db_conn(): 
     if not POOL: _init_pool()
     return PooledConn(POOL)  # type: ignore
@@ -807,18 +812,22 @@ class AdvancedEnsemblePredictor:
         return None, 0.0
     
     def _logistic_predict(self, features: Dict[str, float], market: str) -> float:
-        minute = float(features.get("minute", 0.0))
-        seg = "early" if minute <= 35 else ("mid" if minute <= 70 else "late")
-        name = market
-        if market.startswith("OU_"):
-            try:
-                ln = float(market[3:])
-                name = f"OU_{_fmt_line(ln)}"
-            except:
-                pass
-        # try segmented model first
-        mdl = load_model_from_settings(f"{name}@{seg}") or load_model_from_settings(name)
-        return predict_from_model(mdl, features) if mdl else 0.0
+    """Load the exact model name (segmented by minute) and score it."""
+    minute = float(features.get("minute", 0.0))
+    seg = "early" if minute <= 35 else ("mid" if minute <= 70 else "late")
+
+    name = market
+    # Normalize OU market names like "OU_2.5" to the canonical key
+    if market.startswith("OU_"):
+        try:
+            ln = float(market.split("_", 1)[1])
+            name = f"OU_{_fmt_line(ln)}"
+        except Exception:
+            pass
+
+    # try segmented model first, then fallback
+    mdl = load_model_from_settings(f"{name}@{seg}") or load_model_from_settings(name)
+    return predict_from_model(mdl, features) if mdl else 0.0
     
     def _load_ou_model_for_line(self, line: float) -> Optional[Dict[str, Any]]:
         """Load OU model with fallback to legacy names"""
@@ -1255,12 +1264,20 @@ class MarketSpecificPredictor:
         self.market_feature_sets = self._initialize_market_features()
     
     def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
+        # For OU markets we must respect the exact line (e.g., OU_2.5 vs OU_3.5)
         if market.startswith("OU_"):
-            return self._predict_ou_advanced(features, minute)
+            line = None
+            try:
+                line = float(market.split("_", 1)[1])
+            except Exception:
+                pass
+            return self._predict_ou_advanced(features, minute, line=line, market_key=market)
+
         elif market in self.market_strategies:
             return self.market_strategies[market](features, minute)
-        else:
-            return ensemble_predictor.predict_ensemble(features, market, minute)
+
+        # Fallback to ensemble for anything else
+        return ensemble_predictor.predict_ensemble(features, market, minute)
     
     def _predict_btts_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
         base_prob, base_conf = ensemble_predictor.predict_ensemble(features, "BTTS", minute)
@@ -1279,30 +1296,52 @@ class MarketSpecificPredictor:
         confidence = base_conf * 0.9
         return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
     
-    def _predict_ou_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
+    def _predict_ou_advanced(
+        self,
+        features: Dict[str, float],
+        minute: int,
+        line: Optional[float] = None,
+        market_key: Optional[str] = None
+    ) -> Tuple[float, float]:
+        """
+        Produce OU probability for a specific goal line (e.g., 2.5).
+        Uses line-specific ensemble first, then falls back to the logistic model for that line.
+        """
         base_prob, base_conf = 0.0, 0.0
+
+        # Choose a market name for the ensemble
+        mk = market_key or (f"OU_{_fmt_line(line)}" if line is not None else "OU")
+
+        # Try ensemble with the exact line if available
         try:
-            ensemble_prob, ensemble_conf = ensemble_predictor.predict_ensemble(features, "OU", minute)
-            if ensemble_prob > base_prob:
-                base_prob, base_conf = ensemble_prob, ensemble_conf
+            if line is not None:
+                mk_line = f"OU_{_fmt_line(line)}"
+                ensemble_prob, ensemble_conf = ensemble_predictor.predict_ensemble(features, mk_line, minute)
+            else:
+                ensemble_prob, ensemble_conf = ensemble_predictor.predict_ensemble(features, mk, minute)
+
+            base_prob, base_conf = float(ensemble_prob), float(ensemble_conf)
         except Exception as e:
-            log.warning(f"[OU_PREDICT] Ensemble failed: {e}")
-        if base_prob <= 0:
-            for line in OU_LINES:
-                mdl = ensemble_predictor._load_ou_model_for_line(line)
-                if mdl:
-                    prob = predict_from_model(mdl, features)
-                    confidence = 0.8
-                    if prob > base_prob:
-                        base_prob, base_conf = prob, confidence
-                    break
-        if base_prob <= 0:
+            log.warning(f"[OU_PREDICT] Ensemble failed for {mk}: {e}")
+
+        # Fallback: if ensemble gave nothing useful and we have a concrete line, use the logistic model for that line
+        if (base_prob <= 0.0) and (line is not None):
+            mdl = ensemble_predictor._load_ou_model_for_line(line)
+            if mdl:
+                base_prob = predict_from_model(mdl, features)
+                base_conf = max(base_conf, 0.8)
+
+        if base_prob <= 0.0:
             return 0.0, 0.0
+
+        # Apply market-specific adjustments and confidence shaping
         adjustments = self._calculate_ou_adjustments(features, minute)
-        adjusted_prob = max(0.0, min(1.0, base_prob * (1 + adjustments)))
+        adjusted_prob = max(0.0, min(1.0, base_prob * (1.0 + adjustments)))
         confidence_factor = self._calculate_ou_confidence_factor(features, minute)
         final_confidence = max(0.0, min(1.0, base_conf * confidence_factor))
-        return adjusted_prob, final_confidence
+
+        # Keep probabilities out of the 0/1 extremes to prevent hard contradictions downstream
+        return _clamp_prob(adjusted_prob), final_confidence
     
     def _calculate_ou_adjustments(self, features: Dict[str, float], minute: int) -> float:
         adjustments = 0.0
