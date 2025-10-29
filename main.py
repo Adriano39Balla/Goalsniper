@@ -1,3 +1,5 @@
+# file: main.py
+
 # goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate
 # UPGRADED & PATCHED: Robust Supabase connectivity (IPv4 + PgBouncer + SSL), fixed calibration math,
 # sanity + minute cutoffs, per-candidate odds quality, configurable sleep window, GET-enabled admin routes.
@@ -172,7 +174,7 @@ except Exception:
 
 # Optional-but-recommended warnings — ADDED
 if not ADMIN_API_KEY:
-    log.warning("ADMIN_API_KEY is not set — /admin/* endpoints are less protected.")
+    log.warning("ADMIN_API_KEY not set — admin endpoints will return 401 (disabled).")
 if not WEBHOOK_SECRET:
     log.warning("TELEGRAM_WEBHOOK_SECRET is not set — /telegram/webhook/<secret> would be unsafe if exposed.")
 
@@ -189,6 +191,9 @@ def validate_config():
     missing = [k for k, v in required.items() if not v]
     if missing:
         raise SystemExit(f"Missing required config: {missing}")
+    
+    if not ADMIN_API_KEY:
+        log.warning("ADMIN_API_KEY not set — admin endpoints will return 401 (disabled).")
     
     # Validate numeric ranges
     if not (0 <= CONF_THRESHOLD <= 100):
@@ -418,6 +423,17 @@ class PooledConn:
         except Exception as e:
             _metric_inc("db_errors_total", n=1)
             log.error("DB execute failed: %s\nSQL: %s\nParams: %s", e, sql, params)
+            raise
+
+    def executemany(self, sql: str, seq_of_params: list[tuple] | list[list]):
+        if ShutdownManager.is_shutdown_requested():
+            raise Exception("Database operation refused - shutdown in progress")
+        try:
+            self.cur.executemany(sql, seq_of_params or [])
+            return self.cur
+        except Exception as e:
+            _metric_inc("db_errors_total", n=1)
+            log.error("DB executemany failed: %s\nSQL: %s\nBatch size: %s", e, sql, len(seq_of_params or []))
             raise
     
     def fetchone_safe(self):
@@ -1882,16 +1898,30 @@ class SmartOddsAnalyzer:
     def __init__(self):
         self.odds_quality_threshold = 0.85
     
-    def analyze_odds_quality(self, odds_map: dict, prob_hints: dict) -> float:
+    def analyze_odds_quality(self, odds_map: dict, prob_hints: dict[str, float]) -> float:
         if not odds_map:
             return 0.0
-        quality_metrics = []
-        for market, sides in odds_map.items():
-            market_quality = self._market_odds_quality(sides, prob_hints.get(market, {}))
+        quality_metrics: list[float] = []
+        for market_key, sides in odds_map.items():
+            hint_prob = self._resolve_hint_prob(market_key, prob_hints)
+            market_quality = self._market_odds_quality(sides, hint_prob)
             quality_metrics.append(market_quality)
         return sum(quality_metrics) / len(quality_metrics) if quality_metrics else 0.0
     
-    def _market_odds_quality(self, sides: dict, prob_hint: float) -> float:
+    def _resolve_hint_prob(self, odds_market_key: str, hints: dict[str, float]) -> Optional[float]:
+        if odds_market_key == "BTTS":
+            return hints.get("BTTS")
+        if odds_market_key == "1X2":
+            return hints.get("1X2")
+        if odds_market_key.startswith("OU_"):
+            try:
+                line_txt = odds_market_key.split("_", 1)[1]
+                return hints.get(f"Over/Under {line_txt}") or hints.get(f"OU_{line_txt}")
+            except Exception:
+                return None
+        return None
+
+    def _market_odds_quality(self, sides: dict, prob_hint: Optional[float]) -> float:
         if len(sides) < 2:
             return 0.0
         total_implied = sum(1.0 / max(1e-9, data['odds']) for data in sides.values() if data.get('odds'))
@@ -1955,7 +1985,7 @@ def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     try:
         if "Over" in s or "Under" in s:
             import re
-            match = re.search(r'(\d+\.?\d*)', s)
+            match = re.search(r'(\d+(?:\.\d+)?)', s)
             if match:
                 return float(match.group(1))
         return None
@@ -2274,8 +2304,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             
                             if sent:
                                 c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
-                                _metric_inc("tips_sent_total", n=1)
-                                log.info(f"[TIP_SENT] {suggestion} for {home} vs {away} at {minute}'")
+                                # Do not increment tips_sent_total here; send_telegram already increments.
                     except Exception as e:
                         log.exception("[ENHANCED_PROD] insert/send failed: %s", e)
                         continue
@@ -2589,7 +2618,7 @@ def snapshot_odds_for_fixtures(fixtures: List[int]) -> int:
             if not rows:
                 continue
             with db_conn() as c:
-                c.cur.executemany(
+                c.executemany(
                     "INSERT INTO odds_history(match_id,captured_ts,market,selection,odds,book) "
                     "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                     rows
@@ -2905,9 +2934,6 @@ def auto_train_job():
         log.exception("[TRAIN] job failed: %s", e)
         send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
 
-def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
-    return _apply_tune_thresholds(days)
-
 # ───────── Retry unsent tips (unchanged) ─────────
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
     cutoff = int(time.time()) - minutes*60
@@ -3058,9 +3084,6 @@ def _start_scheduler_once():
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
-    except Exception as e:
-        log.exception("[SCHED] failed: %s", e)
-
 # ───────── Admin / auth / endpoints (ALL routes have GET now) ─────────
 def _require_admin():
     key=request.headers.get("X-API-Key") or request.args.get("key") or ((request.json or {}).get("key") if request.is_json else None)
@@ -3151,12 +3174,6 @@ def http_digest():
     msg = daily_accuracy_digest(day=day)
     return jsonify({"ok": True, "sent": bool(msg), "day": day})
 
-@app.route("/admin/auto-tune", methods=["POST","GET"])
-def http_auto_tune():
-    _require_admin()
-    tuned=auto_tune_thresholds(14)
-    return jsonify({"ok": True, "tuned": tuned})
-
 # Ensure _apply_tune_thresholds exists before the public wrapper
 try:
     _apply_tune_thresholds  # type: ignore  # noqa: F401
@@ -3171,6 +3188,12 @@ def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
     except Exception as e:
         log.exception("[AUTO-TUNE] failed: %s", e)
         return {}
+
+@app.route("/admin/auto-tune", methods=["POST","GET"])
+def http_auto_tune():
+    _require_admin()
+    tuned=auto_tune_thresholds(14)
+    return jsonify({"ok": True, "tuned": tuned})
 
 @app.route("/admin/retry-unsent", methods=["POST","GET"])
 def http_retry_unsent():
