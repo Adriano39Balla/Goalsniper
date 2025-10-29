@@ -802,21 +802,18 @@ class AdvancedEnsemblePredictor:
         return None, 0.0
     
     def _logistic_predict(self, features: Dict[str, float], market: str) -> float:
-        """Logistic regression prediction with OU fallback"""
-        mdl = None
-        
-        if market.startswith("OU_"):
-            try:
-                line = float(market[3:])
-                mdl = self._load_ou_model_for_line(line)
-            except Exception as e:
-                log.warning(f"[ENSEMBLE] Failed to parse OU line from {market}: {e}")
-        else:
-            mdl = load_model_from_settings(market)
-            
-        if not mdl:
-            return 0.0
-        return predict_from_model(mdl, features)
+    minute = float(features.get("minute", 0.0))
+    seg = "early" if minute <= 35 else ("mid" if minute <= 70 else "late")
+    name = market
+    if market.startswith("OU_"):
+        try:
+            ln = float(market[3:])
+            name = f"OU_{_fmt_line(ln)}"
+        except:
+            pass
+    # try segmented model first
+    mdl = load_model_from_settings(f"{name}@{seg}") or load_model_from_settings(name)
+    return predict_from_model(mdl, features) if mdl else 0.0
     
     def _load_ou_model_for_line(self, line: float) -> Optional[Dict[str, Any]]:
         """Load OU model with fallback to legacy names"""
@@ -1600,9 +1597,41 @@ def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
     return True
 
 def _get_pre_match_probability(fid: int, market: str):
-    """Get pre-match probability for Bayesian updating"""
-    # This would typically query pre-match models or historical data
-    # For now, return None to indicate no pre-match data available
+    """Use prematch snapshot + PRE models to compute a prior."""
+    try:
+        with db_conn() as c:
+            row = c.execute("SELECT payload FROM prematch_snapshots WHERE match_id=%s", (fid,)).fetchone_safe()
+        if not row or not row[0]:
+            return None
+        payload = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+        feat = (payload or {}).get("feat") or {}
+        if not isinstance(feat, dict) or not feat:
+            return None
+
+        m = (market or "").strip()
+        if m == "BTTS":
+            mdl = load_model_from_settings("PRE_BTTS_YES")
+            return predict_from_model(mdl, feat) if mdl else None
+
+        if m.startswith("Over/Under"):
+            ln = _parse_ou_line_from_suggestion(f"Over {m.split()[-1]} Goals")  # robust parse
+            if ln is None:
+                return None
+            key = f"PRE_OU_{_fmt_line(ln)}"
+            mdl = load_model_from_settings(key)
+            return predict_from_model(mdl, feat) if mdl else None
+
+        if m == "1X2":
+            mh = load_model_from_settings("PRE_WLD_HOME")
+            ma = load_model_from_settings("PRE_WLD_AWAY")
+            if not (mh and ma):
+                return None
+            ph = predict_from_model(mh, feat)
+            pa = predict_from_model(ma, feat)
+            s = max(1e-9, ph + pa)
+            return (ph / s, pa / s)
+    except Exception:
+        return None
     return None
 
 def extract_prematch_features(fx: dict) -> Dict[str, float]:
