@@ -157,6 +157,9 @@ THRESH_MIN_PREDICTIONS  = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
 MIN_THRESH              = float(os.getenv("MIN_THRESH", "55"))
 MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
+# xG proxy enable (new)
+XG_PROXY_ENABLE         = os.getenv("XG_PROXY_ENABLE","1") not in ("0","false","False","no","NO")
+
 STALE_GUARD_ENABLE = os.getenv("STALE_GUARD_ENABLE", "1") not in ("0","false","False","no","NO")
 STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
 MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
@@ -234,6 +237,8 @@ ODDS_AGGREGATION = os.getenv("ODDS_AGGREGATION", "median").lower()# median|best
 ODDS_OUTLIER_MULT = float(os.getenv("ODDS_OUTLIER_MULT", "1.8"))  # drop books > x * median
 ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))# min distinct books per side
 ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))# cap vs fair (1/p)
+ODDS_BLACKLIST_BOOKS = os.getenv("ODDS_BLACKLIST_BOOKS", "")
+ODDS_BLACKLIST = {b.strip().lower() for b in ODDS_BLACKLIST_BOOKS.split(",") if b.strip()}
 
 # ───────── Markets allow-list (draw suppressed) ─────────
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
@@ -802,18 +807,18 @@ class AdvancedEnsemblePredictor:
         return None, 0.0
     
     def _logistic_predict(self, features: Dict[str, float], market: str) -> float:
-    minute = float(features.get("minute", 0.0))
-    seg = "early" if minute <= 35 else ("mid" if minute <= 70 else "late")
-    name = market
-    if market.startswith("OU_"):
-        try:
-            ln = float(market[3:])
-            name = f"OU_{_fmt_line(ln)}"
-        except:
-            pass
-    # try segmented model first
-    mdl = load_model_from_settings(f"{name}@{seg}") or load_model_from_settings(name)
-    return predict_from_model(mdl, features) if mdl else 0.0
+        minute = float(features.get("minute", 0.0))
+        seg = "early" if minute <= 35 else ("mid" if minute <= 70 else "late")
+        name = market
+        if market.startswith("OU_"):
+            try:
+                ln = float(market[3:])
+                name = f"OU_{_fmt_line(ln)}"
+            except:
+                pass
+        # try segmented model first
+        mdl = load_model_from_settings(f"{name}@{seg}") or load_model_from_settings(name)
+        return predict_from_model(mdl, features) if mdl else 0.0
     
     def _load_ou_model_for_line(self, line: float) -> Optional[Dict[str, Any]]:
         """Load OU model with fallback to legacy names"""
@@ -1045,6 +1050,13 @@ def extract_basic_features(m: dict) -> Dict[str,float]:
             if "red" in d or "second yellow" in d:
                 if t == home: red_h += 1
                 elif t == away: red_a += 1
+
+    # xG proxy fallback when vendor xG is missing (env-controlled)
+    if XG_PROXY_ENABLE:
+        if xg_h <= 0 and (sot_h > 0 or sh_total_h > 0):
+            xg_h = 0.12 * float(sot_h) + 0.03 * max(0.0, float(sh_total_h) - float(sot_h))
+        if xg_a <= 0 and (sot_a > 0 or sh_total_a > 0):
+            xg_a = 0.12 * float(sot_a) + 0.03 * max(0.0, float(sh_total_a) - float(sot_a))
 
     return {
         "minute": float(minute),
@@ -1338,7 +1350,7 @@ class MarketSpecificPredictor:
             confidence *= 0.8
         progression_factor = min(1.0, int(features.get("minute", 0)) / 60.0)
         confidence *= (0.5 + 0.5 * progression_factor)
-        total_events = float(features.get("sot_sum", 0) + features.get("cor_sum", 0) + features.get("goals_sum", 0))
+        total_events = float(features.get("sot_sum", 0) + float(features.get("cor_sum", 0)) + float(features.get("goals_sum", 0)))
         if total_events < 5 and minute > 30:
             confidence *= 0.8
         return float(confidence)
@@ -1800,7 +1812,9 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     try:
         for r in js.get("response", []) or []:
             for bk in (r.get("bookmakers") or []):
-                book_name = bk.get("name") or "Book"
+                book_name = (bk.get("name") or "Book").strip()
+                if book_name.lower() in ODDS_BLACKLIST:
+                    continue
                 for mkt in (bk.get("bets") or []):
                     mname = _market_name_normalize(mkt.get("name", ""))
                     vals = mkt.get("values") or []
@@ -2085,6 +2099,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
       • Adds market_cutoff_ok guard per-market.
       • Uses _candidate_is_sane to avoid absurd lines (e.g., Under 2.5 when 3 goals already).
       • Keeps EV/odds gate consistent and honors PER_LEAGUE_CAP / PREDICTIONS_PER_MATCH.
+      • EV-aware threshold discount at final gating (lets strong EV pass).
     """
     if not _db_ping():
         log.error("[ENHANCED_PROD] Database unavailable")
@@ -2164,8 +2179,9 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             continue
                         if not _candidate_is_sane(suggestion, feat):
                             continue
-                        threshold = _get_market_threshold("BTTS")
-                        if adj_prob * 100.0 >= threshold:
+                        # prefilter: allow slightly below market threshold to reach EV gate
+                        pre_thr = max(MIN_THRESH, _get_market_threshold("BTTS") - 10.0)
+                        if adj_prob * 100.0 >= pre_thr:
                             candidates.append(("BTTS", suggestion, adj_prob, btts_confidence))
                             log.info(f"[BTTS_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {btts_confidence:.3f})")
 
@@ -2185,8 +2201,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             continue
                         if not _candidate_is_sane(suggestion, feat):
                             continue
-                        threshold = _get_market_threshold(f"Over/Under {_fmt_line(line)}")
-                        if adj_prob * 100.0 >= threshold:
+                        pre_thr = max(MIN_THRESH, _get_market_threshold(f"Over/Under {_fmt_line(line)}") - 10.0)
+                        if adj_prob * 100.0 >= pre_thr:
                             candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, ou_confidence))
                             log.info(f"[OU_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {ou_confidence:.3f})")
 
@@ -2203,8 +2219,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         for suggestion, adj_prob in adjusted_1x2.items():
                             if not market_cutoff_ok(minute, "1X2", suggestion):
                                 continue
-                            threshold = _get_market_threshold("1X2")
-                            if adj_prob * 100.0 >= threshold:
+                            pre_thr = max(MIN_THRESH, _get_market_threshold("1X2") - 10.0)
+                            if adj_prob * 100.0 >= pre_thr:
                                 candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
                                 log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
                 except Exception as e:
@@ -2282,6 +2298,15 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     else:
                         if not ALLOW_TIPS_WITHOUT_ODDS:
                             continue
+
+                    # EV-aware threshold discount at final gate
+                    threshold = _get_market_threshold(mk)
+                    thr_discount = 0.0
+                    if ev_pct is not None:
+                        thr_discount = max(0.0, min(8.0, 0.4 * max(0.0, ev_pct)))  # up to 8pp discount for strong EV
+                    effective_thr = max(MIN_THRESH, threshold - thr_discount)
+                    if prob * 100.0 < effective_thr:
+                        continue
 
                     rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0) * max(0.0, confidence)
                     ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score, confidence))
