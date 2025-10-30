@@ -1520,17 +1520,48 @@ adaptive_learner = AdaptiveLearningSystem()
 # ───────── Missing Function Implementations ─────────
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
-    """Check if we have sufficient statistical coverage"""
-    # Check if we have basic stats available
-    required_stats = ['xg_h', 'xg_a', 'sot_h', 'sot_a']
-    has_required = all(feat.get(stat, 0) > 0 for stat in required_stats)
-    
-    # For early minutes, require less coverage
-    if minute < 25:
-        return has_required or feat.get('pos_h', 0) > 0
-    else:
-        # For later minutes, require better coverage
-        return has_required and feat.get('pos_h', 0) > 0
+    """
+    Decide if we have sufficient statistical coverage to score a match.
+
+    Rationale:
+    - Early game ( < 25' ): allow tips with *any* signal (possession OR activity OR xG).
+    - Later game (>= 25'): require possession plus some activity/xG/goals so we don't act on empty feeds.
+    Notes:
+    - We can't distinguish "missing" vs "zero" from the API here (missing keys become 0),
+      so we use possession/activity proxies rather than insisting on >0 SOT for both sides.
+    """
+    try:
+        m = int(minute)
+    except Exception:
+        m = 0
+
+    # Signals
+    pos_h = float(feat.get("pos_h", 0.0))
+    pos_a = float(feat.get("pos_a", 0.0))
+    pos_known = (pos_h > 0.0) or (pos_a > 0.0)
+
+    shots_total = float(feat.get("sh_total_h", 0.0) + feat.get("sh_total_a", 0.0))
+    sot_sum     = float(feat.get("sot_sum", 0.0))
+    corners     = float(feat.get("cor_sum", 0.0))
+    goals_sum   = float(feat.get("goals_sum", 0.0))
+    xg_sum      = float(feat.get("xg_sum", 0.0))
+
+    # "Activity" = anything happening on the pitch we can see in the feed
+    activity = shots_total + sot_sum + corners + goals_sum
+
+    if m < 25:
+        # Be permissive early: any one of these is enough
+        return bool(pos_known or activity > 0 or xg_sum > 0)
+
+    # From 25' onward, ask for possession AND (some activity or xG or goals)
+    if pos_known and (activity >= 2 or xg_sum > 0 or goals_sum > 0):
+        return True
+
+    # From late game, be slightly more permissive if there are goals (scoreboard is always reliable)
+    if m >= 70 and goals_sum > 0:
+        return True
+
+    return False
 
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     """Check if the data feed is stale"""
