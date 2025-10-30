@@ -1648,7 +1648,8 @@ def _get_pre_match_probability(fid: int, market: str):
     """Use prematch snapshot + PRE models to compute a prior."""
     try:
         with db_conn() as c:
-            row = c.execute("SELECT payload FROM prematch_snapshots WHERE match_id=%s", (fid,)).fetchone_safe()
+            c.execute("SELECT payload FROM prematch_snapshots WHERE match_id=%s", (fid,))
+            row = c.fetchone_safe()
         if not row or not row[0]:
             return None
         payload = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
@@ -2204,17 +2205,19 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     _dbg("no_fixture_id")
                     continue
 
-                # Duplicate cooldown
+                # Duplicate cooldown — FIXED: use c.fetchone_safe() (not chaining on cursor)
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - DUP_COOLDOWN_MIN * 60
-                    row = c.execute(
+                    c.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
                         (fid, cutoff),
-                    ).fetchone_safe()
+                    )
+                    row = c.fetchone_safe()
                     if row:
                         _dbg("dup_cooldown_block", fid=fid, cutoff=cutoff, cooldown_min=DUP_COOLDOWN_MIN)
                         continue
 
+                # Extract advanced features
                 feat = feature_engineer.extract_advanced_features(m)
                 minute = int(feat.get("minute", 0))
 
@@ -2228,10 +2231,12 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     _dbg("feed_stale", fid=fid, minute=minute)
                     continue
 
-                # Harvest snapshots (every 3 min)
+                # Harvest snapshot
                 if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
-                    try: save_snapshot_from_match(m, feat)
-                    except: pass
+                    try:
+                        save_snapshot_from_match(m, feat)
+                    except Exception:
+                        pass
 
                 game_state_analyzer = GameStateAnalyzer()
                 game_state = game_state_analyzer.analyze_game_state(feat)
@@ -2420,8 +2425,10 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         ))
                         if sent:
                             with db_conn() as c3:
-                                c3.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
-                                           (fid, created_ts))
+                                c3.execute(
+                                    "UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
+                                    (fid, created_ts)
+                                )
                     except Exception as e:
                         log.exception("[ENHANCED_PROD] insert/send failed: %s", e)
                         _dbg("insert_send_error", err=str(e))
@@ -2445,10 +2452,6 @@ def enhanced_production_scan() -> Tuple[int, int]:
     log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
     _metric_inc("tips_generated_total", n=saved)
     return saved, live_seen
-
-# Keep production_scan as alias
-def production_scan() -> Tuple[int, int]:
-    return enhanced_production_scan()
 
 # ───────── Model loader (with validation) ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
