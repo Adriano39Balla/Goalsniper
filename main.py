@@ -234,6 +234,7 @@ ODDS_AGGREGATION = os.getenv("ODDS_AGGREGATION", "median").lower()# median|best
 ODDS_OUTLIER_MULT = float(os.getenv("ODDS_OUTLIER_MULT", "1.8"))  # drop books > x * median
 ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))# min distinct books per side
 ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))# cap vs fair (1/p)
+ODDS_QUALITY_MIN = float(os.getenv("ODDS_QUALITY_MIN", "0.35"))   # ✅ added: min acceptable odds quality (0-1)
 
 # ───────── Markets allow-list (draw suppressed) ─────────
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
@@ -740,16 +741,7 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
     fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
     return fixtures
 
-def _odds_key_for_market(market_txt: str, suggestion: str) -> str | None:
-    """Map our market/suggestion to the odds_map key."""
-    if market_txt == "BTTS":
-        return "BTTS"
-    if market_txt == "1X2":
-        return "1X2"
-    if market_txt.startswith("Over/Under"):
-        ln = _parse_ou_line_from_suggestion(suggestion)
-        return f"OU_{_fmt_line(ln)}" if ln is not None else None
-    return None
+# (Removed duplicated _odds_key_for_market here; single definition kept later)
 
 # ───────── ENHANCEMENT 1: Advanced Ensemble Learning System ─────────
 class AdvancedEnsemblePredictor:
@@ -2452,6 +2444,10 @@ def enhanced_production_scan() -> Tuple[int, int]:
     log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
     _metric_inc("tips_generated_total", n=saved)
     return saved, live_seen
+
+# ✅ Alias for scheduler & admin endpoint
+def production_scan() -> Tuple[int, int]:
+    return enhanced_production_scan()
 
 # ───────── Model loader (with validation) ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
