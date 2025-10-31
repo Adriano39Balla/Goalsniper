@@ -263,7 +263,7 @@ session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=
 # ───────── Caches & timezones — UPDATED TZ ─────────
 STATS_CACHE:  Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
-ODDS_CACHE:   Dict[int, Tuple[float, dict]] = {}
+ODDS_CACHE:   Dict[Tuple[str,int], Tuple[float, dict]] = {}  # patched: key includes live/prematch scope
 SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC = ZoneInfo("UTC")
@@ -478,7 +478,7 @@ def _db_ping() -> bool:
         try:
             _init_pool()
             with db_conn() as c2:
-                c2.execute("SELECT 1")
+                c.execute("SELECT 1")
                 return True
         except Exception as e:
             _metric_inc("db_errors_total", n=1)
@@ -1336,7 +1336,7 @@ class MarketSpecificPredictor:
         adjustments = 0.0
         current_goals = float(features.get("goals_sum", 0))
         xg_sum = float(features.get("xg_sum", 0))
-        minute = max(1, int(features.get("minute", 1)))
+        minute = max(1, int(features.get("minute", 0)))
         xg_per_minute = xg_sum / minute
         expected_goals_by_now = (xg_per_minute * minute)
         if expected_goals_by_now > 0:
@@ -1664,6 +1664,11 @@ def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
         goals_a = feat.get("goals_a", 0)
         if goals_h > 0 and goals_a > 0:
             return False
+    # Once both teams have scored, BTTS: Yes is trivial and live price ~1.01;
+    # we don't tip this late triviality.
+    if suggestion == "BTTS: Yes":
+        if float(feat.get("goals_h", 0)) > 0 and float(feat.get("goals_a", 0)) > 0:
+            return False
             
     return True
 
@@ -1760,9 +1765,9 @@ def cleanup_caches():
         EVENTS_CACHE.pop(fid, None)
         
     # Clean ODDS_CACHE
-    expired = [fid for fid, (ts, _) in ODDS_CACHE.items() if now - ts > 300]
-    for fid in expired:
-        ODDS_CACHE.pop(fid, None)
+    expired = [key for key, (ts, _) in ODDS_CACHE.items() if now - ts > 300]
+    for key in expired:
+        ODDS_CACHE.pop(key, None)
         
     # Clean NEG_CACHE
     expired = [key for key, (ts, _) in NEG_CACHE.items() if now - ts > NEG_TTL_SEC]
@@ -1809,10 +1814,10 @@ def _min_odds_for_market(market: str) -> float:
     return 1.01
 
 def _odds_cache_get(fid: int) -> Optional[dict]:
-    rec=ODDS_CACHE.get(fid)
+    rec=ODDS_CACHE.get(("odds", fid))
     if not rec: return None
     ts,data=rec
-    if time.time()-ts>120: ODDS_CACHE.pop(fid,None); return None
+    if time.time()-ts>120: ODDS_CACHE.pop(("odds", fid),None); return None
     return data
 
 def _market_name_normalize(s: str) -> str:
@@ -1846,26 +1851,26 @@ def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) 
     pick = min(filtered, key=lambda t: abs(t[0] - target))
     return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
 
-def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
+def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None, *, live_only: bool = False) -> dict:
     """
     Aggregated odds map:
       { "BTTS": {...}, "1X2": {...}, "OU_2.5": {...}, ... }
-    Prefers /odds/live, falls back to /odds; aggregates across books.
+    In in-play contexts set live_only=True to forbid prematch fallback.
     """
     now = time.time()
-    k=("odds", fid)
+    k = ("odds_live" if live_only else "odds", fid)
     ts_empty = NEG_CACHE.get(k, (0.0, False))
     if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return {}
-    if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: return ODDS_CACHE[fid][1]
+    if k in ODDS_CACHE and now-ODDS_CACHE[k][0] < 120: return ODDS_CACHE[k][1]
 
     def _fetch(path: str) -> dict:
         js = _api_get(f"{BASE_URL}/{path}", {"fixture": fid}) or {}
         return js if isinstance(js, dict) else {}
 
     js = {}
-    if ODDS_SOURCE in ("auto", "live"):
+    if ODDS_SOURCE in ("auto", "live") or live_only:
         js = _fetch("odds/live")
-    if not (js.get("response") or []) and ODDS_SOURCE in ("auto", "prematch"):
+    if not (js.get("response") or []) and not live_only and ODDS_SOURCE in ("auto", "prematch"):
         js = _fetch("odds")
 
     by_market: dict[str, dict[str, list[tuple[float, str]]]] = {}
@@ -1933,7 +1938,7 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
             if ag is not None:
                 out[mkey][side] = {"odds": float(ag), "book": label}
 
-    ODDS_CACHE[fid] = (time.time(), out)
+    ODDS_CACHE[k] = (time.time(), out)
     if not out: NEG_CACHE[k] = (now, True)
     return out
 
@@ -2118,11 +2123,13 @@ def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     except Exception:
         return None
 
-def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
+def _price_gate(market_text: str, suggestion: str, fid: int, *, minute: Optional[int] = None) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
     Return (pass, odds, book, ev_pct). If odds missing and ALLOW_TIPS_WITHOUT_ODDS=0 => block.
     """
-    odds_map=fetch_odds(fid) if API_KEY else {}
+    # In-play must use LIVE odds only to avoid prematch leakage.
+    live_only = (minute or 0) > 0
+    odds_map = fetch_odds(fid, live_only=live_only) if API_KEY else {}
     odds=None; book=None
     if market_text=="BTTS":
         d=odds_map.get("BTTS",{})
@@ -2277,6 +2284,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     if btts_prob > 0 and btts_conf > 0.5:
                         preds = {"BTTS: Yes": btts_prob, "BTTS: No": max(0.0, 1 - btts_prob)}
                         preds = game_state_analyzer.adjust_predictions(preds, game_state)
+                        preds = {k: _clamp_prob(v) for k, v in preds.items()}
                         for suggestion, p in preds.items():
                             if not market_cutoff_ok(minute, "BTTS", suggestion):
                                 _dbg("cutoff_block", market="BTTS", suggestion=suggestion, minute=minute)
@@ -2306,6 +2314,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             f"Under {_fmt_line(line)} Goals": max(0.0, 1 - ou_prob),
                         }
                         preds = game_state_analyzer.adjust_predictions(preds, game_state)
+                        preds = {k: _clamp_prob(v) for k, v in preds.items()}
                         for suggestion, p in preds.items():
                             if not market_cutoff_ok(minute, mkkey, suggestion):
                                 _dbg("cutoff_block", market=mkkey, suggestion=suggestion, minute=minute)
@@ -2330,6 +2339,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         ph, pa = ph/s, pa/s
                         preds = {"Home Win": ph, "Away Win": pa}
                         preds = game_state_analyzer.adjust_predictions(preds, game_state)
+                        preds = {k: _clamp_prob(v) for k, v in preds.items()}
                         for suggestion, p in preds.items():
                             if not market_cutoff_ok(minute, "1X2", suggestion):
                                 _dbg("cutoff_block", market="1X2", suggestion=suggestion, minute=minute)
@@ -2347,7 +2357,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     _dbg("no_candidates_post_threshold", fid=fid, minute=minute)
                     continue
 
-                odds_map = fetch_odds(fid) if API_KEY else {}
+                # Use LIVE odds for in-play ranking/EV/quality
+                odds_map = fetch_odds(fid, live_only=(minute > 0)) if API_KEY else {}
                 ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
 
                 for mk, sug, prob, conf in candidates:
@@ -2379,7 +2390,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         tgt = "Over" if sug.startswith("Over") else "Under"
                         if tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
 
-                    pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
+                    pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid, minute=minute)
                     if not pass_odds:
                         _dbg("price_gate_block", market=mk, sug=sug, have_odds=bool(odds), min=_min_odds_for_market(mk))
                         continue
