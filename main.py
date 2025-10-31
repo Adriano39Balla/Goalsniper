@@ -1,8 +1,3 @@
-Please do me the honor
-
-
-
-
 # file: main.py
 
 # goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate
