@@ -2195,6 +2195,75 @@ def _format_enhanced_tip_message(home, away, league, minute, score, suggestion,
             f"📈 <b>Confidence:</b> {prob_pct:.1f}%{ai_info}{money}\n"
             f"🏆 <b>League:</b> {escape(league)}{stat}")
 
+def explain_tip(match, features, model_output):
+    explanation = []
+
+    # Map common aliases (supports both your snippet's keys and this app's keys)
+    def _g(keys, default=0.0):
+        if not isinstance(keys, (list, tuple)):
+            keys = [keys]
+        for k in keys:
+            if k in features and features[k] is not None:
+                v = features[k]
+                try:
+                    # strip possible "%" strings
+                    return float(str(v).replace("%", ""))
+                except Exception:
+                    try:
+                        return float(v)
+                    except Exception:
+                        return default
+        return default
+
+    xg_home = _g(['xg_home', 'xg_h'], 0.0)
+    xg_away = _g(['xg_away', 'xg_a'], 0.0)
+    possession_home = _g(['possession_home', 'pos_h'], 0.0)
+    corners_home = _g(['corners_home', 'cor_h'], 0.0)
+    corners_away = _g(['corners_away', 'cor_a'], 0.0)
+    shots_on_target_away = _g(['shots_on_target_away', 'sot_a'], 0.0)
+
+    # EV can be provided as 'ev' or 'ev_pct' in this project
+    ev = None
+    if 'ev' in features:
+        try:
+            ev = float(str(features['ev']).replace("%", ""))
+        except Exception:
+            ev = None
+    elif 'ev_pct' in features:
+        try:
+            ev = float(str(features['ev_pct']).replace("%", ""))
+        except Exception:
+            ev = None
+
+    # Confidence from model_output dict, if provided
+    conf = None
+    if isinstance(model_output, dict) and 'confidence' in model_output:
+        try:
+            conf = float(model_output['confidence'])
+        except Exception:
+            conf = None
+
+    # 1 — Game dynamics
+    if xg_home < 0.2 and xg_away < 0.2:
+        explanation.append("Both teams have low xG — low actual threat so far.")
+    if possession_home > 65 and xg_home < 0.3:
+        explanation.append("Favorite has possession but isn't creating danger.")
+    if corners_away >= corners_home - 1:
+        explanation.append("Underdog creating set-piece pressure despite low possession.")
+    if shots_on_target_away > 0:
+        explanation.append("Away side has tested the keeper.")
+
+    # 2 — Market logic
+    if ev is not None and ev > 100:
+        explanation.append(f"Massive EV detected: {round(ev, 1)}% suggests bookmaker mispricing.")
+
+    # 3 — Model reasoning
+    if conf is not None and conf > 0.75:
+        explanation.append("AI confidence strong based on historical patterns in similar matches.")
+
+    # Combine
+    return " ".join(explanation)
+
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems (patched) ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
     """
