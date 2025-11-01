@@ -1508,48 +1508,21 @@ adaptive_learner = AdaptiveLearningSystem()
 # ───────── Missing Function Implementations ─────────
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
-    """
-    Decide if we have sufficient statistical coverage to score a match.
+    """Stricter coverage gates to avoid junk in mid/late game."""
+    has_sot = (feat.get('sot_h', 0) > 0) and (feat.get('sot_a', 0) > 0)
+    has_pos = (feat.get('pos_h', 0) > 0) and (feat.get('pos_a', 0) > 0)
+    has_xg  = (feat.get('xg_h', 0) > 0) and (feat.get('xg_a', 0) > 0)
 
-    Rationale:
-    - Early game ( < 25' ): allow tips with *any* signal (possession OR activity OR xG).
-    - Later game (>= 25'): require possession plus some activity/xG/goals so we don't act on empty feeds.
-    Notes:
-    - We can't distinguish "missing" vs "zero" from the API here (missing keys become 0),
-      so we use possession/activity proxies rather than insisting on >0 SOT for both sides.
-    """
-    try:
-        m = int(minute)
-    except Exception:
-        m = 0
+    if minute < 25:
+        # Early: permissive
+        return has_pos or has_sot or has_xg
 
-    # Signals
-    pos_h = float(feat.get("pos_h", 0.0))
-    pos_a = float(feat.get("pos_a", 0.0))
-    pos_known = (pos_h > 0.0) or (pos_a > 0.0)
+    if 25 <= minute < 55:
+        # Mid-game: need shots+possession OR xG
+        return (has_pos and has_sot) or has_xg
 
-    shots_total = float(feat.get("sh_total_h", 0.0) + feat.get("sh_total_a", 0.0))
-    sot_sum     = float(feat.get("sot_sum", 0.0))
-    corners     = float(feat.get("cor_sum", 0.0))
-    goals_sum   = float(feat.get("goals_sum", 0.0))
-    xg_sum      = float(feat.get("xg_sum", 0.0))
-
-    # "Activity" = anything happening on the pitch we can see in the feed
-    activity = shots_total + sot_sum + corners + goals_sum
-
-    if m < 25:
-        # Be permissive early: any one of these is enough
-        return bool(pos_known or activity > 0 or xg_sum > 0)
-
-    # From 25' onward, ask for possession AND (some activity or xG or goals)
-    if pos_known and (activity >= 2 or xg_sum > 0 or goals_sum > 0):
-        return True
-
-    # From late game, be slightly more permissive if there are goals (scoreboard is always reliable)
-    if m >= 70 and goals_sum > 0:
-        return True
-
-    return False
+    # Late: need xG OR very active match (both SOT and enough total events)
+    return has_xg or (has_pos and has_sot and (feat.get('sot_sum', 0) >= 6))
 
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     """Check if the data feed is stale"""
@@ -1655,63 +1628,18 @@ def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
             
     return True
 
-def _get_pre_match_probability(fid: int, market: str):
-    """Use prematch snapshot + PRE models to compute a prior."""
-    try:
-        with db_conn() as c:
-            c.execute("SELECT payload FROM prematch_snapshots WHERE match_id=%s", (fid,))
-            row = c.fetchone_safe()
-        if not row or not row[0]:
-            return None
-        payload = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
-        feat = (payload or {}).get("feat") or {}
-        if not isinstance(feat, dict) or not feat:
-            return None
-
-        m = (market or "").strip()
-        if m == "BTTS":
-            mdl = load_model_from_settings("PRE_BTTS_YES")
-            return predict_from_model(mdl, feat) if mdl else None
-
-        if m.startswith("Over/Under"):
-            ln = _parse_ou_line_from_suggestion(f"Over {m.split()[-1]} Goals")  # robust parse
-            if ln is None:
-                return None
-            key = f"PRE_OU_{_fmt_line(ln)}"
-            mdl = load_model_from_settings(key)
-            return predict_from_model(mdl, feat) if mdl else None
-
-        if m == "1X2":
-            mh = load_model_from_settings("PRE_WLD_HOME")
-            ma = load_model_from_settings("PRE_WLD_AWAY")
-            if not (mh and ma):
-                return None
-            ph = predict_from_model(mh, feat)
-            pa = predict_from_model(ma, feat)
-            s = max(1e-9, ph + pa)
-            return (ph / s, pa / s)
-    except Exception:
-        return None
-    return None
-
-def extract_prematch_features(fx: dict) -> Dict[str, float]:
-    """Extract features for pre-match predictions"""
-    # Basic prematch features - would typically include:
-    # team form, H2H, missing players, etc.
-    feat = {}
-    
-    # Placeholder implementation
-    teams = fx.get("teams", {}) or {}
-    home_team = (teams.get("home") or {}).get("name", "")
-    away_team = (teams.get("away") or {}).get("name", "")
-    
-    # Add basic features (these would be populated from external data)
-    feat["home_team_strength"] = 0.5
-    feat["away_team_strength"] = 0.5
-    feat["form_differential"] = 0.0
-    feat["h2h_advantage"] = 0.0
-    
-    return feat
+def _inplay_1x2_sanity_ok(suggestion: str, feat: Dict[str, float], odds: Optional[float]) -> bool:
+    """
+    Late-game 1X2 sanity: if a side leads by >=2 after 60', live odds should be short.
+    Big odds at that state implies stale/prematch leakage → block.
+    """
+    minute = int(feat.get("minute", 0))
+    gd = int(feat.get("goals_h", 0) - feat.get("goals_a", 0))
+    if suggestion not in ("Home Win", "Away Win"):
+        return True
+    if minute >= 60 and abs(gd) >= 2 and odds is not None and odds > 1.50:
+        return False
+    return True
 
 def _score_prob(feat: Dict[str, float], mdl: Optional[Dict[str, Any]]) -> float:
     """Score probability using a model"""
@@ -1834,27 +1762,44 @@ def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) 
     pick = min(filtered, key=lambda t: abs(t[0] - target))
     return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
 
-def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
+def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None, require_live: bool = False) -> dict:
     """
     Aggregated odds map:
       { "BTTS": {...}, "1X2": {...}, "OU_2.5": {...}, ... }
-    Prefers /odds/live, falls back to /odds; aggregates across books.
+    If require_live=True and live odds are unavailable, return {} (do NOT fall back to prematch).
     """
     now = time.time()
     k=("odds", fid)
     ts_empty = NEG_CACHE.get(k, (0.0, False))
-    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return {}
-    if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: return ODDS_CACHE[fid][1]
+    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): 
+        return {}
+    if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: 
+        return ODDS_CACHE[fid][1]
 
     def _fetch(path: str) -> dict:
         js = _api_get(f"{BASE_URL}/{path}", {"fixture": fid}) or {}
         return js if isinstance(js, dict) else {}
 
     js = {}
+    src = None
+
+    # Try live first
     if ODDS_SOURCE in ("auto", "live"):
         js = _fetch("odds/live")
-    if not (js.get("response") or []) and ODDS_SOURCE in ("auto", "prematch"):
+        if (js.get("response") or []):
+            src = "live"
+
+    # If require_live=True, don't fall back to prematch
+    if not (js.get("response") or []) and not require_live and ODDS_SOURCE in ("auto", "prematch"):
         js = _fetch("odds")
+        if (js.get("response") or []):
+            src = "prematch"
+
+    if require_live and src != "live":
+        # mark negative briefly and don't cache prematch into live slot
+        NEG_CACHE[k] = (now, True)
+        ODDS_CACHE[fid] = (time.time(), {})
+        return {}
 
     by_market: dict[str, dict[str, list[tuple[float, str]]]] = {}
     try:
@@ -1892,6 +1837,30 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     except Exception:
         pass
 
+    def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+        if not vals:
+            return None, None
+        xs = sorted([o for (o, _) in vals if (o or 0) > 0])
+        if not xs:
+            return None, None
+        import statistics
+        med = statistics.median(xs)
+        filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
+        if not filtered:
+            filtered = vals
+        xs2 = sorted([o for (o, _) in filtered])
+        med2 = statistics.median(xs2)
+        if prob_hint is not None and prob_hint > 0:
+            fair = 1.0 / max(1e-6, float(prob_hint))
+            cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
+            filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
+        if ODDS_AGGREGATION == "best":
+            best = max(filtered, key=lambda t: t[0])
+            return float(best[0]), str(best[1])
+        target = med2
+        pick = min(filtered, key=lambda t: abs(t[0] - target))
+        return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
+
     out: dict[str, dict[str, dict]] = {}
     for mkey, side_map in by_market.items():
         ok = True
@@ -1922,7 +1891,8 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
                 out[mkey][side] = {"odds": float(ag), "book": label}
 
     ODDS_CACHE[fid] = (time.time(), out)
-    if not out: NEG_CACHE[k] = (now, True)
+    if not out: 
+        NEG_CACHE[k] = (now, True)
     return out
 
 # ───────── Bayesian & GameState & Odds Quality ─────────
@@ -2106,11 +2076,12 @@ def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     except Exception:
         return None
 
-def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
+def _price_gate(market_text: str, suggestion: str, fid: int, require_live_odds: bool = False) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
-    Return (pass, odds, book, ev_pct). If odds missing and ALLOW_TIPS_WITHOUT_ODDS=0 => block.
+    Return (pass, odds, book, ev_pct).
+    If require_live_odds=True and no live odds found => block, regardless of ALLOW_TIPS_WITHOUT_ODDS.
     """
-    odds_map=fetch_odds(fid) if API_KEY else {}
+    odds_map = fetch_odds(fid, require_live=require_live_odds) if API_KEY else {}
     odds=None; book=None
     if market_text=="BTTS":
         d=odds_map.get("BTTS",{})
@@ -2127,8 +2098,13 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
         if tgt in d:
             odds = d[tgt]["odds"]
             book = d[tgt]["book"]
+
+    # Require live odds for in-play picks
     if odds is None:
+        if require_live_odds:
+            return (False, None, None, None)
         return (True, None, None, None) if ALLOW_TIPS_WITHOUT_ODDS else (False, None, None, None)
+
     min_odds=_min_odds_for_market(market_text)
     if not (min_odds <= odds <= MAX_ODDS_ALL):
         return (False, odds, book, None)
@@ -2464,6 +2440,8 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         continue
                     if odds is None:
                         odds, book = odds2, book2
+                    if mk == "1X2" and not _inplay_1x2_sanity_ok(suggestion, feat, odds):
+                        continue
 
                     ev_pct = None
                     if odds is not None:
