@@ -1,4 +1,4 @@
-# goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate
+# goalsniper — FULL AI mode (in-play) with odds + EV gate
 # UPGRADED & PATCHED: Robust Supabase connectivity (IPv4 + PgBouncer + SSL), fixed calibration math,
 # sanity + minute cutoffs, per-candidate odds quality, configurable sleep window, GET-enabled admin routes.
 
@@ -159,16 +159,6 @@ STALE_GUARD_ENABLE = os.getenv("STALE_GUARD_ENABLE", "1") not in ("0","false","F
 STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
 MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
 TIP_MAX_MINUTE_ENV = os.getenv("TIP_MAX_MINUTE", "")
-
-MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
-MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
-MOTD_HOUR               = int(os.getenv("MOTD_HOUR", "19"))
-MOTD_MINUTE             = int(os.getenv("MOTD_MINUTE", "15"))
-MOTD_CONF_MIN           = float(os.getenv("MOTD_CONF_MIN", "70"))
-try:
-    MOTD_LEAGUE_IDS = [int(x) for x in (os.getenv("MOTD_LEAGUE_IDS","").split(",")) if x.strip().isdigit()]
-except Exception:
-    MOTD_LEAGUE_IDS = []
 
 # Optional-but-recommended warnings — ADDED
 if not ADMIN_API_KEY:
@@ -2176,21 +2166,43 @@ def _format_enhanced_tip_message(home, away, league, minute, score, suggestion,
                 f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
         if feat.get("pos_h",0) or feat.get("pos_a",0): 
             stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
+    
+    # FIXED: Rename "Confidence" to "Win Probability" when appropriate
+    current_score = score.split('-')
+    home_goals, away_goals = int(current_score[0]), int(current_score[1])
+    
+    # Determine if this is a current state (like Home Win when already winning)
+    is_current_state_prediction = (
+        (suggestion == "Home Win" and home_goals > away_goals) or
+        (suggestion == "Away Win" and away_goals > home_goals) or
+        (suggestion == "BTTS: Yes" and home_goals > 0 and away_goals > 0) or
+        (suggestion == "BTTS: No" and (home_goals == 0 or away_goals == 0))
+    )
+    
+    confidence_label = "📈 Win Probability" if is_current_state_prediction else "📈 Confidence"
+    
     ai_info = ""
     if confidence is not None:
         confidence_level = "🟢 HIGH" if confidence > 0.8 else "🟡 MEDIUM" if confidence > 0.6 else "🔴 LOW"
         ai_info = f"\n🤖 <b>AI Confidence:</b> {confidence_level} ({confidence:.1%})"
+    
     money = ""
     if odds:
         if ev_pct is not None:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
         else:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
+    
+    # FIXED: Add context about current match state
+    context_note = ""
+    if is_current_state_prediction:
+        context_note = f"\n⚠️ <i>Note: This reflects current match probability based on score and time</i>"
+    
     return ("⚽️ <b>🤖 AI ENHANCED TIP!</b>\n"
             f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
             f"🕒 <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score)}\n"
             f"<b>Tip:</b> {escape(suggestion)}\n"
-            f"📈 <b>Confidence:</b> {prob_pct:.1f}%{ai_info}{money}\n"
+            f"{confidence_label}: {prob_pct:.1f}%{ai_info}{money}{context_note}\n"
             f"🏆 <b>League:</b> {escape(league)}{stat}")
 
 def explain_tip(match, features, model_output):
@@ -2791,327 +2803,6 @@ def daily_accuracy_digest(day: str = "today") -> Optional[str]:
     log.info("[DIGEST] Sent daily digest (%s) with %d tips, %d graded", label, total, graded)
     return msg
 
-# ───────── Prematch pipeline (kept; minor safety tweaks) ─────────
-def _kickoff_berlin(utc_iso: str|None) -> str:
-    try:
-        if not utc_iso: return "TBD"
-        dt=datetime.fromisoformat(utc_iso.replace("Z","+00:00"))
-        return dt.astimezone(BERLIN_TZ).strftime("%H:%M")
-    except: return "TBD"
-
-def save_prematch_snapshot(fx: dict, feat: Dict[str, float]) -> None:
-    fixture = fx.get("fixture") or {}
-    fid = int(fixture.get("id") or 0)
-    if not fid:
-        return
-    now = int(time.time())
-    payload = json.dumps({"feat": {k: float(feat.get(k, 0.0) or 0.0) for k in feat.keys()}},
-                         separators=(",", ":"), ensure_ascii=False)
-    with db_conn() as c:
-        c.execute(
-            "INSERT INTO prematch_snapshots(match_id, created_ts, payload) "
-            "VALUES (%s,%s,%s) "
-            "ON CONFLICT (match_id) DO UPDATE SET created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload",
-            (fid, now, payload)
-        )
-
-def snapshot_odds_for_fixtures(fixtures: List[int]) -> int:
-    wrote = 0
-    now = int(time.time())
-    for fid in fixtures:
-        try:
-            od = fetch_odds(fid)
-            rows = []
-            for mk, sides in (od or {}).items():
-                for sel, payload in (sides or {}).items():
-                    o = float((payload or {}).get("odds") or 0)
-                    b = (payload or {}).get("book") or "Book"
-                    if o <= 0: 
-                        continue
-                    rows.append((fid, now, mk, sel, o, b))
-            if not rows:
-                continue
-            with db_conn() as c:
-                c.executemany(
-                    "INSERT INTO odds_history(match_id,captured_ts,market,selection,odds,book) "
-                    "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                    rows
-                )
-                wrote += len(rows)
-        except Exception:
-            continue
-    return wrote
-
-def _today_fixture_ids() -> List[int]:
-    fixtures = _collect_todays_prematch_fixtures()
-    return [int(((fx.get('fixture') or {}).get('id') or 0)) for fx in fixtures if int(((fx.get('fixture') or {}).get('id') or 0))]
-
-def fetch_lineup_and_save(fid: int) -> bool:
-    js = _api_get(f"{BASE_URL}/fixtures/lineups", {"fixture": fid}) or {}
-    arr = js.get("response") or []
-    if not arr:
-        return False
-    with db_conn() as c:
-        c.execute(
-            "INSERT INTO lineups(match_id,created_ts,payload) VALUES (%s,%s,%s) "
-            "ON CONFLICT (match_id) DO UPDATE SET created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload",
-            (int(fid), int(time.time()), json.dumps(arr, separators=(",", ":")))
-        )
-    return True
-
-def prematch_scan_save() -> int:
-    fixtures = _collect_todays_prematch_fixtures()
-    if not fixtures:
-        return 0
-
-    saved = 0
-    for fx in fixtures:
-        fixture = fx.get("fixture") or {}
-        lg = fx.get("league") or {}
-        teams = fx.get("teams") or {}
-
-        home = (teams.get("home") or {}).get("name", "")
-        away = (teams.get("away") or {}).get("name", "")
-        league_id = int(lg.get("id") or 0)
-        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-        fid = int(fixture.get("id") or 0)
-
-        feat = extract_prematch_features(fx)
-        if not fid or not feat:
-            continue
-
-        try:
-            save_prematch_snapshot(fx, feat)
-        except Exception:
-            pass
-
-        candidates: List[Tuple[str, str, float]] = []
-
-        # PRE OU
-        for line in OU_LINES:
-            mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-            if not mdl:
-                continue
-            p = _score_prob(feat, mdl)
-            mk = f"Over/Under {_fmt_line(line)}"
-            thr = _get_market_threshold_pre(mk)
-            if p * 100.0 >= thr:
-                candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p))
-            q = 1.0 - p
-            if q * 100.0 >= thr:
-                candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", q))
-
-        # PRE BTTS
-        mdl = load_model_from_settings("PRE_BTTS_YES")
-        if mdl:
-            p = _score_prob(feat, mdl)
-            thr = _get_market_threshold_pre("BTTS")
-            if p * 100.0 >= thr:
-                candidates.append(("PRE BTTS", "BTTS: Yes", p))
-            q = 1.0 - p
-            if q * 100.0 >= thr:
-                candidates.append(("PRE BTTS", "BTTS: No", q))
-
-        # PRE 1X2 (draw suppressed)
-        mh, ma = load_model_from_settings("PRE_WLD_HOME"), load_model_from_settings("PRE_WLD_AWAY")
-        if mh and ma:
-            ph = _score_prob(feat, mh)
-            pa = _score_prob(feat, ma)
-            s = max(EPS, ph + pa)
-            ph, pa = ph / s, pa / s
-            thr = _get_market_threshold_pre("1X2")
-            if ph * 100.0 >= thr:
-                candidates.append(("PRE 1X2", "Home Win", ph))
-            if pa * 100.0 >= thr:
-                candidates.append(("PRE 1X2", "Away Win", pa))
-
-        if not candidates:
-            continue
-
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        base_now = int(time.time())
-        per_match = 0
-
-        for idx, (mk, sug, prob) in enumerate(candidates):
-            if sug not in ALLOWED_SUGGESTIONS:
-                continue
-            if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                break
-
-            pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ", ""), sug, fid)
-            if not pass_odds:
-                continue
-
-            ev_pct = None
-            if odds is not None:
-                edge = _ev(prob, odds)
-                ev_bps = int(round(edge * 10000))
-                ev_pct = round(edge * 100.0, 1)
-                if int(round(edge * 10000)) < EDGE_MIN_BPS:
-                    continue
-            else:
-                continue  # odds mandatory by default
-
-            created_ts = base_now + idx
-            raw = float(prob)
-            pct = round(raw * 100.0, 1)
-
-            with db_conn() as c2:
-                c2.execute(
-                    "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,"
-                    "score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'0-0',0,%s,%s,%s,%s,0)",
-                    (
-                        fid, league_id, league, home, away, mk, sug,
-                        float(pct), raw, created_ts,
-                        (float(odds) if odds is not None else None),
-                        (book or None),
-                        (float(ev_pct) if ev_pct is not None else None),
-                    ),
-                )
-            saved += 1
-            per_match += 1
-
-    log.info("[PREMATCH] saved=%d", saved)
-    return saved
-
-# ───────── MOTD (kept) ─────────
-MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
-
-def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, odds=None, book=None, ev_pct=None):
-    money = ""
-    if odds:
-        if ev_pct is not None:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
-        else:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
-    return (
-        "🏅 <b>Match of the Day</b>\n"
-        f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
-        f"🏆 <b>League:</b> {escape(league)}\n"
-        f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
-        f"<b>Tip:</b> {escape(suggestion)}\n"
-        f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}"
-    )
-
-def send_match_of_the_day() -> bool:
-    if os.getenv("MOTD_PREDICT", "1") in ("0", "false", "False", "no", "NO"):
-        log.info("[MOTD] MOTD disabled by configuration")
-        return send_telegram("🏅 MOTD disabled.")
-    
-    log.info("[MOTD] Starting Match of the Day selection...")
-    
-    fixtures = _collect_todays_prematch_fixtures()
-    if not fixtures:
-        log.warning("[MOTD] No fixtures found for today")
-        return send_telegram("🏅 Match of the Day: no fixtures today.")
-    
-    log.info("[MOTD] Found %d fixtures for today", len(fixtures))
-
-    if MOTD_LEAGUE_IDS:
-        fixtures = [f for f in fixtures if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
-        log.info("[MOTD] After league filtering: %d fixtures", len(fixtures))
-        if not fixtures:
-            return send_telegram("🏅 Match of the Day: no fixtures in configured leagues.")
-
-    best_candidate = None
-    best_score = 0.0
-
-    for fx in fixtures:
-        try:
-            fixture = fx.get("fixture") or {}
-            lg = fx.get("league") or {}
-            teams = fx.get("teams") or {}
-            fid = int((fixture.get("id") or 0))
-            if not fid:
-                continue
-            home = (teams.get("home") or {}).get("name", "")
-            away = (teams.get("away") or {}).get("name", "")
-            league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-            kickoff_txt = _kickoff_berlin((fixture.get("date") or ""))
-            feat = extract_prematch_features(fx)
-            if not feat:
-                continue
-
-            candidates = []
-
-            for line in OU_LINES:
-                mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-                if not mdl: 
-                    continue
-                p = _score_prob(feat, mdl)
-                mk = f"Over/Under {_fmt_line(line)}"
-                thr = _get_market_threshold_pre(mk)
-                if p * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append((mk, f"Over {_fmt_line(line)} Goals", p, home, away, league, kickoff_txt, fid))
-                q = 1.0 - p
-                if q * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append((mk, f"Under {_fmt_line(line)} Goals", q, home, away, league, kickoff_txt, fid))
-
-            mdl = load_model_from_settings("PRE_BTTS_YES")
-            if mdl:
-                p = _score_prob(feat, mdl)
-                thr = _get_market_threshold_pre("BTTS")
-                if p * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append(("BTTS", "BTTS: Yes", p, home, away, league, kickoff_txt, fid))
-                q = 1.0 - p
-                if q * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append(("BTTS", "BTTS: No", q, home, away, league, kickoff_txt, fid))
-
-            mh = load_model_from_settings("PRE_WLD_HOME")
-            ma = load_model_from_settings("PRE_WLD_AWAY")
-            if mh and ma:
-                ph = _score_prob(feat, mh)
-                pa = _score_prob(feat, ma)
-                s = max(EPS, ph + pa)
-                ph, pa = ph / s, pa / s
-                thr = _get_market_threshold_pre("1X2")
-                if ph * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append(("1X2", "Home Win", ph, home, away, league, kickoff_txt, fid))
-                if pa * 100.0 >= max(thr, MOTD_CONF_MIN):
-                    candidates.append(("1X2", "Away Win", pa, home, away, league, kickoff_txt, fid))
-
-            if not candidates:
-                continue
-
-            for mk, sug, prob, home, away, league, kickoff_txt, fid in candidates:
-                prob_pct = prob * 100.0
-                pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
-                if not pass_odds:
-                    continue
-                ev_pct = None
-                if odds is not None:
-                    edge = _ev(prob, odds)
-                    ev_bps = int(round(edge * 10000))
-                    ev_pct = round(edge * 100.0, 1)
-                    if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
-                        continue
-                else:
-                    continue
-
-                candidate_score = prob_pct + (ev_pct or 0)
-                if best_candidate is None or candidate_score > best_score:
-                    best_candidate = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
-                    best_score = candidate_score
-
-        except Exception as e:
-            log.exception("[MOTD] Error processing fixture: %s", e)
-            continue
-
-    if not best_candidate:
-        log.info("[MOTD] No suitable match found for MOTD")
-        return send_telegram("🏅 Match of the Day: no prematch pick met thresholds today.")
-
-    prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best_candidate
-    log.info("[MOTD] Selected: %s vs %s - %s (%.1f%%)", home, away, sug, prob_pct)
-    message = _format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct)
-    success = send_telegram(message)
-    if success:
-        log.info("[MOTD] Successfully sent MOTD")
-    else:
-        log.error("[MOTD] Failed to send MOTD message")
-    return success
-
 # ───────── Auto-train / Auto-tune (unchanged) ─────────
 def auto_train_job():
     if not TRAIN_ENABLE:
@@ -3262,12 +2953,7 @@ def _start_scheduler_once():
                                       timezone=BERLIN_TZ),
                           id="digest", max_instances=1, coalesce=True)
 
-        if os.getenv("MOTD_PREDICT", "1") not in ("0", "false", "False", "no", "NO"):
-            sched.add_job(lambda: _run_with_pg_lock(1004, send_match_of_the_day),
-                          CronTrigger(hour=int(os.getenv("MOTD_HOUR", "19")),
-                                      minute=int(os.getenv("MOTD_MINUTE", "15")),
-                                      timezone=BERLIN_TZ),
-                          id="motd", max_instances=1, coalesce=True)
+        # REMOVED: MOTD scheduling job
 
         if TRAIN_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1005, auto_train_job),
@@ -3283,17 +2969,13 @@ def _start_scheduler_once():
         sched.add_job(lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200),
                       "interval", minutes=10, id="retry", max_instances=1, coalesce=True)
 
-        # periodic odds snapshots
-        sched.add_job(lambda: _run_with_pg_lock(1008, lambda: snapshot_odds_for_fixtures(_today_fixture_ids())),
-                      "interval", seconds=180, id="odds_snap", max_instances=1, coalesce=True)
-
         # cache cleanup
         sched.add_job(cleanup_caches, "interval", hours=1, id="cache_cleanup")
 
         sched.start()
         _SCHED = sched  # <-- keep reference for shutdown
         _scheduler_started = True
-        send_telegram("🚀 goalsniper AI mode (in-play + prematch) with ENHANCED PREDICTIONS started.")
+        send_telegram("🚀 goalsniper AI mode (in-play) with ENHANCED PREDICTIONS started.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
@@ -3305,7 +2987,7 @@ def _require_admin():
 
 @app.route("/", methods=["GET"])
 def root(): 
-    return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI_ENHANCED", "scheduler": RUN_SCHEDULER})
+    return jsonify({"ok": True, "name": "goalsniper", "mode": "INPLAY_AI_ENHANCED", "scheduler": RUN_SCHEDULER})
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -3415,28 +3097,8 @@ def http_retry_unsent():
     n=retry_unsent_tips(30,200)
     return jsonify({"ok": True, "resent": n})
 
-@app.route("/admin/prematch-scan", methods=["POST","GET"])
-def http_prematch_scan():
-    _require_admin()
-    saved = prematch_scan_save()
-    return jsonify({"ok": True, "saved": int(saved)})
-
-@app.route("/admin/motd", methods=["POST","GET"])
-def http_motd():
-    _require_admin()
-    ok = send_match_of_the_day()
-    return jsonify({"ok": bool(ok)})
-
-@app.route("/admin/motd-test", methods=["POST","GET"])
-def http_motd_test():
-    _require_admin()
-    log.info("[MOTD-TEST] Manual MOTD trigger")
-    try:
-        ok = send_match_of_the_day()
-        return jsonify({"ok": bool(ok), "message": "MOTD test completed"})
-    except Exception as e:
-        log.exception("[MOTD-TEST] Failed: %s", e)
-        return jsonify({"ok": False, "error": str(e)}), 500
+# REMOVED: prematch-scan endpoint
+# REMOVED: motd endpoints
 
 @app.route("/settings/<key>", methods=["GET","POST"])
 def http_settings(key: str):
@@ -3471,9 +3133,9 @@ def telegram_webhook(secret: str):
     update=request.get_json(silent=True) or {}
     try:
         msg=(update.get("message") or {}).get("text") or ""
-        if msg.startswith("/start"): send_telegram("👋 goalsniper bot (FULL AI ENHANCED mode) is online.")
+        if msg.startswith("/start"): send_telegram("👋 goalsniper bot (IN-PLAY AI ENHANCED mode) is online.")
         elif msg.startswith("/digest"): daily_accuracy_digest()
-        elif msg.startswith("/motd"): send_match_of_the_day()
+        # REMOVED: MOTD command
         elif msg.startswith("/scan"):
             parts=msg.split()
             if len(parts)>1 and ADMIN_API_KEY and parts[1]==ADMIN_API_KEY:
