@@ -1,5 +1,3 @@
-# db.py
-
 import os
 import sys
 import logging
@@ -9,32 +7,46 @@ import psycopg2
 import psycopg2.pool
 from contextlib import contextmanager
 
+from config import DATABASE_URL
+
+# ───────────────────────────── Logging ───────────────────────────── #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] - %(message)s"
+)
 log = logging.getLogger(__name__)
 
-# PostgreSQL Connection Pool
+# ───────────────────────────── DB Config ───────────────────────────── #
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", 1))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", 10))
+
 POOL: psycopg2.pool.SimpleConnectionPool = None
 _SHUTDOWN_RAN = False
 _SHUTDOWN_HANDLERS_SET = False
 
+# ───────────────────────────── Pool Setup ───────────────────────────── #
 
 def validate_config():
-    if not os.getenv("DATABASE_URL"):
-        raise RuntimeError("DATABASE_URL not set")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set in environment or config.py")
 
 
 def _init_pool():
     global POOL
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
+    if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured.")
 
-    POOL = psycopg2.pool.SimpleConnectionPool(
-        minconn=1,
-        maxconn=10,
-        dsn=db_url,
-        sslmode='require'
-    )
-    log.info("[DB] PostgreSQL connection pool initialized.")
+    try:
+        POOL = psycopg2.pool.SimpleConnectionPool(
+            minconn=DB_POOL_MIN,
+            maxconn=DB_POOL_MAX,
+            dsn=DATABASE_URL,
+            sslmode='require'
+        )
+        log.info("[DB] PostgreSQL connection pool initialized (%d–%d)", DB_POOL_MIN, DB_POOL_MAX)
+    except Exception as e:
+        log.exception("[DB] Failed to initialize PostgreSQL pool: %s", e)
+        raise
 
 
 @contextmanager
@@ -42,53 +54,55 @@ def db_conn():
     """Database connection context manager."""
     conn = POOL.getconn()
     try:
-        yield conn.cursor()
+        with conn.cursor() as cursor:
+            yield cursor
         conn.commit()
     except Exception as e:
         conn.rollback()
-        raise e
+        log.exception("[DB] Error during DB transaction: %s", e)
+        raise
     finally:
         POOL.putconn(conn)
 
 
+# ───────────────────────────── Init Schema ───────────────────────────── #
+
 def init_db():
     """Ensures the necessary tables exist."""
     with db_conn() as c:
-        c.execute(
-            """
+        c.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
-            """
-        )
-        c.execute(
-            """
+        """)
+        c.execute("""
             CREATE TABLE IF NOT EXISTS prematch_snapshots (
                 match_id   BIGINT PRIMARY KEY,
                 created_ts BIGINT,
                 payload    TEXT
             )
-            """
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)"
-        )
-        c.execute(
-            """
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pre_snap_ts 
+            ON prematch_snapshots (created_ts DESC)
+        """)
+        c.execute("""
             CREATE TABLE IF NOT EXISTS tip_snapshots (
                 match_id   BIGINT,
                 created_ts BIGINT,
                 payload    TEXT,
                 PRIMARY KEY (match_id, created_ts)
             )
-            """
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_snap_by_match ON tip_snapshots (match_id, created_ts DESC)"
-        )
-        log.info("[DB] Schema initialized.")
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_snap_by_match 
+            ON tip_snapshots (match_id, created_ts DESC)
+        """)
+    log.info("[DB] Schema initialized successfully.")
 
+
+# ───────────────────────────── Shutdown & Signals ───────────────────────────── #
 
 def shutdown_handler(signum=None, frame=None, *, from_atexit: bool = False):
     """Clean up once. Don't call sys.exit() when invoked by atexit."""
@@ -103,7 +117,6 @@ def shutdown_handler(signum=None, frame=None, *, from_atexit: bool = False):
     except Exception:
         pass
 
-    # Close DB pool if open
     try:
         if POOL:
             POOL.closeall()
@@ -111,7 +124,6 @@ def shutdown_handler(signum=None, frame=None, *, from_atexit: bool = False):
     except Exception as e:
         log.warning("[DB] Error closing pool during shutdown: %s", e)
 
-    # Only exit on signal path; atexit must never sys.exit()
     if not from_atexit:
         try:
             sys.exit(0)
@@ -128,3 +140,16 @@ def register_shutdown_handlers():
     signal.signal(signal.SIGINT, lambda s, f: shutdown_handler(s, f, from_atexit=False))
     signal.signal(signal.SIGTERM, lambda s, f: shutdown_handler(s, f, from_atexit=False))
     atexit.register(lambda: shutdown_handler(from_atexit=True))
+
+
+# ───────────────────────────── Optional: Health Check ───────────────────────────── #
+
+def check_db_health() -> bool:
+    """Returns True if DB is reachable and working."""
+    try:
+        with db_conn() as cur:
+            cur.execute("SELECT 1")
+            return cur.fetchone() == (1,)
+    except Exception as e:
+        log.warning("[DB] Health check failed: %s", e)
+        return False
