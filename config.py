@@ -1,39 +1,54 @@
-# config.py
-
 import os
 import pytz
+import logging
 
 # ─────────────────────────── Timezones ─────────────────────────── #
 TZ_UTC = pytz.UTC
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
+# ─────────────────────────── Logging ─────────────────────────── #
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] - %(message)s")
+
 # ─────────────────────────── Feature Toggles ─────────────────────────── #
-TRAIN_ENABLE = os.getenv("TRAIN_ENABLE", "1") not in ("0", "false", "False", "no", "NO")
-AUTO_TUNE_ENABLE = os.getenv("AUTO_TUNE_ENABLE", "0") not in ("0", "false", "False", "no", "NO")
-RUN_SCHEDULER = os.getenv("RUN_SCHEDULER", "1") not in ("0", "false", "False", "no", "NO")
-DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "0") not in ("0", "false", "False", "no", "NO")
+TRAIN_ENABLE: bool = os.getenv("TRAIN_ENABLE", "1") not in ("0", "false", "False", "no", "NO")
+AUTO_TUNE_ENABLE: bool = os.getenv("AUTO_TUNE_ENABLE", "0") not in ("0", "false", "False", "no", "NO")
+RUN_SCHEDULER: bool = os.getenv("RUN_SCHEDULER", "1") not in ("0", "false", "False", "no", "NO")
+DAILY_ACCURACY_DIGEST_ENABLE: bool = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "0") not in ("0", "false", "False", "no", "NO")
 
 # ─────────────────────────── Scheduler Timing ─────────────────────────── #
-SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "20"))
-BACKFILL_EVERY_MIN = int(os.getenv("BACKFILL_EVERY_MIN", "8"))
-TRAIN_HOUR_UTC = int(os.getenv("TRAIN_HOUR_UTC", "5"))
-TRAIN_MINUTE_UTC = int(os.getenv("TRAIN_MINUTE_UTC", "10"))
+SCAN_INTERVAL_SEC: int = int(os.getenv("SCAN_INTERVAL_SEC", "20"))
+BACKFILL_EVERY_MIN: int = int(os.getenv("BACKFILL_EVERY_MIN", "8"))
+TRAIN_HOUR_UTC: int = int(os.getenv("TRAIN_HOUR_UTC", "5"))
+TRAIN_MINUTE_UTC: int = int(os.getenv("TRAIN_MINUTE_UTC", "10"))
 
 # ─────────────────────────── Telegram / Admin ─────────────────────────── #
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
+ADMIN_API_KEY: str = os.getenv("ADMIN_API_KEY", "")
 
-# ─────────────────────────── Football API ─────────────────────────── #
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY = os.getenv("API_KEY", "").strip()
+# ─────────────────────────── Football API / Auth ─────────────────────────── #
+FOOTBALL_API_URL: str = os.getenv("FOOTBALL_API_URL", "").strip()
+API_KEY: str = os.getenv("API_KEY", "").strip()
+MODEL_VERSION: str = os.getenv("MODEL_VERSION", "model_v2")
 
-# ─────────────────────────── Metrics ─────────────────────────── #
+# ─────────────────────────── Flask Server ─────────────────────────── #
+FLASK_HOST: str = os.getenv("HOST", "0.0.0.0")
+FLASK_PORT: int = int(os.getenv("PORT", "8080"))
+
+# ─────────────────────────── Database ─────────────────────────── #
+DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+
+# ─────────────────────────── Global Metrics Container (use with care) ─────────────────────────── #
 METRICS = {}
 
-# ─────────────────────────── Other ─────────────────────────── #
-MODEL_VERSION = os.getenv("MODEL_VERSION", "model_v2")
+# ─────────────────────────── Sanity Checks ─────────────────────────── #
+if not TELEGRAM_BOT_TOKEN:
+    logging.warning("⚠️ TELEGRAM_BOT_TOKEN is not set.")
 
-# Default Flask host/port (used in main.py for app.run)
-FLASK_HOST = os.getenv("HOST", "0.0.0.0")
-FLASK_PORT = int(os.getenv("PORT", "8080"))
+if not FOOTBALL_API_URL:
+    logging.warning("⚠️ FOOTBALL_API_URL is not set.")
+
+if not DATABASE_URL:
+    logging.warning("⚠️ DATABASE_URL is not set.")
