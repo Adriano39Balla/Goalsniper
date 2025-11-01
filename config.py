@@ -24,8 +24,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 # ─────────────────────────── Football API ─────────────────────────── #
-FOOTBALL_API_URL = os.getenv("FOOTBALL_API_URL", "").strip()
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("API_KEY", "").strip()
 
 # ─────────────────────────── Metrics ─────────────────────────── #
 METRICS = {}
