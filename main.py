@@ -1034,10 +1034,18 @@ def extract_basic_features(m: dict) -> Dict[str,float]:
     pos_h = _pos_pct(sh.get("Ball Possession", 0))
     pos_a = _pos_pct(sa.get("Ball Possession", 0))
 
-    # FIXED: Estimate xG since API-Football doesn't provide it in standard stats
-    # Use shots on target as proxy for xG (rough estimate: ~30% of SOT become goals)
-    xg_h = sot_h * 0.3
-    xg_a = sot_a * 0.3
+    # **UPDATED: Use REAL xG when available, estimate when not**
+    xg_h = _num(sh.get("Expected Goals", 0))
+    xg_a = _num(sa.get("Expected Goals", 0))
+    
+    # Only estimate if real xG is not available (0 or missing)
+    if xg_h == 0 and xg_a == 0:
+        # Fallback: estimate xG from shots on target
+        xg_h = sot_h * 0.3
+        xg_a = sot_a * 0.3
+        log.info(f"[XG_ESTIMATE] Using estimated xG: {xg_h:.2f}-{xg_a:.2f}")
+    else:
+        log.info(f"[XG_REAL] Using API xG: {xg_h:.2f}-{xg_a:.2f}")
 
     red_h = red_a = yellow_h = yellow_a = 0
     for ev in (m.get("events") or []):
@@ -1513,22 +1521,28 @@ adaptive_learner = AdaptiveLearningSystem()
 # ───────── Missing Function Implementations ─────────
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
-    """UPDATED coverage check - uses ACTUALLY AVAILABLE statistics from API-Football"""
+    """UPDATED coverage check - prioritizes matches with REAL xG data"""
     
-    # Use statistics that API-Football actually provides
+    # Check if we have REAL xG data (not estimated)
+    has_real_xg = (feat.get('xg_h', 0) > 0) and (feat.get('xg_a', 0) > 0)
     has_sot = (feat.get('sot_h', 0) > 0) and (feat.get('sot_a', 0) > 0)
     has_pos = (feat.get('pos_h', 0) > 0) and (feat.get('pos_a', 0) > 0)
     has_shots = (feat.get('sh_total_h', 0) > 0) and (feat.get('sh_total_a', 0) > 0)
 
-    # Early game (0-25 min): be lenient - just need basic stats
+    # If we have REAL xG data, be more lenient (this is high-quality data)
+    if has_real_xg:
+        if minute < 20:
+            return has_pos or has_sot  # Basic coverage with real xG
+        else:
+            return has_pos  # Just need possession with real xG
+
+    # For estimated xG, use stricter requirements
     if minute < 25:
         return has_pos or has_sot or has_shots
 
-    # Mid-game (25-55 min): require better coverage
     if 25 <= minute < 55:
         return (has_pos and has_sot) or (has_pos and has_shots)
 
-    # Late game (55+ min): require solid data
     return has_pos and has_sot and has_shots
 
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
