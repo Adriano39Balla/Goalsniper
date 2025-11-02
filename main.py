@@ -2348,12 +2348,15 @@ def check_models_loaded():
             print(f"[MODEL] {name}: NOT FOUND")
 
 def debug_scan_issues():
-    """Temporary debug function to identify why no tips are generated"""
+    """Enhanced debug function to identify why high-confidence predictions are blocked"""
     try:
         matches = fetch_live_matches()
-        print(f"[DEBUG] Found {len(matches)} live matches")
+        log.info(f"[DEBUG] Found {len(matches)} live matches")
         
-        for i, m in enumerate(matches[:10]):  # Check first 10 matches
+        viable_matches = 0
+        high_confidence_found = 0
+        
+        for i, m in enumerate(matches[:20]):  # Check first 20 matches
             fid = int((m.get("fixture") or {}).get("id") or 0)
             if not fid:
                 continue
@@ -2362,23 +2365,152 @@ def debug_scan_issues():
                 feat = feature_engineer.extract_advanced_features(m)
                 minute = int(feat.get("minute", 0))
                 
-                print(f"[DEBUG] Match {i+1}: {_teams(m)} | Minute: {minute} | Coverage: {stats_coverage_ok(feat, minute)}")
+                coverage_ok = stats_coverage_ok(feat, minute)
+                minute_ok = minute >= TIP_MIN_MINUTE
+                stale_ok = not is_feed_stale(fid, m, minute)
                 
-                # Test predictions for each market
-                markets_to_test = ["BTTS"] + [f"OU_{_fmt_line(line)}" for line in OU_LINES]
-                for market in markets_to_test:
-                    try:
-                        prob, conf = market_predictor.predict_for_market(feat, market, minute)
-                        if prob > 0:
-                            print(f"  {market}: {prob:.1%} (conf: {conf:.1%})")
-                    except Exception as e:
-                        print(f"  {market}: ERROR - {e}")
+                status = "VIABLE" if (coverage_ok and minute_ok and stale_ok) else "FILTERED"
+                if status == "VIABLE":
+                    viable_matches += 1
+                
+                log.info(f"[DEBUG] Match {i+1}: {_teams(m)} | Minute: {minute} | Status: {status}")
+                log.info(f"[DEBUG]   Coverage: {coverage_ok} | Minute OK: {minute_ok} (min {TIP_MIN_MINUTE}) | Not Stale: {stale_ok}")
+                
+                # Show key features for context
+                if coverage_ok:
+                    log.info(f"[DEBUG]   Key features - Goals: {feat.get('goals_h', 0)}-{feat.get('goals_a', 0)} | "
+                           f"xG: {feat.get('xg_h', 0):.2f}-{feat.get('xg_a', 0):.2f} | "
+                           f"Shots: {int(feat.get('sot_h', 0))}-{int(feat.get('sot_a', 0))}")
+                
+                # Only test predictions for viable matches
+                if coverage_ok and minute_ok:
+                    markets_to_test = ["BTTS"] + [f"OU_{_fmt_line(line)}" for line in OU_LINES]
+                    any_predictions = False
+                    high_conf_in_match = False
+                    
+                    for market in markets_to_test:
+                        try:
+                            prob, conf = market_predictor.predict_for_market(feat, market, minute)
+                            prob_pct = prob * 100
+                            threshold = _get_market_threshold(market)
+                            passes_threshold = prob_pct >= threshold
+                            
+                            if prob > 0.1:  # Only show meaningful predictions
+                                any_predictions = True
+                                
+                                # Highlight high confidence predictions
+                                if prob > 0.7:  # 70%+ probability
+                                    high_conf_in_match = True
+                                    high_confidence_found += 1
+                                    log.info(f"🎯 [HIGH CONF] {market}: {prob_pct:.1f}% (conf: {conf:.1%}) - NEED: {threshold:.1f}%")
+                                    
+                                    # Detailed analysis for high-confidence predictions
+                                    if market == "BTTS":
+                                        suggestions = ["BTTS: Yes", "BTTS: No"]
+                                    elif market.startswith("OU_"):
+                                        line = float(market.split("_")[1])
+                                        suggestions = [f"Over {line} Goals", f"Under {line} Goals"]
+                                    else:
+                                        suggestions = []
+                                    
+                                    for suggestion in suggestions:
+                                        # Check market cutoff
+                                        cutoff_ok = market_cutoff_ok(minute, market, suggestion)
+                                        log.info(f"   📋 Cutoff check: {cutoff_ok} (minute {minute})")
+                                        
+                                        # Check sanity
+                                        sane = _candidate_is_sane(suggestion, feat)
+                                        log.info(f"   🧠 Sanity check: {sane}")
+                                        
+                                        # Check price gate
+                                        pass_odds, odds, book, ev_pct = _price_gate(market, suggestion, fid)
+                                        log.info(f"   💰 Price gate: {pass_odds} | Odds: {odds} | Book: {book}")
+                                        
+                                        # Calculate EV if odds available
+                                        if odds and prob > 0:
+                                            edge = _ev(prob, float(odds))
+                                            ev_bps = int(round(edge * 10000))
+                                            ev_ok = ev_bps >= EDGE_MIN_BPS
+                                            log.info(f"   📈 EV: {edge:.1%} ({ev_bps} bps) | Min needed: {EDGE_MIN_BPS} | EV OK: {ev_ok}")
+                                        
+                                        # Check if it would pass all gates
+                                        all_gates_ok = (
+                                            cutoff_ok and 
+                                            sane and 
+                                            (pass_odds or ALLOW_TIPS_WITHOUT_ODDS) and
+                                            (not odds or ev_ok)
+                                        )
+                                        log.info(f"   ✅ All gates passed: {all_gates_ok}")
+                                        
+                                else:
+                                    log.info(f"[DEBUG]   {market}: {prob_pct:.1f}% (conf: {conf:.1%}) - {'PASS' if passes_threshold else 'FAIL'}")
+                                    
+                        except Exception as e:
+                            log.info(f"[DEBUG]   {market}: ERROR - {str(e)[:100]}")
+                    
+                    if high_conf_in_match:
+                        log.info(f"🔥 MATCH HAS HIGH-CONFIDENCE PREDICTIONS - ANALYZING BLOCKERS")
+                    
+                    if not any_predictions:
+                        log.info(f"[DEBUG]   No predictions > 10% for any market")
                         
             except Exception as e:
-                print(f"[DEBUG] Error processing match {i+1}: {e}")
+                log.info(f"[DEBUG] Error processing match {i+1}: {str(e)[:100]}")
                 
+        log.info(f"[DEBUG] SUMMARY:")
+        log.info(f"[DEBUG]   Total matches: {len(matches[:20])}")
+        log.info(f"[DEBUG]   Viable matches: {viable_matches}")
+        log.info(f"[DEBUG]   High-confidence predictions found: {high_confidence_found}")
+        
+        # Show current configuration
+        log.info(f"[DEBUG] CURRENT CONFIG:")
+        log.info(f"[DEBUG]   CONF_THRESHOLD: {CONF_THRESHOLD}")
+        log.info(f"[DEBUG]   TIP_MIN_MINUTE: {TIP_MIN_MINUTE}") 
+        log.info(f"[DEBUG]   EDGE_MIN_BPS: {EDGE_MIN_BPS}")
+        log.info(f"[DEBUG]   ALLOW_TIPS_WITHOUT_ODDS: {ALLOW_TIPS_WITHOUT_ODDS}")
+        log.info(f"[DEBUG]   MARKET_CUTOFFS: {_MARKET_CUTOFFS}")
+        
     except Exception as e:
-        print(f"[DEBUG] Failed to fetch matches: {e}")
+        log.info(f"[DEBUG] Failed to fetch matches: {e}")
+
+def check_prediction_quality():
+    """Check if models are producing reasonable predictions"""
+    log.info("[QUALITY_CHECK] Testing model prediction quality...")
+    
+    # Test case 1: Balanced match
+    test1 = {
+        "minute": 25.0,
+        "goals_h": 1.0, "goals_a": 1.0,
+        "xg_h": 1.2, "xg_a": 1.1,
+        "sot_h": 5.0, "sot_a": 4.0,
+        "pos_h": 55.0, "pos_a": 45.0,
+        "pressure_home": 60.0, "pressure_away": 50.0,
+        "goals_sum": 2.0, "xg_sum": 2.3,
+        "goals_last_15": 1.0
+    }
+    
+    # Test case 2: One-sided match  
+    test2 = {
+        "minute": 25.0,
+        "goals_h": 2.0, "goals_a": 0.0,
+        "xg_h": 2.5, "xg_a": 0.3,
+        "sot_h": 8.0, "sot_a": 1.0,
+        "pos_h": 65.0, "pos_a": 35.0,
+        "pressure_home": 75.0, "pressure_away": 25.0,
+        "goals_sum": 2.0, "xg_sum": 2.8,
+        "goals_last_15": 1.0
+    }
+    
+    test_cases = [("Balanced", test1), ("One-sided", test2)]
+    
+    for name, features in test_cases:
+        log.info(f"[QUALITY_CHECK] {name} match:")
+        for market in ["BTTS", "OU_2.5", "OU_3.5"]:
+            try:
+                prob, conf = market_predictor.predict_for_market(features, market, 25)
+                log.info(f"  {market}: {prob:.1%} (conf: {conf:.1%})")
+            except Exception as e:
+                log.info(f"  {market}: ERROR - {e}")
 
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems (patched) ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
