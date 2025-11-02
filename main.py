@@ -1023,16 +1023,21 @@ def extract_basic_features(m: dict) -> Dict[str,float]:
             stats[t] = { (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
     sh = stats.get(home, {}) or {}
     sa = stats.get(away, {}) or {}
-    xg_h = _num(sh.get("Expected Goals", 0))
-    xg_a = _num(sa.get("Expected Goals", 0))
-    sot_h = _num(sh.get("Shots on Target", sh.get("Shots on Goal", 0)))
-    sot_a = _num(sa.get("Shots on Target", sa.get("Shots on Goal", 0)))
-    sh_total_h = _num(sh.get("Total Shots", sh.get("Shots Total", 0)))
-    sh_total_a = _num(sa.get("Total Shots", sa.get("Shots Total", 0)))
+    
+    # FIXED: Use ACTUAL API-Football statistics that exist
+    sot_h = _num(sh.get("Shots on Goal", sh.get("Shots on Target", 0)))
+    sot_a = _num(sa.get("Shots on Goal", sa.get("Shots on Target", 0)))
+    sh_total_h = _num(sh.get("Total Shots", 0))
+    sh_total_a = _num(sa.get("Total Shots", 0))
     cor_h = _num(sh.get("Corner Kicks", 0))
     cor_a = _num(sa.get("Corner Kicks", 0))
     pos_h = _pos_pct(sh.get("Ball Possession", 0))
     pos_a = _pos_pct(sa.get("Ball Possession", 0))
+
+    # FIXED: Estimate xG since API-Football doesn't provide it in standard stats
+    # Use shots on target as proxy for xG (rough estimate: ~30% of SOT become goals)
+    xg_h = sot_h * 0.3
+    xg_a = sot_a * 0.3
 
     red_h = red_a = yellow_h = yellow_a = 0
     for ev in (m.get("events") or []):
@@ -1508,27 +1513,23 @@ adaptive_learner = AdaptiveLearningSystem()
 # ───────── Missing Function Implementations ─────────
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
-    """MORE LENIENT coverage check - focus on basic stats only"""
+    """UPDATED coverage check - uses ACTUALLY AVAILABLE statistics from API-Football"""
     
-    # Basic requirement: at least some possession or shots data
-    has_basic_stats = (
-        (feat.get('pos_h', 0) > 0 or feat.get('pos_a', 0) > 0) or
-        (feat.get('sot_h', 0) > 0 or feat.get('sot_a', 0) > 0) or
-        (feat.get('sh_total_h', 0) > 0 or feat.get('sh_total_a', 0) > 0)
-    )
-    
-    if not has_basic_stats:
-        return False
-    
-    # Early game: be very lenient
-    if minute < 30:
-        return True
-    
-    # Mid-late game: require at least possession data
-    if minute >= 30:
-        return (feat.get('pos_h', 0) > 0 and feat.get('pos_a', 0) > 0)
-    
-    return True
+    # Use statistics that API-Football actually provides
+    has_sot = (feat.get('sot_h', 0) > 0) and (feat.get('sot_a', 0) > 0)
+    has_pos = (feat.get('pos_h', 0) > 0) and (feat.get('pos_a', 0) > 0)
+    has_shots = (feat.get('sh_total_h', 0) > 0) and (feat.get('sh_total_a', 0) > 0)
+
+    # Early game (0-25 min): be lenient - just need basic stats
+    if minute < 25:
+        return has_pos or has_sot or has_shots
+
+    # Mid-game (25-55 min): require better coverage
+    if 25 <= minute < 55:
+        return (has_pos and has_sot) or (has_pos and has_shots)
+
+    # Late game (55+ min): require solid data
+    return has_pos and has_sot and has_shots
 
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     """Check if the data feed is stale"""
@@ -3016,6 +3017,33 @@ def http_init_db():
     _require_admin()
     init_db()
     return jsonify({"ok": True})
+
+@app.route("/debug/live-match/<int:fid>", methods=["GET"])
+def debug_live_match(fid: int):
+    """Check what data we're getting for a specific match"""
+    # Fetch fresh data
+    js = _api_get(FOOTBALL_API_URL, {"id": fid}) or {}
+    match = js.get("response", [{}])[0] if js.get("response") else {}
+    
+    if not match:
+        return jsonify({"error": "Match not found", "fixture_id": fid})
+    
+    # Get stats and features
+    match["statistics"] = fetch_match_stats(fid)
+    feat = extract_basic_features(match)
+    
+    # Check coverage
+    minute = int(feat.get("minute", 0))
+    coverage_ok = stats_coverage_ok(feat, minute)
+    
+    return jsonify({
+        "fixture_id": fid,
+        "minute": minute,
+        "coverage_ok": coverage_ok,
+        "features": feat,
+        "has_statistics": bool(match.get("statistics")),
+        "statistics_count": len(match.get("statistics", [])),
+    })
 
 @app.route("/admin/scan", methods=["POST","GET"])
 def http_scan():
