@@ -1522,28 +1522,22 @@ adaptive_learner = AdaptiveLearningSystem()
 # ───────── Missing Function Implementations ─────────
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
-    """RELAXED coverage check - prioritize getting tips over perfect data"""
+    """NUCLEAR OPTION - Accept virtually everything"""
+    # Only reject if we have absolutely NO data at all
+    has_any_data = any([
+        feat.get('pos_h', 0) > 0, feat.get('pos_a', 0) > 0,
+        feat.get('sot_h', 0) > 0, feat.get('sot_a', 0) > 0, 
+        feat.get('goals_h', 0) > 0, feat.get('goals_a', 0) > 0,
+        feat.get('cor_h', 0) > 0, feat.get('cor_a', 0) > 0,
+        feat.get('sh_total_h', 0) > 0, feat.get('sh_total_a', 0) > 0
+    ])
     
-    # For testing, accept almost any data
-    if minute < 15:
-        # Basic early-game requirements
-        has_basic_stats = (
-            feat.get('pos_h', 0) > 0 or 
-            feat.get('pos_a', 0) > 0 or
-            feat.get('sot_h', 0) > 0 or 
-            feat.get('sot_a', 0) > 0
-        )
-        return has_basic_stats
+    # After 30 minutes, require at least SOME data
+    if minute > 30:
+        return has_any_data
     
-    # After 15 minutes, be more lenient
-    if 15 <= minute < 30:
-        return True  # Accept almost anything
-    
-    # After 30 minutes, basic requirements
-    has_possession = (feat.get('pos_h', 0) > 0 and feat.get('pos_a', 0) > 0)
-    has_shots = (feat.get('sot_h', 0) > 0 or feat.get('sot_a', 0) > 0)
-    
-    return has_possession or has_shots
+    # Before 30 minutes, be very lenient
+    return True
 
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     """Check if the data feed is stale"""
