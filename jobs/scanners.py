@@ -9,7 +9,7 @@ from core.features import feature_engineer
 from core.predictors import market_predictor
 from services.api_client import api_client, fetch_odds
 from services.telegram import telegram_service
-from services.markets import (
+from core.markets import (
     _parse_ou_line_from_suggestion, _odds_key_for_market, _market_family,
     market_cutoff_ok, _candidate_is_sane, _inplay_1x2_sanity_ok,
     _min_odds_for_market, _ev, calculate_ev_bps
