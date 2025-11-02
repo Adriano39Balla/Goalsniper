@@ -166,7 +166,43 @@ class MarketPredictor:
             return base_prob, base_conf
         except Exception as e:
             log.warning(f"[OU_ADV] Prediction error for {market_key}: {e}")
-            return 0.0, 0.0
+            return 0.0, 0.0.
+            
+def _predict_1x2_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float, float]:
+    """1X2 advanced prediction - added to fix missing method error"""
+    log.info("[DEBUG] Using MarketPredictor._predict_1x2_advanced")
+    
+    try:
+        # Get base probabilities from ensemble
+        prob_h, conf_h = self.ensemble_predictor.predict_ensemble(features, "1X2_HOME", minute)
+        prob_a, conf_a = self.ensemble_predictor.predict_ensemble(features, "1X2_AWAY", minute)
+        
+        # Normalize to get probabilities that sum to 1
+        total = prob_h + prob_a
+        if total > 0:
+            prob_h /= total
+            prob_a /= total
+        
+        # Calculate draw probability
+        prob_draw = max(0.0, 1.0 - (prob_h + prob_a))
+        
+        # Re-normalize all three
+        total_three = prob_h + prob_a + prob_draw
+        if total_three > 0:
+            prob_h /= total_three
+            prob_a /= total_three
+            prob_draw /= total_three
+        
+        confidence = (conf_h + conf_a) / 2.0
+        
+        log.info(f"[DEBUG] 1X2 Probs - H:{prob_h:.3f}, A:{prob_a:.3f}, D:{prob_draw:.3f}, Conf:{confidence:.3f}")
+        
+        return float(prob_h), float(prob_a), float(confidence)
+        
+    except Exception as e:
+        log.error(f"[1X2] Advanced prediction failed: {e}")
+        # Fallback: equal probabilities
+        return 0.33, 0.33, 0.5
 
 # Global predictor instance
 market_predictor = MarketPredictor()
