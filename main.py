@@ -23,6 +23,7 @@ _SCHED = None
 _SHUTDOWN_RAN = False
 _SHUTDOWN_HANDLERS_SET = False
 EPS = 1e-9
+DEBUG_SELECTION_LOG = os.getenv("DEBUG_SELECTION_LOG", "0") not in ("0","false","False","no","NO")  # ADDED: Debug selection logging
 
 # ───────── Env bootstrap ─────────
 try:
@@ -1731,6 +1732,16 @@ def _format_tip_message(home, away, league, minute, score, suggestion, confidenc
             f"📈 <b>Confidence:</b> {confidence:.1f}%{money}\n"
             f"🏆 <b>League:</b> {escape(league)}{stat}")
 
+# ───────── Debug logging function ─────────
+def _dbg(reason: str, **ctx):
+    """Debug logging for selection process"""
+    if DEBUG_SELECTION_LOG:
+        try:
+            bits = " ".join(f"{k}={ctx[k]}" for k in ctx)
+            log.info(f"[SELECTOR] {reason} | {bits}")
+        except Exception as e:
+            log.info(f"[SELECTOR] {reason} | [context format failed: {e}]")
+
 # ───────── Odds helpers & aggregation ─────────
 def _ev(prob: float, odds: float) -> float:
     """Return expected value as decimal (e.g. 0.05 = +5%)."""
@@ -1758,6 +1769,30 @@ def _market_name_normalize(s: str) -> str:
     if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
     if "over/under" in s or "total" in s or "goals" in s: return "OU"
     return s
+
+def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+    if not vals:
+        return None, None
+    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
+    if not xs:
+        return None, None
+    import statistics
+    med = statistics.median(xs)
+    filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
+    if not filtered:
+        filtered = vals
+    xs2 = sorted([o for (o, _) in filtered])
+    med2 = statistics.median(xs2)
+    if prob_hint is not None and prob_hint > 0:
+        fair = 1.0 / max(1e-6, float(prob_hint))
+        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
+        filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
+    if ODDS_AGGREGATION == "best":
+        best = max(filtered, key=lambda t: t[0])
+        return float(best[0]), str(best[1])
+    target = med2
+    pick = min(filtered, key=lambda t: abs(t[0] - target))
+    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
 
 def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None, require_live: bool = True) -> dict:
     """
@@ -1887,6 +1922,65 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None, require_
     else:
         log.info(f"[ODDS] Successfully parsed {len(out)} markets for fixture {fid}")
     return out
+
+    def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+        if not vals:
+            return None, None
+        xs = sorted([o for (o, _) in vals if (o or 0) > 0])
+        if not xs:
+            return None, None
+        import statistics
+        med = statistics.median(xs)
+        filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
+        if not filtered:
+            filtered = vals
+        xs2 = sorted([o for (o, _) in filtered])
+        med2 = statistics.median(xs2)
+        if prob_hint is not None and prob_hint > 0:
+            fair = 1.0 / max(1e-6, float(prob_hint))
+            cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
+            filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
+        if ODDS_AGGREGATION == "best":
+            best = max(filtered, key=lambda t: t[0])
+            return float(best[0]), str(best[1])
+        target = med2
+        pick = min(filtered, key=lambda t: abs(t[0] - target))
+        return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
+
+    out: dict[str, dict[str, dict]] = {}
+    for mkey, side_map in by_market.items():
+        ok = True
+        for side, lst in side_map.items():
+            if len({b for (_, b) in lst}) < max(1, ODDS_REQUIRE_N_BOOKS):
+                ok = False
+                break
+        if not ok:
+            continue
+
+        out[mkey] = {}
+        for side, lst in side_map.items():
+            hint = None
+            if prob_hints:
+                if mkey == "BTTS":
+                    hint = prob_hints.get("BTTS: Yes") if side == "Yes" else (1.0 - (prob_hints.get("BTTS: Yes") or 0.0))
+                elif mkey == "1X2":
+                    hint = prob_hints.get("Home Win") if side == "Home" else (prob_hints.get("Away Win") if side == "Away" else None)
+                elif mkey.startswith("OU_"):
+                    try:
+                        ln = float(mkey.split("_", 1)[1])
+                        key = f"{_fmt_line(ln)}"
+                        hint = prob_hints.get(f"Over {key} Goals") if side == "Over" else (1.0 - (prob_hints.get(f"Over {key} Goals") or 0.0))
+                    except:
+                        pass
+            ag, label = _aggregate_price(lst, hint)
+            if ag is not None:
+                out[mkey][side] = {"odds": float(ag), "book": label}
+
+    ODDS_CACHE[fid] = (time.time(), out)
+    if not out: 
+        NEG_CACHE[k] = (now, True)
+    return out
+
 # ───────── Bayesian & GameState & Odds Quality ─────────
 class BayesianUpdater:
     def __init__(self):
@@ -2125,14 +2219,6 @@ def _odds_key_for_market(market_txt: str, suggestion: str) -> str | None:
         return f"OU_{_fmt_line(ln)}" if ln is not None else None
     return None
 
-def _dbg(reason: str, **ctx):
-    if DEBUG_SELECTION_LOG:
-        try:
-            bits = " ".join(f"{k}={ctx[k]}" for k in ctx)
-            log.info(f"[SELECTOR] {reason} | {bits}")
-        except Exception:
-            pass
-
 # ───────── Formatting (enhanced tip) ─────────
 def _format_enhanced_tip_message(home, away, league, minute, score, suggestion, 
                                prob_pct, feat, odds=None, book=None, ev_pct=None, confidence=None):
@@ -2258,282 +2344,291 @@ def enhanced_production_scan() -> Tuple[int, int]:
     Enhanced scan with per-gate debug logging so you can see exactly
     why candidates are dropped (set DEBUG_SELECTION_LOG=1 in .env).
     """
-    if not _db_ping():
-        log.error("[ENHANCED_PROD] Database unavailable")
-        return (0, 0)
-
     try:
-        matches = fetch_live_matches()
-    except Exception as e:
-        log.error("[ENHANCED_PROD] Failed to fetch live matches: %s", e)
-        return (0, 0)
+        if not _db_ping():
+            log.error("[ENHANCED_PROD] Database unavailable")
+            return (0, 0)
 
-    live_seen = len(matches)
-    if live_seen == 0:
-        log.info("[ENHANCED_PROD] no live matches")
-        return 0, 0
+        try:
+            matches = fetch_live_matches()
+        except Exception as e:
+            log.error("[ENHANCED_PROD] Failed to fetch live matches: %s", e)
+            return (0, 0)
 
-    saved = 0
-    now_ts = int(time.time())
-    per_league_counter: dict[int, int] = {}
+        live_seen = len(matches)
+        if live_seen == 0:
+            log.info("[ENHANCED_PROD] no live matches")
+            return 0, 0
 
-    with db_conn() as c:
-        for m in matches:
-            try:
-                fid = int((m.get("fixture") or {}).get("id") or 0)
-                if not fid:
-                    _dbg("no_fixture_id")
-                    continue
+        saved = 0
+        now_ts = int(time.time())
+        per_league_counter: dict[int, int] = {}
 
-                # Duplicate cooldown — FIXED: use c.fetchone_safe() (not chaining on cursor)
-                if DUP_COOLDOWN_MIN > 0:
-                    cutoff = now_ts - DUP_COOLDOWN_MIN * 60
-                    c.execute(
-                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
-                        (fid, cutoff),
-                    )
-                    row = c.fetchone_safe()
-                    if row:
-                        _dbg("dup_cooldown_block", fid=fid, cutoff=cutoff, cooldown_min=DUP_COOLDOWN_MIN)
+        with db_conn() as c:
+            for m in matches:
+                try:
+                    fid = int((m.get("fixture") or {}).get("id") or 0)
+                    if not fid:
+                        _dbg("no_fixture_id")
                         continue
 
-                # Extract advanced features
-                feat = feature_engineer.extract_advanced_features(m)
-                minute = int(feat.get("minute", 0))
-
-                if not stats_coverage_ok(feat, minute):
-                    _dbg("coverage_fail", fid=fid, minute=minute)
-                    continue
-                if minute < TIP_MIN_MINUTE:
-                    _dbg("minute_low", fid=fid, minute=minute, min_req=TIP_MIN_MINUTE)
-                    continue
-                if is_feed_stale(fid, m, minute):
-                    _dbg("feed_stale", fid=fid, minute=minute)
-                    continue
-
-                # Harvest snapshot
-                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
-                    try:
-                        save_snapshot_from_match(m, feat)
-                    except Exception:
-                        pass
-
-                game_state_analyzer = GameStateAnalyzer()
-                game_state = game_state_analyzer.analyze_game_state(feat)
-
-                league_id, league = _league_name(m)
-                home, away = _teams(m)
-                score = _pretty_score(m)
-
-                candidates: List[Tuple[str, str, float, float]] = []
-                log.info(f"[MARKET_SCAN] Processing {home} vs {away} at minute {minute}")
-
-                # 1) BTTS
-                try:
-                    btts_prob, btts_conf = market_predictor.predict_for_market(feat, "BTTS", minute)
-                    if btts_prob > 0 and btts_conf > 0.5:
-                        preds = {"BTTS: Yes": btts_prob, "BTTS: No": max(0.0, 1 - btts_prob)}
-                        preds = game_state_analyzer.adjust_predictions(preds, game_state)
-                        for suggestion, p in preds.items():
-                            if not market_cutoff_ok(minute, "BTTS", suggestion):
-                                _dbg("cutoff_block", market="BTTS", suggestion=suggestion, minute=minute)
-                                continue
-                            if not _candidate_is_sane(suggestion, feat):
-                                _dbg("sanity_block", market="BTTS", suggestion=suggestion, goals_sum=feat.get("goals_sum",0))
-                                continue
-                            thr = _get_market_threshold("BTTS")
-                            if p * 100.0 >= thr:
-                                _dbg("BTTS_PASS", suggestion=suggestion, prob=round(p,3), conf=round(btts_conf,3), thr=thr)
-                                candidates.append(("BTTS", suggestion, p, btts_conf))
-                            else:
-                                _dbg("threshold_block", market="BTTS", suggestion=suggestion, prob_pct=round(p*100,1), thr=thr)
-                except Exception as e:
-                    _dbg("btts_predict_error", err=str(e))
-
-                # 2) OU
-                for line in OU_LINES:
-                    mkkey = f"Over/Under {_fmt_line(line)}"
-                    try:
-                        ou_prob, ou_conf = market_predictor.predict_for_market(feat, f"OU_{_fmt_line(line)}", minute)
-                        if ou_prob <= 0 or ou_conf <= 0.5:
-                            _dbg("ou_low_base", line=_fmt_line(line), prob=round(ou_prob,3), conf=round(ou_conf,3))
+                    # Duplicate cooldown — FIXED: use c.fetchone_safe() (not chaining on cursor)
+                    if DUP_COOLDOWN_MIN > 0:
+                        cutoff = now_ts - DUP_COOLDOWN_MIN * 60
+                        c.execute(
+                            "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
+                            (fid, cutoff),
+                        )
+                        row = c.fetchone_safe()
+                        if row:
+                            _dbg("dup_cooldown_block", fid=fid, cutoff=cutoff, cooldown_min=DUP_COOLDOWN_MIN)
                             continue
-                        preds = {
-                            f"Over {_fmt_line(line)} Goals": ou_prob,
-                            f"Under {_fmt_line(line)} Goals": max(0.0, 1 - ou_prob),
-                        }
-                        preds = game_state_analyzer.adjust_predictions(preds, game_state)
-                        for suggestion, p in preds.items():
-                            if not market_cutoff_ok(minute, mkkey, suggestion):
-                                _dbg("cutoff_block", market=mkkey, suggestion=suggestion, minute=minute)
-                                continue
-                            if not _candidate_is_sane(suggestion, feat):
-                                _dbg("sanity_block", market=mkkey, suggestion=suggestion, goals_sum=feat.get("goals_sum",0))
-                                continue
-                            thr = _get_market_threshold(mkkey)
-                            if p * 100.0 >= thr:
-                                _dbg("OU_PASS", suggestion=suggestion, line=_fmt_line(line), prob=round(p,3), conf=round(ou_conf,3), thr=thr)
-                                candidates.append((mkkey, suggestion, p, ou_conf))
-                            else:
-                                _dbg("threshold_block", market=mkkey, suggestion=suggestion, prob_pct=round(p*100,1), thr=thr)
+
+                    # Extract advanced features with error handling
+                    try:
+                        feat = feature_engineer.extract_advanced_features(m)
                     except Exception as e:
-                        _dbg("ou_predict_error", line=_fmt_line(line), err=str(e))
+                        _dbg("feature_extraction_failed", fid=fid, err=str(e))
+                        continue
+                        
+                    minute = int(feat.get("minute", 0))
 
-                # 3) 1X2 (draw suppressed)
-                try:
-                    ph, pa, c1 = market_predictor._predict_1x2_advanced(feat, minute)
-                    if ph > 0 and pa > 0 and c1 > 0.5:
-                        s = max(EPS, ph + pa)
-                        ph, pa = ph/s, pa/s
-                        preds = {"Home Win": ph, "Away Win": pa}
-                        preds = game_state_analyzer.adjust_predictions(preds, game_state)
-                        for suggestion, p in preds.items():
-                            if not market_cutoff_ok(minute, "1X2", suggestion):
-                                _dbg("cutoff_block", market="1X2", suggestion=suggestion, minute=minute)
-                                continue
-                            thr = _get_market_threshold("1X2")
-                            if p * 100.0 >= thr:
-                                _dbg("WLD_PASS", suggestion=suggestion, prob=round(p,3), conf=round(c1,3), thr=thr)
-                                candidates.append(("1X2", suggestion, p, c1))
-                            else:
-                                _dbg("threshold_block", market="1X2", suggestion=suggestion, prob_pct=round(p*100,1), thr=thr)
-                except Exception as e:
-                    _dbg("wld_predict_error", err=str(e))
-
-                if not candidates:
-                    _dbg("no_candidates_post_threshold", fid=fid, minute=minute)
-                    continue
-
-                odds_map = fetch_odds(fid) if API_KEY else {}
-                ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
-
-                for mk, sug, prob, conf in candidates:
-                    if sug not in ALLOWED_SUGGESTIONS:
-                        _dbg("suggestion_not_allowed", suggestion=sug)
+                    if not stats_coverage_ok(feat, minute):
+                        _dbg("coverage_fail", fid=fid, minute=minute)
+                        continue
+                    if minute < TIP_MIN_MINUTE:
+                        _dbg("minute_low", fid=fid, minute=minute, min_req=TIP_MIN_MINUTE)
+                        continue
+                    if is_feed_stale(fid, m, minute):
+                        _dbg("feed_stale", fid=fid, minute=minute)
                         continue
 
-                    # Per-market odds quality
-                    okey = _odds_key_for_market(mk, sug)
-                    oa = SmartOddsAnalyzer()
-                    oq = oa.analyze_odds_quality(odds_map, {mk: prob}, target_market_key=okey)
-                    if oq < oa.odds_quality_threshold:
-                        _dbg("odds_quality_block", market=mk, sug=sug, quality=round(oq,3), need=oa.odds_quality_threshold)
-                        continue
+                    # Harvest snapshot
+                    if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
+                        try:
+                            save_snapshot_from_match(m, feat)
+                        except Exception:
+                            pass
 
-                    # Odds lookup + price gate
-                    odds = None; book = None
-                    if mk == "BTTS":
-                        d = (odds_map.get("BTTS") or {})
-                        tgt = "Yes" if sug.endswith("Yes") else "No"
-                        if tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
-                    elif mk == "1X2":
-                        d = (odds_map.get("1X2") or {})
-                        tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
-                        if tgt and tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
-                    elif mk.startswith("Over/Under"):
-                        ln = _parse_ou_line_from_suggestion(sug)
-                        d = (odds_map.get(f"OU_{_fmt_line(ln)}") or {}) if ln is not None else {}
-                        tgt = "Over" if sug.startswith("Over") else "Under"
-                        if tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
+                    game_state_analyzer = GameStateAnalyzer()
+                    game_state = game_state_analyzer.analyze_game_state(feat)
 
-                    pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
-                    if not pass_odds:
-                        _dbg("price_gate_block", market=mk, sug=sug, have_odds=bool(odds), min=_min_odds_for_market(mk))
-                        continue
-                    if odds is None:
-                        odds, book = odds2, book2
-                    if mk == "1X2" and not _inplay_1x2_sanity_ok(suggestion, feat, odds):
-                        continue
+                    league_id, league = _league_name(m)
+                    home, away = _teams(m)
+                    score = _pretty_score(m)
 
-                    ev_pct = None
-                    if odds is not None:
-                        edge = _ev(prob, float(odds))
-                        ev_bps = int(round(edge * 10000))
-                        ev_pct = round(edge * 100.0, 1)
-                        if ev_bps < EDGE_MIN_BPS:
-                            _dbg("ev_block", market=mk, sug=sug, ev_bps=ev_bps, need=EDGE_MIN_BPS, odds=odds, prob=round(prob,3))
-                            continue
-                    elif not ALLOW_TIPS_WITHOUT_ODDS:
-                        _dbg("missing_odds_block", market=mk, sug=sug)
-                        continue
+                    candidates: List[Tuple[str, str, float, float]] = []
+                    log.info(f"[MARKET_SCAN] Processing {home} vs {away} at minute {minute}")
 
-                    rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0) * max(0.0, conf)
-                    ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score, conf))
-
-                if not ranked:
-                    _dbg("ranked_empty_after_gates", fid=fid, minute=minute)
-                    continue
-
-                ranked.sort(key=lambda x: x[6], reverse=True)
-
-                per_match = 0
-                base_now = int(time.time())
-
-                for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank, conf) in enumerate(ranked):
-                    if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
-                        _dbg("per_league_cap_block", league_id=league_id, cap=PER_LEAGUE_CAP)
-                        break
-                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                        break
-
-                    created_ts = base_now + idx
-                    raw = float(prob); prob_pct = round(raw * 100.0, 1)
-
+                    # 1) BTTS
                     try:
-                        with db_conn() as c2:
-                            c2.execute(
-                                "INSERT INTO tips("
-                                "match_id,league_id,league,home,away,market,suggestion,"
-                                "confidence,confidence_raw,score_at_tip,minute,created_ts,"
-                                "odds,book,ev_pct,sent_ok"
-                                ") VALUES ("
-                                "%s,%s,%s,%s,%s,%s,%s,"
-                                "%s,%s,%s,%s,%s,"
-                                "%s,%s,%s,%s"
-                                ")",
-                                (
-                                    fid, league_id, league, home, away,
-                                    market_txt, suggestion,
-                                    float(prob_pct), raw, score, minute, created_ts,
-                                    (float(odds) if odds is not None else None),
-                                    (book or None),
-                                    (float(ev_pct) if ev_pct is not None else None),
-                                    0,
-                                ),
-                            )
-                        sent = send_telegram(_format_enhanced_tip_message(
-                            home, away, league, minute, score, suggestion,
-                            float(prob_pct), feat, odds, book, ev_pct, conf
-                        ))
-                        if sent:
-                            with db_conn() as c3:
-                                c3.execute(
-                                    "UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
-                                    (fid, created_ts)
+                        btts_prob, btts_conf = market_predictor.predict_for_market(feat, "BTTS", minute)
+                        if btts_prob > 0 and btts_conf > 0.5:
+                            preds = {"BTTS: Yes": btts_prob, "BTTS: No": max(0.0, 1 - btts_prob)}
+                            preds = game_state_analyzer.adjust_predictions(preds, game_state)
+                            for suggestion, p in preds.items():
+                                if not market_cutoff_ok(minute, "BTTS", suggestion):
+                                    _dbg("cutoff_block", market="BTTS", suggestion=suggestion, minute=minute)
+                                    continue
+                                if not _candidate_is_sane(suggestion, feat):
+                                    _dbg("sanity_block", market="BTTS", suggestion=suggestion, goals_sum=feat.get("goals_sum",0))
+                                    continue
+                                thr = _get_market_threshold("BTTS")
+                                if p * 100.0 >= thr:
+                                    _dbg("BTTS_PASS", suggestion=suggestion, prob=round(p,3), conf=round(btts_conf,3), thr=thr)
+                                    candidates.append(("BTTS", suggestion, p, btts_conf))
+                                else:
+                                    _dbg("threshold_block", market="BTTS", suggestion=suggestion, prob_pct=round(p*100,1), thr=thr)
+                    except Exception as e:
+                        _dbg("btts_predict_error", err=str(e))
+
+                    # 2) OU
+                    for line in OU_LINES:
+                        mkkey = f"Over/Under {_fmt_line(line)}"
+                        try:
+                            ou_prob, ou_conf = market_predictor.predict_for_market(feat, f"OU_{_fmt_line(line)}", minute)
+                            if ou_prob <= 0 or ou_conf <= 0.5:
+                                _dbg("ou_low_base", line=_fmt_line(line), prob=round(ou_prob,3), conf=round(ou_conf,3))
+                                continue
+                            preds = {
+                                f"Over {_fmt_line(line)} Goals": ou_prob,
+                                f"Under {_fmt_line(line)} Goals": max(0.0, 1 - ou_prob),
+                            }
+                            preds = game_state_analyzer.adjust_predictions(preds, game_state)
+                            for suggestion, p in preds.items():
+                                if not market_cutoff_ok(minute, mkkey, suggestion):
+                                    _dbg("cutoff_block", market=mkkey, suggestion=suggestion, minute=minute)
+                                    continue
+                                if not _candidate_is_sane(suggestion, feat):
+                                    _dbg("sanity_block", market=mkkey, suggestion=suggestion, goals_sum=feat.get("goals_sum",0))
+                                    continue
+                                thr = _get_market_threshold(mkkey)
+                                if p * 100.0 >= thr:
+                                    _dbg("OU_PASS", suggestion=suggestion, line=_fmt_line(line), prob=round(p,3), conf=round(ou_conf,3), thr=thr)
+                                    candidates.append((mkkey, suggestion, p, ou_conf))
+                                else:
+                                    _dbg("threshold_block", market=mkkey, suggestion=suggestion, prob_pct=round(p*100,1), thr=thr)
+                        except Exception as e:
+                            _dbg("ou_predict_error", line=_fmt_line(line), err=str(e))
+
+                    # 3) 1X2 (draw suppressed)
+                    try:
+                        ph, pa, c1 = market_predictor._predict_1x2_advanced(feat, minute)
+                        if ph > 0 and pa > 0 and c1 > 0.5:
+                            s = max(EPS, ph + pa)
+                            ph, pa = ph/s, pa/s
+                            preds = {"Home Win": ph, "Away Win": pa}
+                            preds = game_state_analyzer.adjust_predictions(preds, game_state)
+                            for suggestion, p in preds.items():
+                                if not market_cutoff_ok(minute, "1X2", suggestion):
+                                    _dbg("cutoff_block", market="1X2", suggestion=suggestion, minute=minute)
+                                    continue
+                                thr = _get_market_threshold("1X2")
+                                if p * 100.0 >= thr:
+                                    _dbg("WLD_PASS", suggestion=suggestion, prob=round(p,3), conf=round(c1,3), thr=thr)
+                                    candidates.append(("1X2", suggestion, p, c1))
+                                else:
+                                    _dbg("threshold_block", market="1X2", suggestion=suggestion, prob_pct=round(p*100,1), thr=thr)
+                    except Exception as e:
+                        _dbg("wld_predict_error", err=str(e))
+
+                    if not candidates:
+                        _dbg("no_candidates_post_threshold", fid=fid, minute=minute)
+                        continue
+
+                    odds_map = fetch_odds(fid) if API_KEY else {}
+                    ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
+
+                    for mk, sug, prob, conf in candidates:
+                        if sug not in ALLOWED_SUGGESTIONS:
+                            _dbg("suggestion_not_allowed", suggestion=sug)
+                            continue
+
+                        # Per-market odds quality
+                        okey = _odds_key_for_market(mk, sug)
+                        oa = SmartOddsAnalyzer()
+                        oq = oa.analyze_odds_quality(odds_map, {mk: prob}, target_market_key=okey)
+                        if oq < oa.odds_quality_threshold:
+                            _dbg("odds_quality_block", market=mk, sug=sug, quality=round(oq,3), need=oa.odds_quality_threshold)
+                            continue
+
+                        # Odds lookup + price gate
+                        odds = None; book = None
+                        if mk == "BTTS":
+                            d = (odds_map.get("BTTS") or {})
+                            tgt = "Yes" if sug.endswith("Yes") else "No"
+                            if tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
+                        elif mk == "1X2":
+                            d = (odds_map.get("1X2") or {})
+                            tgt = "Home" if sug == "Home Win" else ("Away" if sug == "Away Win" else None)
+                            if tgt and tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
+                        elif mk.startswith("Over/Under"):
+                            ln = _parse_ou_line_from_suggestion(sug)
+                            d = (odds_map.get(f"OU_{_fmt_line(ln)}") or {}) if ln is not None else {}
+                            tgt = "Over" if sug.startswith("Over") else "Under"
+                            if tgt in d: odds, book = d[tgt]["odds"], d[tgt]["book"]
+
+                        pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
+                        if not pass_odds:
+                            _dbg("price_gate_block", market=mk, sug=sug, have_odds=bool(odds), min=_min_odds_for_market(mk))
+                            continue
+                        if odds is None:
+                            odds, book = odds2, book2
+                        if mk == "1X2" and not _inplay_1x2_sanity_ok(sug, feat, odds):
+                            continue
+
+                        ev_pct = None
+                        if odds is not None:
+                            edge = _ev(prob, float(odds))
+                            ev_bps = int(round(edge * 10000))
+                            ev_pct = round(edge * 100.0, 1)
+                            if ev_bps < EDGE_MIN_BPS:
+                                _dbg("ev_block", market=mk, sug=sug, ev_bps=ev_bps, need=EDGE_MIN_BPS, odds=odds, prob=round(prob,3))
+                                continue
+                        elif not ALLOW_TIPS_WITHOUT_ODDS:
+                            _dbg("missing_odds_block", market=mk, sug=sug)
+                            continue
+
+                        rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0) * max(0.0, conf)
+                        ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score, conf))
+
+                    if not ranked:
+                        _dbg("ranked_empty_after_gates", fid=fid, minute=minute)
+                        continue
+
+                    ranked.sort(key=lambda x: x[6], reverse=True)
+
+                    per_match = 0
+                    base_now = int(time.time())
+
+                    for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank, conf) in enumerate(ranked):
+                        if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
+                            _dbg("per_league_cap_block", league_id=league_id, cap=PER_LEAGUE_CAP)
+                            break
+                        if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                            break
+
+                        created_ts = base_now + idx
+                        raw = float(prob); prob_pct = round(raw * 100.0, 1)
+
+                        try:
+                            with db_conn() as c2:
+                                c2.execute(
+                                    "INSERT INTO tips("
+                                    "match_id,league_id,league,home,away,market,suggestion,"
+                                    "confidence,confidence_raw,score_at_tip,minute,created_ts,"
+                                    "odds,book,ev_pct,sent_ok"
+                                    ") VALUES ("
+                                    "%s,%s,%s,%s,%s,%s,%s,"
+                                    "%s,%s,%s,%s,%s,"
+                                    "%s,%s,%s,%s"
+                                    ")",
+                                    (
+                                        fid, league_id, league, home, away,
+                                        market_txt, suggestion,
+                                        float(prob_pct), raw, score, minute, created_ts,
+                                        (float(odds) if odds is not None else None),
+                                        (book or None),
+                                        (float(ev_pct) if ev_pct is not None else None),
+                                        0,
+                                    ),
                                 )
-                    except Exception as e:
-                        log.exception("[ENHANCED_PROD] insert/send failed: %s", e)
-                        _dbg("insert_send_error", err=str(e))
-                        continue
+                            sent = send_telegram(_format_enhanced_tip_message(
+                                home, away, league, minute, score, suggestion,
+                                float(prob_pct), feat, odds, book, ev_pct, conf
+                            ))
+                            if sent:
+                                with db_conn() as c3:
+                                    c3.execute(
+                                        "UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
+                                        (fid, created_ts)
+                                    )
+                        except Exception as e:
+                            log.exception("[ENHANCED_PROD] insert/send failed: %s", e)
+                            _dbg("insert_send_error", err=str(e))
+                            continue
 
-                    saved += 1
-                    per_match += 1
-                    per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
+                        saved += 1
+                        per_match += 1
+                        per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
+
+                        if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                            break
 
                     if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
                         break
 
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
+                except Exception as e:
+                    log.exception("[ENHANCED_PROD] match loop failed: %s", e)
+                    _dbg("match_loop_error", err=str(e))
+                    continue
 
-            except Exception as e:
-                log.exception("[ENHANCED_PROD] match loop failed: %s", e)
-                _dbg("match_loop_error", err=str(e))
-                continue
-
-    log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
-    _metric_inc("tips_generated_total", n=saved)
-    return saved, live_seen
+        log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
+        _metric_inc("tips_generated_total", n=saved)
+        return saved, live_seen
+    except Exception as e:
+        log.exception("[ENHANCED_PROD] Global scan error: %s", e)
+        return (0, 0)
 
 # ✅ Alias for scheduler & admin endpoint
 def production_scan() -> Tuple[int, int]:
