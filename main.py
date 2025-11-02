@@ -3307,7 +3307,7 @@ def debug_live_match(fid: int):
 def http_scan():
     _require_admin()
     s,l = production_scan()
-    return jsonify({"ok": True, "saved": s, "live_seen":
+    return jsonify({"ok": True, "saved": s, "live_seen":})
 
 @app.route("/admin/backfill-results", methods=["POST","GET"])
 def http_backfill():
