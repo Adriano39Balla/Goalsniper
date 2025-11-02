@@ -2338,6 +2338,49 @@ def explain_tip(match, features, model_output):
     # Combine
     return " ".join(explanation)
 
+def check_models_loaded():
+    """Check if models are properly loaded"""
+    model_names = ["BTTS", "OU_2.5", "OU_3.5", "1X2"]
+    for name in model_names:
+        model = load_model_from_settings(name)
+        if model:
+            print(f"[MODEL] {name}: LOADED (weights: {len(model.get('weights', {}))})")
+        else:
+            print(f"[MODEL] {name}: NOT FOUND")
+
+def debug_scan_issues():
+    """Temporary debug function to identify why no tips are generated"""
+    try:
+        matches = fetch_live_matches()
+        print(f"[DEBUG] Found {len(matches)} live matches")
+        
+        for i, m in enumerate(matches[:10]):  # Check first 10 matches
+            fid = int((m.get("fixture") or {}).get("id") or 0)
+            if not fid:
+                continue
+                
+            try:
+                feat = feature_engineer.extract_advanced_features(m)
+                minute = int(feat.get("minute", 0))
+                
+                print(f"[DEBUG] Match {i+1}: {_teams(m)} | Minute: {minute} | Coverage: {stats_coverage_ok(feat, minute)}")
+                
+                # Test predictions for each market
+                markets_to_test = ["BTTS"] + [f"OU_{_fmt_line(line)}" for line in OU_LINES]
+                for market in markets_to_test:
+                    try:
+                        prob, conf = market_predictor.predict_for_market(feat, market, minute)
+                        if prob > 0:
+                            print(f"  {market}: {prob:.1%} (conf: {conf:.1%})")
+                    except Exception as e:
+                        print(f"  {market}: ERROR - {e}")
+                        
+            except Exception as e:
+                print(f"[DEBUG] Error processing match {i+1}: {e}")
+                
+    except Exception as e:
+        print(f"[DEBUG] Failed to fetch matches: {e}")
+
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems (patched) ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
     """
@@ -3198,6 +3241,12 @@ def http_retry_unsent():
     _require_admin()
     n=retry_unsent_tips(30,200)
     return jsonify({"ok": True, "resent": n})
+
+@app.route("/admin/debug-scan", methods=["GET"])
+def http_debug_scan():
+    _require_admin()
+    debug_scan_issues()
+    return jsonify({"ok": True, "message": "Check logs for debug output"})
 
 @app.route("/debug/match-stats/<int:fid>", methods=["GET"])
 def debug_match_stats(fid: int):
