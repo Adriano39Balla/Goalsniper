@@ -1759,30 +1759,6 @@ def _market_name_normalize(s: str) -> str:
     if "over/under" in s or "total" in s or "goals" in s: return "OU"
     return s
 
-def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
-    if not vals:
-        return None, None
-    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
-    if not xs:
-        return None, None
-    import statistics
-    med = statistics.median(xs)
-    filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
-    if not filtered:
-        filtered = vals
-    xs2 = sorted([o for (o, _) in filtered])
-    med2 = statistics.median(xs2)
-    if prob_hint is not None and prob_hint > 0:
-        fair = 1.0 / max(1e-6, float(prob_hint))
-        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-        filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
-    if ODDS_AGGREGATION == "best":
-        best = max(filtered, key=lambda t: t[0])
-        return float(best[0]), str(best[1])
-    target = med2
-    pick = min(filtered, key=lambda t: abs(t[0] - target))
-    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
-
 def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None, require_live: bool = True) -> dict:
     """
     Aggregated odds map - LIVE ODDS ONLY for in-play matches
@@ -1911,65 +1887,6 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None, require_
     else:
         log.info(f"[ODDS] Successfully parsed {len(out)} markets for fixture {fid}")
     return out
-
-    def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
-        if not vals:
-            return None, None
-        xs = sorted([o for (o, _) in vals if (o or 0) > 0])
-        if not xs:
-            return None, None
-        import statistics
-        med = statistics.median(xs)
-        filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
-        if not filtered:
-            filtered = vals
-        xs2 = sorted([o for (o, _) in filtered])
-        med2 = statistics.median(xs2)
-        if prob_hint is not None and prob_hint > 0:
-            fair = 1.0 / max(1e-6, float(prob_hint))
-            cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-            filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
-        if ODDS_AGGREGATION == "best":
-            best = max(filtered, key=lambda t: t[0])
-            return float(best[0]), str(best[1])
-        target = med2
-        pick = min(filtered, key=lambda t: abs(t[0] - target))
-        return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
-
-    out: dict[str, dict[str, dict]] = {}
-    for mkey, side_map in by_market.items():
-        ok = True
-        for side, lst in side_map.items():
-            if len({b for (_, b) in lst}) < max(1, ODDS_REQUIRE_N_BOOKS):
-                ok = False
-                break
-        if not ok:
-            continue
-
-        out[mkey] = {}
-        for side, lst in side_map.items():
-            hint = None
-            if prob_hints:
-                if mkey == "BTTS":
-                    hint = prob_hints.get("BTTS: Yes") if side == "Yes" else (1.0 - (prob_hints.get("BTTS: Yes") or 0.0))
-                elif mkey == "1X2":
-                    hint = prob_hints.get("Home Win") if side == "Home" else (prob_hints.get("Away Win") if side == "Away" else None)
-                elif mkey.startswith("OU_"):
-                    try:
-                        ln = float(mkey.split("_", 1)[1])
-                        key = f"{_fmt_line(ln)}"
-                        hint = prob_hints.get(f"Over {key} Goals") if side == "Over" else (1.0 - (prob_hints.get(f"Over {key} Goals") or 0.0))
-                    except:
-                        pass
-            ag, label = _aggregate_price(lst, hint)
-            if ag is not None:
-                out[mkey][side] = {"odds": float(ag), "book": label}
-
-    ODDS_CACHE[fid] = (time.time(), out)
-    if not out: 
-        NEG_CACHE[k] = (now, True)
-    return out
-
 # ───────── Bayesian & GameState & Odds Quality ─────────
 class BayesianUpdater:
     def __init__(self):
