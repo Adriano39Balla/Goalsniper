@@ -1522,29 +1522,28 @@ adaptive_learner = AdaptiveLearningSystem()
 # ───────── Missing Function Implementations ─────────
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
-    """UPDATED coverage check - prioritizes matches with REAL xG data"""
+    """RELAXED coverage check - prioritize getting tips over perfect data"""
     
-    # Check if we have REAL xG data (not estimated)
-    has_real_xg = (feat.get('xg_h', 0) > 0) and (feat.get('xg_a', 0) > 0)
-    has_sot = (feat.get('sot_h', 0) > 0) and (feat.get('sot_a', 0) > 0)
-    has_pos = (feat.get('pos_h', 0) > 0) and (feat.get('pos_a', 0) > 0)
-    has_shots = (feat.get('sh_total_h', 0) > 0) and (feat.get('sh_total_a', 0) > 0)
-
-    # If we have REAL xG data, be more lenient (this is high-quality data)
-    if has_real_xg:
-        if minute < 20:
-            return has_pos or has_sot  # Basic coverage with real xG
-        else:
-            return has_pos  # Just need possession with real xG
-
-    # For estimated xG, use stricter requirements
-    if minute < 25:
-        return has_pos or has_sot or has_shots
-
-    if 25 <= minute < 55:
-        return (has_pos and has_sot) or (has_pos and has_shots)
-
-    return has_pos and has_sot and has_shots
+    # For testing, accept almost any data
+    if minute < 15:
+        # Basic early-game requirements
+        has_basic_stats = (
+            feat.get('pos_h', 0) > 0 or 
+            feat.get('pos_a', 0) > 0 or
+            feat.get('sot_h', 0) > 0 or 
+            feat.get('sot_a', 0) > 0
+        )
+        return has_basic_stats
+    
+    # After 15 minutes, be more lenient
+    if 15 <= minute < 30:
+        return True  # Accept almost anything
+    
+    # After 30 minutes, basic requirements
+    has_possession = (feat.get('pos_h', 0) > 0 and feat.get('pos_a', 0) > 0)
+    has_shots = (feat.get('sot_h', 0) > 0 or feat.get('sot_a', 0) > 0)
+    
+    return has_possession or has_shots
 
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     """Check if the data feed is stale"""
