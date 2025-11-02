@@ -20,6 +20,54 @@ def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     except Exception:
         return None
 
+def calculate_ev(probability: float, odds: float) -> float:
+    """
+    Calculate Expected Value (EV) as decimal percentage.
+    
+    Args:
+        probability: Probability as decimal (0.0-1.0)
+        odds: Decimal odds (e.g., 2.0 for even money)
+    
+    Returns:
+        EV as decimal (e.g., 0.05 = +5% edge, -0.10 = -10% edge)
+    """
+    try:
+        return float(probability) * max(0.0, float(odds)) - 1.0
+    except (ValueError, TypeError):
+        return -1.0  # Return negative EV on error
+
+def calculate_ev_percentage(probability: float, odds: float) -> float:
+    """
+    Calculate Expected Value as percentage.
+    
+    Args:
+        probability: Probability as decimal (0.0-1.0)
+        odds: Decimal odds
+    
+    Returns:
+        EV as percentage (e.g., 5.0 = +5%, -10.0 = -10%)
+    """
+    ev_decimal = calculate_ev(probability, odds)
+    return ev_decimal * 100.0
+
+def calculate_ev_bps(probability: float, odds: float) -> int:
+    """
+    Calculate Expected Value in basis points (bps).
+    
+    Args:
+        probability: Probability as decimal (0.0-1.0)
+        odds: Decimal odds
+    
+    Returns:
+        EV in basis points (e.g., 500 = +5%, -250 = -2.5%)
+    """
+    ev_decimal = calculate_ev(probability, odds)
+    return int(round(ev_decimal * 10000))
+
+def _ev(prob: float, odds: float) -> float:
+    """Legacy EV function alias for compatibility with existing code"""
+    return calculate_ev(prob, odds)
+
 def _odds_key_for_market(market_txt: str, suggestion: str) -> str | None:
     """Map our market/suggestion to odds_map key."""
     if market_txt == "BTTS":
