@@ -6,6 +6,130 @@ from zoneinfo import ZoneInfo
 
 log = logging.getLogger("goalsniper.features")
 
+# Core utility functions for feature calculation
+def _calculate_pressure(feat: Dict[str, float], side: str) -> float:
+    """Calculate pressure for home or away team"""
+    suffix = "_h" if side == "home" else "_a"
+    possession = feat.get(f"pos{suffix}", 50)
+    shots = feat.get(f"sot{suffix}", 0)
+    xg = feat.get(f"xg{suffix}", 0)
+    possession_norm = possession / 100.0
+    shots_norm = min(shots / 10.0, 1.0)
+    xg_norm = min(xg / 3.0, 1.0)
+    return (possession_norm * 0.3 + shots_norm * 0.4 + xg_norm * 0.3) * 100
+
+def _calculate_xg_momentum(feat: Dict[str, float]) -> float:
+    """Calculate xG momentum (goals vs expected goals)"""
+    total_xg = feat.get("xg_sum", 0)
+    total_goals = feat.get("goals_sum", 0)
+    if total_xg <= 0:
+        return 0.0
+    return (total_goals - total_xg) / max(1, total_xg)
+
+def _recent_xg_impact(feat: Dict[str, float], minute: int) -> float:
+    """Calculate recent xG impact per minute"""
+    if minute <= 0:
+        return 0.0
+    xg_per_minute = feat.get("xg_sum", 0) / minute
+    return xg_per_minute * 90
+
+def _defensive_stability(feat: Dict[str, float]) -> float:
+    """Calculate defensive stability for both teams"""
+    goals_conceded_h = feat.get("goals_a", 0)
+    goals_conceded_a = feat.get("goals_h", 0)
+    xg_against_h = feat.get("xg_a", 0)
+    xg_against_a = feat.get("xg_h", 0)
+    defensive_efficiency_h = 1 - (goals_conceded_h / max(1, xg_against_h)) if xg_against_h > 0 else 1.0
+    defensive_efficiency_a = 1 - (goals_conceded_a / max(1, xg_against_a)) if xg_against_a > 0 else 1.0
+    return (defensive_efficiency_h + defensive_efficiency_a) / 2
+
+# Event analysis functions
+def _count_goals_since(events: List[dict], current_minute: int, window: int) -> int:
+    """Count goals in the last N minutes"""
+    cutoff = current_minute - window
+    goals = 0
+    for event in events:
+        minute = event.get('time', {}).get('elapsed', 0)
+        if minute >= cutoff and event.get('type') == 'Goal':
+            goals += 1
+    return goals
+
+def _count_shots_since(events: List[dict], current_minute: int, window: int) -> int:
+    """Count shots in the last N minutes"""
+    cutoff = current_minute - window
+    shots = 0
+    shot_types = {'Shot', 'Missed Shot', 'Shot on Target', 'Saved Shot'}
+    for event in events:
+        minute = event.get('time', {}).get('elapsed', 0)
+        if minute >= cutoff and event.get('type') in shot_types:
+            shots += 1
+    return shots
+
+def _count_cards_since(events: List[dict], current_minute: int, window: int) -> int:
+    """Count cards in the last N minutes"""
+    cutoff = current_minute - window
+    cards = 0
+    for event in events:
+        minute = event.get('time', {}).get('elapsed', 0)
+        if minute >= cutoff and event.get('type') == 'Card':
+            cards += 1
+    return cards
+
+# Standalone feature extraction functions
+def extract_basic_features(match_data: Dict[str, Any]) -> Dict[str, float]:
+    """Standalone function for basic feature extraction (for compatibility)"""
+    return FeatureEngineer()._extract_basic_features(match_data)
+
+def extract_enhanced_features(match_data: Dict[str, Any]) -> Dict[str, float]:
+    """Standalone function for enhanced feature extraction (for compatibility)"""
+    base_feat = extract_basic_features(match_data)
+    minute = base_feat.get("minute", 0)
+    events = match_data.get("events", [])
+    
+    base_feat.update({
+        "goals_last_15": float(_count_goals_since(events, minute, 15)),
+        "shots_last_15": float(_count_shots_since(events, minute, 15)),
+        "cards_last_15": float(_count_cards_since(events, minute, 15)),
+        "pressure_home": _calculate_pressure(base_feat, "home"),
+        "pressure_away": _calculate_pressure(base_feat, "away"),
+        "score_advantage": base_feat.get("goals_h", 0) - base_feat.get("goals_a", 0),
+        "xg_momentum": _calculate_xg_momentum(base_feat),
+        "recent_xg_impact": _recent_xg_impact(base_feat, minute),
+        "defensive_stability": _defensive_stability(base_feat)
+    })
+    return base_feat
+
+# Data quality and validation functions
+def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
+    """Check if we have sufficient data coverage for predictions"""
+    # Only reject if we have absolutely NO data at all
+    has_any_data = any([
+        feat.get('pos_h', 0) > 0, feat.get('pos_a', 0) > 0,
+        feat.get('sot_h', 0) > 0, feat.get('sot_a', 0) > 0, 
+        feat.get('goals_h', 0) > 0, feat.get('goals_a', 0) > 0,
+        feat.get('cor_h', 0) > 0, feat.get('cor_a', 0) > 0,
+        feat.get('sh_total_h', 0) > 0, feat.get('sh_total_a', 0) > 0
+    ])
+    
+    # After 30 minutes, require at least SOME data
+    if minute > 30:
+        return has_any_data
+    
+    # Before 30 minutes, be very lenient
+    return True
+
+def is_feed_stale(fid: int, match_data: Dict[str, Any], minute: int) -> bool:
+    """Check if the data feed is stale"""
+    # Note: This function needs access to STATS_CACHE from main module
+    # For now, we'll provide a basic implementation
+    # The main module should handle the full implementation with cache access
+    events = match_data.get("events", [])
+    if events:
+        latest_event_minute = max([ev.get('time', {}).get('elapsed', 0) for ev in events], default=0)
+        if minute - latest_event_minute > 10 and minute > 30:
+            return True
+    return False
+
 class FeatureEngineer:
     """Advanced feature engineering with temporal patterns and game context"""
     
@@ -27,10 +151,20 @@ class FeatureEngineer:
         strength_features = self._extract_team_strength_indicators(match_data, base_features)
         base_features.update(strength_features)
         
+        # Add pressure calculations
+        base_features.update({
+            "pressure_home": self._calculate_pressure(base_features, "home"),
+            "pressure_away": self._calculate_pressure(base_features, "away"),
+            "xg_momentum": self._calculate_xg_momentum(base_features),
+            "recent_xg_impact": self._recent_xg_impact(base_features, int(base_features.get("minute", 0))),
+            "defensive_stability": self._defensive_stability(base_features)
+        })
+        
         return base_features
     
     def _extract_basic_features(self, match_data: Dict[str, Any]) -> Dict[str, float]:
         """Extract basic match features - MUST MATCH training data extraction"""
+        # ... your existing implementation ...
         home = match_data["teams"]["home"]["name"]
         away = match_data["teams"]["away"]["name"]
         goals = match_data.get("goals", {})
@@ -168,6 +302,20 @@ class FeatureEngineer:
         
         return strength_features
     
+    # Pressure and momentum calculation methods
+    def _calculate_pressure(self, feat: Dict[str, float], side: str) -> float:
+        return _calculate_pressure(feat, side)
+    
+    def _calculate_xg_momentum(self, feat: Dict[str, float]) -> float:
+        return _calculate_xg_momentum(feat)
+    
+    def _recent_xg_impact(self, feat: Dict[str, float], minute: int) -> float:
+        return _recent_xg_impact(feat, minute)
+    
+    def _defensive_stability(self, feat: Dict[str, float]) -> float:
+        return _defensive_stability(feat)
+    
+    # ... rest of your existing methods (_num, _pos_pct, _extract_cards, etc.) ...
     def _num(self, value) -> float:
         """Convert any value to float, handling percentages"""
         try:
@@ -300,3 +448,15 @@ class FeatureEngineer:
 
 # Global feature engineer instance
 feature_engineer = FeatureEngineer()
+
+# Export important functions for use in other modules
+__all__ = [
+    'feature_engineer', 
+    'extract_basic_features', 
+    'extract_enhanced_features',
+    'stats_coverage_ok', 
+    'is_feed_stale',
+    '_calculate_pressure',
+    '_calculate_xg_momentum',
+    '_defensive_stability'
+]
