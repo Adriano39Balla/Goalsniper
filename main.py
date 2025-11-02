@@ -1508,21 +1508,27 @@ adaptive_learner = AdaptiveLearningSystem()
 # ───────── Missing Function Implementations ─────────
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
-    """Stricter coverage gates to avoid junk in mid/late game."""
-    has_sot = (feat.get('sot_h', 0) > 0) and (feat.get('sot_a', 0) > 0)
-    has_pos = (feat.get('pos_h', 0) > 0) and (feat.get('pos_a', 0) > 0)
-    has_xg  = (feat.get('xg_h', 0) > 0) and (feat.get('xg_a', 0) > 0)
-
-    if minute < 25:
-        # Early: permissive
-        return has_pos or has_sot or has_xg
-
-    if 25 <= minute < 55:
-        # Mid-game: need shots+possession OR xG
-        return (has_pos and has_sot) or has_xg
-
-    # Late: need xG OR very active match (both SOT and enough total events)
-    return has_xg or (has_pos and has_sot and (feat.get('sot_sum', 0) >= 6))
+    """MORE LENIENT coverage check - focus on basic stats only"""
+    
+    # Basic requirement: at least some possession or shots data
+    has_basic_stats = (
+        (feat.get('pos_h', 0) > 0 or feat.get('pos_a', 0) > 0) or
+        (feat.get('sot_h', 0) > 0 or feat.get('sot_a', 0) > 0) or
+        (feat.get('sh_total_h', 0) > 0 or feat.get('sh_total_a', 0) > 0)
+    )
+    
+    if not has_basic_stats:
+        return False
+    
+    # Early game: be very lenient
+    if minute < 30:
+        return True
+    
+    # Mid-late game: require at least possession data
+    if minute >= 30:
+        return (feat.get('pos_h', 0) > 0 and feat.get('pos_a', 0) > 0)
+    
+    return True
 
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     """Check if the data feed is stale"""
@@ -3075,8 +3081,19 @@ def http_retry_unsent():
     n=retry_unsent_tips(30,200)
     return jsonify({"ok": True, "resent": n})
 
-# REMOVED: prematch-scan endpoint
-# REMOVED: motd endpoints
+@app.route("/debug/match-stats/<int:fid>", methods=["GET"])
+def debug_match_stats(fid: int):
+    """Debug endpoint to check what stats we're getting"""
+    stats = fetch_match_stats(fid)
+    feat = extract_basic_features({"fixture": {"id": fid}, "teams": {}, "goals": {}, "statistics": stats, "events": []})
+    
+    return jsonify({
+        "fixture_id": fid,
+        "stats_available": bool(stats),
+        "features": feat,
+        "coverage_ok": stats_coverage_ok(feat, int(feat.get("minute", 0))),
+        "raw_stats": stats[:2] if stats else []  # First 2 stat entries
+    })
 
 @app.route("/settings/<key>", methods=["GET","POST"])
 def http_settings(key: str):
@@ -3106,14 +3123,12 @@ def http_latest():
 def telegram_webhook(secret: str):
     if (WEBHOOK_SECRET or "") != secret: abort(403)
     if request.method == "GET":
-        # Allow manual ping/diagnostics
         return jsonify({"ok": True, "webhook": "ready"})
     update=request.get_json(silent=True) or {}
     try:
         msg=(update.get("message") or {}).get("text") or ""
         if msg.startswith("/start"): send_telegram("👋 goalsniper bot (IN-PLAY AI ENHANCED mode) is online.")
         elif msg.startswith("/digest"): daily_accuracy_digest()
-        # REMOVED: MOTD command
         elif msg.startswith("/scan"):
             parts=msg.split()
             if len(parts)>1 and ADMIN_API_KEY and parts[1]==ADMIN_API_KEY:
