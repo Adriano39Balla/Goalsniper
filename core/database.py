@@ -193,3 +193,7 @@ class DatabaseCursor:
 
 def get_cursor():
     return DatabaseCursor()
+
+def get_cursor(self):
+    """Get a database cursor context manager"""
+    return DatabaseCursor()
