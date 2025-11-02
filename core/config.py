@@ -5,6 +5,31 @@ from dataclasses import dataclass
 
 log = logging.getLogger("goalsniper.config")
 
+# Add these utility functions at the top level
+def _parse_market_cutoffs(s: str) -> Dict[str, int]:
+    """Parse market cutoff configuration from environment"""
+    out = {}
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok or "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        try:
+            out[k.strip().upper()] = int(float(v.strip()))
+        except Exception:
+            pass
+    return out
+
+def _fmt_line(line: float) -> str:
+    """Format line for display (remove trailing zeros)"""
+    return f"{line}".rstrip("0").rstrip(".")
+
+def _clamp_prob(p: float) -> float:
+    """Keep probabilities away from 0/1 to avoid overconfident cascades."""
+    eps = float(os.getenv("PROB_CLAMP_EPS", "0.005"))
+    return min(1.0 - eps, max(eps, float(p)))
+
+# Your existing dataclasses...
 @dataclass
 class DatabaseConfig:
     url: str
@@ -57,6 +82,39 @@ class SchedulerConfig:
     backfill_days: int = 14
     train_hour_utc: int = 2
     train_minute_utc: int = 12
+
+# NEW dataclasses
+@dataclass
+class AdvancedModelConfig:
+    target_precision: float = 0.60
+    thresh_min_predictions: int = 25
+    min_thresh: float = 55.0
+    max_thresh: float = 85.0
+
+@dataclass
+class CacheConfig:
+    settings_ttl: int = 60
+    models_ttl: int = 120
+    neg_ttl_sec: int = 45
+    stale_stats_max_sec: int = 240
+
+@dataclass
+class MarketConfig:
+    allowed_suggestions: set = None
+    market_cutoffs: Dict[str, int] = None
+    total_match_minutes: int = 95
+    
+    def __post_init__(self):
+        if self.allowed_suggestions is None:
+            self.allowed_suggestions = {
+                "BTTS: Yes", "BTTS: No", "Home Win", "Away Win"
+            }
+        if self.market_cutoffs is None:
+            self.market_cutoffs = {"BTTS": 75, "1X2": 80, "OU": 88}
+
+@dataclass
+class DebugConfig:
+    debug_selection_log: bool = False
 
 class Config:
     def __init__(self):
@@ -134,6 +192,33 @@ class Config:
             train_minute_utc=int(os.getenv('TRAIN_MINUTE_UTC', '12'))
         )
 
+        # NEW: Advanced Models
+        self.advanced_models = AdvancedModelConfig(
+            target_precision=float(os.getenv('TARGET_PRECISION', '0.60')),
+            thresh_min_predictions=int(os.getenv('THRESH_MIN_PREDICTIONS', '25')),
+            min_thresh=float(os.getenv('MIN_THRESH', '55')),
+            max_thresh=float(os.getenv('MAX_THRESH', '85'))
+        )
+
+        # NEW: Cache
+        self.cache = CacheConfig(
+            settings_ttl=int(os.getenv('SETTINGS_TTL_SEC', '60')),
+            models_ttl=int(os.getenv('MODELS_CACHE_TTL_SEC', '120')),
+            neg_ttl_sec=int(os.getenv('NEG_TTL_SEC', '45')),
+            stale_stats_max_sec=int(os.getenv('STALE_STATS_MAX_SEC', '240'))
+        )
+
+        # NEW: Markets
+        self.markets = MarketConfig(
+            total_match_minutes=int(os.getenv('TOTAL_MATCH_MINUTES', '95')),
+            market_cutoffs=self._parse_market_cutoffs(os.getenv('MARKET_CUTOFFS', 'BTTS=75,1X2=80,OU=88'))
+        )
+
+        # NEW: Debug
+        self.debug = DebugConfig(
+            debug_selection_log=os.getenv('DEBUG_SELECTION_LOG', '0').lower() not in ('0', 'false', 'no')
+        )
+
         # Feature flags
         self.harvest_mode = os.getenv('HARVEST_MODE', '1').lower() not in ('0', 'false', 'no')
         self.train_enable = os.getenv('TRAIN_ENABLE', '1').lower() not in ('0', 'false', 'no')
@@ -143,6 +228,23 @@ class Config:
 
         # OU Lines
         self.ou_lines = self._parse_ou_lines()
+
+        # League blocking
+        self.league_block_patterns = [
+            "u17", "u18", "u19", "u20", "u21", "u23", 
+            "youth", "junior", "reserve", "res.", 
+            "friendlies", "friendly"
+        ]
+        self.league_deny_ids = [
+            x.strip() for x in os.getenv("LEAGUE_DENY_IDS", "").split(",") 
+            if x.strip()
+        ]
+
+        # Add OU lines to allowed suggestions
+        for line in self.ou_lines:
+            s = self._fmt_line(line)
+            self.markets.allowed_suggestions.add(f"Over {s} Goals")
+            self.markets.allowed_suggestions.add(f"Under {s} Goals")
 
     def _parse_ou_lines(self) -> List[float]:
         env_val = os.getenv('OU_LINES', '2.5,3.5')
@@ -157,6 +259,19 @@ class Config:
                 pass
         return out or [2.5, 3.5]
 
+    def _parse_market_cutoffs(self, cutoff_str: str) -> Dict[str, int]:
+        return _parse_market_cutoffs(cutoff_str)
+
+    def _fmt_line(self, line: float) -> str:
+        return _fmt_line(line)
+
+    def get_tip_max_minute(self) -> Optional[int]:
+        """Get the maximum minute for tips, considering environment and market cutoffs"""
+        try:
+            return int(float(os.getenv("TIP_MAX_MINUTE", ""))) if os.getenv("TIP_MAX_MINUTE") else None
+        except Exception:
+            return None
+
     def validate(self):
         """Validate configuration"""
         if not (0 <= self.models.confidence_threshold <= 100):
@@ -169,3 +284,6 @@ class Config:
 
 # Global config instance
 config = Config()
+
+# Export utility functions for use in other modules
+__all__ = ['config', '_fmt_line', '_clamp_prob', '_parse_market_cutoffs']
