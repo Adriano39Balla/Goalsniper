@@ -4,10 +4,17 @@ services:
     build:
       builder: python:3.11
       buildCommand: pip install --no-cache-dir -r requirements.txt
-      startCommand: python main.py
+      startCommand: python -m goalsniper.app
+    # Optional: Add health check
+    healthcheck:
+      path: /health
+      port: 8080
+      initialDelay: 30
 
   trainer:
     build:
       builder: python:3.11
       buildCommand: pip install --no-cache-dir -r requirements.txt
-      startCommand: python train_models.py --db-url $DATABASE_URL
+      startCommand: python -m goalsniper.services.training
+    # Optional: Make it run periodically instead of continuously
+    # Or keep as is if you want it running continuously
