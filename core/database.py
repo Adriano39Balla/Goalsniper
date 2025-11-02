@@ -119,7 +119,6 @@ class DatabaseManager:
         try:
             return self.pool.getconn()
         except Exception:
-            # Reinitialize on failure
             self._initialized = False
             self.initialize()
             return self.pool.getconn()
@@ -135,23 +134,63 @@ class DatabaseManager:
             except:
                 pass
 
+    def get_cursor(self):
+        """Get a database cursor context manager"""
+        return DatabaseCursor()
+
     def init_schema(self):
         """Initialize database schema"""
         with self.get_cursor() as c:
-            # Tips table
             c.execute("""CREATE TABLE IF NOT EXISTS tips (
-                match_id BIGINT, league_id BIGINT, league TEXT,
-                home TEXT, away TEXT, market TEXT, suggestion TEXT,
-                confidence DOUBLE PRECISION, confidence_raw DOUBLE PRECISION,
-                score_at_tip TEXT, minute INTEGER, created_ts BIGINT,
-                odds DOUBLE PRECISION, book TEXT, ev_pct DOUBLE PRECISION,
+                match_id BIGINT, 
+                league_id BIGINT, 
+                league TEXT,
+                home TEXT, 
+                away TEXT, 
+                market TEXT, 
+                suggestion TEXT,
+                confidence DOUBLE PRECISION, 
+                confidence_raw DOUBLE PRECISION,
+                score_at_tip TEXT, 
+                minute INTEGER, 
+                created_ts BIGINT,
+                odds DOUBLE PRECISION, 
+                book TEXT, 
+                ev_pct DOUBLE PRECISION,
                 sent_ok INTEGER DEFAULT 1,
-                PRIMARY KEY (match_id, created_ts))""")
+                PRIMARY KEY (match_id, created_ts)
+            )""")
             
-            # Other tables...
-            # [Rest of your schema initialization code]
+            c.execute("""CREATE TABLE IF NOT EXISTS matches (
+                match_id BIGINT PRIMARY KEY,
+                league_id BIGINT,
+                league TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                match_time BIGINT,
+                status TEXT,
+                home_score INTEGER,
+                away_score INTEGER,
+                last_updated BIGINT
+            )""")
+            
+            c.execute("""CREATE TABLE IF NOT EXISTS alerts (
+                alert_id SERIAL PRIMARY KEY,
+                match_id BIGINT,
+                alert_type TEXT,
+                message TEXT,
+                created_ts BIGINT,
+                sent BOOLEAN DEFAULT FALSE
+            )""")
+            
+            c.execute("""CREATE TABLE IF NOT EXISTS system_logs (
+                log_id SERIAL PRIMARY KEY,
+                level TEXT,
+                message TEXT,
+                timestamp BIGINT,
+                component TEXT
+            )""")
 
-# Global database instance
 db = DatabaseManager()
 
 class DatabaseCursor:
@@ -190,10 +229,3 @@ class DatabaseCursor:
     
     def fetchall(self):
         return self.cur.fetchall()
-
-def get_cursor():
-    return DatabaseCursor()
-
-def get_cursor(self):
-    """Get a database cursor context manager"""
-    return DatabaseCursor()
