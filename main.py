@@ -2440,7 +2440,8 @@ class GameStateAnalyzer:
 
 class SmartOddsAnalyzer:
     def __init__(self):
-        self.odds_quality_threshold = ODDS_QUALITY_MIN
+        # Lower the threshold temporarily for debugging
+        self.odds_quality_threshold = float(os.getenv("ODDS_QUALITY_MIN", "0.15"))  # Reduced from 0.35
 
     def analyze_odds_quality(self, odds_map: dict, prob_hints: dict[str, float],
                              target_market_key: str | None = None) -> float:
@@ -2450,55 +2451,86 @@ class SmartOddsAnalyzer:
         from dragging the quality down.
         """
         if not odds_map:
+            log.warning(f"[ODDS_QUALITY] No odds map provided")
             return 0.0
 
         def _market_odds_quality(sides: dict, prob_hint: float | None) -> float:
             if not sides:
+                log.debug(f"[ODDS_QUALITY] No sides in market")
                 return 0.0
+            
             total_implied = 0.0
             n = 0
-            for data in sides.values():
+            valid_odds = []
+            
+            for side_name, data in sides.items():
                 o = (data or {}).get("odds")
                 if o and o > 0:
                     total_implied += 1.0 / float(o)
+                    valid_odds.append(o)
                     n += 1
+            
             if n == 0:
+                log.debug(f"[ODDS_QUALITY] No valid odds found")
                 return 0.0
+            
+            # Calculate overround (bookmaker margin)
             overround = max(0.0, total_implied - 1.0)
-            overround_quality = max(0.0, 1.0 - overround * 5.0)
-
+            overround_quality = max(0.0, 1.0 - overround * 3.0)  # More lenient than 5.0
+            
+            # Calculate model consistency quality
             model_quality = 1.0
-            if prob_hint is not None:
+            if prob_hint is not None and prob_hint > 0:
                 try:
-                    best_side = max(sides.items(), key=lambda x: (x[1] or {}).get("odds", 0.0))
-                    best_odds = (best_side[1] or {}).get("odds") or 0.0
-                    if best_odds > 0:
-                        edge = float(prob_hint) * float(best_odds) - 1.0
-                        model_quality = min(1.0, max(0.0, edge + 1.0))
-                except Exception:
-                    pass
-            return (overround_quality + model_quality) / 2.0
+                    # Find the best odds for this side
+                    best_odds = max(valid_odds)
+                    edge = float(prob_hint) * float(best_odds) - 1.0
+                    model_quality = min(1.0, max(0.0, edge + 1.0))
+                    log.debug(f"[ODDS_QUALITY] prob_hint={prob_hint:.3f}, best_odds={best_odds:.2f}, edge={edge:.3f}, model_quality={model_quality:.3f}")
+                except Exception as e:
+                    log.warning(f"[ODDS_QUALITY] Error calculating model quality: {e}")
+                    model_quality = 0.5  # Default neutral quality
+            
+            final_quality = (overround_quality + model_quality) / 2.0
+            log.debug(f"[ODDS_QUALITY] market: overround={overround:.3f}, overround_quality={overround_quality:.3f}, model_quality={model_quality:.3f}, final={final_quality:.3f}")
+            return final_quality
 
+        # If we have a specific target market, only evaluate that one
         if target_market_key and target_market_key in odds_map:
             sides = odds_map.get(target_market_key) or {}
             hint = self._resolve_hint_for_specific(prob_hints, target_market_key)
-            return _market_odds_quality(sides, hint)
+            quality = _market_odds_quality(sides, hint)
+            log.info(f"[ODDS_QUALITY] Target market '{target_market_key}': quality={quality:.3f}")
+            return quality
 
+        # Otherwise average all markets (fallback)
         qualities = []
         for mk, sides in odds_map.items():
             hint = self._resolve_hint_for_specific(prob_hints, mk)
-            qualities.append(_market_odds_quality(sides, hint))
-        return sum(qualities) / len(qualities) if qualities else 0.0
+            quality = _market_odds_quality(sides, hint)
+            qualities.append(quality)
+            log.debug(f"[ODDS_QUALITY] Market '{mk}': quality={quality:.3f}")
+        
+        final_quality = sum(qualities) / len(qualities) if qualities else 0.0
+        log.info(f"[ODDS_QUALITY] Overall quality: {final_quality:.3f} from {len(qualities)} markets")
+        return final_quality
 
     def _resolve_hint_for_specific(self, hints: dict[str, float], market_key: str) -> float | None:
+        """Resolve probability hint for specific market"""
+        if not hints:
+            return None
+            
+        # Map market keys to hint keys
         if market_key == "BTTS":
-            return hints.get("BTTS")
-        if market_key == "1X2":
-            return hints.get("1X2")
-        if market_key.startswith("OU_"):
+            return hints.get("BTTS: Yes")  # Use Yes probability for BTTS
+        elif market_key == "1X2":
+            # For 1X2, we need to be careful - use the appropriate side
+            # This will be handled by the caller
+            return hints.get("Home Win") or hints.get("Away Win")
+        elif market_key.startswith("OU_"):
             try:
                 line_txt = market_key.split("_", 1)[1]
-                return hints.get(f"Over/Under {line_txt}") or hints.get(f"OU_{line_txt}")
+                return hints.get(f"Over {line_txt} Goals")
             except Exception:
                 return None
         return None
