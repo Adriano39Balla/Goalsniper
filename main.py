@@ -1,3 +1,4 @@
+# file: app.py
 # goalsniper — FULL AI mode (in-play) with odds + EV gate
 # UPGRADED & PATCHED: Robust Supabase connectivity (IPv4 + PgBouncer + SSL), fixed calibration math,
 # sanity + minute cutoffs, per-candidate odds quality, configurable sleep window, GET-enabled admin routes.
@@ -244,23 +245,6 @@ OU_LINES = [ln for ln in _parse_lines(os.getenv("OU_LINES","2.5,3.5"), [2.5,3.5]
 TOTAL_MATCH_MINUTES   = int(os.getenv("TOTAL_MATCH_MINUTES", "95"))
 PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "1"))  # was 2 — tighter by default
 PER_LEAGUE_CAP        = int(os.getenv("PER_LEAGUE_CAP", "2"))         # was 0 — cap league dominance by default
-
-# ───────── Odds/EV controls — UPDATED DEFAULTS ─────────
-MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU", "1.50"))  # was 1.30
-MIN_ODDS_BTTS = float(os.getenv("MIN_ODDS_BTTS", "1.50"))  # was 1.30
-MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2", "1.50"))  # was 1.30
-MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL", "20.0"))
-EDGE_MIN_BPS  = int(os.getenv("EDGE_MIN_BPS", "600"))      # was 300 bps
-ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")  # optional API-Football book id
-ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","0") not in ("0","false","False","no","NO")  # default hardened to 0
-
-# Aggregated odds controls (new)
-ODDS_SOURCE = os.getenv("ODDS_SOURCE", "auto").lower()            # auto|live|prematch
-ODDS_AGGREGATION = os.getenv("ODDS_AGGREGATION", "median").lower()# median|best
-ODDS_OUTLIER_MULT = float(os.getenv("ODDS_OUTLIER_MULT", "1.8"))  # drop books > x * median
-ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))# min distinct books per side
-ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))# cap vs fair (1/p)
-ODDS_QUALITY_MIN = float(os.getenv("ODDS_QUALITY_MIN", "0.35"))   # ✅ added: min acceptable odds quality (0-1)
 
 # ───────── Markets allow-list (draw suppressed) ─────────
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
@@ -1047,10 +1031,10 @@ def _pos_pct(v) -> float:
     except: return 0.0
 
 def extract_basic_features(m: dict) -> Dict[str,float]:
-    home = m["teams"]["home"]["name"]
-    away = m["teams"]["away"]["name"]
-    gh = m["goals"]["home"] or 0
-    ga = m["goals"]["away"] or 0
+    home = (m.get("teams") or {}).get("home", {}).get("name", "")
+    away = (m.get("teams") or {}).get("away", {}).get("name", "")
+    gh = (m.get("goals") or {}).get("home") or 0
+    ga = (m.get("goals") or {}).get("away") or 0
     minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
     stats = {}
     for s in (m.get("statistics") or []):
@@ -1835,73 +1819,12 @@ def _format_tip_message(home, away, league, minute, score, suggestion, confidenc
     """Simplified tip message formatter"""
     money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book}" if odds else ""
     ev_text = f" • <b>EV:</b> {ev_pct:+.1f}%" if ev_pct is not None else ""
-    
     return (f"⚽️ <b>AI TIP</b>\n"
             f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
             f"🕒 <b>Minute:</b> {minute}' | <b>Score:</b> {escape(score)}\n"
             f"<b>Tip:</b> {escape(suggestion)}\n"
             f"📈 <b>Confidence:</b> {confidence:.1f}%{money}{ev_text}\n"
             f"🏆 <b>League:</b> {escape(league)}")
-
-    def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
-        if not vals:
-            return None, None
-        xs = sorted([o for (o, _) in vals if (o or 0) > 0])
-        if not xs:
-            return None, None
-        import statistics
-        med = statistics.median(xs)
-        filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
-        if not filtered:
-            filtered = vals
-        xs2 = sorted([o for (o, _) in filtered])
-        med2 = statistics.median(xs2)
-        if prob_hint is not None and prob_hint > 0:
-            fair = 1.0 / max(1e-6, float(prob_hint))
-            cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-            filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
-        if ODDS_AGGREGATION == "best":
-            best = max(filtered, key=lambda t: t[0])
-            return float(best[0]), str(best[1])
-        target = med2
-        pick = min(filtered, key=lambda t: abs(t[0] - target))
-        return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
-
-    out: dict[str, dict[str, dict]] = {}
-    for mkey, side_map in by_market.items():
-        ok = True
-        for side, lst in side_map.items():
-            if len({b for (_, b) in lst}) < max(1, ODDS_REQUIRE_N_BOOKS):
-                ok = False
-                break
-        if not ok:
-            continue
-
-        out[mkey] = {}
-        for side, lst in side_map.items():
-            hint = None
-            if prob_hints:
-                if mkey == "BTTS":
-                    hint = prob_hints.get("BTTS: Yes") if side == "Yes" else (1.0 - (prob_hints.get("BTTS: Yes") or 0.0))
-                elif mkey == "1X2":
-                    hint = prob_hints.get("Home Win") if side == "Home" else (prob_hints.get("Away Win") if side == "Away" else None)
-                elif mkey.startswith("OU_"):
-                    try:
-                        ln = float(mkey.split("_", 1)[1])
-                        key = f"{_fmt_line(ln)}"
-                        hint = prob_hints.get(f"Over {key} Goals") if side == "Over" else (1.0 - (prob_hints.get(f"Over {key} Goals") or 0.0))
-                    except:
-                        pass
-            ag, label = _aggregate_price(lst, hint)
-            if ag is not None:
-                out[mkey][side] = {"odds": float(ag), "book": label}
-
-    ODDS_CACHE[fid] = (time.time(), out)
-    if not out: 
-        NEG_CACHE[k] = (now, True)
-    else:
-        log.info(f"[ODDS] Successfully parsed {len(out)} markets for fixture {fid}")
-    return out
 
 def _odds_key_for_market(market_txt: str, suggestion: str) -> str | None:
     """Map our market/suggestion to odds_map key."""
@@ -2422,17 +2345,9 @@ def _get_market_threshold(market: str) -> float:
         error_handler.handle_error("_get_market_threshold", e, {"market": market})
         return CONF_THRESHOLD
 
-def _market_name_normalize(s: str) -> str:
-    s=(s or "").lower()
-    if "both teams" in s or "btts" in s: return "BTTS"
-    if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
-    if "over/under" in s or "total" in s or "goals" in s: return "OU"
-    return s
-
 def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
     """Check if a prediction candidate makes sense given current match state"""
     try:
-        minute = int(feat.get("minute", 0))
         goals_sum = feat.get("goals_sum", 0)
         
         # Check for absurd Over/Under predictions
@@ -2440,13 +2355,12 @@ def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
             try:
                 line = _parse_ou_line_from_suggestion(suggestion)
                 if line and goals_sum > line:
-                    return False  # Can't go under if already over
+                    return False
             except:
                 pass
                 
         # Check for absurd BTTS predictions
-        if suggestion == "BTTS: No" and goals_sum >= 2:
-            # If both teams have scored, BTTS: No doesn't make sense
+        if suggestion == "BTTS: No":
             goals_h = feat.get("goals_h", 0)
             goals_a = feat.get("goals_a", 0)
             if goals_h > 0 and goals_a > 0:
@@ -2483,7 +2397,6 @@ def _score_prob(feat: Dict[str, float], mdl: Optional[Dict[str, Any]]) -> float:
 def _get_market_threshold_pre(market: str) -> float:
     """Get confidence threshold for pre-match markets"""
     try:
-        # Pre-match markets might have different thresholds
         market_key = f"conf_threshold_pre:{market}"
         cached = get_setting_cached(market_key)
         if cached:
@@ -2491,8 +2404,6 @@ def _get_market_threshold_pre(market: str) -> float:
                 return float(cached)
             except:
                 pass
-        
-        # Slightly higher threshold for pre-match by default
         return CONF_THRESHOLD + 5.0
     except Exception as e:
         error_handler.handle_error("_get_market_threshold_pre", e, {"market": market})
@@ -2557,102 +2468,76 @@ class GameStateAnalyzer:
         return adjusted
 
 class SmartOddsAnalyzer:
+    """Odds quality scoring to avoid stale/prematch leakage."""
     def __init__(self):
-        # Lower the threshold temporarily for debugging
-        self.odds_quality_threshold = float(os.getenv("ODDS_QUALITY_MIN", "0.15"))  # Reduced from 0.35
+        # Keep threshold configurable via env; default matches hardened 0.35
+        self.odds_quality_threshold = float(os.getenv("ODDS_QUALITY_MIN", "0.35"))
 
-    def analyze_odds_quality(self, odds_map: dict, prob_hints: dict[str, float],
-                         target_market_key: str | None = None) -> float:
-    """Simplified odds quality check"""
-    if not odds_map:
-        return 0.0
-    
-    # If we have a specific target market, check if it has any odds
-    if target_market_key and target_market_key in odds_map:
-        market_data = odds_map[target_market_key]
-        if market_data and any('odds' in side_data for side_data in market_data.values()):
-            return 0.5  # Good enough quality
-    
-    # If no specific target, check if we have any odds at all
-    if any(odds_map.values()):
-        return 0.3  # Basic quality
-    
-    return 0.0
+    def analyze_odds_quality(
+        self,
+        odds_map: dict,
+        prob_hints: dict[str, float] | None,
+        target_market_key: str | None = None
+    ) -> float:
+        """Return [0..1] quality score; higher is better."""
+        if not odds_map:
+            return 0.0
 
-        def _market_odds_quality(sides: dict, prob_hint: float | None) -> float:
-            if not sides:
-                log.debug(f"[ODDS_QUALITY] No sides in market")
-                return 0.0
-            
-            total_implied = 0.0
-            n = 0
-            valid_odds = []
-            
-            for side_name, data in sides.items():
-                o = (data or {}).get("odds")
-                if o and o > 0:
-                    total_implied += 1.0 / float(o)
-                    valid_odds.append(o)
-                    n += 1
-            
-            if n == 0:
-                log.debug(f"[ODDS_QUALITY] No valid odds found")
-                return 0.0
-            
-            # Calculate overround (bookmaker margin)
-            overround = max(0.0, total_implied - 1.0)
-            overround_quality = max(0.0, 1.0 - overround * 3.0)  # More lenient than 5.0
-            
-            # Calculate model consistency quality
-            model_quality = 1.0
-            if prob_hint is not None and prob_hint > 0:
-                try:
-                    # Find the best odds for this side
-                    best_odds = max(valid_odds)
-                    edge = float(prob_hint) * float(best_odds) - 1.0
-                    model_quality = min(1.0, max(0.0, edge + 1.0))
-                    log.debug(f"[ODDS_QUALITY] prob_hint={prob_hint:.3f}, best_odds={best_odds:.2f}, edge={edge:.3f}, model_quality={model_quality:.3f}")
-                except Exception as e:
-                    log.warning(f"[ODDS_QUALITY] Error calculating model quality: {e}")
-                    model_quality = 0.5  # Default neutral quality
-            
-            final_quality = (overround_quality + model_quality) / 2.0
-            log.debug(f"[ODDS_QUALITY] market: overround={overround:.3f}, overround_quality={overround_quality:.3f}, model_quality={model_quality:.3f}, final={final_quality:.3f}")
-            return final_quality
-
-        # If we have a specific target market, only evaluate that one
         if target_market_key and target_market_key in odds_map:
             sides = odds_map.get(target_market_key) or {}
-            hint = self._resolve_hint_for_specific(prob_hints, target_market_key)
-            quality = _market_odds_quality(sides, hint)
-            log.info(f"[ODDS_QUALITY] Target market '{target_market_key}': quality={quality:.3f}")
-            return quality
+            hint = self._resolve_hint_for_specific(prob_hints or {}, target_market_key)
+            return self._market_odds_quality(sides, hint)
 
-        # Otherwise average all markets (fallback)
-        qualities = []
+        qualities: list[float] = []
         for mk, sides in odds_map.items():
-            hint = self._resolve_hint_for_specific(prob_hints, mk)
-            quality = _market_odds_quality(sides, hint)
-            qualities.append(quality)
-            log.debug(f"[ODDS_QUALITY] Market '{mk}': quality={quality:.3f}")
-        
-        final_quality = sum(qualities) / len(qualities) if qualities else 0.0
-        log.info(f"[ODDS_QUALITY] Overall quality: {final_quality:.3f} from {len(qualities)} markets")
-        return final_quality
+            hint = self._resolve_hint_for_specific(prob_hints or {}, mk)
+            qualities.append(self._market_odds_quality(sides, hint))
+        return sum(qualities) / len(qualities) if qualities else 0.0
+
+    def _market_odds_quality(self, sides: dict, prob_hint: float | None) -> float:
+        """Blend overround and model-consistency."""
+        if not sides:
+            return 0.0
+
+        total_implied = 0.0
+        valid_odds: list[float] = []
+        for data in (sides or {}).values():
+            o = (data or {}).get("odds")
+            if o and o > 0:
+                val = float(o)
+                total_implied += 1.0 / val
+                valid_odds.append(val)
+
+        if not valid_odds:
+            return 0.0
+
+        # Overround -> lower is better
+        overround = max(0.0, total_implied - 1.0)
+        overround_quality = max(0.0, 1.0 - overround * 3.0)
+
+        # Model consistency: if model shows edge, bump quality (but cap)
+        model_quality = 1.0
+        if prob_hint is not None and prob_hint > 0:
+            try:
+                best_odds = max(valid_odds)
+                edge = float(prob_hint) * best_odds - 1.0
+                model_quality = min(1.0, max(0.0, edge + 1.0))
+            except Exception:
+                model_quality = 0.5
+
+        return (overround_quality + model_quality) / 2.0
 
     def _resolve_hint_for_specific(self, hints: dict[str, float], market_key: str) -> float | None:
-        """Resolve probability hint for specific market"""
         if not hints:
             return None
-            
-        # Map market keys to hint keys
         if market_key == "BTTS":
-            return hints.get("BTTS: Yes")  # Use Yes probability for BTTS
-        elif market_key == "1X2":
-            # For 1X2, we need to be careful - use the appropriate side
-            # This will be handled by the caller
-            return hints.get("Home Win") or hints.get("Away Win")
-        elif market_key.startswith("OU_"):
+            return hints.get("BTTS: Yes")
+        if market_key == "1X2":
+            # caller decides side; use the larger side hint for basic quality
+            hw = hints.get("Home Win") or 0.0
+            aw = hints.get("Away Win") or 0.0
+            return max(hw, aw) or None
+        if market_key.startswith("OU_"):
             try:
                 line_txt = market_key.split("_", 1)[1]
                 return hints.get(f"Over {line_txt} Goals")
@@ -2712,7 +2597,6 @@ def _price_gate(market_text: str, suggestion: str, fid: int, require_live_odds: 
     Return (pass, odds, book, ev_pct).
     For in-play tips, ALWAYS require live odds - no prematch fallback.
     """
-    # Always require LIVE odds for in-play picks
     odds_map = fetch_odds(fid, require_live=True) if API_KEY else {}
     odds = None
     book = None
@@ -2737,7 +2621,6 @@ def _price_gate(market_text: str, suggestion: str, fid: int, require_live_odds: 
             odds = d[tgt]["odds"]
             book = d[tgt]["book"]
 
-    # CRITICAL: Require live odds for in-play picks - no fallback to prematch
     if odds is None:
         log.warning(f"[PRICE_GATE] No LIVE odds found for {market_text} {suggestion} in fixture {fid}")
         return (False, None, None, None)
@@ -2747,11 +2630,7 @@ def _price_gate(market_text: str, suggestion: str, fid: int, require_live_odds: 
         log.warning(f"[PRICE_GATE] Odds {odds} outside range {min_odds}-{MAX_ODDS_ALL} for {market_text}")
         return (False, odds, book, None)
     
-    # Calculate EV
-    ev_pct = None
-    # Note: We'll calculate EV in the main scanning function where we have the probability
-    
-    return (True, odds, book, ev_pct)
+    return (True, odds, book, None)
 
 # ───────── Formatting (enhanced tip) ─────────
 def _format_enhanced_tip_message(home, away, league, minute, score, suggestion, 
@@ -2765,18 +2644,14 @@ def _format_enhanced_tip_message(home, away, league, minute, score, suggestion,
         if feat.get("pos_h",0) or feat.get("pos_a",0): 
             stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
     
-    # FIXED: Rename "Confidence" to "Win Probability" when appropriate
     current_score = score.split('-')
     home_goals, away_goals = int(current_score[0]), int(current_score[1])
-    
-    # Determine if this is a current state (like Home Win when already winning)
     is_current_state_prediction = (
         (suggestion == "Home Win" and home_goals > away_goals) or
         (suggestion == "Away Win" and away_goals > home_goals) or
         (suggestion == "BTTS: Yes" and home_goals > 0 and away_goals > 0) or
         (suggestion == "BTTS: No" and (home_goals == 0 or away_goals == 0))
     )
-    
     confidence_label = "📈 Win Probability" if is_current_state_prediction else "📈 Confidence"
     
     ai_info = ""
@@ -2791,7 +2666,6 @@ def _format_enhanced_tip_message(home, away, league, minute, score, suggestion,
         else:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
     
-    # FIXED: Add context about current match state
     context_note = ""
     if is_current_state_prediction:
         context_note = f"\n⚠️ <i>Note: This reflects current match probability based on score and time</i>"
@@ -2806,7 +2680,6 @@ def _format_enhanced_tip_message(home, away, league, minute, score, suggestion,
 def explain_tip(match, features, model_output):
     explanation = []
 
-    # Map common aliases (supports both your snippet's keys and this app's keys)
     def _g(keys, default=0.0):
         if not isinstance(keys, (list, tuple)):
             keys = [keys]
@@ -2814,7 +2687,6 @@ def explain_tip(match, features, model_output):
             if k in features and features[k] is not None:
                 v = features[k]
                 try:
-                    # strip possible "%" strings
                     return float(str(v).replace("%", ""))
                 except Exception:
                     try:
@@ -2830,28 +2702,19 @@ def explain_tip(match, features, model_output):
     corners_away = _g(['corners_away', 'cor_a'], 0.0)
     shots_on_target_away = _g(['shots_on_target_away', 'sot_a'], 0.0)
 
-    # EV can be provided as 'ev' or 'ev_pct' in this project
     ev = None
     if 'ev' in features:
-        try:
-            ev = float(str(features['ev']).replace("%", ""))
-        except Exception:
-            ev = None
+        try: ev = float(str(features['ev']).replace("%", ""))
+        except Exception: ev = None
     elif 'ev_pct' in features:
-        try:
-            ev = float(str(features['ev_pct']).replace("%", ""))
-        except Exception:
-            ev = None
+        try: ev = float(str(features['ev_pct']).replace("%", ""))
+        except Exception: ev = None
 
-    # Confidence from model_output dict, if provided
     conf = None
     if isinstance(model_output, dict) and 'confidence' in model_output:
-        try:
-            conf = float(model_output['confidence'])
-        except Exception:
-            conf = None
+        try: conf = float(model_output['confidence'])
+        except Exception: conf = None
 
-    # 1 — Game dynamics
     if xg_home < 0.2 and xg_away < 0.2:
         explanation.append("Both teams have low xG — low actual threat so far.")
     if possession_home > 65 and xg_home < 0.3:
@@ -2860,16 +2723,10 @@ def explain_tip(match, features, model_output):
         explanation.append("Underdog creating set-piece pressure despite low possession.")
     if shots_on_target_away > 0:
         explanation.append("Away side has tested the keeper.")
-
-    # 2 — Market logic
     if ev is not None and ev > 100:
         explanation.append(f"Massive EV detected: {round(ev, 1)}% suggests bookmaker mispricing.")
-
-    # 3 — Model reasoning
     if conf is not None and conf > 0.75:
         explanation.append("AI confidence strong based on historical patterns in similar matches.")
-
-    # Combine
     return " ".join(explanation)
 
 def check_models_loaded():
@@ -2911,13 +2768,11 @@ def debug_scan_issues():
                 log.info(f"[DEBUG] Match {i+1}: {_teams(m)} | Minute: {minute} | Status: {status}")
                 log.info(f"[DEBUG]   Coverage: {coverage_ok} | Minute OK: {minute_ok} (min {TIP_MIN_MINUTE}) | Not Stale: {stale_ok}")
                 
-                # Show key features for context
                 if coverage_ok:
                     log.info(f"[DEBUG]   Key features - Goals: {feat.get('goals_h', 0)}-{feat.get('goals_a', 0)} | "
                            f"xG: {feat.get('xg_h', 0):.2f}-{feat.get('xg_a', 0):.2f} | "
                            f"Shots: {int(feat.get('sot_h', 0))}-{int(feat.get('sot_a', 0))}")
                 
-                # Only test predictions for viable matches
                 if coverage_ok and minute_ok:
                     markets_to_test = ["BTTS"] + [f"OU_{_fmt_line(line)}" for line in OU_LINES]
                     any_predictions = False
@@ -2930,16 +2785,13 @@ def debug_scan_issues():
                             threshold = _get_market_threshold(market)
                             passes_threshold = prob_pct >= threshold
                             
-                            if prob > 0.1:  # Only show meaningful predictions
+                            if prob > 0.1:
                                 any_predictions = True
-                                
-                                # Highlight high confidence predictions
-                                if prob > 0.7:  # 70%+ probability
+                                if prob > 0.7:
                                     high_conf_in_match = True
                                     high_confidence_found += 1
                                     log.info(f"🎯 [HIGH CONF] {market}: {prob_pct:.1f}% (conf: {conf:.1%}) - NEED: {threshold:.1f}%")
                                     
-                                    # Detailed analysis for high-confidence predictions
                                     if market == "BTTS":
                                         suggestions = ["BTTS: Yes", "BTTS: No"]
                                     elif market.startswith("OU_"):
@@ -2949,26 +2801,21 @@ def debug_scan_issues():
                                         suggestions = []
                                     
                                     for suggestion in suggestions:
-                                        # Check market cutoff
                                         cutoff_ok = market_cutoff_ok(minute, market, suggestion)
                                         log.info(f"   📋 Cutoff check: {cutoff_ok} (minute {minute})")
                                         
-                                        # Check sanity
                                         sane = _candidate_is_sane(suggestion, feat)
                                         log.info(f"   🧠 Sanity check: {sane}")
                                         
-                                        # Check price gate
                                         pass_odds, odds, book, ev_pct = _price_gate(market, suggestion, fid)
                                         log.info(f"   💰 Price gate: {pass_odds} | Odds: {odds} | Book: {book}")
                                         
-                                        # Calculate EV if odds available
                                         if odds and prob > 0:
                                             edge = _ev(prob, float(odds))
                                             ev_bps = int(round(edge * 10000))
                                             ev_ok = ev_bps >= EDGE_MIN_BPS
                                             log.info(f"   📈 EV: {edge:.1%} ({ev_bps} bps) | Min needed: {EDGE_MIN_BPS} | EV OK: {ev_ok}")
                                         
-                                        # Check if it would pass all gates
                                         all_gates_ok = (
                                             cutoff_ok and 
                                             sane and 
@@ -2976,7 +2823,6 @@ def debug_scan_issues():
                                             (not odds or ev_ok)
                                         )
                                         log.info(f"   ✅ All gates passed: {all_gates_ok}")
-                                        
                                 else:
                                     log.info(f"[DEBUG]   {market}: {prob_pct:.1f}% (conf: {conf:.1%}) - {'PASS' if passes_threshold else 'FAIL'}")
                                     
@@ -2997,7 +2843,6 @@ def debug_scan_issues():
         log.info(f"[DEBUG]   Viable matches: {viable_matches}")
         log.info(f"[DEBUG]   High-confidence predictions found: {high_confidence_found}")
         
-        # Show current configuration
         log.info(f"[DEBUG] CURRENT CONFIG:")
         log.info(f"[DEBUG]   CONF_THRESHOLD: {CONF_THRESHOLD}")
         log.info(f"[DEBUG]   TIP_MIN_MINUTE: {TIP_MIN_MINUTE}") 
@@ -3012,7 +2857,6 @@ def check_prediction_quality():
     """Check if models are producing reasonable predictions"""
     log.info("[QUALITY_CHECK] Testing model prediction quality...")
     
-    # Test case 1: Balanced match
     test1 = {
         "minute": 25.0,
         "goals_h": 1.0, "goals_a": 1.0,
@@ -3023,8 +2867,6 @@ def check_prediction_quality():
         "goals_sum": 2.0, "xg_sum": 2.3,
         "goals_last_15": 1.0
     }
-    
-    # Test case 2: One-sided match  
     test2 = {
         "minute": 25.0,
         "goals_h": 2.0, "goals_a": 0.0,
@@ -3035,9 +2877,7 @@ def check_prediction_quality():
         "goals_sum": 2.0, "xg_sum": 2.8,
         "goals_last_15": 1.0
     }
-    
     test_cases = [("Balanced", test1), ("One-sided", test2)]
-    
     for name, features in test_cases:
         log.info(f"[QUALITY_CHECK] {name} match:")
         for market in ["BTTS", "OU_2.5", "OU_3.5"]:
@@ -3050,8 +2890,7 @@ def check_prediction_quality():
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems (patched) ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
     """
-    Enhanced scan with per-gate debug logging so you can see exactly
-    why candidates are dropped (set DEBUG_SELECTION_LOG=1 in .env).
+    Enhanced scan with per-gate debug logging (DEBUG_SELECTION_LOG=1).
     """
     try:
         if not _db_ping():
@@ -3081,7 +2920,6 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         _dbg("no_fixture_id")
                         continue
 
-                    # Duplicate cooldown — FIXED: use c.fetchone_safe() (not chaining on cursor)
                     if DUP_COOLDOWN_MIN > 0:
                         cutoff = now_ts - DUP_COOLDOWN_MIN * 60
                         c.execute(
@@ -3093,7 +2931,6 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             _dbg("dup_cooldown_block", fid=fid, cutoff=cutoff, cooldown_min=DUP_COOLDOWN_MIN)
                             continue
 
-                    # Extract advanced features with error handling
                     try:
                         feat = feature_engineer.extract_advanced_features(m)
                     except Exception as e:
@@ -3112,7 +2949,6 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         _dbg("feed_stale", fid=fid, minute=minute)
                         continue
 
-                    # Harvest snapshot
                     if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
                         try:
                             save_snapshot_from_match(m, feat)
@@ -3375,9 +3211,6 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     if mdl is not None: _MODELS_CACHE.set(name, mdl)
     return mdl
 
-# ───────── Logistic predict (PATCHED calibration math) ─────────
-# Note: predict_from_model is now defined above in the missing functions section
-
 # ───────── Outcomes/backfill/digest (minor safety tweaks preserved) ─────────
 def _tip_outcome_for_result(suggestion: str, res: Dict[str,Any]) -> Optional[int]:
     gh=int(res.get("final_goals_h") or 0); ga=int(res.get("final_goals_a") or 0)
@@ -3468,7 +3301,6 @@ def _digest_day_range(day: str) -> Tuple[int, Optional[int], str]:
         end   = start + timedelta(days=1)
         label = "yesterday"
         return int(start.timestamp()), int(end.timestamp()), label
-    # YYYY-MM-DD support
     try:
         target = datetime.strptime(day, "%Y-%m-%d").date()
         start = datetime.combine(target, datetime.min.time(), tzinfo=BERLIN_TZ)
@@ -3477,7 +3309,6 @@ def _digest_day_range(day: str) -> Tuple[int, Optional[int], str]:
         return int(start.timestamp()), int(end.timestamp()), label
     except Exception:
         pass
-    # default: today
     start = datetime.combine(now_bln.date(), datetime.min.time(), tzinfo=BERLIN_TZ)
     return int(start.timestamp()), None, "today"
 
@@ -3492,13 +3323,11 @@ def daily_accuracy_digest(day: str = "today") -> Optional[str]:
     start_ts, end_ts, label = _digest_day_range(day)
     log.info("[DIGEST] Generating digest for %s (start_ts=%s end_ts=%s)", label, start_ts, end_ts or "now")
 
-    # Backfill first
     try:
         backfill_results_for_open_matches(400)
     except Exception as e:
         log.warning("[DIGEST] backfill skipped/failed: %s", e)
 
-    # Build query with optional end bound
     where_end = " AND t.created_ts < %s" if end_ts is not None else ""
     params = (start_ts,) + ((end_ts,) if end_ts is not None else ())
 
@@ -3543,7 +3372,7 @@ def daily_accuracy_digest(day: str = "today") -> Optional[str]:
     if graded == 0:
         msg = f"📊 Daily Accuracy Digest for {label}\nNo graded tips for this window."
         if rows:
-            pending = len([r for r in rows if r[6] is None or r[7] is None])  # no result yet
+            pending = len([r for r in rows if r[6] is None or r[7] is None])
             if pending:
                 msg += f"\n⏳ {pending} tips still pending results."
     else:
@@ -3644,7 +3473,6 @@ def shutdown_handler(signum=None, frame=None, *, from_atexit: bool = False):
     except Exception:
         pass
 
-    # Stop scheduler if running
     try:
         if _SCHED is not None:
             try:
@@ -3654,18 +3482,15 @@ def shutdown_handler(signum=None, frame=None, *, from_atexit: bool = False):
     except Exception:
         pass
 
-    # Close DB pool if open
     try:
         if POOL:
             try:
                 POOL.closeall()
             except Exception as e:
-                # harmless if it's already closed
                 log.warning("Error closing pool during shutdown: %s", e)
     except Exception:
         pass
 
-    # Only exit on signal path; atexit must never sys.exit()
     if not from_atexit:
         try:
             sys.exit(0)
@@ -3679,7 +3504,6 @@ def register_shutdown_handlers():
     _SHUTDOWN_HANDLERS_SET = True
 
     import signal, atexit
-    # Wrap to mark the source
     def _sig_wrapper(sig):
         return lambda s, f: shutdown_handler(s, f, from_atexit=False)
 
@@ -3706,7 +3530,6 @@ def _start_scheduler_once():
         return
     try:
         sched = BackgroundScheduler(timezone=TZ_UTC)
-        # core jobs
         sched.add_job(lambda: _run_with_pg_lock(1001, production_scan),
                       "interval", seconds=SCAN_INTERVAL_SEC, id="scan", max_instances=1, coalesce=True)
         sched.add_job(lambda: _run_with_pg_lock(1002, backfill_results_for_open_matches, 400),
@@ -3719,8 +3542,6 @@ def _start_scheduler_once():
                                       timezone=BERLIN_TZ),
                           id="digest", max_instances=1, coalesce=True)
 
-        # REMOVED: MOTD scheduling job
-
         if TRAIN_ENABLE:
             sched.add_job(lambda: _run_with_pg_lock(1005, auto_train_job),
                           CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=TZ_UTC),
@@ -3731,15 +3552,13 @@ def _start_scheduler_once():
                           CronTrigger(hour=4, minute=7, timezone=TZ_UTC),
                           id="auto_tune", max_instances=1, coalesce=True)
 
-        # retry unsent
         sched.add_job(lambda: _run_with_pg_lock(1007, retry_unsent_tips, 30, 200),
                       "interval", minutes=10, id="retry", max_instances=1, coalesce=True)
 
-        # cache cleanup
         sched.add_job(cleanup_caches, "interval", hours=1, id="cache_cleanup")
 
         sched.start()
-        _SCHED = sched  # <-- keep reference for shutdown
+        _SCHED = sched
         _scheduler_started = True
         send_telegram("🚀 goalsniper AI mode (in-play) with ENHANCED PREDICTIONS started.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
@@ -3802,18 +3621,14 @@ def http_init_db():
 @app.route("/debug/live-match/<int:fid>", methods=["GET"])
 def debug_live_match(fid: int):
     """Check what data we're getting for a specific match"""
-    # Fetch fresh data
     js = _api_get(FOOTBALL_API_URL, {"id": fid}) or {}
     match = js.get("response", [{}])[0] if js.get("response") else {}
     
     if not match:
         return jsonify({"error": "Match not found", "fixture_id": fid})
     
-    # Get stats and features
     match["statistics"] = fetch_match_stats(fid)
     feat = extract_basic_features(match)
-    
-    # Check coverage
     minute = int(feat.get("minute", 0))
     coverage_ok = stats_coverage_ok(feat, minute)
     
@@ -3892,7 +3707,7 @@ def debug_match_stats(fid: int):
         "stats_available": bool(stats),
         "features": feat,
         "coverage_ok": stats_coverage_ok(feat, int(feat.get("minute", 0))),
-        "raw_stats": stats[:2] if stats else []  # First 2 stat entries
+        "raw_stats": stats[:2] if stats else []
     })
 
 @app.route("/settings/<key>", methods=["GET","POST"])
@@ -3944,16 +3759,15 @@ def _on_boot():
     """Enhanced boot process with comprehensive validation"""
     try:
         register_shutdown_handlers()
-        enhanced_validate_config()  # Use enhanced validation
+        enhanced_validate_config()
         _init_pool()
         init_db()
         
-        # Run unit tests if in debug mode
         if os.getenv("DEBUG", "0") not in ("0", "false", "False", "no", "NO"):
             test_helpers.run_all_tests()
         
         set_setting("boot_ts", str(int(time.time())))
-        set_setting("boot_version", "2.0.0-enhanced")  # Track enhanced version
+        set_setting("boot_version", "2.0.0-enhanced")
         
         _start_scheduler_once()
         
