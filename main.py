@@ -215,6 +215,31 @@ def _parse_lines(env_val: str, default: List[float]) -> List[float]:
         except: pass
     return out or default
 
+# ───────── Odds/EV controls — UPDATED DEFAULTS ─────────
+MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU", "1.50"))  # was 1.30
+MIN_ODDS_BTTS = float(os.getenv("MIN_ODDS_BTTS", "1.50"))  # was 1.30
+MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2", "1.50"))  # was 1.30
+MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL", "20.0"))
+EDGE_MIN_BPS  = int(os.getenv("EDGE_MIN_BPS", "600"))      # was 300 bps
+ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")  # optional API-Football book id
+ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","0") not in ("0","false","False","no","NO")  # default hardened to 0
+
+# Aggregated odds controls (new)
+ODDS_SOURCE = os.getenv("ODDS_SOURCE", "auto").lower()            # auto|live|prematch
+ODDS_AGGREGATION = os.getenv("ODDS_AGGREGATION", "median").lower()# median|best
+ODDS_OUTLIER_MULT = float(os.getenv("ODDS_OUTLIER_MULT", "1.8"))  # drop books > x * median
+ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))# min distinct books per side
+ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))# cap vs fair (1/p)
+ODDS_QUALITY_MIN = float(os.getenv("ODDS_QUALITY_MIN", "0.35"))   # ✅ added: min acceptable odds quality (0-1)
+
+# ───────── Odds helpers & aggregation ─────────
+def _market_name_normalize(s: str) -> str:
+    s=(s or "").lower()
+    if "both teams" in s or "btts" in s: return "BTTS"
+    if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
+    if "over/under" in s or "total" in s or "goals" in s: return "OU"
+    return s
+
 OU_LINES = [ln for ln in _parse_lines(os.getenv("OU_LINES","2.5,3.5"), [2.5,3.5]) if abs(ln-1.5)>1e-6]
 TOTAL_MATCH_MINUTES   = int(os.getenv("TOTAL_MATCH_MINUTES", "95"))
 PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "1"))  # was 2 — tighter by default
@@ -1663,6 +1688,136 @@ def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float
         log.error(f"[PREDICT] Error in predict_from_model: {e}")
         return 0.0
 
+# ───────── Odds fetching function ─────────
+def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None, require_live: bool = True) -> dict:
+    """
+    Aggregated odds map - LIVE ODDS ONLY for in-play matches
+    If require_live=True and no live odds found, return {} (do NOT fall back to prematch).
+    """
+    now = time.time()
+    k=("odds", fid)
+    ts_empty = NEG_CACHE.get(k, (0.0, False))
+    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): 
+        return {}
+    if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: 
+        return ODDS_CACHE[fid][1]
+
+    def _fetch(path: str) -> dict:
+        js = _api_get(f"{BASE_URL}/{path}", {"fixture": fid}) or {}
+        return js if isinstance(js, dict) else {}
+
+    js = {}
+    src = None
+
+    # Try live first - ONLY LIVE, NO FALLBACK TO PREMATCH
+    js = _fetch("odds/live")
+    if (js.get("response") or []):
+        src = "live"
+        log.info(f"[ODDS] Found LIVE odds for fixture {fid}")
+    else:
+        # NO PREMATCH FALLBACK - return empty to avoid using stale prematch odds
+        log.warning(f"[ODDS] No LIVE odds available for fixture {fid} - rejecting")
+        NEG_CACHE[k] = (now, True)
+        ODDS_CACHE[fid] = (time.time(), {})
+        return {}
+
+    by_market: dict[str, dict[str, list[tuple[float, str]]]] = {}
+    try:
+        for r in js.get("response", []) or []:
+            for bk in (r.get("bookmakers") or []):
+                book_name = bk.get("name") or "Book"
+                for mkt in (bk.get("bets") or []):
+                    mname = _market_name_normalize(mkt.get("name", ""))
+                    vals = mkt.get("values") or []
+                    if mname == "BTTS":
+                        for v in vals:
+                            lbl = (v.get("value") or "").strip().lower()
+                            if "yes" in lbl:
+                                by_market.setdefault("BTTS", {}).setdefault("Yes", []).append((float(v.get("odd") or 0), book_name))
+                            elif "no" in lbl:
+                                by_market.setdefault("BTTS", {}).setdefault("No", []).append((float(v.get("odd") or 0), book_name))
+                    elif mname == "1X2":
+                        for v in vals:
+                            lbl = (v.get("value") or "").strip().lower()
+                            if lbl in ("home","1"):
+                                by_market.setdefault("1X2", {}).setdefault("Home", []).append((float(v.get("odd") or 0), book_name))
+                            elif lbl in ("away","2"):
+                                by_market.setdefault("1X2", {}).setdefault("Away", []).append((float(v.get("odd") or 0), book_name))
+                    elif mname == "OU":
+                        for v in vals:
+                            lbl = (v.get("value") or "").lower()
+                            if ("over" in lbl) or ("under" in lbl):
+                                try:
+                                    ln = float(lbl.split()[-1])
+                                    key = f"OU_{_fmt_line(ln)}"
+                                    side = "Over" if "over" in lbl else "Under"
+                                    by_market.setdefault(key, {}).setdefault(side, []).append((float(v.get("odd") or 0), book_name))
+                                except:
+                                    pass
+    except Exception as e:
+        log.error(f"[ODDS] Error parsing odds for fixture {fid}: {e}")
+        return {}
+
+    def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+        if not vals:
+            return None, None
+        xs = sorted([o for (o, _) in vals if (o or 0) > 0])
+        if not xs:
+            return None, None
+        import statistics
+        med = statistics.median(xs)
+        filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
+        if not filtered:
+            filtered = vals
+        xs2 = sorted([o for (o, _) in filtered])
+        med2 = statistics.median(xs2)
+        if prob_hint is not None and prob_hint > 0:
+            fair = 1.0 / max(1e-6, float(prob_hint))
+            cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
+            filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
+        if ODDS_AGGREGATION == "best":
+            best = max(filtered, key=lambda t: t[0])
+            return float(best[0]), str(best[1])
+        target = med2
+        pick = min(filtered, key=lambda t: abs(t[0] - target))
+        return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
+
+    out: dict[str, dict[str, dict]] = {}
+    for mkey, side_map in by_market.items():
+        ok = True
+        for side, lst in side_map.items():
+            if len({b for (_, b) in lst}) < max(1, ODDS_REQUIRE_N_BOOKS):
+                ok = False
+                break
+        if not ok:
+            continue
+
+        out[mkey] = {}
+        for side, lst in side_map.items():
+            hint = None
+            if prob_hints:
+                if mkey == "BTTS":
+                    hint = prob_hints.get("BTTS: Yes") if side == "Yes" else (1.0 - (prob_hints.get("BTTS: Yes") or 0.0))
+                elif mkey == "1X2":
+                    hint = prob_hints.get("Home Win") if side == "Home" else (prob_hints.get("Away Win") if side == "Away" else None)
+                elif mkey.startswith("OU_"):
+                    try:
+                        ln = float(mkey.split("_", 1)[1])
+                        key = f"{_fmt_line(ln)}"
+                        hint = prob_hints.get(f"Over {key} Goals") if side == "Over" else (1.0 - (prob_hints.get(f"Over {key} Goals") or 0.0))
+                    except:
+                        pass
+            ag, label = _aggregate_price(lst, hint)
+            if ag is not None:
+                out[mkey][side] = {"odds": float(ag), "book": label}
+
+    ODDS_CACHE[fid] = (time.time(), out)
+    if not out: 
+        NEG_CACHE[k] = (now, True)
+    else:
+        log.info(f"[ODDS] Successfully parsed {len(out)} markets for fixture {fid}")
+    return out
+
 def _odds_key_for_market(market_txt: str, suggestion: str) -> str | None:
     """Map our market/suggestion to odds_map key."""
     if market_txt == "BTTS":
@@ -2148,6 +2303,13 @@ def _get_market_threshold(market: str) -> float:
     except Exception as e:
         error_handler.handle_error("_get_market_threshold", e, {"market": market})
         return CONF_THRESHOLD
+
+def _market_name_normalize(s: str) -> str:
+    s=(s or "").lower()
+    if "both teams" in s or "btts" in s: return "BTTS"
+    if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
+    if "over/under" in s or "total" in s or "goals" in s: return "OU"
+    return s
 
 def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
     """Check if a prediction candidate makes sense given current match state"""
