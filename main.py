@@ -17,6 +17,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from collections import defaultdict
 from contextlib import contextmanager
+import math
+import re
 
 # ───────── Global Variables ─────────
 _SCHED = None
@@ -1519,44 +1521,546 @@ class AdaptiveLearningSystem:
 # Initialize adaptive learning system
 adaptive_learner = AdaptiveLearningSystem()
 
-# ───────── Missing Function Implementations ─────────
+# ───────── MISSING FUNCTION IMPLEMENTATIONS ADDED HERE ─────────
+
+def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:
+    """
+    Auto-tune confidence thresholds based on recent performance.
+    Returns dict of market -> new_threshold
+    """
+    log.info(f"[AUTO-TUNE] Starting threshold tuning for {days} days of data")
+    
+    cutoff_ts = int(time.time()) - days * 24 * 3600
+    tuned_thresholds = {}
+    
+    try:
+        with db_conn() as c:
+            # Get recent tips with outcomes
+            rows = c.execute("""
+                SELECT t.market, t.suggestion, t.confidence_raw, 
+                       r.final_goals_h, r.final_goals_a, r.btts_yes
+                FROM tips t
+                JOIN match_results r ON t.match_id = r.match_id
+                WHERE t.created_ts >= %s 
+                AND t.suggestion <> 'HARVEST'
+                AND t.confidence_raw IS NOT NULL
+            """, (cutoff_ts,)).fetchall()
+        
+        if not rows:
+            log.warning("[AUTO-TUNE] No data found for threshold tuning")
+            return {}
+        
+        # Group by market
+        market_data = {}
+        for market, suggestion, confidence, gh, ga, btts in rows:
+            if market not in market_data:
+                market_data[market] = []
+            
+            # Determine outcome
+            outcome = _tip_outcome_for_result(suggestion, {
+                "final_goals_h": gh, 
+                "final_goals_a": ga, 
+                "btts_yes": btts
+            })
+            
+            if outcome is not None:
+                market_data[market].append((float(confidence), outcome))
+        
+        # Calculate optimal thresholds for each market
+        for market, data in market_data.items():
+            if len(data) < THRESH_MIN_PREDICTIONS:
+                log.info(f"[AUTO-TUNE] Insufficient data for {market}: {len(data)} predictions")
+                continue
+            
+            # Sort by confidence
+            data.sort(key=lambda x: x[0])
+            
+            # Find threshold that achieves target precision
+            best_threshold = CONF_THRESHOLD
+            best_precision = 0.0
+            
+            for i in range(len(data)):
+                threshold = data[i][0] * 100  # Convert to percentage
+                if threshold < MIN_THRESH or threshold > MAX_THRESH:
+                    continue
+                
+                # Calculate precision above this threshold
+                high_conf_data = [x for x in data[i:] if x[0] * 100 >= threshold]
+                if len(high_conf_data) < 10:  # Need minimum samples
+                    continue
+                
+                wins = sum(1 for x in high_conf_data if x[1] == 1)
+                precision = wins / len(high_conf_data)
+                
+                if precision >= TARGET_PRECISION and precision > best_precision:
+                    best_precision = precision
+                    best_threshold = threshold
+            
+            if best_precision >= TARGET_PRECISION:
+                tuned_thresholds[market] = best_threshold
+                log.info(f"[AUTO-TUNE] {market}: new threshold {best_threshold:.1f}% (precision: {best_precision:.1%})")
+            
+            # Save the tuned threshold
+            if market in tuned_thresholds:
+                set_setting(f"conf_threshold:{market}", str(tuned_thresholds[market]))
+                _SETTINGS_CACHE.invalidate(f"conf_threshold:{market}")
+        
+        log.info(f"[AUTO-TUNE] Completed: tuned {len(tuned_thresholds)} thresholds")
+        return tuned_thresholds
+        
+    except Exception as e:
+        log.error(f"[AUTO-TUNE] Error during threshold tuning: {e}")
+        return {}
+
+def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
+    """
+    Make prediction using a logistic regression model with calibration.
+    This is the core prediction function that was missing.
+    """
+    if not mdl:
+        return 0.0
+    
+    try:
+        weights = mdl.get("weights", {})
+        intercept = float(mdl.get("intercept", 0.0))
+        
+        # Calculate linear combination
+        linear_score = intercept
+        for feature, weight in weights.items():
+            if feature in features:
+                linear_score += float(weight) * float(features[feature])
+        
+        # Apply sigmoid to get probability
+        probability = 1.0 / (1.0 + math.exp(-linear_score))
+        
+        # Apply calibration if available
+        cal = mdl.get("calibration", {})
+        if cal:
+            method = cal.get("method", "sigmoid").lower()
+            a = float(cal.get("a", 1.0))
+            b = float(cal.get("b", 0.0))
+            
+            if method == "sigmoid":
+                # Calibrate on logit scale
+                prob_clamped = max(1e-12, min(1-1e-12, probability))
+                logit = math.log(prob_clamped / (1 - prob_clamped))
+                calibrated_logit = a * logit + b
+                probability = 1.0 / (1.0 + math.exp(-calibrated_logit))
+        
+        return float(max(0.0, min(1.0, probability)))
+        
+    except Exception as e:
+        log.error(f"[PREDICT] Error in predict_from_model: {e}")
+        return 0.0
+
+def _odds_key_for_market(market_txt: str, suggestion: str) -> str | None:
+    """Map our market/suggestion to odds_map key."""
+    if market_txt == "BTTS":
+        return "BTTS"
+    if market_txt == "1X2":
+        return "1X2"
+    if market_txt.startswith("Over/Under"):
+        ln = _parse_ou_line_from_suggestion(suggestion)
+        return f"OU_{_fmt_line(ln)}" if ln is not None else None
+    return None
+
+def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
+    """Extract the line value from Over/Under suggestion."""
+    try:
+        if "Over" in s or "Under" in s:
+            match = re.search(r'(\d+(?:\.\d+)?)', s)
+            if match:
+                return float(match.group(1))
+        return None
+    except Exception:
+        return None
+
+# ───────── Resource Management for Caches ─────────
+
+class CacheManager:
+    """Manage cache sizes and cleanup to prevent memory leaks"""
+    
+    def __init__(self):
+        self.max_stats_cache_size = 1000
+        self.max_events_cache_size = 1000
+        self.max_odds_cache_size = 500
+        self.max_neg_cache_size = 1000
+        
+    def cleanup_all_caches(self):
+        """Clean up all caches with size limits"""
+        self._cleanup_cache(STATS_CACHE, self.max_stats_cache_size)
+        self._cleanup_cache(EVENTS_CACHE, self.max_events_cache_size)
+        self._cleanup_cache(ODDS_CACHE, self.max_odds_cache_size)
+        self._cleanup_cache(NEG_CACHE, self.max_neg_cache_size)
+        
+        # Also clean up old entries based on timestamp
+        self._cleanup_old_entries(STATS_CACHE, 300)  # 5 minutes
+        self._cleanup_old_entries(EVENTS_CACHE, 300)
+        self._cleanup_old_entries(ODDS_CACHE, 600)   # 10 minutes
+        self._cleanup_old_entries(NEG_CACHE, NEG_TTL_SEC)
+        
+    def _cleanup_cache(self, cache: dict, max_size: int):
+        """Reduce cache size if it exceeds max_size"""
+        if len(cache) > max_size:
+            # Remove oldest entries (assuming keys are inserted in order)
+            keys_to_remove = list(cache.keys())[:len(cache) - max_size]
+            for key in keys_to_remove:
+                cache.pop(key, None)
+                
+    def _cleanup_old_entries(self, cache: dict, max_age_seconds: int):
+        """Remove entries older than max_age_seconds"""
+        current_time = time.time()
+        keys_to_remove = []
+        
+        for key, value in cache.items():
+            if isinstance(value, tuple) and len(value) > 0:
+                timestamp = value[0]
+                if current_time - timestamp > max_age_seconds:
+                    keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            cache.pop(key, None)
+
+# Initialize cache manager
+cache_manager = CacheManager()
+
+def cleanup_caches():
+    """Enhanced cache cleanup with proper resource management"""
+    cache_manager.cleanup_all_caches()
+    log.debug("[CACHE] Cleaned up all caches")
+
+# ───────── Enhanced Configuration Validation ─────────
+
+class ConfigValidator:
+    """Enhanced configuration validation with comprehensive checks"""
+    
+    def __init__(self):
+        self.required_env_vars = [
+            'TELEGRAM_BOT_TOKEN',
+            'TELEGRAM_CHAT_ID', 
+            'API_KEY',
+            'DATABASE_URL'
+        ]
+        
+        self.optional_env_vars = {
+            'ADMIN_API_KEY': 'Warning: Admin endpoints disabled',
+            'WEBHOOK_SECRET': 'Warning: Webhook security disabled',
+            'SENTRY_DSN': 'Info: Error tracking disabled',
+            'REDIS_URL': 'Info: Redis cache disabled'
+        }
+        
+        self.numeric_ranges = {
+            'CONF_THRESHOLD': (0, 100),
+            'SCAN_INTERVAL_SEC': (30, 3600),
+            'TIP_MIN_MINUTE': (1, 90),
+            'MAX_TIPS_PER_SCAN': (1, 1000),
+            'DUP_COOLDOWN_MIN': (0, 1440),
+            'EDGE_MIN_BPS': (0, 10000)
+        }
+        
+    def validate_all(self):
+        """Run all validation checks"""
+        self._check_required_vars()
+        self._check_optional_vars()
+        self._check_numeric_ranges()
+        self._check_database_connection()
+        self._check_api_connectivity()
+        
+    def _check_required_vars(self):
+        """Check required environment variables"""
+        missing = []
+        for var in self.required_env_vars:
+            if not os.getenv(var):
+                missing.append(var)
+                
+        if missing:
+            raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
+            
+    def _check_optional_vars(self):
+        """Warn about missing optional variables"""
+        for var, message in self.optional_env_vars.items():
+            if not os.getenv(var):
+                log.warning(f"{message} ({var} not set)")
+                
+    def _check_numeric_ranges(self):
+        """Validate numeric configuration ranges"""
+        for var, (min_val, max_val) in self.numeric_ranges.items():
+            value = os.getenv(var)
+            if value:
+                try:
+                    num_val = float(value)
+                    if not (min_val <= num_val <= max_val):
+                        log.warning(f"Config {var}={value} outside recommended range {min_val}-{max_val}")
+                except ValueError:
+                    log.warning(f"Config {var}={value} is not a valid number")
+                    
+    def _check_database_connection(self):
+        """Test database connectivity"""
+        try:
+            with db_conn() as c:
+                c.execute("SELECT 1")
+            log.info("[CONFIG] Database connection: OK")
+        except Exception as e:
+            raise SystemExit(f"Database connection failed: {e}")
+            
+    def _check_api_connectivity(self):
+        """Test API-Football connectivity"""
+        try:
+            test_resp = _api_get(FOOTBALL_API_URL, {"live": "all"}, timeout=10)
+            if test_resp is not None:
+                log.info("[CONFIG] API-Football connectivity: OK")
+            else:
+                log.warning("[CONFIG] API-Football test request failed")
+        except Exception as e:
+            log.warning(f"[CONFIG] API-Football connectivity test failed: {e}")
+
+# Initialize config validator
+config_validator = ConfigValidator()
+
+def enhanced_validate_config():
+    """Enhanced configuration validation"""
+    config_validator.validate_all()
+    log.info("[CONFIG] Enhanced configuration validation passed")
+
+# ───────── Comprehensive Error Handling & Logging ─────────
+
+class ErrorHandler:
+    """Centralized error handling with comprehensive logging"""
+    
+    def __init__(self):
+        self.error_counts = defaultdict(int)
+        self.max_errors_per_component = 100
+        
+    def handle_error(self, component: str, error: Exception, context: dict = None):
+        """Handle errors with context and rate limiting"""
+        error_id = f"{component}_{type(error).__name__}"
+        self.error_counts[error_id] += 1
+        
+        if self.error_counts[error_id] <= self.max_errors_per_component:
+            log_message = f"[ERROR] {component}: {error}"
+            if context:
+                log_message += f" | Context: {context}"
+            log.error(log_message)
+            
+            # Send critical errors to Telegram
+            if self.error_counts[error_id] == 1:  # Only first occurrence
+                self._notify_critical_error(component, error, context)
+        else:
+            # Suppress repeated errors but log occasionally
+            if self.error_counts[error_id] % 10 == 0:
+                log.warning(f"[ERROR] {component}: {error} (repeated {self.error_counts[error_id]} times)")
+                
+    def _notify_critical_error(self, component: str, error: Exception, context: dict = None):
+        """Notify critical errors via Telegram"""
+        message = f"🚨 Critical Error in {component}\nError: {error}"
+        if context:
+            message += f"\nContext: {context}"
+        send_telegram(message)
+        
+    def reset_error_count(self, component: str = None):
+        """Reset error counts"""
+        if component:
+            keys_to_remove = [k for k in self.error_counts.keys() if k.startswith(component)]
+            for key in keys_to_remove:
+                self.error_counts.pop(key, None)
+        else:
+            self.error_counts.clear()
+
+# Initialize error handler
+error_handler = ErrorHandler()
+
+# ───────── Unit Test Helpers ─────────
+
+class TestHelpers:
+    """Helper functions for unit testing critical components"""
+    
+    @staticmethod
+    def test_feature_extraction():
+        """Test feature extraction with sample data"""
+        sample_match = {
+            "teams": {"home": {"name": "TeamA"}, "away": {"name": "TeamB"}},
+            "goals": {"home": 1, "away": 0},
+            "fixture": {"status": {"elapsed": 30}},
+            "statistics": [
+                {
+                    "team": {"name": "TeamA"},
+                    "statistics": [
+                        {"type": "Shots on Goal", "value": "5"},
+                        {"type": "Total Shots", "value": "10"},
+                        {"type": "Corner Kicks", "value": "4"},
+                        {"type": "Ball Possession", "value": "60%"},
+                        {"type": "Expected Goals", "value": "1.2"}
+                    ]
+                },
+                {
+                    "team": {"name": "TeamB"},
+                    "statistics": [
+                        {"type": "Shots on Goal", "value": "3"},
+                        {"type": "Total Shots", "value": "8"},
+                        {"type": "Corner Kicks", "value": "2"},
+                        {"type": "Ball Possession", "value": "40%"},
+                        {"type": "Expected Goals", "value": "0.8"}
+                    ]
+                }
+            ],
+            "events": []
+        }
+        
+        try:
+            features = extract_basic_features(sample_match)
+            required_features = ['minute', 'goals_h', 'goals_a', 'xg_h', 'xg_a', 'sot_h', 'sot_a']
+            missing = [f for f in required_features if f not in features]
+            
+            if not missing:
+                log.info("[TEST] Feature extraction: PASSED")
+                return True
+            else:
+                log.error(f"[TEST] Feature extraction: FAILED - Missing features: {missing}")
+                return False
+                
+        except Exception as e:
+            log.error(f"[TEST] Feature extraction: FAILED - {e}")
+            return False
+    
+    @staticmethod
+    def test_prediction_pipeline():
+        """Test the prediction pipeline with sample features"""
+        sample_features = {
+            "minute": 30.0,
+            "goals_h": 1.0, "goals_a": 0.0,
+            "xg_h": 1.2, "xg_a": 0.8,
+            "sot_h": 5.0, "sot_a": 3.0,
+            "pos_h": 60.0, "pos_a": 40.0
+        }
+        
+        try:
+            # Test BTTS prediction
+            btts_prob, btts_conf = market_predictor.predict_for_market(sample_features, "BTTS", 30)
+            
+            # Test OU prediction
+            ou_prob, ou_conf = market_predictor.predict_for_market(sample_features, "OU_2.5", 30)
+            
+            if 0 <= btts_prob <= 1 and 0 <= ou_prob <= 1:
+                log.info("[TEST] Prediction pipeline: PASSED")
+                return True
+            else:
+                log.error(f"[TEST] Prediction pipeline: FAILED - Invalid probabilities: BTTS={btts_prob}, OU={ou_prob}")
+                return False
+                
+        except Exception as e:
+            log.error(f"[TEST] Prediction pipeline: FAILED - {e}")
+            return False
+    
+    @staticmethod
+    def test_database_operations():
+        """Test basic database operations"""
+        try:
+            with db_conn() as c:
+                # Test connection
+                c.execute("SELECT 1")
+                
+                # Test settings table
+                test_key = "test_config_validation"
+                test_value = "test_value"
+                
+                set_setting(test_key, test_value)
+                retrieved = get_setting(test_key)
+                
+                # Cleanup
+                c.execute("DELETE FROM settings WHERE key = %s", (test_key,))
+                
+                if retrieved == test_value:
+                    log.info("[TEST] Database operations: PASSED")
+                    return True
+                else:
+                    log.error(f"[TEST] Database operations: FAILED - Expected {test_value}, got {retrieved}")
+                    return False
+                    
+        except Exception as e:
+            log.error(f"[TEST] Database operations: FAILED - {e}")
+            return False
+    
+    @staticmethod
+    def run_all_tests():
+        """Run all unit tests"""
+        log.info("[TEST] Running all unit tests...")
+        
+        tests = [
+            ("Feature Extraction", TestHelpers.test_feature_extraction),
+            ("Prediction Pipeline", TestHelpers.test_prediction_pipeline),
+            ("Database Operations", TestHelpers.test_database_operations)
+        ]
+        
+        results = []
+        for test_name, test_func in tests:
+            try:
+                result = test_func()
+                results.append((test_name, result))
+            except Exception as e:
+                log.error(f"[TEST] {test_name}: FAILED with exception - {e}")
+                results.append((test_name, False))
+        
+        passed = sum(1 for _, result in results if result)
+        total = len(results)
+        
+        log.info(f"[TEST] Results: {passed}/{total} tests passed")
+        
+        if passed == total:
+            log.info("[TEST] ALL TESTS PASSED")
+        else:
+            log.error("[TEST] SOME TESTS FAILED")
+            
+        return passed == total
+
+# Initialize test helpers
+test_helpers = TestHelpers()
+
+# ───────── Updated Functions with Enhanced Error Handling ─────────
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
     """NUCLEAR OPTION - Accept virtually everything"""
-    # Only reject if we have absolutely NO data at all
-    has_any_data = any([
-        feat.get('pos_h', 0) > 0, feat.get('pos_a', 0) > 0,
-        feat.get('sot_h', 0) > 0, feat.get('sot_a', 0) > 0, 
-        feat.get('goals_h', 0) > 0, feat.get('goals_a', 0) > 0,
-        feat.get('cor_h', 0) > 0, feat.get('cor_a', 0) > 0,
-        feat.get('sh_total_h', 0) > 0, feat.get('sh_total_a', 0) > 0
-    ])
-    
-    # After 30 minutes, require at least SOME data
-    if minute > 30:
-        return has_any_data
-    
-    # Before 30 minutes, be very lenient
-    return True
+    try:
+        # Only reject if we have absolutely NO data at all
+        has_any_data = any([
+            feat.get('pos_h', 0) > 0, feat.get('pos_a', 0) > 0,
+            feat.get('sot_h', 0) > 0, feat.get('sot_a', 0) > 0, 
+            feat.get('goals_h', 0) > 0, feat.get('goals_a', 0) > 0,
+            feat.get('cor_h', 0) > 0, feat.get('cor_a', 0) > 0,
+            feat.get('sh_total_h', 0) > 0, feat.get('sh_total_a', 0) > 0
+        ])
+        
+        # After 30 minutes, require at least SOME data
+        if minute > 30:
+            return has_any_data
+        
+        # Before 30 minutes, be very lenient
+        return True
+    except Exception as e:
+        error_handler.handle_error("stats_coverage_ok", e, {"minute": minute})
+        return False
 
 def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     """Check if the data feed is stale"""
     if not STALE_GUARD_ENABLE:
         return False
     
-    # Check if events are recent
-    events = m.get("events", [])
-    if events:
-        latest_event_minute = max([ev.get('time', {}).get('elapsed', 0) for ev in events], default=0)
-        if minute - latest_event_minute > 10 and minute > 30:
-            return True
-    
-    # Check if stats are recent
-    cache_time = STATS_CACHE.get(fid, (0, []))[0]
-    if time.time() - cache_time > STALE_STATS_MAX_SEC:
-        return True
+    try:
+        # Check if events are recent
+        events = m.get("events", [])
+        if events:
+            latest_event_minute = max([ev.get('time', {}).get('elapsed', 0) for ev in events], default=0)
+            if minute - latest_event_minute > 10 and minute > 30:
+                return True
         
-    return False
+        # Check if stats are recent
+        cache_time = STATS_CACHE.get(fid, (0, []))[0]
+        if time.time() - cache_time > STALE_STATS_MAX_SEC:
+            return True
+            
+        return False
+    except Exception as e:
+        error_handler.handle_error("is_feed_stale", e, {"fid": fid, "minute": minute})
+        return False
 
 def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
     """Save snapshot for training data"""
@@ -1580,81 +2084,105 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
                 (fid, now, payload)
             )
     except Exception as e:
-        log.warning("[SNAPSHOT] Failed to save snapshot: %s", e)
+        error_handler.handle_error("save_snapshot_from_match", e)
 
 def _league_name(m: dict) -> Tuple[int, str]:
     """Extract league ID and name from match data"""
-    league = m.get("league", {}) or {}
-    league_id = int(league.get("id", 0))
-    country = league.get("country", "")
-    name = league.get("name", "")
-    league_name = f"{country} - {name}".strip(" -")
-    return league_id, league_name
+    try:
+        league = m.get("league", {}) or {}
+        league_id = int(league.get("id", 0))
+        country = league.get("country", "")
+        name = league.get("name", "")
+        league_name = f"{country} - {name}".strip(" -")
+        return league_id, league_name
+    except Exception as e:
+        error_handler.handle_error("_league_name", e)
+        return 0, "Unknown"
 
 def _teams(m: dict) -> Tuple[str, str]:
     """Extract team names from match data"""
-    teams = m.get("teams", {}) or {}
-    home = (teams.get("home") or {}).get("name", "")
-    away = (teams.get("away") or {}).get("name", "")
-    return home, away
+    try:
+        teams = m.get("teams", {}) or {}
+        home = (teams.get("home") or {}).get("name", "")
+        away = (teams.get("away") or {}).get("name", "")
+        return home, away
+    except Exception as e:
+        error_handler.handle_error("_teams", e)
+        return "Unknown", "Unknown"
 
 def _pretty_score(m: dict) -> str:
     """Format score string"""
-    goals = m.get("goals", {}) or {}
-    home = goals.get("home") or 0
-    away = goals.get("away") or 0
-    return f"{home}-{away}"
+    try:
+        goals = m.get("goals", {}) or {}
+        home = goals.get("home") or 0
+        away = goals.get("away") or 0
+        return f"{home}-{away}"
+    except Exception as e:
+        error_handler.handle_error("_pretty_score", e)
+        return "0-0"
 
 def _get_market_threshold(market: str) -> float:
     """Get confidence threshold for a specific market"""
-    # Try market-specific threshold first
-    market_key = f"conf_threshold:{market}"
-    cached = get_setting_cached(market_key)
-    if cached:
-        try:
-            return float(cached)
-        except:
-            pass
-    
-    # Fall back to global threshold
-    return CONF_THRESHOLD
+    try:
+        # Try market-specific threshold first
+        market_key = f"conf_threshold:{market}"
+        cached = get_setting_cached(market_key)
+        if cached:
+            try:
+                return float(cached)
+            except:
+                pass
+        
+        # Fall back to global threshold
+        return CONF_THRESHOLD
+    except Exception as e:
+        error_handler.handle_error("_get_market_threshold", e, {"market": market})
+        return CONF_THRESHOLD
 
 def _candidate_is_sane(suggestion: str, feat: Dict[str, float]) -> bool:
     """Check if a prediction candidate makes sense given current match state"""
-    minute = int(feat.get("minute", 0))
-    goals_sum = feat.get("goals_sum", 0)
-    
-    # Check for absurd Over/Under predictions
-    if suggestion.startswith("Under"):
-        try:
-            line = _parse_ou_line_from_suggestion(suggestion)
-            if line and goals_sum > line:
-                return False  # Can't go under if already over
-        except:
-            pass
-            
-    # Check for absurd BTTS predictions
-    if suggestion == "BTTS: No" and goals_sum >= 2:
-        # If both teams have scored, BTTS: No doesn't make sense
-        goals_h = feat.get("goals_h", 0)
-        goals_a = feat.get("goals_a", 0)
-        if goals_h > 0 and goals_a > 0:
-            return False
-            
-    return True
+    try:
+        minute = int(feat.get("minute", 0))
+        goals_sum = feat.get("goals_sum", 0)
+        
+        # Check for absurd Over/Under predictions
+        if suggestion.startswith("Under"):
+            try:
+                line = _parse_ou_line_from_suggestion(suggestion)
+                if line and goals_sum > line:
+                    return False  # Can't go under if already over
+            except:
+                pass
+                
+        # Check for absurd BTTS predictions
+        if suggestion == "BTTS: No" and goals_sum >= 2:
+            # If both teams have scored, BTTS: No doesn't make sense
+            goals_h = feat.get("goals_h", 0)
+            goals_a = feat.get("goals_a", 0)
+            if goals_h > 0 and goals_a > 0:
+                return False
+                
+        return True
+    except Exception as e:
+        error_handler.handle_error("_candidate_is_sane", e, {"suggestion": suggestion})
+        return False
 
 def _inplay_1x2_sanity_ok(suggestion: str, feat: Dict[str, float], odds: Optional[float]) -> bool:
     """
     Late-game 1X2 sanity: if a side leads by >=2 after 60', live odds should be short.
     Big odds at that state implies stale/prematch leakage → block.
     """
-    minute = int(feat.get("minute", 0))
-    gd = int(feat.get("goals_h", 0) - feat.get("goals_a", 0))
-    if suggestion not in ("Home Win", "Away Win"):
+    try:
+        minute = int(feat.get("minute", 0))
+        gd = int(feat.get("goals_h", 0) - feat.get("goals_a", 0))
+        if suggestion not in ("Home Win", "Away Win"):
+            return True
+        if minute >= 60 and abs(gd) >= 2 and odds is not None and odds > 1.50:
+            return False
         return True
-    if minute >= 60 and abs(gd) >= 2 and odds is not None and odds > 1.50:
+    except Exception as e:
+        error_handler.handle_error("_inplay_1x2_sanity_ok", e, {"suggestion": suggestion, "minute": feat.get("minute")})
         return False
-    return True
 
 def _score_prob(feat: Dict[str, float], mdl: Optional[Dict[str, Any]]) -> float:
     """Score probability using a model"""
@@ -1664,315 +2192,21 @@ def _score_prob(feat: Dict[str, float], mdl: Optional[Dict[str, Any]]) -> float:
 
 def _get_market_threshold_pre(market: str) -> float:
     """Get confidence threshold for pre-match markets"""
-    # Pre-match markets might have different thresholds
-    market_key = f"conf_threshold_pre:{market}"
-    cached = get_setting_cached(market_key)
-    if cached:
-        try:
-            return float(cached)
-        except:
-            pass
-    
-    # Slightly higher threshold for pre-match by default
-    return CONF_THRESHOLD + 5.0
-
-def cleanup_caches():
-    """Clean up expired cache entries"""
-    now = time.time()
-    
-    # Clean STATS_CACHE
-    expired = [fid for fid, (ts, _) in STATS_CACHE.items() if now - ts > 300]
-    for fid in expired:
-        STATS_CACHE.pop(fid, None)
-    
-    # Clean EVENTS_CACHE
-    expired = [fid for fid, (ts, _) in EVENTS_CACHE.items() if now - ts > 300]
-    for fid in expired:
-        EVENTS_CACHE.pop(fid, None)
-        
-    # Clean ODDS_CACHE
-    expired = [fid for fid, (ts, _) in ODDS_CACHE.items() if now - ts > 300]
-    for fid in expired:
-        ODDS_CACHE.pop(fid, None)
-        
-    # Clean NEG_CACHE
-    expired = [key for key, (ts, _) in NEG_CACHE.items() if now - ts > NEG_TTL_SEC]
-    for key in expired:
-        NEG_CACHE.pop(key, None)
-
-def _format_tip_message(home, away, league, minute, score, suggestion, confidence, feat, odds=None, book=None, ev_pct=None):
-    """Format a tip message for Telegram (used in retry_unsent_tips)"""
-    stat = ""
-    if any([feat.get("xg_h",0),feat.get("xg_a",0),feat.get("sot_h",0),feat.get("sot_a",0),
-            feat.get("cor_h",0),feat.get("cor_a",0),feat.get("pos_h",0),feat.get("pos_a",0)]):
-        stat = (f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
-                f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
-                f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
-        if feat.get("pos_h",0) or feat.get("pos_a",0): 
-            stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
-    
-    money = ""
-    if odds:
-        if ev_pct is not None:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
-        else:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
-            
-    return ("⚽️ <b>AI TIP!</b>\n"
-            f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
-            f"🕒 <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score)}\n"
-            f"<b>Tip:</b> {escape(suggestion)}\n"
-            f"📈 <b>Confidence:</b> {confidence:.1f}%{money}\n"
-            f"🏆 <b>League:</b> {escape(league)}{stat}")
-
-# ───────── Debug logging function ─────────
-def _dbg(reason: str, **ctx):
-    """Debug logging for selection process"""
-    if DEBUG_SELECTION_LOG:
-        try:
-            bits = " ".join(f"{k}={ctx[k]}" for k in ctx)
-            log.info(f"[SELECTOR] {reason} | {bits}")
-        except Exception as e:
-            log.info(f"[SELECTOR] {reason} | [context format failed: {e}]")
-
-# ───────── Odds helpers & aggregation ─────────
-def _ev(prob: float, odds: float) -> float:
-    """Return expected value as decimal (e.g. 0.05 = +5%)."""
     try:
-        return float(prob) * max(0.0, float(odds)) - 1.0
-    except Exception:
-        return -1.0
-
-def _min_odds_for_market(market: str) -> float:
-    if market.startswith("Over/Under"): return MIN_ODDS_OU
-    if market == "BTTS": return MIN_ODDS_BTTS
-    if market == "1X2":  return MIN_ODDS_1X2
-    return 1.01
-
-def _odds_cache_get(fid: int) -> Optional[dict]:
-    rec=ODDS_CACHE.get(fid)
-    if not rec: return None
-    ts,data=rec
-    if time.time()-ts>120: ODDS_CACHE.pop(fid,None); return None
-    return data
-
-def _market_name_normalize(s: str) -> str:
-    s=(s or "").lower()
-    if "both teams" in s or "btts" in s: return "BTTS"
-    if "match winner" in s or "winner" in s or "1x2" in s: return "1X2"
-    if "over/under" in s or "total" in s or "goals" in s: return "OU"
-    return s
-
-def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
-    if not vals:
-        return None, None
-    xs = sorted([o for (o, _) in vals if (o or 0) > 0])
-    if not xs:
-        return None, None
-    import statistics
-    med = statistics.median(xs)
-    filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
-    if not filtered:
-        filtered = vals
-    xs2 = sorted([o for (o, _) in filtered])
-    med2 = statistics.median(xs2)
-    if prob_hint is not None and prob_hint > 0:
-        fair = 1.0 / max(1e-6, float(prob_hint))
-        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-        filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
-    if ODDS_AGGREGATION == "best":
-        best = max(filtered, key=lambda t: t[0])
-        return float(best[0]), str(best[1])
-    target = med2
-    pick = min(filtered, key=lambda t: abs(t[0] - target))
-    return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
-
-def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None, require_live: bool = True) -> dict:
-    """
-    Aggregated odds map - LIVE ODDS ONLY for in-play matches
-    If require_live=True and no live odds found, return {} (do NOT fall back to prematch).
-    """
-    now = time.time()
-    k=("odds", fid)
-    ts_empty = NEG_CACHE.get(k, (0.0, False))
-    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): 
-        return {}
-    if fid in ODDS_CACHE and now-ODDS_CACHE[fid][0] < 120: 
-        return ODDS_CACHE[fid][1]
-
-    def _fetch(path: str) -> dict:
-        js = _api_get(f"{BASE_URL}/{path}", {"fixture": fid}) or {}
-        return js if isinstance(js, dict) else {}
-
-    js = {}
-    src = None
-
-    # Try live first - ONLY LIVE, NO FALLBACK TO PREMATCH
-    js = _fetch("odds/live")
-    if (js.get("response") or []):
-        src = "live"
-        log.info(f"[ODDS] Found LIVE odds for fixture {fid}")
-    else:
-        # NO PREMATCH FALLBACK - return empty to avoid using stale prematch odds
-        log.warning(f"[ODDS] No LIVE odds available for fixture {fid} - rejecting")
-        NEG_CACHE[k] = (now, True)
-        ODDS_CACHE[fid] = (time.time(), {})
-        return {}
-
-    by_market: dict[str, dict[str, list[tuple[float, str]]]] = {}
-    try:
-        for r in js.get("response", []) or []:
-            for bk in (r.get("bookmakers") or []):
-                book_name = bk.get("name") or "Book"
-                for mkt in (bk.get("bets") or []):
-                    mname = _market_name_normalize(mkt.get("name", ""))
-                    vals = mkt.get("values") or []
-                    if mname == "BTTS":
-                        for v in vals:
-                            lbl = (v.get("value") or "").strip().lower()
-                            if "yes" in lbl:
-                                by_market.setdefault("BTTS", {}).setdefault("Yes", []).append((float(v.get("odd") or 0), book_name))
-                            elif "no" in lbl:
-                                by_market.setdefault("BTTS", {}).setdefault("No", []).append((float(v.get("odd") or 0), book_name))
-                    elif mname == "1X2":
-                        for v in vals:
-                            lbl = (v.get("value") or "").strip().lower()
-                            if lbl in ("home","1"):
-                                by_market.setdefault("1X2", {}).setdefault("Home", []).append((float(v.get("odd") or 0), book_name))
-                            elif lbl in ("away","2"):
-                                by_market.setdefault("1X2", {}).setdefault("Away", []).append((float(v.get("odd") or 0), book_name))
-                    elif mname == "OU":
-                        for v in vals:
-                            lbl = (v.get("value") or "").lower()
-                            if ("over" in lbl) or ("under" in lbl):
-                                try:
-                                    ln = float(lbl.split()[-1])
-                                    key = f"OU_{_fmt_line(ln)}"
-                                    side = "Over" if "over" in lbl else "Under"
-                                    by_market.setdefault(key, {}).setdefault(side, []).append((float(v.get("odd") or 0), book_name))
-                                except:
-                                    pass
+        # Pre-match markets might have different thresholds
+        market_key = f"conf_threshold_pre:{market}"
+        cached = get_setting_cached(market_key)
+        if cached:
+            try:
+                return float(cached)
+            except:
+                pass
+        
+        # Slightly higher threshold for pre-match by default
+        return CONF_THRESHOLD + 5.0
     except Exception as e:
-        log.error(f"[ODDS] Error parsing odds for fixture {fid}: {e}")
-        return {}
-
-    def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
-        if not vals:
-            return None, None
-        xs = sorted([o for (o, _) in vals if (o or 0) > 0])
-        if not xs:
-            return None, None
-        import statistics
-        med = statistics.median(xs)
-        filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
-        if not filtered:
-            filtered = vals
-        xs2 = sorted([o for (o, _) in filtered])
-        med2 = statistics.median(xs2)
-        if prob_hint is not None and prob_hint > 0:
-            fair = 1.0 / max(1e-6, float(prob_hint))
-            cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-            filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
-        if ODDS_AGGREGATION == "best":
-            best = max(filtered, key=lambda t: t[0])
-            return float(best[0]), str(best[1])
-        target = med2
-        pick = min(filtered, key=lambda t: abs(t[0] - target))
-        return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
-
-    out: dict[str, dict[str, dict]] = {}
-    for mkey, side_map in by_market.items():
-        ok = True
-        for side, lst in side_map.items():
-            if len({b for (_, b) in lst}) < max(1, ODDS_REQUIRE_N_BOOKS):
-                ok = False
-                break
-        if not ok:
-            continue
-
-        out[mkey] = {}
-        for side, lst in side_map.items():
-            hint = None
-            if prob_hints:
-                if mkey == "BTTS":
-                    hint = prob_hints.get("BTTS: Yes") if side == "Yes" else (1.0 - (prob_hints.get("BTTS: Yes") or 0.0))
-                elif mkey == "1X2":
-                    hint = prob_hints.get("Home Win") if side == "Home" else (prob_hints.get("Away Win") if side == "Away" else None)
-                elif mkey.startswith("OU_"):
-                    try:
-                        ln = float(mkey.split("_", 1)[1])
-                        key = f"{_fmt_line(ln)}"
-                        hint = prob_hints.get(f"Over {key} Goals") if side == "Over" else (1.0 - (prob_hints.get(f"Over {key} Goals") or 0.0))
-                    except:
-                        pass
-            ag, label = _aggregate_price(lst, hint)
-            if ag is not None:
-                out[mkey][side] = {"odds": float(ag), "book": label}
-
-    ODDS_CACHE[fid] = (time.time(), out)
-    if not out: 
-        NEG_CACHE[k] = (now, True)
-    else:
-        log.info(f"[ODDS] Successfully parsed {len(out)} markets for fixture {fid}")
-    return out
-
-    def _aggregate_price(vals: list[tuple[float, str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
-        if not vals:
-            return None, None
-        xs = sorted([o for (o, _) in vals if (o or 0) > 0])
-        if not xs:
-            return None, None
-        import statistics
-        med = statistics.median(xs)
-        filtered = [(o, b) for (o, b) in vals if o <= med * max(1.0, ODDS_OUTLIER_MULT)]
-        if not filtered:
-            filtered = vals
-        xs2 = sorted([o for (o, _) in filtered])
-        med2 = statistics.median(xs2)
-        if prob_hint is not None and prob_hint > 0:
-            fair = 1.0 / max(1e-6, float(prob_hint))
-            cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
-            filtered = [(o, b) for (o, b) in filtered if o <= cap] or filtered
-        if ODDS_AGGREGATION == "best":
-            best = max(filtered, key=lambda t: t[0])
-            return float(best[0]), str(best[1])
-        target = med2
-        pick = min(filtered, key=lambda t: abs(t[0] - target))
-        return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
-
-    out: dict[str, dict[str, dict]] = {}
-    for mkey, side_map in by_market.items():
-        ok = True
-        for side, lst in side_map.items():
-            if len({b for (_, b) in lst}) < max(1, ODDS_REQUIRE_N_BOOKS):
-                ok = False
-                break
-        if not ok:
-            continue
-
-        out[mkey] = {}
-        for side, lst in side_map.items():
-            hint = None
-            if prob_hints:
-                if mkey == "BTTS":
-                    hint = prob_hints.get("BTTS: Yes") if side == "Yes" else (1.0 - (prob_hints.get("BTTS: Yes") or 0.0))
-                elif mkey == "1X2":
-                    hint = prob_hints.get("Home Win") if side == "Home" else (prob_hints.get("Away Win") if side == "Away" else None)
-                elif mkey.startswith("OU_"):
-                    try:
-                        ln = float(mkey.split("_", 1)[1])
-                        key = f"{_fmt_line(ln)}"
-                        hint = prob_hints.get(f"Over {key} Goals") if side == "Over" else (1.0 - (prob_hints.get(f"Over {key} Goals") or 0.0))
-                    except:
-                        pass
-            ag, label = _aggregate_price(lst, hint)
-            if ag is not None:
-                out[mkey][side] = {"odds": float(ag), "book": label}
-
-    ODDS_CACHE[fid] = (time.time(), out)
-    if not out: 
-        NEG_CACHE[k] = (now, True)
-    return out
+        error_handler.handle_error("_get_market_threshold_pre", e, {"market": market})
+        return CONF_THRESHOLD + 5.0
 
 # ───────── Bayesian & GameState & Odds Quality ─────────
 class BayesianUpdater:
@@ -2144,17 +2378,6 @@ def market_cutoff_ok(minute: Optional[int], market_text: str, suggestion: str) -
         cutoff = max(0, int(TOTAL_MATCH_MINUTES) - 5)
     return m <= int(cutoff)
 
-def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
-    try:
-        if "Over" in s or "Under" in s:
-            import re
-            match = re.search(r'(\d+(?:\.\d+)?)', s)
-            if match:
-                return float(match.group(1))
-        return None
-    except Exception:
-        return None
-
 def _price_gate(market_text: str, suggestion: str, fid: int, require_live_odds: bool = True) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
     Return (pass, odds, book, ev_pct).
@@ -2200,17 +2423,6 @@ def _price_gate(market_text: str, suggestion: str, fid: int, require_live_odds: 
     # Note: We'll calculate EV in the main scanning function where we have the probability
     
     return (True, odds, book, ev_pct)
-
-def _odds_key_for_market(market_txt: str, suggestion: str) -> str | None:
-    """Map our market/suggestion to odds_map key."""
-    if market_txt == "BTTS":
-        return "BTTS"
-    if market_txt == "1X2":
-        return "1X2"
-    if market_txt.startswith("Over/Under"):
-        ln = _parse_ou_line_from_suggestion(suggestion)
-        return f"OU_{_fmt_line(ln)}" if ln is not None else None
-    return None
 
 # ───────── Formatting (enhanced tip) ─────────
 def _format_enhanced_tip_message(home, away, league, minute, score, suggestion, 
@@ -2835,25 +3047,7 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     return mdl
 
 # ───────── Logistic predict (PATCHED calibration math) ─────────
-def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
-    w = mdl.get("weights") or {}
-    s = float(mdl.get("intercept", 0.0) or 0.0)
-    for k, v in w.items():
-        s += float(v or 0.0) * float(features.get(k, 0.0))
-    # base prob from linear predictor
-    prob = 1.0 / (1.0 + np.exp(-s))
-    # apply calibration on LOGIT, not on prob directly
-    cal = mdl.get("calibration") or {}
-    try:
-        method = str(cal.get("method", "sigmoid")).lower()
-        a = float(cal.get("a", 1.0)); b = float(cal.get("b", 0.0))
-        if method in ("platt", "sigmoid"):
-            p = max(1e-12, min(1-1e-12, prob))
-            z = np.log(p/(1-p))
-            prob = 1.0 / (1.0 + np.exp(-(a*z + b)))
-    except Exception:
-        pass
-    return float(max(0.0, min(1.0, prob)))
+# Note: predict_from_model is now defined above in the missing functions section
 
 # ───────── Outcomes/backfill/digest (minor safety tweaks preserved) ─────────
 def _tip_outcome_for_result(suggestion: str, res: Dict[str,Any]) -> Optional[int]:
@@ -3340,21 +3534,6 @@ def http_digest():
     msg = daily_accuracy_digest(day=day)
     return jsonify({"ok": True, "sent": bool(msg), "day": day})
 
-# Ensure _apply_tune_thresholds exists before the public wrapper
-try:
-    _apply_tune_thresholds  # type: ignore  # noqa: F401
-except NameError:
-    def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:  # type: ignore
-        log.warning("[AUTO-TUNE] _apply_tune_thresholds missing; no-op")
-        return {}
-
-def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
-    try:
-        return _apply_tune_thresholds(days)
-    except Exception as e:
-        log.exception("[AUTO-TUNE] failed: %s", e)
-        return {}
-
 @app.route("/admin/auto-tune", methods=["POST","GET"])
 def http_auto_tune():
     _require_admin()
@@ -3430,14 +3609,30 @@ def telegram_webhook(secret: str):
         log.warning("telegram webhook parse error: %s", e)
     return jsonify({"ok": True})
 
-# ───────── Boot ─────────
+# ───────── NEW: Enhanced Boot with Comprehensive Validation ─────────
+
 def _on_boot():
-    register_shutdown_handlers()
-    validate_config()
-    _init_pool()
-    init_db()
-    set_setting("boot_ts", str(int(time.time())))
-    _start_scheduler_once()
+    """Enhanced boot process with comprehensive validation"""
+    try:
+        register_shutdown_handlers()
+        enhanced_validate_config()  # Use enhanced validation
+        _init_pool()
+        init_db()
+        
+        # Run unit tests if in debug mode
+        if os.getenv("DEBUG", "0") not in ("0", "false", "False", "no", "NO"):
+            test_helpers.run_all_tests()
+        
+        set_setting("boot_ts", str(int(time.time())))
+        set_setting("boot_version", "2.0.0-enhanced")  # Track enhanced version
+        
+        _start_scheduler_once()
+        
+        log.info("[BOOT] Enhanced goalsniper AI system started successfully")
+        
+    except Exception as e:
+        log.error(f"[BOOT] Failed to start: {e}")
+        raise
 
 _on_boot()
 
