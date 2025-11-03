@@ -1,5 +1,3 @@
-train_models.py
-
 import os, json, logging, sys
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
