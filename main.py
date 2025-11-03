@@ -27,6 +27,16 @@ _SHUTDOWN_HANDLERS_SET = False
 EPS = 1e-9
 DEBUG_SELECTION_LOG = os.getenv("DEBUG_SELECTION_LOG", "0") not in ("0","false","False","no","NO")  # ADDED: Debug selection logging
 
+# ───────── Debug logging function ─────────
+def _dbg(reason: str, **ctx):
+    """Debug logging for selection process"""
+    if DEBUG_SELECTION_LOG:
+        try:
+            bits = " ".join(f"{k}={ctx[k]}" for k in ctx)
+            log.info(f"[SELECTOR] {reason} | {bits}")
+        except Exception as e:
+            log.info(f"[SELECTOR] {reason} | [context format failed: {e}]")
+
 # ───────── Env bootstrap ─────────
 try:
     from dotenv import load_dotenv
