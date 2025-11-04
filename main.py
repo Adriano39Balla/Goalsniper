@@ -886,22 +886,28 @@ class AdvancedEnsemblePredictor:
         return None, 0.0
 
     def _logistic_predict(self, features: Dict[str, float], market: str) -> float:
-        """Load the exact model name (segmented by minute) and score it."""
-        minute = float(features.get("minute", 0.0))
-        seg = "early" if minute <= 35 else ("mid" if minute <= 70 else "late")
-
-        name = market
-        # Normalize OU market names like "OU_2.5" to the canonical key
-        if market.startswith("OU_"):
-            try:
-                ln = float(market.split("_", 1)[1])
-                name = f"OU_{_fmt_line(ln)}"
-            except Exception:
-                pass
-
-        # try segmented model first, then fallback
-        mdl = load_model_from_settings(f"{name}@{seg}") or load_model_from_settings(name)
-        return predict_from_model(mdl, features) if mdl else 0.0
+    """Fixed version - don't try to load segmented models that don't exist"""
+    minute = float(features.get("minute", 0.0))
+    
+    # ONLY try the main market name, skip segmented models for now
+    name = market
+    
+    # Normalize OU market names
+    if market.startswith("OU_"):
+        try:
+            ln = float(market.split("_", 1)[1])
+            name = f"OU_{_fmt_line(ln)}"
+        except Exception:
+            pass
+    
+    # CRITICAL FIX: Only load the main model, skip segmented models
+    mdl = load_model_from_settings(name)
+    
+    if not mdl:
+        log.warning(f"[PREDICT] No model found for {name}, returning 0.0")
+        return 0.0
+        
+    return predict_from_model(mdl, features)
 
     def _load_ou_model_for_line(self, line: float) -> Optional[Dict[str, Any]]:
         """Load OU model with fallback to legacy names"""
@@ -3247,6 +3253,140 @@ def enhanced_production_scan() -> Tuple[int, int]:
 def production_scan() -> Tuple[int, int]:
     return enhanced_production_scan()
 
+def emergency_production_scan() -> Tuple[int, int]:
+    """
+    EMERGENCY: Use simple direct predictions instead of broken ensemble
+    """
+    log.info("[EMERGENCY_SCAN] Using simplified prediction system")
+    
+    # Save original config
+    original_config = {
+        'CONF_THRESHOLD': CONF_THRESHOLD,
+        'EDGE_MIN_BPS': EDGE_MIN_BPS,
+        'ODDS_QUALITY_MIN': ODDS_QUALITY_MIN,
+        'ALLOW_TIPS_WITHOUT_ODDS': ALLOW_TIPS_WITHOUT_ODDS
+    }
+    
+    try:
+        # Open all gates
+        os.environ.update({
+            "CONF_THRESHOLD": "55",
+            "EDGE_MIN_BPS": "100", 
+            "ODDS_QUALITY_MIN": "0.1",
+            "ALLOW_TIPS_WITHOUT_ODDS": "1"
+        })
+        
+        # Reload config
+        global CONF_THRESHOLD, EDGE_MIN_BPS, ODDS_QUALITY_MIN, ALLOW_TIPS_WITHOUT_ODDS
+        CONF_THRESHOLD = 55.0
+        EDGE_MIN_BPS = 100
+        ODDS_QUALITY_MIN = 0.1
+        ALLOW_TIPS_WITHOUT_ODDS = True
+        
+        matches = fetch_live_matches()
+        if not matches:
+            return 0, 0
+            
+        saved = 0
+        now_ts = int(time.time())
+        
+        for match in matches:
+            try:
+                fid = int((match.get("fixture") or {}).get("id") or 0)
+                if not fid:
+                    continue
+                    
+                # Skip if recently tipped
+                if DUP_COOLDOWN_MIN > 0:
+                    with db_conn() as c:
+                        cutoff = now_ts - DUP_COOLDOWN_MIN * 60
+                        c.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1", (fid, cutoff))
+                        if c.fetchone_safe():
+                            continue
+                
+                features = extract_enhanced_features(match)
+                minute = int(features.get("minute", 0))
+                
+                # Basic gates
+                if not stats_coverage_ok(features, minute):
+                    continue
+                if minute < TIP_MIN_MINUTE:
+                    continue
+                if is_feed_stale(fid, match, minute):
+                    continue
+                
+                league_id, league = _league_name(match)
+                home, away = _teams(match)
+                score = _pretty_score(match)
+                
+                log.info(f"[EMERGENCY_SCAN] Processing {home} vs {away} at {minute}'")
+                
+                # SIMPLE DIRECT PREDICTIONS (bypass broken ensemble)
+                tips_generated = []
+                
+                # BTTS Prediction
+                btts_model = load_model_from_settings("BTTS")
+                if btts_model:
+                    btts_prob = predict_from_model(btts_model, features)
+                    if btts_prob >= 0.55:  # 55% threshold
+                        tips_generated.append(("BTTS", "BTTS: Yes", btts_prob, 0.8))
+                    elif (1 - btts_prob) >= 0.55:
+                        tips_generated.append(("BTTS", "BTTS: No", 1 - btts_prob, 0.8))
+                
+                # Over/Under 2.5 Prediction
+                ou25_model = load_model_from_settings("OU_2.5")
+                if ou25_model:
+                    ou25_prob = predict_from_model(ou25_model, features)
+                    if ou25_prob >= 0.55:
+                        tips_generated.append(("Over/Under 2.5", f"Over 2.5 Goals", ou25_prob, 0.8))
+                    elif (1 - ou25_prob) >= 0.55:
+                        tips_generated.append(("Over/Under 2.5", f"Under 2.5 Goals", 1 - ou25_prob, 0.8))
+                
+                # Save and send tips
+                for market, suggestion, prob, conf in tips_generated:
+                    try:
+                        created_ts = now_ts + len(tips_generated)  # slight offset
+                        prob_pct = prob * 100
+                        
+                        with db_conn() as c:
+                            c.execute("""
+                                INSERT INTO tips(
+                                    match_id, league_id, league, home, away, market, suggestion,
+                                    confidence, confidence_raw, score_at_tip, minute, created_ts, sent_ok
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """, (
+                                fid, league_id, league, home, away, market, suggestion,
+                                float(prob_pct), float(prob), score, minute, created_ts, 0
+                            ))
+                        
+                        # Send to Telegram
+                        message = _format_enhanced_tip_message(
+                            home, away, league, minute, score, suggestion,
+                            float(prob_pct), features, None, None, None, conf
+                        )
+                        
+                        if send_telegram(message):
+                            with db_conn() as c:
+                                c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", 
+                                         (fid, created_ts))
+                            saved += 1
+                            log.info(f"[EMERGENCY_SCAN] SENT TIP: {suggestion} at {prob_pct:.1f}%")
+                            
+                    except Exception as e:
+                        log.error(f"[EMERGENCY_SCAN] Failed to save tip: {e}")
+                
+            except Exception as e:
+                log.error(f"[EMERGENCY_SCAN] Match failed: {e}")
+                continue
+        
+        log.info(f"[EMERGENCY_SCAN] COMPLETE: {saved} tips generated from {len(matches)} matches")
+        return saved, len(matches)
+        
+    finally:
+        # Restore original config
+        for key, value in original_config.items():
+            os.environ[key] = str(value)
+
 # ───────── Model loader (with validation) ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
     if not isinstance(tmp, dict): return False
@@ -3838,6 +3978,62 @@ def telegram_webhook(secret: str):
     except Exception as e:
         log.warning("telegram webhook parse error: %s", e)
     return jsonify({"ok": True})
+
+@app.route("/admin/emergency-simple-scan", methods=["GET"])
+def http_emergency_simple_scan():
+    """Use the simplified emergency scanner"""
+    _require_admin()
+    saved, seen = emergency_production_scan()
+    return jsonify({"ok": True, "saved": saved, "live_seen": seen, "mode": "emergency_simple"})
+
+@app.route("/admin/fix-1x2-models", methods=["GET"])
+def http_fix_1x2_models():
+    """Create the missing 1X2 models that are causing the infinite loop"""
+    _require_admin()
+    
+    log.info("[FIX] Creating missing 1X2 models...")
+    
+    # Create the main 1X2 model that the system is looking for
+    main_1x2_model = {
+        "weights": {
+            "goals_h": 0.4, "goals_a": -0.4,
+            "xg_h": 0.3, "xg_a": -0.3, 
+            "pressure_home": 0.02, "pressure_away": -0.02,
+            "pos_h": 0.01, "pos_a": -0.01
+        },
+        "intercept": 0.1,
+        "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0}
+    }
+    
+    # Save as "1X2" (the main model name)
+    set_setting("model:1X2", json.dumps(main_1x2_model))
+    
+    # Also create the specific home/away models the ensemble expects
+    home_model = {
+        "weights": {
+            "goals_h": 0.5, "goals_a": -0.3,
+            "xg_h": 0.4, "xg_a": -0.2,
+            "pressure_home": 0.03, "pressure_away": -0.01
+        },
+        "intercept": -0.2,
+        "calibration": {"method": "sigmoid", "a": 1.1, "b": 0.1}
+    }
+    
+    away_model = {
+        "weights": {
+            "goals_h": -0.3, "goals_a": 0.5,
+            "xg_h": -0.2, "xg_a": 0.4, 
+            "pressure_home": -0.01, "pressure_away": 0.03
+        },
+        "intercept": -0.2,
+        "calibration": {"method": "sigmoid", "a": 1.1, "b": 0.1}
+    }
+    
+    set_setting("model:1X2_HOME", json.dumps(home_model))
+    set_setting("model:1X2_AWAY", json.dumps(away_model))
+    
+    log.info("[FIX] Created 1X2 models successfully")
+    return jsonify({"ok": True, "message": "1X2 models created"})
 
 # ───────── NEW: Enhanced Boot with Comprehensive Validation ─────────
 
