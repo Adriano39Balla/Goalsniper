@@ -2559,7 +2559,7 @@ class SmartOddsAnalyzer:
         return (overround_quality + model_quality) / 2
 
 # Prematch feature extraction (keep original for now)
-def extract_prematch_features(f: dict) -> Dict[str, float]:
+def extract_prematch_features(f: dict) -> Optional[Dict[str, float]]:
     home_id = ((f.get("teams") or {}).get("home") or {}).get("id")
     away_id = ((f.get("teams") or {}).get("away") or {}).get("id")
     home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
@@ -2571,20 +2571,45 @@ def extract_prematch_features(f: dict) -> Dict[str, float]:
     recent_a = _api_last_fixtures(away_id, 5)
     h2h = _api_h2h(home_id, away_id, 5)
 
+    missing_reasons = []
+
     if recent_h:
         feat["avg_goals_h"] = np.mean([(m.get("goals") or {}).get("home", 0) for m in recent_h])
+    else:
+        missing_reasons.append("no_recent_home_fixtures")
+
     if recent_a:
         feat["avg_goals_a"] = np.mean([(m.get("goals") or {}).get("away", 0) for m in recent_a])
+    else:
+        missing_reasons.append("no_recent_away_fixtures")
+
     if h2h:
-        feat["avg_goals_h2h"] = np.mean([(m.get("goals") or {}).get("home", 0) + (m.get("goals") or {}).get("away", 0) for m in h2h])
+        feat["avg_goals_h2h"] = np.mean([
+            (m.get("goals") or {}).get("home", 0) + (m.get("goals") or {}).get("away", 0)
+            for m in h2h
+        ])
+    else:
+        missing_reasons.append("no_h2h_data")
 
     try:
-        dts_h = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_h]
-        dts_a = [datetime.fromisoformat((m.get("fixture") or {}).get("date","")) for m in recent_a]
-        if dts_h: feat["rest_days_h"] = (datetime.now(tz=TZ_UTC) - max(dts_h).astimezone(TZ_UTC)).days
-        if dts_a: feat["rest_days_a"] = (datetime.now(tz=TZ_UTC) - max(dts_a).astimezone(TZ_UTC)).days
-    except Exception:
-        pass
+        dts_h = [datetime.fromisoformat((m.get("fixture") or {}).get("date", "")) for m in recent_h if m.get("fixture")]
+        dts_a = [datetime.fromisoformat((m.get("fixture") or {}).get("date", "")) for m in recent_a if m.get("fixture")]
+        if dts_h:
+            feat["rest_days_h"] = (datetime.now(tz=TZ_UTC) - max(dts_h).astimezone(TZ_UTC)).days
+        else:
+            missing_reasons.append("missing_home_dates")
+        if dts_a:
+            feat["rest_days_a"] = (datetime.now(tz=TZ_UTC) - max(dts_a).astimezone(TZ_UTC)).days
+        else:
+            missing_reasons.append("missing_away_dates")
+    except Exception as e:
+        missing_reasons.append(f"date_parse_error: {str(e)}")
+
+    # Decide if the feature dict is acceptable
+    min_features_required = 3  # adjust based on your models
+    if len(feat) < min_features_required:
+        log.warning(f"[FEATURES_SKIPPED] {home} vs {away} (fid={fid}) - reasons: {missing_reasons}")
+        return None
 
     return feat
 
