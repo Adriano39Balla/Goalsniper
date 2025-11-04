@@ -3254,6 +3254,9 @@ def emergency_production_scan() -> Tuple[int, int]:
     """
     EMERGENCY: Use simple direct predictions instead of broken ensemble
     """
+    # Declare globals at the TOP of the function
+    global CONF_THRESHOLD, EDGE_MIN_BPS, ODDS_QUALITY_MIN, ALLOW_TIPS_WITHOUT_ODDS
+    
     log.info("[EMERGENCY_SCAN] Using simplified prediction system")
     
     # Save original config
@@ -3273,8 +3276,7 @@ def emergency_production_scan() -> Tuple[int, int]:
             "ALLOW_TIPS_WITHOUT_ODDS": "1"
         })
         
-        # Reload config
-        global CONF_THRESHOLD, EDGE_MIN_BPS, ODDS_QUALITY_MIN, ALLOW_TIPS_WITHOUT_ODDS
+        # Reload config - now these are declared as global
         CONF_THRESHOLD = 55.0
         EDGE_MIN_BPS = 100
         ODDS_QUALITY_MIN = 0.1
@@ -3335,9 +3337,9 @@ def emergency_production_scan() -> Tuple[int, int]:
                 if ou25_model:
                     ou25_prob = predict_from_model(ou25_model, features)
                     if ou25_prob >= 0.55:
-                        tips_generated.append(("Over/Under 2.5", f"Over 2.5 Goals", ou25_prob, 0.8))
+                        tips_generated.append(("Over/Under 2.5", "Over 2.5 Goals", ou25_prob, 0.8))
                     elif (1 - ou25_prob) >= 0.55:
-                        tips_generated.append(("Over/Under 2.5", f"Under 2.5 Goals", 1 - ou25_prob, 0.8))
+                        tips_generated.append(("Over/Under 2.5", "Under 2.5 Goals", 1 - ou25_prob, 0.8))
                 
                 # Save and send tips
                 for market, suggestion, prob, conf in tips_generated:
@@ -3383,6 +3385,12 @@ def emergency_production_scan() -> Tuple[int, int]:
         # Restore original config
         for key, value in original_config.items():
             os.environ[key] = str(value)
+        
+        # Restore global variables
+        CONF_THRESHOLD = original_config['CONF_THRESHOLD']
+        EDGE_MIN_BPS = original_config['EDGE_MIN_BPS']
+        ODDS_QUALITY_MIN = original_config['ODDS_QUALITY_MIN']
+        ALLOW_TIPS_WITHOUT_ODDS = original_config['ALLOW_TIPS_WITHOUT_ODDS']
 
 # ───────── Model loader (with validation) ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
