@@ -886,25 +886,25 @@ class AdvancedEnsemblePredictor:
         return None, 0.0
 
     def _logistic_predict(self, features: Dict[str, float], market: str) -> float:
-    """Fixed version - don't try to load segmented models that don't exist"""
-    # Skip segmented model loading entirely for now
-    name = market
+        """Fixed version - don't try to load segmented models that don't exist"""
+        # Skip segmented model loading entirely for now
+        name = market
     
-    # Normalize OU market names like "OU_2.5" to the canonical key
-    if market.startswith("OU_"):
-        try:
-            ln = float(market.split("_", 1)[1])
-            name = f"OU_{_fmt_line(ln)}"
-        except Exception:
-            pass
+        # Normalize OU market names like "OU_2.5" to the canonical key
+        if market.startswith("OU_"):
+            try:
+                ln = float(market.split("_", 1)[1])
+                name = f"OU_{_fmt_line(ln)}"
+            except Exception:
+                pass
 
-    # Only try the main model name
-    mdl = load_model_from_settings(name)
-    if not mdl:
-        log.warning(f"[ENSEMBLE] No model found for {name}")
-        return 0.0
+        # Only try the main model name
+        mdl = load_model_from_settings(name)
+        if not mdl:
+            log.warning(f"[ENSEMBLE] No model found for {name}")
+            return 0.0
         
-    return predict_from_model(mdl, features)
+        return predict_from_model(mdl, features)
 
     def _load_ou_model_for_line(self, line: float) -> Optional[Dict[str, Any]]:
         """Load OU model with fallback to legacy names"""
