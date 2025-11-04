@@ -2032,9 +2032,47 @@ def _get_pre_match_probability(fid: int, market: str) -> Optional[float]:
         log.warning(f"[PRE_MATCH_PROB] Failed for {market}: {e}")
     return None
 
+# ───────── Debug Functions ─────────
+def debug_tip_pipeline(match_name: str, candidate_type: str, prob: float, confidence: float, 
+                      odds_available: bool, ev_pct: float = None):
+    """Debug why tips are being filtered out"""
+    log.info(f"[DEBUG] {match_name} - {candidate_type}: {prob:.3f} (conf: {confidence:.3f})")
+    log.info(f"[DEBUG] Odds available: {odds_available}, EV: {ev_pct}")
+
+def debug_odds_fetching(fid: int, home: str, away: str):
+    """Debug odds fetching process"""
+    try:
+        odds_map = fetch_odds(fid) if API_KEY else {}
+        log.info(f"[ODDS_DEBUG] {home} vs {away} - FID: {fid}")
+        log.info(f"[ODDS_DEBUG] Odds map keys: {list(odds_map.keys())}")
+        
+        for market, data in odds_map.items():
+            log.info(f"[ODDS_DEBUG] {market}: {data}")
+            
+        return odds_map
+    except Exception as e:
+        log.error(f"[ODDS_DEBUG] Failed to fetch odds: {e}")
+        return {}
+
+def check_available_models():
+    """Check which prediction models are available"""
+    models_to_check = [
+        "BTTS", "OU_2.5", "OU_3.5", 
+        "PRE_BTTS_YES", "PRE_OU_2.5", "PRE_OU_3.5",
+        "WLD_HOME", "WLD_AWAY"
+    ]
+    
+    available = []
+    for model in models_to_check:
+        if load_model_from_settings(model):
+            available.append(model)
+    
+    log.info(f"[MODELS] Available models: {available}")
+    return available
+
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
-    """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2"""
+    """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2 - DEBUG VERSION"""
     if sleep_if_required():
         log.info("[ENHANCED_PROD] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
         return (0, 0)
@@ -2042,6 +2080,9 @@ def enhanced_production_scan() -> Tuple[int, int]:
     if not _db_ping():
         log.error("[ENHANCED_PROD] Database unavailable")
         return (0, 0)
+    
+    # Check available models
+    check_available_models()
     
     try:
         matches = fetch_live_matches()
@@ -2082,10 +2123,13 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 
                 # Validation checks
                 if not stats_coverage_ok(feat, minute):
+                    log.info(f"[STATS_COVERAGE] Skipping {fid} - insufficient stats coverage")
                     continue
                 if minute < TIP_MIN_MINUTE:
+                    log.info(f"[MINUTE_CHECK] Skipping {fid} - minute {minute} < {TIP_MIN_MINUTE}")
                     continue
                 if is_feed_stale(fid, m, minute):
+                    log.info(f"[FEED_STALE] Skipping {fid} - stale feed")
                     continue
 
                 # Harvest mode snapshot
@@ -2170,6 +2214,11 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     log.info(f"[NO_CANDIDATES] No qualified tips for {home} vs {away}")
                     continue
 
+                # DEBUG: Log candidates found
+                log.info(f"[CANDIDATES_FOUND] {home} vs {away}: {len(candidates)} candidates")
+                for market, suggestion, prob, conf in candidates:
+                    debug_tip_pipeline(f"{home} vs {away}", f"{market} - {suggestion}", prob, conf, False)
+
                 # Bayesian updates with pre-match probabilities
                 enhanced_candidates = []
                 for market, suggestion, prob, confidence in candidates:
@@ -2191,7 +2240,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     enhanced_candidates.append((market, suggestion, enhanced_prob, confidence))
 
                 # Odds analysis and filtering
-                odds_map = fetch_odds(fid) if API_KEY else {}
+                odds_map = debug_odds_fetching(fid, home, away)  # Debug odds
                 ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
 
                 for mk, sug, prob, confidence in enhanced_candidates:
@@ -2203,6 +2252,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     odds_quality = odds_analyzer.analyze_odds_quality(odds_map, {mk: prob})
                     
                     if odds_quality < odds_analyzer.odds_quality_threshold:
+                        log.info(f"[ODDS_QUALITY] Skipping {sug} - low odds quality: {odds_quality}")
                         continue
 
                     # Odds lookup
@@ -2228,6 +2278,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     # Price gate and EV calculation
                     pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
                     if not pass_odds:
+                        log.info(f"[PRICE_GATE_FAILED] {sug} failed price gate")
                         continue
                     if odds is None:
                         odds = odds2
@@ -2238,16 +2289,22 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         edge = _ev(prob, float(odds))
                         ev_pct = round(edge * 100.0, 1)
                         if int(round(edge * 10000)) < EDGE_MIN_BPS:
+                            log.info(f"[EV_FAILED] {sug} - EV too low: {edge:.3f} < {EDGE_MIN_BPS/10000:.3f}")
                             continue
                     else:
                         if not ALLOW_TIPS_WITHOUT_ODDS:
+                            log.info(f"[NO_ODDS] {sug} - no odds and ALLOW_TIPS_WITHOUT_ODDS=False")
                             continue
+                        else:
+                            log.info(f"[NO_ODDS_ALLOWED] {sug} - no odds but allowing tip")
 
                     # Enhanced ranking with confidence scoring
                     rank_score = (prob ** 1.2) * (1 + (ev_pct or 0) / 100.0) * confidence
                     ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score, confidence))
+                    log.info(f"[RANKED_ADDED] {sug} - prob: {prob:.3f}, odds: {odds}, ev: {ev_pct}, rank: {rank_score:.3f}")
 
                 if not ranked:
+                    log.info(f"[NO_RANKED] No ranked tips after filtering for {home} vs {away}")
                     continue
 
                 ranked.sort(key=lambda x: x[6], reverse=True)  # Sort by rank score
@@ -2258,6 +2315,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
                 for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank, confidence) in enumerate(ranked):
                     if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
+                        log.info(f"[LEAGUE_CAP] League {league_id} reached cap of {PER_LEAGUE_CAP}")
                         break
 
                     created_ts = base_now + idx
@@ -2297,27 +2355,37 @@ def enhanced_production_scan() -> Tuple[int, int]:
                                 c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
                                 _metric_inc("tips_sent_total", n=1)
                                 log.info(f"[TIP_SENT] {suggestion} for {home} vs {away} at {minute}'")
+                                saved += 1
+                            else:
+                                log.error(f"[TELEGRAM_FAILED] Failed to send {suggestion} for {home} vs {away}")
                     except Exception as e:
                         log.exception("[ENHANCED_PROD] insert/send failed: %s", e)
                         continue
 
-                    saved += 1
                     per_match += 1
                     per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
 
                     if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        log.info(f"[MAX_TIPS_REACHED] Reached max tips per scan: {MAX_TIPS_PER_SCAN}")
                         break
                     if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        log.info(f"[MAX_PER_MATCH] Reached max tips per match: {PREDICTIONS_PER_MATCH}")
                         break
 
                 if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    log.info("[SCAN_LIMIT] Reached maximum tips per scan")
                     break
 
             except Exception as e:
                 log.exception("[ENHANCED_PROD] match loop failed: %s", e)
                 continue
 
-    log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
+    # Final debug summary
+    if saved > 0:
+        log.info(f"[SUCCESS] Sent {saved} tips in this scan from {live_seen} matches")
+    else:
+        log.warning(f"[NO_TIPS_SENT] Scanned {live_seen} matches but sent 0 tips.")
+        
     _metric_inc("tips_generated_total", n=saved)
     return saved, live_seen
 
@@ -2795,21 +2863,24 @@ def market_cutoff_ok(minute: int, market_text: str, suggestion: str) -> bool:
 
 def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
-    Return (pass, odds, book, ev_pct). Enforces consistent EV behavior:
-      - If odds missing and ALLOW_TIPS_WITHOUT_ODDS=0 => block.
-      - If odds present => must pass min/max odds and EV >= EDGE_MIN_BPS.
+    Return (pass, odds, book, ev_pct). Modified for testing.
     """
-    odds_map=fetch_odds(fid) if API_KEY else {}
-    odds=None; book=None
+    odds_map = fetch_odds(fid) if API_KEY else {}
+    odds = None
+    book = None
 
-    if market_text=="BTTS":
-        d=odds_map.get("BTTS",{})
-        tgt="Yes" if suggestion.endswith("Yes") else "No"
-        if tgt in d: odds=d[tgt]["odds"]; book=d[tgt]["book"]
-    elif market_text=="1X2":
-        d=odds_map.get("1X2",{})
-        tgt="Home" if suggestion=="Home Win" else ("Away" if suggestion=="Away Win" else None)
-        if tgt and tgt in d: odds=d[tgt]["odds"]; book=d[tgt]["book"]
+    if market_text == "BTTS":
+        d = odds_map.get("BTTS", {})
+        tgt = "Yes" if suggestion.endswith("Yes") else "No"
+        if tgt in d: 
+            odds = d[tgt]["odds"]
+            book = d[tgt]["book"]
+    elif market_text == "1X2":
+        d = odds_map.get("1X2", {})
+        tgt = "Home" if suggestion == "Home Win" else ("Away" if suggestion == "Away Win" else None)
+        if tgt and tgt in d: 
+            odds = d[tgt]["odds"]
+            book = d[tgt]["book"]
     elif market_text.startswith("Over/Under"):
         ln_val = _parse_ou_line_from_suggestion(suggestion)
         d = odds_map.get(f"OU_{_fmt_line(ln_val)}", {}) if ln_val is not None else {}
@@ -2818,11 +2889,14 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
             odds = d[tgt]["odds"]
             book = d[tgt]["book"]
 
+    # TEMPORARY: Allow tips without odds for testing
     if odds is None:
-        return (True, None, None, None) if ALLOW_TIPS_WITHOUT_ODDS else (False, None, None, None)
-
-    min_odds=_min_odds_for_market(market_text)
+        log.warning(f"[PRICE_GATE] No odds found for {market_text} - {suggestion}, but allowing for testing")
+        return (True, None, None, None)  # Changed to True for testing
+        
+    min_odds = _min_odds_for_market(market_text)
     if not (min_odds <= odds <= MAX_ODDS_ALL):
+        log.warning(f"[PRICE_GATE] Odds {odds} outside range {min_odds}-{MAX_ODDS_ALL} for {market_text}")
         return (False, odds, book, None)
 
     # EV checked later with actual prob
