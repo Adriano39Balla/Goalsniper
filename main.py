@@ -511,125 +511,23 @@ def send_telegram(text: str) -> bool:
         ok = bool(r.ok)
         if ok: _metric_inc("tips_sent_total", n=1)
         return ok
-    except Exception:
+    except Exception as e:
+        log.error("[TELEGRAM] Failed to send message: %s", e)
         return False
 
 # ───────── API helpers (with circuit breaker & metrics) ─────────
-def _api_get(url: str, params: dict, timeout: int = 15):
-    if not API_KEY: return None
-    now = time.time()
-    if API_CB["opened_until"] > now:
-        log.warning("[CB] Circuit open, rejecting request to %s", url)
-        return None
-        
-    # Reset circuit breaker after cooldown if we have successes
-    if API_CB["failures"] > 0 and now - API_CB.get("last_success", 0) > API_CB_COOLDOWN_SEC:
-        log.info("[CB] Resetting circuit breaker after quiet period")
-        API_CB["failures"] = 0
-        API_CB["opened_until"] = 0
+def api_get_with_sleep(url: str, params: dict, timeout: int = 15):
+    """API call with basic rate limiting"""
+    # Add small delay to avoid rate limiting
+    time.sleep(0.1)
+    return _api_get(url, params, timeout)
 
-    # simple endpoint label for metrics
-    lbl = "unknown"
-    try:
-        if "/odds/live" in url or "/odds" in url: lbl = "odds"
-        elif "/statistics" in url: lbl = "statistics"
-        elif "/events" in url: lbl = "events"
-        elif "/lineups" in url: lbl = "lineups"
-        elif "/headtohead" in url: lbl = "h2h"
-        elif "/fixtures" in url: lbl = "fixtures"
-    except Exception:
-        lbl = "unknown"
-
-    try:
-        r=session.get(url, headers=HEADERS, params=params, timeout=min(timeout, REQ_TIMEOUT_SEC))
-        _metric_inc("api_calls_total", label=lbl, n=1)
-        if r.status_code == 429:
-            METRICS["api_rate_limited_total"] += 1
-            API_CB["failures"] += 1
-        elif r.status_code >= 500:
-            API_CB["failures"] += 1
-        else:
-            API_CB["failures"] = 0
-            API_CB["last_success"] = now
-
-        if API_CB["failures"] >= API_CB_THRESHOLD:
-            API_CB["opened_until"] = now + API_CB_COOLDOWN_SEC
-            log.warning("[CB] API-Football opened for %ss", API_CB_COOLDOWN_SEC)
-
-        return r.json() if r.ok else None
-    except Exception:
-        API_CB["failures"] += 1
-        if API_CB["failures"] >= API_CB_THRESHOLD:
-            API_CB["opened_until"] = time.time() + API_CB_COOLDOWN_SEC
-            log.warning("[CB] API-Football opened due to exceptions")
-        return None
-
-# ───────── League filter ─────────
-_BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
-def _blocked_league(league_obj: dict) -> bool:
-    name=str((league_obj or {}).get("name","")).lower()
-    country=str((league_obj or {}).get("country","")).lower()
-    typ=str((league_obj or {}).get("type","")).lower()
-    txt=f"{country} {name} {typ}"
-    if any(p in txt for p in _BLOCK_PATTERNS): return True
-    deny=[x.strip() for x in os.getenv("LEAGUE_DENY_IDS","").split(",") if x.strip()]
-    lid=str((league_obj or {}).get("id") or "")
-    if lid in deny: return True
-    return False
-
-# ───────── Live fetches (with negative-result cache) ─────────
-def fetch_match_stats(fid: int) -> list:
-    now=time.time()
-    k=("stats", fid)
-    ts_empty = NEG_CACHE.get(k, (0.0, False))
-    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
-    if fid in STATS_CACHE and now-STATS_CACHE[fid][0] < 90: return STATS_CACHE[fid][1]
-    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
-    out=js.get("response",[]) if isinstance(js,dict) else []
-    STATS_CACHE[fid]=(now,out)
-    if not out: NEG_CACHE[k]=(now, True)
-    return out
-
-def fetch_match_events(fid: int) -> list:
-    now=time.time()
-    k=("events", fid)
-    ts_empty = NEG_CACHE.get(k, (0.0, False))
-    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
-    if fid in EVENTS_CACHE and now-EVENTS_CACHE[fid][0] < 90: return EVENTS_CACHE[fid][1]
-    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
-    out=js.get("response",[]) if isinstance(js,dict) else []
-    EVENTS_CACHE[fid]=(now,out)
-    if not out: NEG_CACHE[k]=(now, True)
-    return out
-
-def fetch_live_matches() -> List[dict]:
-    js=api_get_with_sleep(FOOTBALL_API_URL, {"live":"all"}) or {}
-    matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
-    out=[]
-    for m in matches:
-        st=((m.get("fixture") or {}).get("status") or {})
-        elapsed=st.get("elapsed"); short=(st.get("short") or "").upper()
-        if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES: continue
-        fid=(m.get("fixture") or {}).get("id")
-        m["statistics"]=fetch_match_stats(fid); m["events"]=fetch_match_events(fid)
-        out.append(m)
-    return out
-
-# ───────── Prematch helpers (short) ─────────
-def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
-    js=api_get_with_sleep(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
-    return js.get("response",[]) if isinstance(js,dict) else []
-
-def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
-    js=api_get_with_sleep(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
-    return js.get("response",[]) if isinstance(js,dict) else []
-
-# ───────── Missing Function Implementations ─────────
 def _api_get(url: str, params: dict, timeout: int = 15):
     """
     Make API request with proper error handling and circuit breaker
     """
     if not API_KEY: 
+        log.error("[API] No API key available")
         return None
         
     now = time.time()
@@ -656,14 +554,17 @@ def _api_get(url: str, params: dict, timeout: int = 15):
         lbl = "unknown"
 
     try:
-        r = session.get(url, headers=HEADERS, params=params, timeout=min(timeout, REQ_TIMEOUT_SEC))
+        log.debug("[API] Calling %s with params %s", url, params)
+        r=session.get(url, headers=HEADERS, params=params, timeout=min(timeout, REQ_TIMEOUT_SEC))
         _metric_inc("api_calls_total", label=lbl, n=1)
         
         if r.status_code == 429:
             METRICS["api_rate_limited_total"] += 1
             API_CB["failures"] += 1
+            log.warning("[API] Rate limited (429) for %s", url)
         elif r.status_code >= 500:
             API_CB["failures"] += 1
+            log.error("[API] Server error %s for %s", r.status_code, url)
         else:
             API_CB["failures"] = 0
             API_CB["last_success"] = now
@@ -672,13 +573,28 @@ def _api_get(url: str, params: dict, timeout: int = 15):
             API_CB["opened_until"] = now + API_CB_COOLDOWN_SEC
             log.warning("[CB] API-Football opened for %ss", API_CB_COOLDOWN_SEC)
 
-        return r.json() if r.ok else None
-    except Exception as e:
+        if r.ok:
+            log.debug("[API] Success for %s", url)
+            return r.json()
+        else:
+            log.error("[API] Request failed with status %s: %s", r.status_code, r.text)
+            return None
+            
+    except requests.exceptions.Timeout:
+        log.error("[API] Timeout for %s", url)
         API_CB["failures"] += 1
-        if API_CB["failures"] >= API_CB_THRESHOLD:
-            API_CB["opened_until"] = time.time() + API_CB_COOLDOWN_SEC
-            log.warning("[CB] API-Football opened due to exceptions: %s", e)
-        return None
+    except requests.exceptions.ConnectionError:
+        log.error("[API] Connection error for %s", url)
+        API_CB["failures"] += 1
+    except Exception as e:
+        log.error("[API] Unexpected error for %s: %s", url, e)
+        API_CB["failures"] += 1
+        
+    if API_CB["failures"] >= API_CB_THRESHOLD:
+        API_CB["opened_until"] = time.time() + API_CB_COOLDOWN_SEC
+        log.warning("[CB] API-Football opened due to exceptions")
+        
+    return None
 
 def _league_name(m: dict) -> Tuple[int, str]:
     """Extract league ID and name from match data"""
@@ -926,6 +842,66 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
                 fixtures.append(r)
     fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
     return fixtures
+
+# ───────── Live fetches (with negative-result cache) ─────────
+def fetch_match_stats(fid: int) -> list:
+    now=time.time()
+    k=("stats", fid)
+    ts_empty = NEG_CACHE.get(k, (0.0, False))
+    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
+    if fid in STATS_CACHE and now-STATS_CACHE[fid][0] < 90: return STATS_CACHE[fid][1]
+    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
+    out=js.get("response",[]) if isinstance(js,dict) else []
+    STATS_CACHE[fid]=(now,out)
+    if not out: NEG_CACHE[k]=(now, True)
+    return out
+
+def fetch_match_events(fid: int) -> list:
+    now=time.time()
+    k=("events", fid)
+    ts_empty = NEG_CACHE.get(k, (0.0, False))
+    if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC): return []
+    if fid in EVENTS_CACHE and now-EVENTS_CACHE[fid][0] < 90: return EVENTS_CACHE[fid][1]
+    js=api_get_with_sleep(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
+    out=js.get("response",[]) if isinstance(js,dict) else []
+    EVENTS_CACHE[fid]=(now,out)
+    if not out: NEG_CACHE[k]=(now, True)
+    return out
+
+def fetch_live_matches() -> List[dict]:
+    js=api_get_with_sleep(FOOTBALL_API_URL, {"live":"all"}) or {}
+    matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
+    out=[]
+    for m in matches:
+        st=((m.get("fixture") or {}).get("status") or {})
+        elapsed=st.get("elapsed"); short=(st.get("short") or "").upper()
+        if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES: continue
+        fid=(m.get("fixture") or {}).get("id")
+        m["statistics"]=fetch_match_stats(fid); m["events"]=fetch_match_events(fid)
+        out.append(m)
+    return out
+
+# ───────── Prematch helpers (short) ─────────
+def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
+    js=api_get_with_sleep(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
+    return js.get("response",[]) if isinstance(js,dict) else []
+
+def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
+    js=api_get_with_sleep(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
+    return js.get("response",[]) if isinstance(js,dict) else []
+
+# ───────── League filter ─────────
+_BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
+def _blocked_league(league_obj: dict) -> bool:
+    name=str((league_obj or {}).get("name","")).lower()
+    country=str((league_obj or {}).get("country","")).lower()
+    typ=str((league_obj or {}).get("type","")).lower()
+    txt=f"{country} {name} {typ}"
+    if any(p in txt for p in _BLOCK_PATTERNS): return True
+    deny=[x.strip() for x in os.getenv("LEAGUE_DENY_IDS","").split(",") if x.strip()]
+    lid=str((league_obj or {}).get("id") or "")
+    if lid in deny: return True
+    return False
 
 # ───────── ENHANCEMENT 1: Advanced Ensemble Learning System ─────────
 class AdvancedEnsemblePredictor:
@@ -2038,9 +2014,9 @@ def check_available_models():
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
     """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2 - DEBUG VERSION"""
-     if not _db_ping():
-         log.error("[ENHANCED_PROD] Database unavailable")
-         return (0, 0)
+    if not _db_ping():
+        log.error("[ENHANCED_PROD] Database unavailable")
+        return (0, 0)
     
     # Check available models
     check_available_models()
@@ -3214,11 +3190,7 @@ def _fixture_by_id(mid: int) -> Optional[dict]:
 def _is_final(short: str) -> bool: return (short or "").upper() in {"FT","AET","PEN"}
 
 def backfill_results_for_open_matches(max_rows: int = 200) -> int:
-    """Backfill results with sleep time check"""
-    if sleep_if_required():
-        log.info("[BACKFILL] Skipping during sleep hours (22:00-08:00 Berlin time)")
-        return 0
-    
+    """Backfill results without sleep time check"""
     now_ts=int(time.time()); cutoff=now_ts - BACKFILL_DAYS*24*3600; updated=0
     with db_conn() as c:
         rows=c.execute("""
@@ -3359,11 +3331,7 @@ def save_prematch_snapshot(fx: dict, feat: Dict[str, float]) -> None:
         )
 
 def snapshot_odds_for_fixtures(fixtures: List[int]) -> int:
-    """Odds snapshot with sleep time check"""
-    if sleep_if_required():
-        log.info("[ODDS_SNAPSHOT] Skipping during sleep hours (22:00-08:00 Berlin time)")
-        return 0
-    
+    """Odds snapshot without sleep time check"""
     wrote = 0
     now = int(time.time())
     for fid in fixtures:
@@ -3408,11 +3376,7 @@ def fetch_lineup_and_save(fid: int) -> bool:
     return True
 
 def prematch_scan_save() -> int:
-    """Prematch scan with sleep time check"""
-    if sleep_if_required():
-        log.info("[PREMATCH] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
-        return 0
-    
+    """Prematch scan without sleep time check"""
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
         return 0
@@ -3548,11 +3512,7 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, 
     )
 
 def send_match_of_the_day() -> bool:
-    """Send Match of the Day with sleep time check"""
-    if sleep_if_required():
-        log.info("[MOTD] Skipping during sleep hours (22:00-08:00 Berlin time)")
-        return False
-    
+    """Send Match of the Day without sleep time check"""
     if os.getenv("MOTD_PREDICT", "1") in ("0", "false", "False", "no", "NO"):
         log.info("[MOTD] MOTD disabled by configuration")
         return send_telegram("🏅 MOTD disabled.")
