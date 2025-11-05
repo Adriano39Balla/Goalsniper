@@ -208,13 +208,17 @@ def validate_config():
 
 # ───────── Lines ─────────
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
-    out=[]
+    out = []
     for t in (env_val or "").split(","):
-        t=t.strip()
-        if not t: continue
-        try: out.append(float(t))
-        except: pass
+        t = t.strip()
+        if not t:
+            continue
+        try:
+            out.append(float(t))
+        except ValueError:
+            print(f"Warning: could not parse '{t}' as float")
     return out or default
+
 
 # ───────── Odds/EV controls — UPDATED DEFAULTS ─────────
 MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU", "1.50"))  # was 1.30
@@ -770,39 +774,97 @@ class AdvancedEnsemblePredictor:
             'momentum': 0.10
         }
 
-    def predict_ensemble(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
-        """Enhanced ensemble prediction with confidence scoring"""
-        predictions = []
-        confidences = []
+    def _safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        x = float(x)
+        if math.isnan(x):
+            return default
+        return x
+    except Exception:
+        return default
 
-        for model_type in self.model_types:
-            try:
-                prob, confidence = self._predict_single_model(features, market, minute, model_type)
-                if prob is not None:
-                    predictions.append((model_type, prob, confidence))
-                    confidences.append(confidence)
-            except Exception as e:
-                log.warning(f"[ENSEMBLE] {model_type} model failed: %s", e)
-                continue
+def _clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
 
-        if not predictions:
-            return 0.0, 0.0
+def predict_ensemble(self, features: Dict[str, float], market: str, minute: int) -> Tuple[Optional[float], Optional[float]]:
+    """Enhanced ensemble prediction with confidence scoring."""
+    predictions = []
+    per_model_debug = []
 
-        weighted_sum = 0.0
-        total_weight = 0.0
+    for model_type in self.model_types:
+        try:
+            prob, confidence = self._predict_single_model(features, market, minute, model_type)
+        except Exception:
+            log.exception("[ENSEMBLE] model %s raised during prediction", model_type)
+            continue
 
-        for model_type, prob, confidence in predictions:
-            base_weight = self.ensemble_weights.get(model_type, 0.1)
-            recent_performance = self._get_recent_performance(model_type, market)
-            time_weight = self._calculate_time_weight(minute, model_type)
-            final_weight = base_weight * confidence * recent_performance * time_weight
-            weighted_sum += prob * final_weight
-            total_weight += final_weight
+        prob = _safe_float(prob, None)
+        confidence = _safe_float(confidence, None)
 
-        ensemble_prob = weighted_sum / total_weight if total_weight > 0 else 0.0
-        ensemble_confidence = float(np.mean(confidences)) if confidences else 0.0
+        if prob is None or confidence is None:
+            log.debug("[ENSEMBLE] model %s returned invalid outputs prob=%r conf=%r", model_type, prob, confidence)
+            continue
 
-        return ensemble_prob, ensemble_confidence
+        prob = _clamp(prob, 0.0, 1.0)
+        confidence = _clamp(confidence, 0.0, 1.0)
+
+        predictions.append((model_type, prob, confidence))
+
+    if not predictions:
+        # No usable models — return explicit sentinel so callers can fallback deliberately
+        return None, None
+
+    weighted_sum = 0.0
+    total_weight = 0.0
+    weighted_conf_sum = 0.0
+
+    for model_type, prob, confidence in predictions:
+        base_weight = float(self.ensemble_weights.get(model_type, 0.1))
+
+        recent_performance = _safe_float(self._get_recent_performance(model_type, market), 1.0)
+        recent_performance = _clamp(recent_performance, 0.01, 2.0)
+
+        time_weight = _safe_float(self._calculate_time_weight(minute, model_type), 1.0)
+        time_weight = _clamp(time_weight, 0.01, 2.0)
+
+        # final weight stays positive and not vanishing
+        final_weight = max(1e-4, base_weight) * max(1e-4, confidence) * recent_performance * time_weight
+
+        contribution = prob * final_weight
+        weighted_sum += contribution
+        total_weight += final_weight
+        weighted_conf_sum += confidence * final_weight
+
+        per_model_debug.append({
+            "model": model_type,
+            "prob": prob,
+            "conf": confidence,
+            "base_weight": base_weight,
+            "recent_perf": recent_performance,
+            "time_weight": time_weight,
+            "final_weight": final_weight,
+            "contribution": contribution
+        })
+
+    if total_weight < 1e-6:
+        log.warning("[ENSEMBLE] total_weight too small; per_model_debug=%s", per_model_debug)
+        return None, None
+
+    ensemble_prob = weighted_sum / total_weight
+    ensemble_confidence = weighted_conf_sum / total_weight
+
+    ensemble_prob = _clamp(ensemble_prob, 0.0, 1.0)
+    ensemble_confidence = _clamp(ensemble_confidence, 0.0, 1.0)
+
+    # Helpful debug: log a compact summary at debug level
+    log.debug("[ENSEMBLE] market=%s minute=%s prob=%s conf=%s models=%s",
+              market, minute, ensemble_prob, ensemble_confidence,
+              [{k: v for k, v in d.items() if k in ("model", "prob", "conf", "final_weight")} for d in per_model_debug])
+
+    return ensemble_prob, ensemble_confidence
+
 
     def _predict_single_model(self, features: Dict[str, float], market: str, minute: int, model_type: str) -> Tuple[Optional[float], float]:
         if model_type == 'logistic':
