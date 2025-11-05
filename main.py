@@ -223,7 +223,7 @@ ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))# min distinct
 ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))# cap vs fair (1/p)
 
 # ───────── Markets allow-list (draw suppressed) ─────────
-ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
+ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win", "O/U: 2.5", "O/U: 3.5"}
 def _fmt_line(line: float) -> str: return f"{line}".rstrip("0").rstrip(".")
 for _ln in OU_LINES:
     s=_fmt_line(_ln); ALLOWED_SUGGESTIONS.add(f"Over {s} Goals"); ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
@@ -249,41 +249,6 @@ SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC = ZoneInfo("UTC")
 BERLIN_TZ = ZoneInfo("Europe/Berlin")  # fixed (was Europe/Amsterdam)
-
-# ───────── Sleep Method for API-Football Rate Limiting ─────────
-def is_sleep_time() -> bool:
-    """
-    Check if current time is within sleep hours (22:00-08:00 Berlin time).
-    Returns True if we should sleep (pause API calls), False otherwise.
-    """
-    try:
-        now_berlin = datetime.now(BERLIN_TZ)
-        current_hour = now_berlin.hour
-        # Sleep between 22:00 (10 PM) and 08:00 (8 AM)
-        return current_hour >= 22 or current_hour < 8
-    except Exception as e:
-        log.warning("[SLEEP_TIME] Error checking sleep time: %s", e)
-        return False
-
-def sleep_if_required():
-    """
-    Sleep during specified hours (22:00-08:00 Berlin time) to avoid API rate limiting.
-    This function should be called before making API-Football calls.
-    """
-    if is_sleep_time():
-        log.info("[SLEEP] Sleeping during quiet hours (22:00-08:00 Berlin time) to avoid API rate limiting")
-        return True
-    return False
-
-def api_get_with_sleep(url: str, params: dict, timeout: int = 15):
-    """
-    Wrapper around _api_get that respects sleep hours.
-    Returns None during sleep hours to avoid API calls.
-    """
-    if sleep_if_required():
-        log.debug("[SLEEP] Skipping API call to %s during sleep hours", url)
-        return None
-    return _api_get(url, params, timeout)
 
 # ───────── Negative-result cache to avoid hammering same endpoints ─────────
 NEG_CACHE: Dict[Tuple[str,int], Tuple[float, bool]] = {}
