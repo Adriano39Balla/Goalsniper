@@ -2038,11 +2038,7 @@ def check_available_models():
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
     """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2 - DEBUG VERSION"""
-    if sleep_if_required():
-        log.info("[ENHANCED_PROD] Skipping scan during sleep hours (22:00-08:00 Berlin time)")
-        return (0, 0)
-    
-    if not _db_ping():
+     if not _db_ping():
         log.error("[ENHANCED_PROD] Database unavailable")
         return (0, 0)
     
