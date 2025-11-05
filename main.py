@@ -1433,6 +1433,55 @@ class MarketSpecificPredictor:
         confidence = base_conf * 0.9  # Slightly reduce confidence for complex market
         
         return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
+
+    def validate_btts_prediction(suggestion, current_goals_h, current_goals_a, minute):
+    """Validate if BTTS prediction makes sense given current state"""
+    btts_already_happened = current_goals_h > 0 and current_goals_a > 0
+    
+    if suggestion == "BTTS: Yes" and btts_already_happened:
+        # BTTS already happened - this prediction is invalid
+        log.warning(f"Invalid BTTS: Yes prediction - already happened at {minute}'")
+        return False
+        
+    elif suggestion == "BTTS: No" and btts_already_happened:
+        # BTTS already happened, so "No" is incorrect
+        log.warning(f"Invalid BTTS: No prediction - already happened at {minute}'")
+        return False
+        
+    return True
+
+    def convert_btts_after_occurrence(features, current_goals_h, current_goals_a):
+    """Convert BTTS predictions to additional goals predictions after BTTS occurs"""
+    btts_happened = current_goals_h > 0 and current_goals_a > 0
+    
+    if btts_happened:
+        # Once BTTS happens, switch to predicting MORE goals
+        return [
+            ("Additional Goals", "Over 0.5 Additional Goals", features.get("additional_goals_prob", 0.5)),
+            ("Additional Goals", "Over 1.5 Additional Goals", features.get("additional_goals_prob", 0.3))
+        ]
+    
+    return None
+
+    def get_correct_btts_interpretation(minute, goals_h, goals_a):
+    """Determine what BTTS should mean at this game state"""
+    btts_current = goals_h > 0 and goals_a > 0
+    
+    if minute < 80 and not btts_current:
+        # Normal case: predict if both teams will score
+        return "BTTS: Yes", "BTTS: No"
+    
+    elif minute < 80 and btts_current:
+        # BTTS happened early: predict if MORE goals will come
+        return "Additional Goals: Yes", "Additional Goals: No"
+    
+    elif minute >= 80 and not btts_current:
+        # Late game: predict if BTTS will happen in remaining time
+        return "BTTS in Remaining Time: Yes", "BTTS in Remaining Time: No"
+    
+    else:
+        # BTTS already happened late game - market should settle
+        return None, None
     
     def _predict_ou_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
         """Advanced Over/Under prediction with proper model loading"""
@@ -2013,7 +2062,7 @@ def check_available_models():
 
 # ───────── ENHANCEMENT 5: Enhanced Production Scan with AI Systems ─────────
 def enhanced_production_scan() -> Tuple[int, int]:
-    """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2 - DEBUG VERSION"""
+    """Enhanced scan with fixed market prediction and proper validation"""
     if not _db_ping():
         log.error("[ENHANCED_PROD] Database unavailable")
         return (0, 0)
@@ -2057,6 +2106,9 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 # Extract advanced features
                 feat = feature_engineer.extract_advanced_features(m)
                 minute = int(feat.get("minute", 0))
+                current_goals_h = int(feat.get("goals_h", 0))
+                current_goals_a = int(feat.get("goals_a", 0))
+                btts_happened = current_goals_h > 0 and current_goals_a > 0
                 
                 # Validation checks
                 if not stats_coverage_ok(feat, minute):
@@ -2087,22 +2139,27 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 candidates: List[Tuple[str, str, float, float]] = []
 
                 # PREDICT ALL MARKETS: BTTS, OU, 1X2
-                log.info(f"[MARKET_SCAN] Processing {home} vs {away} at minute {minute}")
+                log.info(f"[MARKET_SCAN] Processing {home} vs {away} at minute {minute} (Score: {score})")
                 
-                # 1. BTTS Market
-                btts_prob, btts_confidence = market_predictor.predict_for_market(feat, "BTTS", minute)
-                if btts_prob > 0 and btts_confidence > 0.5:
-                    btts_predictions = {
-                        "BTTS: Yes": btts_prob,
-                        "BTTS: No": 1 - btts_prob
-                    }
-                    adjusted_btts = game_state_analyzer.adjust_predictions(btts_predictions, game_state)
-                    
-                    for suggestion, adj_prob in adjusted_btts.items():
-                        threshold = _get_market_threshold("BTTS")
-                        if adj_prob * 100 >= threshold:
-                            candidates.append(("BTTS", suggestion, adj_prob, btts_confidence))
-                            log.info(f"[BTTS_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {btts_confidence:.3f})")
+                # 1. BTTS Market - WITH VALIDATION
+                if not btts_happened or minute < 5:  # Only predict BTTS if it hasn't happened yet
+                    btts_prob, btts_confidence = market_predictor.predict_for_market(feat, "BTTS", minute)
+                    if btts_prob > 0 and btts_confidence > 0.5:
+                        btts_predictions = {
+                            "BTTS: Yes": btts_prob,
+                            "BTTS: No": 1 - btts_prob
+                        }
+                        adjusted_btts = game_state_analyzer.adjust_predictions(btts_predictions, game_state)
+                        
+                        for suggestion, adj_prob in adjusted_btts.items():
+                            # Apply confidence caps for BTTS
+                            capped_confidence = apply_confidence_caps(btts_confidence, minute, "BTTS")
+                            threshold = _get_market_threshold("BTTS")
+                            if adj_prob * 100 >= threshold:
+                                candidates.append(("BTTS", suggestion, adj_prob, capped_confidence))
+                                log.info(f"[BTTS_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {capped_confidence:.3f})")
+                else:
+                    log.info(f"[BTTS_SKIP] BTTS already happened at {minute}', skipping BTTS market")
 
                 # 2. Over/Under Markets
                 for line in OU_LINES:
@@ -2117,10 +2174,12 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         adjusted_ou = game_state_analyzer.adjust_predictions(ou_predictions, game_state)
                         
                         for suggestion, adj_prob in adjusted_ou.items():
+                            # Apply confidence caps for OU
+                            capped_confidence = apply_confidence_caps(ou_confidence, minute, "OU")
                             threshold = _get_market_threshold(f"Over/Under {_fmt_line(line)}")
                             if adj_prob * 100 >= threshold:
-                                candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, ou_confidence))
-                                log.info(f"[OU_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {ou_confidence:.3f})")
+                                candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, capped_confidence))
+                                log.info(f"[OU_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {capped_confidence:.3f})")
 
                 # 3. 1X2 Market (Draw suppressed)
                 try:
@@ -2140,19 +2199,35 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         adjusted_1x2 = game_state_analyzer.adjust_predictions(predictions_1X2, game_state)
                         
                         for suggestion, adj_prob in adjusted_1x2.items():
+                            # Apply confidence caps for 1X2
+                            capped_confidence = apply_confidence_caps(confidence_1x2, minute, "1X2")
                             threshold = _get_market_threshold("1X2")
                             if adj_prob * 100 >= threshold:
-                                candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
-                                log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
+                                candidates.append(("1X2", suggestion, adj_prob, capped_confidence))
+                                log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {capped_confidence:.3f})")
                 except Exception as e:
                     log.warning(f"[1X2_PREDICT] Failed for {home} vs {away}: {e}")
+
+                # 4. Additional Goals Market (if BTTS happened early)
+                if btts_happened and minute < 70:
+                    additional_candidates = predict_additional_goals(feat, minute, current_goals_h, current_goals_a)
+                    if additional_candidates:
+                        candidates.extend(additional_candidates)
+                        log.info(f"[ADDITIONAL_GOALS] Added {len(additional_candidates)} additional goals candidates")
 
                 if not candidates:
                     log.info(f"[NO_CANDIDATES] No qualified tips for {home} vs {away}")
                     continue
 
+                # Apply confidence sanity checks to all candidates
+                candidates = apply_confidence_sanity_checks(candidates, minute, current_goals_h, current_goals_a)
+                
+                if not candidates:
+                    log.info(f"[NO_SANE_CANDIDATES] All candidates filtered out by sanity checks for {home} vs {away}")
+                    continue
+
                 # DEBUG: Log candidates found
-                log.info(f"[CANDIDATES_FOUND] {home} vs {away}: {len(candidates)} candidates")
+                log.info(f"[CANDIDATES_FOUND] {home} vs {away}: {len(candidates)} candidates after sanity checks")
                 for market, suggestion, prob, conf in candidates:
                     debug_tip_pipeline(f"{home} vs {away}", f"{market} - {suggestion}", prob, conf, False)
 
@@ -2211,6 +2286,17 @@ def enhanced_production_scan() -> Tuple[int, int]:
                         tgt = "Over" if sug.startswith("Over") else "Under"
                         if tgt in d:
                             odds, book = d[tgt]["odds"], d[tgt]["book"]
+                    elif mk == "Additional Goals":
+                        # Map additional goals to standard OU markets
+                        ln = _parse_ou_line_from_suggestion(sug.replace("Additional ", ""))
+                        if ln is not None:
+                            total_current = current_goals_h + current_goals_a
+                            target_total = total_current + ln
+                            ou_key = f"OU_{_fmt_line(target_total)}"
+                            d = odds_map.get(ou_key, {})
+                            tgt = "Over" if sug.startswith("Additional Over") else "Under"
+                            if tgt in d:
+                                odds, book = d[tgt]["odds"], d[tgt]["book"]
 
                     # Price gate and EV calculation
                     pass_odds, odds2, book2, _ = _price_gate(mk, sug, fid)
@@ -2325,6 +2411,120 @@ def enhanced_production_scan() -> Tuple[int, int]:
         
     _metric_inc("tips_generated_total", n=saved)
     return saved, live_seen
+
+# =============================================================================
+# NEW VALIDATION FUNCTIONS
+# =============================================================================
+
+def apply_confidence_caps(raw_confidence: float, minute: int, market: str) -> float:
+    """Apply confidence caps based on minute and market"""
+    # Base caps by market
+    market_caps = {
+        'BTTS': 88.0,
+        'OU': 85.0, 
+        '1X2': 82.0,
+        'Additional Goals': 80.0
+    }
+    
+    max_cap = market_caps.get(market, 80.0)
+    
+    # Time-based scaling - confidence grows with game time
+    if minute < 25:
+        time_factor = 0.6 + (minute * 0.016)  # 60% at min 0, 100% at min 25
+    elif minute < 60:
+        time_factor = 1.0
+    else:
+        time_factor = 1.0 + ((minute - 60) * 0.005)  # Slight increase late game
+    
+    capped_confidence = min(raw_confidence * 100, max_cap * time_factor)
+    
+    # Early game additional penalty
+    if minute < 20:
+        capped_confidence *= 0.8
+    
+    return capped_confidence / 100.0  # Return as probability
+
+def apply_confidence_sanity_checks(candidates: List[Tuple[str, str, float, float]], 
+                                 minute: int, goals_h: int, goals_a: int) -> List[Tuple[str, str, float, float]]:
+    """Apply sanity checks to filter invalid predictions"""
+    sane_candidates = []
+    btts_happened = goals_h > 0 and goals_a > 0
+    
+    for market, suggestion, prob, confidence in candidates:
+        # Skip invalid BTTS predictions
+        if market == "BTTS":
+            if btts_happened:
+                log.warning(f"[SANITY_CHECK] Skipping BTTS prediction - already happened at {minute}'")
+                continue
+                
+        # Skip extremely high confidence early predictions
+        if minute < 25 and confidence > 0.85:
+            log.warning(f"[SANITY_CHECK] Skipping overconfident early prediction: {confidence:.3f} at {minute}'")
+            continue
+            
+        # Skip predictions that don't make logical sense
+        if not is_prediction_logical(market, suggestion, minute, goals_h, goals_a):
+            log.warning(f"[SANITY_CHECK] Skipping illogical prediction: {market} - {suggestion}")
+            continue
+            
+        sane_candidates.append((market, suggestion, prob, confidence))
+    
+    return sane_candidates
+
+def is_prediction_logical(market: str, suggestion: str, minute: int, goals_h: int, goals_a: int) -> bool:
+    """Check if prediction makes logical sense"""
+    total_goals = goals_h + goals_a
+    
+    # BTTS: No when it's already 2-2 (illogical)
+    if market == "BTTS" and suggestion == "BTTS: No" and goals_h >= 2 and goals_a >= 2:
+        return False
+        
+    # Under predictions when many goals already scored
+    if market.startswith("Over/Under") and suggestion.startswith("Under"):
+        line = _parse_ou_line_from_suggestion(suggestion)
+        if line and total_goals >= line:
+            return False  # Can't go under if already exceeded
+            
+    # Additional sanity checks
+    if minute > 80 and confidence > 0.9:
+        # Very high confidence late in game is suspicious
+        return False
+        
+    return True
+
+def predict_additional_goals(features: Dict[str, float], minute: int, goals_h: int, goals_a: int) -> List[Tuple[str, str, float, float]]:
+    """Predict additional goals when BTTS happens early"""
+    total_goals = goals_h + goals_a
+    candidates = []
+    
+    # Only predict if BTTS happened and there's reasonable time left
+    if minute > 70 or total_goals < 2:
+        return candidates
+    
+    try:
+        # Use existing OU models to predict additional goals
+        for line in [0.5, 1.5]:
+            market_key = f"OU_{_fmt_line(total_goals + line)}"
+            prob, confidence = market_predictor.predict_for_market(features, market_key, minute)
+            
+            if prob > 0 and confidence > 0.4:
+                # Adjust probability for additional goals context
+                adjusted_prob = prob * 0.9  # Slightly reduce probability
+                capped_confidence = apply_confidence_caps(confidence, minute, "Additional Goals")
+                
+                candidates.append((
+                    "Additional Goals",
+                    f"Additional Over {_fmt_line(line)} Goals",
+                    adjusted_prob,
+                    capped_confidence
+                ))
+                
+                log.info(f"[ADD_GOALS_CANDIDATE] Additional Over {line}: {adjusted_prob:.3f}")
+                
+    except Exception as e:
+        log.warning(f"[ADD_GOALS_PREDICT] Failed: {e}")
+    
+    return candidates
 
 def _format_enhanced_tip_message(home, away, league, minute, score, suggestion, 
                                prob_pct, feat, odds=None, book=None, ev_pct=None, confidence=None):
