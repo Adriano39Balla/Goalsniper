@@ -208,17 +208,13 @@ def validate_config():
 
 # ───────── Lines ─────────
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
-    out = []
+    out=[]
     for t in (env_val or "").split(","):
-        t = t.strip()
-        if not t:
-            continue
-        try:
-            out.append(float(t))
-        except ValueError:
-            print(f"Warning: could not parse '{t}' as float")
+        t=t.strip()
+        if not t: continue
+        try: out.append(float(t))
+        except: pass
     return out or default
-
 
 # ───────── Odds/EV controls — UPDATED DEFAULTS ─────────
 MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU", "1.50"))  # was 1.30
@@ -774,97 +770,39 @@ class AdvancedEnsemblePredictor:
             'momentum': 0.10
         }
 
-    def _safe_float(x, default=None):
-        try:
-            if x is None:
-                return default
-            x = float(x)
-            if math.isnan(x):
-                return default
-            return x
-        except Exception:
-            return default
+    def predict_ensemble(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
+        """Enhanced ensemble prediction with confidence scoring"""
+        predictions = []
+        confidences = []
 
-def _clamp(x, lo=0.0, hi=1.0):
-    return max(lo, min(hi, x))
+        for model_type in self.model_types:
+            try:
+                prob, confidence = self._predict_single_model(features, market, minute, model_type)
+                if prob is not None:
+                    predictions.append((model_type, prob, confidence))
+                    confidences.append(confidence)
+            except Exception as e:
+                log.warning(f"[ENSEMBLE] {model_type} model failed: %s", e)
+                continue
 
-def predict_ensemble(self, features: Dict[str, float], market: str, minute: int) -> Tuple[Optional[float], Optional[float]]:
-    """Enhanced ensemble prediction with confidence scoring."""
-    predictions = []
-    per_model_debug = []
+        if not predictions:
+            return 0.0, 0.0
 
-    for model_type in self.model_types:
-        try:
-            prob, confidence = self._predict_single_model(features, market, minute, model_type)
-        except Exception:
-            log.exception("[ENSEMBLE] model %s raised during prediction", model_type)
-            continue
+        weighted_sum = 0.0
+        total_weight = 0.0
 
-        prob = _safe_float(prob, None)
-        confidence = _safe_float(confidence, None)
+        for model_type, prob, confidence in predictions:
+            base_weight = self.ensemble_weights.get(model_type, 0.1)
+            recent_performance = self._get_recent_performance(model_type, market)
+            time_weight = self._calculate_time_weight(minute, model_type)
+            final_weight = base_weight * confidence * recent_performance * time_weight
+            weighted_sum += prob * final_weight
+            total_weight += final_weight
 
-        if prob is None or confidence is None:
-            log.debug("[ENSEMBLE] model %s returned invalid outputs prob=%r conf=%r", model_type, prob, confidence)
-            continue
+        ensemble_prob = weighted_sum / total_weight if total_weight > 0 else 0.0
+        ensemble_confidence = float(np.mean(confidences)) if confidences else 0.0
 
-        prob = _clamp(prob, 0.0, 1.0)
-        confidence = _clamp(confidence, 0.0, 1.0)
-
-        predictions.append((model_type, prob, confidence))
-
-    if not predictions:
-        # No usable models — return explicit sentinel so callers can fallback deliberately
-        return None, None
-
-    weighted_sum = 0.0
-    total_weight = 0.0
-    weighted_conf_sum = 0.0
-
-    for model_type, prob, confidence in predictions:
-        base_weight = float(self.ensemble_weights.get(model_type, 0.1))
-
-        recent_performance = _safe_float(self._get_recent_performance(model_type, market), 1.0)
-        recent_performance = _clamp(recent_performance, 0.01, 2.0)
-
-        time_weight = _safe_float(self._calculate_time_weight(minute, model_type), 1.0)
-        time_weight = _clamp(time_weight, 0.01, 2.0)
-
-        # final weight stays positive and not vanishing
-        final_weight = max(1e-4, base_weight) * max(1e-4, confidence) * recent_performance * time_weight
-
-        contribution = prob * final_weight
-        weighted_sum += contribution
-        total_weight += final_weight
-        weighted_conf_sum += confidence * final_weight
-
-        per_model_debug.append({
-            "model": model_type,
-            "prob": prob,
-            "conf": confidence,
-            "base_weight": base_weight,
-            "recent_perf": recent_performance,
-            "time_weight": time_weight,
-            "final_weight": final_weight,
-            "contribution": contribution
-        })
-
-    if total_weight < 1e-6:
-        log.warning("[ENSEMBLE] total_weight too small; per_model_debug=%s", per_model_debug)
-        return None, None
-
-    ensemble_prob = weighted_sum / total_weight
-    ensemble_confidence = weighted_conf_sum / total_weight
-
-    ensemble_prob = _clamp(ensemble_prob, 0.0, 1.0)
-    ensemble_confidence = _clamp(ensemble_confidence, 0.0, 1.0)
-
-    # Helpful debug: log a compact summary at debug level
-    log.debug("[ENSEMBLE] market=%s minute=%s prob=%s conf=%s models=%s",
-              market, minute, ensemble_prob, ensemble_confidence,
-              [{k: v for k, v in d.items() if k in ("model", "prob", "conf", "final_weight")} for d in per_model_debug])
-
-    return ensemble_prob, ensemble_confidence
-
+        return ensemble_prob, ensemble_confidence
 
     def _predict_single_model(self, features: Dict[str, float], market: str, minute: int, model_type: str) -> Tuple[Optional[float], float]:
         if model_type == 'logistic':
@@ -2247,42 +2185,6 @@ class TestHelpers:
             
         return passed == total
 
-# Initialize test helpers
-test_helpers = TestHelpers()
-
-# TEMPORARY DEBUGGING - Add this function and call it
-def debug_tip_selection():
-    """Temporarily bypass all filters to test if tips are generated"""
-    log.info("[DEBUG] Running tip selection with filters bypassed")
-    
-    # Set temporary permissive settings
-    original_conf_threshold = CONF_THRESHOLD
-    original_edge_bps = EDGE_MIN_BPS
-    original_odds_quality = ODDS_QUALITY_MIN
-    
-    try:
-        # Temporarily relax thresholds
-        os.environ["CONF_THRESHOLD"] = "50"
-        os.environ["EDGE_MIN_BPS"] = "100" 
-        os.environ["ODDS_QUALITY_MIN"] = "0.05"
-        
-        # Run scan
-        saved, seen = production_scan()
-        log.info(f"[DEBUG] Scan result: {saved} tips saved from {seen} matches")
-        
-    finally:
-        # Restore original settings
-        os.environ["CONF_THRESHOLD"] = str(original_conf_threshold)
-        os.environ["EDGE_MIN_BPS"] = str(original_edge_bps)
-        os.environ["ODDS_QUALITY_MIN"] = str(original_odds_quality)
-
-# Call this from an admin endpoint for testing
-@app.route("/admin/debug-tips", methods=["GET"])
-def http_debug_tips():
-    _require_admin()
-    debug_tip_selection()
-    return jsonify({"ok": True, "message": "Debug scan completed"})
-
 # ───────── Updated Functions with Enhanced Error Handling ─────────
 
 def stats_coverage_ok(feat: Dict[str, float], minute: int) -> bool:
@@ -2530,10 +2432,14 @@ class GameStateAnalyzer:
         return adjusted
 
 class SmartOddsAnalyzer:
-    """Odds quality scoring to avoid stale/prematch leakage."""
-    def __init__(self):
-        # Keep threshold configurable via env; default matches hardened 0.35
-        self.odds_quality_threshold = float(os.getenv("ODDS_QUALITY_MIN", "0.35"))
+    """Odds quality scoring to avoid stale/prematch leakage.
+    Why: allow injecting threshold so debug runs can relax it reliably.
+    """
+    def __init__(self, threshold: float | None = None):
+        if threshold is None:
+            # fallback to env, keep legacy default
+            threshold = float(os.getenv("ODDS_QUALITY_MIN", "0.35"))
+        self.odds_quality_threshold = float(threshold)
 
     def analyze_odds_quality(
         self,
@@ -2573,11 +2479,9 @@ class SmartOddsAnalyzer:
         if not valid_odds:
             return 0.0
 
-        # Overround -> lower is better
         overround = max(0.0, total_implied - 1.0)
         overround_quality = max(0.0, 1.0 - overround * 3.0)
 
-        # Model consistency: if model shows edge, bump quality (but cap)
         model_quality = 1.0
         if prob_hint is not None and prob_hint > 0:
             try:
@@ -2590,22 +2494,76 @@ class SmartOddsAnalyzer:
         return (overround_quality + model_quality) / 2.0
 
     def _resolve_hint_for_specific(self, hints: dict[str, float], market_key: str) -> float | None:
+        """
+        Accept multiple synonyms:
+        - BTTS / BTTS: Yes
+        - 1X2 / Home Win / Away Win  (use max(home, away) as broad market hint)
+        - OU_* / Over/Under X / Over X Goals
+        Why: original code often passed {market: p}; this maps robustly.
+        """
         if not hints:
             return None
-        if market_key == "BTTS":
-            return hints.get("BTTS: Yes")
-        if market_key == "1X2":
-            # caller decides side; use the larger side hint for basic quality
-            hw = hints.get("Home Win") or 0.0
-            aw = hints.get("Away Win") or 0.0
-            return max(hw, aw) or None
-        if market_key.startswith("OU_"):
+
+        mk = (market_key or "").strip()
+
+        if mk == "BTTS":
+            return (
+                hints.get("BTTS: Yes")
+                or hints.get("BTTS")
+                or hints.get("btts_yes")
+                or hints.get("BTTS:Yes")
+            )
+
+        if mk == "1X2":
+            hw = float(hints.get("Home Win", 0.0))
+            aw = float(hints.get("Away Win", 0.0))
+            broad = float(hints.get("1X2", 0.0))
+            return max(hw, aw, broad) or None
+
+        if mk.startswith("OU_"):
             try:
-                line_txt = market_key.split("_", 1)[1]
-                return hints.get(f"Over {line_txt} Goals")
+                line_txt = mk.split("_", 1)[1]
             except Exception:
-                return None
+                line_txt = None
+            if line_txt:
+                return (
+                    hints.get(f"Over {line_txt} Goals")
+                    or hints.get(f"Over/Under {line_txt}")
+                    or hints.get(f"OU_{line_txt}")
+                    or hints.get("OU")
+                )
+
+        # Also handle "Over/Under X" grouped markets
+        if mk.startswith("Over/Under"):
+            try:
+                line_txt = mk.split(" ", 1)[1]
+            except Exception:
+                line_txt = None
+            if line_txt:
+                return (
+                    hints.get(f"Over {line_txt} Goals")
+                    or hints.get(f"OU_{line_txt}")
+                    or hints.get(mk)
+                )
         return None
+
+
+def _count_shots_since(events: List[dict], current_minute: int, window: int) -> int:
+    """
+    More tolerant to API-Football event labels for shots.
+    Why: previous version assumed specific strings that may not appear.
+    """
+    cutoff = current_minute - window
+    shots = 0
+    for ev in events or []:
+        minute = int(((ev.get('time') or {}).get('elapsed') or 0))
+        if minute < cutoff:
+            continue
+        et = (ev.get('type') or "").strip().lower()
+        ed = (ev.get('detail') or "").strip().lower()
+        if et == 'shot' or 'shot' in et or 'on target' in ed or 'off target' in ed or 'saved' in ed or 'blocked' in ed:
+            shots += 1
+    return shots
 
 # ───────── Market cutoff helpers (minutes) ─────────
 def _parse_market_cutoffs(s: str) -> dict[str, int]:
@@ -2953,6 +2911,7 @@ def check_prediction_quality():
 def enhanced_production_scan() -> Tuple[int, int]:
     """
     Enhanced scan with per-gate debug logging (DEBUG_SELECTION_LOG=1).
+    Patched: odds-quality gate now uses side-aligned hints and an injectable threshold.
     """
     try:
         if not _db_ping():
@@ -3111,13 +3070,27 @@ def enhanced_production_scan() -> Tuple[int, int]:
                             _dbg("suggestion_not_allowed", suggestion=sug)
                             continue
 
-                        # Per-market odds quality
+                        # ── PATCHED: side-aligned odds-quality hint + injectable threshold (why: avoid false blocks)
                         okey = _odds_key_for_market(mk, sug)
-                        oa = SmartOddsAnalyzer()
-                        oq = oa.analyze_odds_quality(odds_map, {mk: prob}, target_market_key=okey)
+                        hint_map: dict[str, float] = {}
+                        if mk == "BTTS":
+                            yes_prob = prob if sug.endswith("Yes") else (1.0 - prob)
+                            hint_map["BTTS: Yes"] = float(yes_prob)
+                        elif mk == "1X2":
+                            hint_map[sug] = float(prob)  # Home Win or Away Win
+                        elif mk.startswith("Over/Under"):
+                            ln = _parse_ou_line_from_suggestion(sug)
+                            if ln is not None:
+                                over_key = f"Over {_fmt_line(ln)} Goals"
+                                over_prob = prob if sug.startswith("Over") else (1.0 - prob)
+                                hint_map[over_key] = float(over_prob)
+
+                        oa = SmartOddsAnalyzer(threshold=ODDS_QUALITY_MIN)
+                        oq = oa.analyze_odds_quality(odds_map, hint_map, target_market_key=okey)
                         if oq < oa.odds_quality_threshold:
                             _dbg("odds_quality_block", market=mk, sug=sug, quality=round(oq,3), need=oa.odds_quality_threshold)
                             continue
+                        # ── end PATCHED
 
                         # Odds lookup + price gate
                         odds = None; book = None
@@ -3236,10 +3209,6 @@ def enhanced_production_scan() -> Tuple[int, int]:
     except Exception as e:
         log.exception("[ENHANCED_PROD] Global scan error: %s", e)
         return (0, 0)
-
-# ✅ Alias for scheduler & admin endpoint
-def production_scan() -> Tuple[int, int]:
-    return enhanced_production_scan()
 
 # ───────── Model loader (with validation) ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
