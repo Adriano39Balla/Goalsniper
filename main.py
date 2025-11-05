@@ -1435,20 +1435,22 @@ class MarketSpecificPredictor:
         return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
 
     def validate_btts_prediction(suggestion, current_goals_h, current_goals_a, minute):
-    """Validate if BTTS prediction makes sense given current state"""
-    btts_already_happened = current_goals_h > 0 and current_goals_a > 0
-    
-    if suggestion == "BTTS: Yes" and btts_already_happened:
-        # BTTS already happened - this prediction is invalid
-        log.warning(f"Invalid BTTS: Yes prediction - already happened at {minute}'")
-        return False
-        
-    elif suggestion == "BTTS: No" and btts_already_happened:
-        # BTTS already happened, so "No" is incorrect
-        log.warning(f"Invalid BTTS: No prediction - already happened at {minute}'")
-        return False
-        
-    return True
+        """Validate if BTTS prediction makes sense given current state"""
+
+        btts_already_happened = current_goals_h > 0 and current_goals_a > 0
+
+        if btts_already_happened:
+            return suggestion == "BTTS: Yes"
+
+        if suggestion == "BTTS: Yes":
+            if minute >= 80 and (current_goals_h == 0 or current_goals_a == 0):
+                return False
+
+        if suggestion == "BTTS: No":
+            if minute >= 80 and current_goals_h == 0 and current_goals_a == 0:
+                return True
+
+        return True
 
     def convert_btts_after_occurrence(features, current_goals_h, current_goals_a):
     """Convert BTTS predictions to additional goals predictions after BTTS occurs"""
