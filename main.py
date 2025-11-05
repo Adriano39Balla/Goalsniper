@@ -166,7 +166,7 @@ MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
 STALE_GUARD_ENABLE = os.getenv("STALE_GUARD_ENABLE", "1") not in ("0","false","False","no","NO")
 STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
-MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88"))
+MARKET_CUTOFFS_RAW = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
 TIP_MAX_MINUTE_ENV = os.getenv("TIP_MAX_MINUTE", "")
 
 if not ADMIN_API_KEY:
