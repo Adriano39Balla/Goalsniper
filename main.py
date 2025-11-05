@@ -2039,8 +2039,8 @@ def check_available_models():
 def enhanced_production_scan() -> Tuple[int, int]:
     """Enhanced scan with fixed market prediction for BTTS, OU, and 1X2 - DEBUG VERSION"""
      if not _db_ping():
-        log.error("[ENHANCED_PROD] Database unavailable")
-        return (0, 0)
+         log.error("[ENHANCED_PROD] Database unavailable")
+         return (0, 0)
     
     # Check available models
     check_available_models()
