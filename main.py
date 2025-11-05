@@ -775,15 +775,15 @@ class AdvancedEnsemblePredictor:
         }
 
     def _safe_float(x, default=None):
-    try:
-        if x is None:
+        try:
+            if x is None:
+                return default
+            x = float(x)
+            if math.isnan(x):
+                return default
+            return x
+        except Exception:
             return default
-        x = float(x)
-        if math.isnan(x):
-            return default
-        return x
-    except Exception:
-        return default
 
 def _clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
