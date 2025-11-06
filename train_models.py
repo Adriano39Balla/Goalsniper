@@ -62,11 +62,12 @@ class PooledConn:
         self.conn=self.pool.getconn(); self.conn.autocommit=True
         self.cur=self.conn.cursor(); return self
     def __exit__(self, et, ev, tb):
-        try: self.cur and self.cur.close()
+        try:
+            if self.cur: self.cur.close()
         finally:
             if self.conn:
                 try: self.pool.putconn(self.conn)
-                except: 
+                except:
                     try: self.conn.close()
                     except: pass
     def execute(self, sql, params=()):
@@ -74,11 +75,17 @@ class PooledConn:
             raise Exception("DB op refused: shutdown")
         self.cur.execute(sql, params or ()); return self.cur
     def fetchone_safe(self):
-        try: row=self.cur.fetchone(); return None if row is None or len(row)==0 else row
-        except Exception as e: log.warning("[TRAIN_DB] fetchone_safe: %s", e); return None
+        try:
+            row=self.cur.fetchone()
+            return None if row is None or len(row)==0 else row
+        except Exception as e:
+            log.warning("[TRAIN_DB] fetchone_safe: %s", e); return None
     def fetchall_safe(self):
-        try: rows=self.cur.fetchall(); return rows if rows else []
-        except Exception as e: log.warning("[TRAIN_DB] fetchall_safe: %s", e); return []
+        try:
+            rows=self.cur.fetchall()
+            return rows if rows else []
+        except Exception as e:
+            log.warning("[TRAIN_DB] fetchall_safe: %s", e); return []
 
 def db_conn(): 
     if not POOL: _init_pool()
@@ -86,7 +93,8 @@ def db_conn():
 
 def _db_ping()->bool:
     try:
-        with db_conn() as c: c.execute("SELECT 1")
+        with db_conn() as c:
+            c.execute("SELECT 1")
         return True
     except Exception as e:
         log.error("[TRAIN_DB] ping failed: %s", e); return False
@@ -97,7 +105,8 @@ def _db_ping()->bool:
 def get_setting(key: str) -> Optional[str]:
     try:
         with db_conn() as c:
-            row = c.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone_safe()
+            c.execute("SELECT value FROM settings WHERE key=%s", (key,))
+            row = c.fetchone_safe()  # FIX: call on wrapper, not cursor
             return row[0] if row else None
     except Exception as e:
         log.error("get_setting(%s) failed: %s", key, e); return None
@@ -142,7 +151,7 @@ def extract_basic_features(m: dict) -> Dict[str,float]:
         pos_h = _pos_pct(sh.get("Ball Possession", 0)); pos_a = _pos_pct(sa.get("Ball Possession", 0))
         xg_h = _num(sh.get("Expected Goals", 0)); xg_a = _num(sa.get("Expected Goals", 0))
         if xg_h == 0 and xg_a == 0:
-            xg_h = sot_h * 0.3; xg_a = sot_a * 0.3  # fallback
+            xg_h = sot_h * 0.3; xg_a = sot_a * 0.3
         red_h = red_a = yellow_h = yellow_a = 0
         for ev in (m.get("events") or []):
             if (ev.get("type", "").lower() == "card"):
@@ -194,7 +203,6 @@ def _api_get(url: str, params: dict) -> Optional[dict]:
         return None
 
 def backfill_results_for_snapshot_ids(match_ids: List[int]) -> int:
-    """Optional: ensure match_results rows exist for given ids using API-Football."""
     if not API_KEY or not match_ids: return 0
     written = 0
     with db_conn() as c:
@@ -222,14 +230,12 @@ def backfill_results_for_snapshot_ids(match_ids: List[int]) -> int:
     return written
 
 def load_training_rows(days: int = 60, min_minute: int = 20) -> List[Dict[str, Any]]:
-    """Load snapshot features + final results (graded) for in-play training."""
     if not _db_ping():
         log.error("DB unavailable"); return []
 
     cutoff_ts = int((datetime.now() - timedelta(days=days)).timestamp())
     with db_conn() as c:
-        # First pass: see what we could grade
-        rows = c.execute(
+        c.execute(
             """
             SELECT s.match_id, s.created_ts, s.payload,
                    r.final_goals_h, r.final_goals_a, r.btts_yes
@@ -240,15 +246,15 @@ def load_training_rows(days: int = 60, min_minute: int = 20) -> List[Dict[str, A
             LIMIT 20000
             """,
             (cutoff_ts,)
-        ).fetchall_safe()
+        )
+        rows = c.fetchall_safe()  # FIX
 
-    missing = sorted({mid for (mid, *_rest) in rows if _rest[2] is None})  # r.final_goals_h is None
+    missing = sorted({mid for (mid, *_rest) in rows if _rest[2] is None})
     if missing and API_KEY:
         backfill_results_for_snapshot_ids(missing)
 
-    # Re-query with updated results (cheap)
     with db_conn() as c2:
-        rows = c2.execute(
+        c2.execute(
             """
             SELECT s.match_id, s.created_ts, s.payload,
                    r.final_goals_h, r.final_goals_a, r.btts_yes
@@ -259,7 +265,8 @@ def load_training_rows(days: int = 60, min_minute: int = 20) -> List[Dict[str, A
             LIMIT 20000
             """,
             (cutoff_ts,)
-        ).fetchall_safe()
+        )
+        rows = c2.fetchall_safe()  # FIX
 
     out: List[Dict[str, Any]] = []
     kept, skipped_minute, skipped_quality, parse_errors = 0,0,0,0
@@ -282,7 +289,7 @@ def load_training_rows(days: int = 60, min_minute: int = 20) -> List[Dict[str, A
                 "btts_yes": int(btts)
             })
             kept += 1
-        except Exception as e:
+        except Exception:
             parse_errors += 1
             continue
 
@@ -302,7 +309,7 @@ def make_label(row: Dict[str, Any], target: str) -> Optional[int]:
             line = float(target.split("_",1)[1])
         except Exception:
             return None
-        return 1 if (total > line) else 0  # push on line is vanishingly rare; treat as 0
+        return 1 if (total > line) else 0
     if target == "1X2_HOME":
         return 1 if gh > ga else 0
     if target == "1X2_AWAY":
@@ -322,7 +329,6 @@ def build_dataset(rows: List[Dict[str,Any]], target: str) -> Tuple[np.ndarray, n
         y_list.append(int(y))
     if not X_list: return np.zeros((0,0)), np.zeros((0,)), []
 
-    # keep only features with variance
     names = sorted({k for d in X_list for k in d.keys()})
     vals = np.array([[float(d.get(n,0.0)) for n in names] for d in X_list], dtype=float)
     vari = np.var(vals, axis=0)
@@ -337,7 +343,6 @@ def build_dataset(rows: List[Dict[str,Any]], target: str) -> Tuple[np.ndarray, n
 def train_logreg_balanced(X: np.ndarray, y: np.ndarray) -> Tuple[LogisticRegression, Dict[str,float]]:
     model = LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced')
     model.fit(X, y)
-    # simple metrics
     y_pred = model.predict(X)
     acc = float((y_pred == y).mean())
     pos = int(y.sum()); n = int(len(y))
@@ -353,7 +358,6 @@ def to_model_blob(model: LogisticRegression, feature_names: List[str], metrics: 
         "train_acc": metrics.get("acc_train", 0.0),
         "samples": int(metrics.get("n", 0)),
         "positive_samples": int(metrics.get("pos", 0)),
-        # Keep calibration identity; main.py supports a,b
         "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0},
         "created_ts": int(time.time())
     }
@@ -373,11 +377,6 @@ def simple_tune_thresholds(test_scores: Dict[str, float], default_thr: float) ->
 # Main training entry
 # ──────────────────────────────────────────────────────────────────────────────
 def train_models(days: int = 60, min_minute: int = 20) -> Dict[str, Any]:
-    """
-    Trains in-play models from tip_snapshots graded by match_results.
-    Saves under keys the runtime actually loads: model_v2:{name}.
-    Targets: BTTS, OU_2.5, OU_3.5, 1X2_HOME, 1X2_AWAY.
-    """
     log.info("Starting model training (days=%d, min_minute=%d)", days, min_minute)
     if not _db_ping():
         return {"ok": False, "error": "Database unavailable"}
@@ -402,7 +401,6 @@ def train_models(days: int = 60, min_minute: int = 20) -> Dict[str, Any]:
             trained[name] = False
             continue
 
-        # split
         try:
             X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
         except Exception as e:
@@ -428,7 +426,6 @@ def train_models(days: int = 60, min_minute: int = 20) -> Dict[str, Any]:
     tuned = simple_tune_thresholds(test_scores, default_thr)
     for mk, thr in tuned.items():
         try:
-            # Persist thresholds under same keys used by main (_get_market_threshold)
             store_key = {
                 "BTTS": "BTTS",
                 "OU_2.5": "Over/Under 2.5",
