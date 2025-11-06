@@ -1,50 +1,36 @@
 # file: train_models.py
-import os, json, logging, sys, time, re
+import os, json, logging, sys, time, atexit, signal, warnings
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
-import requests
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.exceptions import ConvergenceWarning
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config / env
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────── Logging ─────────────────────
+log = logging.getLogger("train_models")
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s [train_models] - %(message)s"))
+log.handlers = [handler]
+log.setLevel(logging.INFO)
+log.propagate = False
+
+# ───────────────────── DB Pool ─────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("DATABASE_URL is required")
 
-API_KEY = os.getenv("API_KEY")  # optional, for result backfill
-BASE_URL = "https://v3.football.api-sports.io"
-FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
-HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"} if API_KEY else {}
-REQ_TIMEOUT = float(os.getenv("REQ_TIMEOUT_SEC", "8.0"))
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────────────────────────
-log = logging.getLogger("train_models")
-_handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s [train_models] - %(message)s"))
-log.handlers = [_handler]
-log.setLevel(logging.INFO)
-log.propagate = False
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DB pool (simple version compatible with main)
-# ──────────────────────────────────────────────────────────────────────────────
 POOL: Optional[SimpleConnectionPool] = None
 
 class ShutdownManager:
     _shutdown_requested = False
     @classmethod
-    def is_shutdown_requested(cls): return cls._shutdown_requested
+    def is_shutdown_requested(cls) -> bool: return cls._shutdown_requested
     @classmethod
-    def request_shutdown(cls): cls._shutdown_requested = True
+    def request_shutdown(cls) -> None: cls._shutdown_requested = True
 
 def _init_pool():
     global POOL
@@ -57,57 +43,117 @@ class PooledConn:
     def __init__(self, pool): self.pool=pool; self.conn=None; self.cur=None
     def __enter__(self):
         if ShutdownManager.is_shutdown_requested():
-            raise Exception("DB refused: shutdown")
+            raise RuntimeError("Shutdown in progress")
         _init_pool()
-        self.conn=self.pool.getconn(); self.conn.autocommit=True
-        self.cur=self.conn.cursor(); return self
+        self.conn=self.pool.getconn(); self.conn.autocommit=True; self.cur=self.conn.cursor()
+        return self
     def __exit__(self, et, ev, tb):
         try:
             if self.cur: self.cur.close()
         finally:
             if self.conn:
                 try: self.pool.putconn(self.conn)
-                except:
+                except: 
                     try: self.conn.close()
                     except: pass
-    def execute(self, sql, params=()):
-        if ShutdownManager.is_shutdown_requested():
-            raise Exception("DB op refused: shutdown")
+    def execute(self, sql: str, params: tuple|list=()):
         self.cur.execute(sql, params or ()); return self.cur
-    def fetchone_safe(self):
-        try:
-            row=self.cur.fetchone()
-            return None if row is None or len(row)==0 else row
-        except Exception as e:
-            log.warning("[TRAIN_DB] fetchone_safe: %s", e); return None
+    def fetchone_safe(self): 
+        try: row=self.cur.fetchone(); return (None if row is None or len(row)==0 else row)
+        except Exception as e: log.warning("[TRAIN_DB] fetchone_safe: %s", e); return None
     def fetchall_safe(self):
-        try:
-            rows=self.cur.fetchall()
-            return rows if rows else []
-        except Exception as e:
-            log.warning("[TRAIN_DB] fetchall_safe: %s", e); return []
+        try: rows=self.cur.fetchall(); return rows or []
+        except Exception as e: log.warning("[TRAIN_DB] fetchall_safe: %s", e); return []
 
 def db_conn(): 
     if not POOL: _init_pool()
     return PooledConn(POOL)
 
-def _db_ping()->bool:
+def _db_ping() -> bool:
     try:
         with db_conn() as c:
             c.execute("SELECT 1")
         return True
     except Exception as e:
-        log.error("[TRAIN_DB] ping failed: %s", e); return False
+        log.error("[TRAIN_DB] ping failed: %s", e)
+        return False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Settings helpers (match main.py)
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────── Feature helpers (match main.py) ─────────────────
+def _num(v) -> float:
+    try:
+        if isinstance(v,str) and v.endswith("%"): return float(v[:-1])
+        return float(v or 0)
+    except: return 0.0
+
+def _pos_pct(v) -> float:
+    try: return float(str(v).replace("%","").strip() or 0)
+    except: return 0.0
+
+def extract_basic_features(m: dict) -> Dict[str,float]:
+    """Keep aligned with main.py extract_basic_features."""
+    try:
+        teams = m.get("teams") or {}
+        home = (teams.get("home") or {}).get("name","")
+        away = (teams.get("away") or {}).get("name","")
+        goals = m.get("goals") or {}
+        gh = goals.get("home") or 0
+        ga = goals.get("away") or 0
+        minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
+
+        stats={}
+        for s in (m.get("statistics") or []):
+            t=(s.get("team") or {}).get("name")
+            if t: stats[t]={ (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
+        sh=stats.get(home, {}) or {}; sa=stats.get(away, {}) or {}
+
+        sot_h=_num(sh.get("Shots on Goal", sh.get("Shots on Target", 0)))
+        sot_a=_num(sa.get("Shots on Goal", sa.get("Shots on Target", 0)))
+        sh_total_h=_num(sh.get("Total Shots", 0)); sh_total_a=_num(sa.get("Total Shots", 0))
+        cor_h=_num(sh.get("Corner Kicks", 0)); cor_a=_num(sa.get("Corner Kicks", 0))
+        pos_h=_pos_pct(sh.get("Ball Possession", 0)); pos_a=_pos_pct(sa.get("Ball Possession", 0))
+
+        xg_h=_num(sh.get("Expected Goals", 0)); xg_a=_num(sa.get("Expected Goals", 0))
+        if xg_h==0 and xg_a==0:
+            xg_h = sot_h*0.3; xg_a = sot_a*0.3  # only when missing
+
+        red_h=red_a=yellow_h=yellow_a=0
+        for ev in (m.get("events") or []):
+            if (ev.get("type","").lower()=="card"):
+                d=(ev.get("detail","") or "").lower(); t=(ev.get("team") or {}).get("name") or ""
+                if "yellow" in d and "second" not in d:
+                    if t==home: yellow_h+=1
+                    elif t==away: yellow_a+=1
+                if "red" in d or "second yellow" in d:
+                    if t==home: red_h+=1
+                    elif t==away: red_a+=1
+
+        return {
+            "minute": float(minute),
+            "goals_h": float(gh), "goals_a": float(ga),
+            "goals_sum": float(gh+ga), "goals_diff": float(gh-ga),
+            "xg_h": float(xg_h), "xg_a": float(xg_a),
+            "xg_sum": float(xg_h+xg_a), "xg_diff": float(xg_h-xg_a),
+            "sot_h": float(sot_h), "sot_a": float(sot_a), "sot_sum": float(sot_h+sot_a),
+            "sh_total_h": float(sh_total_h), "sh_total_a": float(sh_total_a),
+            "cor_h": float(cor_h), "cor_a": float(cor_a), "cor_sum": float(cor_h+cor_a),
+            "pos_h": float(pos_h), "pos_a": float(pos_a), "pos_diff": float(pos_h-pos_a),
+            "red_h": float(red_h), "red_a": float(red_a), "red_sum": float(red_h+red_a),
+            "yellow_h": float(yellow_h), "yellow_a": float(yellow_a)
+        }
+    except Exception as e:
+        log.error("Feature extraction failed: %s", e)
+        return {}
+
+# ───────────────── Settings I/O ─────────────────
 def get_setting(key: str) -> Optional[str]:
     try:
         with db_conn() as c:
-            c.execute("SELECT value FROM settings WHERE key=%s", (key,))
-            row = c.fetchone_safe()  # FIX: call on wrapper, not cursor
-            return row[0] if row else None
+            cur = c.execute("SELECT value FROM settings WHERE key=%s", (key,))
+            row = None
+            try: row = cur.fetchone()
+            except: pass
+            if not row: return None
+            return row[0]
     except Exception as e:
         log.error("get_setting(%s) failed: %s", key, e); return None
 
@@ -119,361 +165,252 @@ def set_setting(key: str, value: str) -> None:
             (key, value)
         )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Feature extraction (must mirror main.py basic features)
-# ──────────────────────────────────────────────────────────────────────────────
-def _num(v)->float:
-    try:
-        if isinstance(v,str) and v.endswith("%"): return float(v[:-1])
-        return float(v or 0)
-    except: return 0.0
-
-def _pos_pct(v)->float:
-    try: return float(str(v).replace("%","").strip() or 0)
-    except: return 0.0
-
-def extract_basic_features(m: dict) -> Dict[str,float]:
-    try:
-        home = (m.get("teams") or {}).get("home", {}).get("name", "")
-        away = (m.get("teams") or {}).get("away", {}).get("name", "")
-        gh = (m.get("goals") or {}).get("home") or 0
-        ga = (m.get("goals") or {}).get("away") or 0
-        minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
-        stats = {}
-        for s in (m.get("statistics") or []):
-            t = (s.get("team") or {}).get("name")
-            if t: stats[t] = { (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
-        sh = stats.get(home, {}) or {}; sa = stats.get(away, {}) or {}
-        sot_h = _num(sh.get("Shots on Goal", sh.get("Shots on Target", 0)))
-        sot_a = _num(sa.get("Shots on Goal", sa.get("Shots on Target", 0)))
-        sh_total_h = _num(sh.get("Total Shots", 0)); sh_total_a = _num(sa.get("Total Shots", 0))
-        cor_h = _num(sh.get("Corner Kicks", 0)); cor_a = _num(sa.get("Corner Kicks", 0))
-        pos_h = _pos_pct(sh.get("Ball Possession", 0)); pos_a = _pos_pct(sa.get("Ball Possession", 0))
-        xg_h = _num(sh.get("Expected Goals", 0)); xg_a = _num(sa.get("Expected Goals", 0))
-        if xg_h == 0 and xg_a == 0:
-            xg_h = sot_h * 0.3; xg_a = sot_a * 0.3
-        red_h = red_a = yellow_h = yellow_a = 0
-        for ev in (m.get("events") or []):
-            if (ev.get("type", "").lower() == "card"):
-                d = (ev.get("detail", "") or "").lower()
-                t = (ev.get("team") or {}).get("name") or ""
-                if "yellow" in d and "second" not in d:
-                    if t == home: yellow_h += 1
-                    elif t == away: yellow_a += 1
-                if "red" in d or "second yellow" in d:
-                    if t == home: red_h += 1
-                    elif t == away: red_a += 1
-        return {
-            "minute": float(minute),
-            "goals_h": float(gh), "goals_a": float(ga),
-            "goals_sum": float(gh + ga), "goals_diff": float(gh - ga),
-            "xg_h": float(xg_h), "xg_a": float(xg_a),
-            "xg_sum": float(xg_h + xg_a), "xg_diff": float(xg_h - xg_a),
-            "sot_h": float(sot_h), "sot_a": float(sot_a), "sot_sum": float(sot_h + sot_a),
-            "sh_total_h": float(sh_total_h), "sh_total_a": float(sh_total_a),
-            "cor_h": float(cor_h), "cor_a": float(cor_a), "cor_sum": float(cor_h + cor_a),
-            "pos_h": float(pos_h), "pos_a": float(pos_a), "pos_diff": float(pos_h - pos_a),
-            "red_h": float(red_h), "red_a": float(red_a), "red_sum": float(red_h + red_a),
-            "yellow_h": float(yellow_h), "yellow_a": float(yellow_a)
-        }
-    except Exception as e:
-        log.error("Feature extraction failed: %s", e)
-        return {}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Data loading & backfill
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────── Load training snapshots ─────────────────
 def _has_sufficient_data(features: Dict[str, float], minute: int) -> bool:
     try:
-        base = (features.get('sot_h',0)>0 or features.get('sot_a',0)>0 or
-                features.get('pos_h',0)>0 or features.get('pos_a',0)>0 or
-                features.get('cor_h',0)>0 or features.get('cor_a',0)>0)
+        has_any = any(features.get(k,0)>0 for k in ("sot_h","sot_a","pos_h","pos_a","xg_sum","cor_sum"))
         if minute > 60:
-            base = base and (features.get('xg_sum',0)>0 or features.get('sot_sum',0)>=3)
-        return bool(base)
-    except Exception:
-        return False
+            return has_any and (features.get("sot_sum",0)>=2 or features.get("xg_sum",0)>0)
+        return has_any
+    except: return False
 
-def _api_get(url: str, params: dict) -> Optional[dict]:
-    if not API_KEY: return None
-    try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=REQ_TIMEOUT)
-        return r.json() if r.ok else None
-    except Exception:
-        return None
-
-def backfill_results_for_snapshot_ids(match_ids: List[int]) -> int:
-    if not API_KEY or not match_ids: return 0
-    written = 0
-    with db_conn() as c:
-        for mid in match_ids[:400]:
-            js = _api_get(FOOTBALL_API_URL, {"id": mid}) or {}
-            arr = (js.get("response") or []) if isinstance(js, dict) else []
-            if not arr: continue
-            fx = arr[0]
-            st = (((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-            if st not in {"FT","AET","PEN"}: continue
-            goals = fx.get("goals") or {}
-            gh = int(goals.get("home") or 0); ga = int(goals.get("away") or 0)
-            btts = 1 if (gh>0 and ga>0) else 0
-            c.execute(
-                "INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
-                "VALUES(%s,%s,%s,%s,%s) "
-                "ON CONFLICT(match_id) DO UPDATE SET "
-                "final_goals_h=EXCLUDED.final_goals_h, final_goals_a=EXCLUDED.final_goals_a, "
-                "btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
-                (mid, gh, ga, btts, int(time.time()))
-            )
-            written += 1
-    if written:
-        log.info("[BACKFILL] wrote %d match_results", written)
-    return written
-
-def load_training_rows(days: int = 60, min_minute: int = 20) -> List[Dict[str, Any]]:
+def load_training_data(days: int = 60, min_minute: int = 20) -> List[Dict[str, Any]]:
     if not _db_ping():
         log.error("DB unavailable"); return []
-
-    cutoff_ts = int((datetime.now() - timedelta(days=days)).timestamp())
+    cutoff_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+    out: List[Dict[str,Any]] = []
     with db_conn() as c:
-        c.execute(
-            """
-            SELECT s.match_id, s.created_ts, s.payload,
-                   r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM tip_snapshots s
-            LEFT JOIN match_results r ON r.match_id = s.match_id
-            WHERE s.created_ts >= %s
-            ORDER BY s.created_ts DESC
+        c.execute("""
+            SELECT payload FROM tip_snapshots
+            WHERE created_ts >= %s
+            ORDER BY created_ts DESC
             LIMIT 20000
-            """,
-            (cutoff_ts,)
-        )
-        rows = c.fetchall_safe()  # FIX
-
-    missing = sorted({mid for (mid, *_rest) in rows if _rest[2] is None})
-    if missing and API_KEY:
-        backfill_results_for_snapshot_ids(missing)
-
-    with db_conn() as c2:
-        c2.execute(
-            """
-            SELECT s.match_id, s.created_ts, s.payload,
-                   r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM tip_snapshots s
-            JOIN match_results r ON r.match_id = s.match_id
-            WHERE s.created_ts >= %s
-            ORDER BY s.created_ts DESC
-            LIMIT 20000
-            """,
-            (cutoff_ts,)
-        )
-        rows = c2.fetchall_safe()  # FIX
-
-    out: List[Dict[str, Any]] = []
-    kept, skipped_minute, skipped_quality, parse_errors = 0,0,0,0
-
-    for (mid, cts, payload, gh, ga, btts) in rows:
-        try:
-            data = json.loads(payload)
-            features = data.get("features") or {}
-            minute = int(features.get("minute", 0))
-            if minute < min_minute:
-                skipped_minute += 1; continue
-            if not _has_sufficient_data(features, minute):
-                skipped_quality += 1; continue
-            out.append({
-                "match_id": int(mid),
-                "created_ts": int(cts),
-                "features": features,
-                "final_goals_h": int(gh),
-                "final_goals_a": int(ga),
-                "btts_yes": int(btts)
-            })
-            kept += 1
-        except Exception:
-            parse_errors += 1
-            continue
-
-    log.info("Snapshots graded: %d (skipped minute=%d, quality=%d, parse=%d)", kept, skipped_minute, skipped_quality, parse_errors)
+        """, (cutoff_ts,))
+        for (payload,) in c.fetchall_safe():
+            try:
+                data = json.loads(payload)
+                m = data.get("match",{}) or {}
+                feat = data.get("features",{}) or {}
+                minute = int(feat.get("minute",0))
+                if minute < min_minute: continue
+                # Use DB backfilled result if available
+                fid = int(((m.get("fixture") or {}).get("id") or 0))
+                if fid:
+                    # optional: attach final score from match_results if present
+                    try:
+                        with db_conn() as c2:
+                            r = c2.execute("SELECT final_goals_h,final_goals_a,btts_yes FROM match_results WHERE match_id=%s",(fid,)).fetchone()
+                            if r:
+                                g = {"home": int(r[0] or 0), "away": int(r[1] or 0)}
+                                m["goals"] = g
+                                (m.setdefault("fixture",{}).setdefault("status",{}))["short"]="FT"
+                    except Exception as e:
+                        log.debug("match_results lookup fail: %s", e)
+                if not _has_sufficient_data(feat, minute): continue
+                out.append({"match": m, "features": feat, "timestamp": data.get("timestamp",0)})
+            except Exception as e:
+                log.debug("snapshot parse skip: %s", e)
+    log.info("Loaded %d training samples (>= %d')", len(out), min_minute)
     return out
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Labeling per target
-# ──────────────────────────────────────────────────────────────────────────────
-def make_label(row: Dict[str, Any], target: str) -> Optional[int]:
-    gh = int(row["final_goals_h"]); ga = int(row["final_goals_a"])
-    total = gh + ga
-    if target == "BTTS":
-        return 1 if (gh>0 and ga>0) else 0
-    if target.startswith("OU_"):
-        try:
-            line = float(target.split("_",1)[1])
-        except Exception:
-            return None
-        return 1 if (total > line) else 0
-    if target == "1X2_HOME":
-        return 1 if gh > ga else 0
-    if target == "1X2_AWAY":
-        return 1 if ga > gh else 0
-    return None
+# ───────────────── Labeling ─────────────────
+def calculate_outcome(match_data: dict, market: str, suggestion: str) -> Optional[int]:
+    try:
+        goals = match_data.get("goals") or {}
+        gh = int(goals.get("home") or 0); ga = int(goals.get("away") or 0)
+        total = gh + ga
+        # Accept if we have a final score (via FT mark above)
+        short = (((match_data.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if short not in {"FT","AET","PEN"}: return None
+        if market == "BTTS":
+            return 1 if ((suggestion=="BTTS: Yes" and gh>0 and ga>0) or (suggestion=="BTTS: No" and (gh==0 or ga==0))) else 0
+        if market.startswith("OU_"):
+            try:
+                line = float(market.split("_",1)[1])
+                if suggestion.startswith("Over"):
+                    return 1 if total > line else (0 if total < line else None)
+                else:
+                    return 1 if total < line else (0 if total > line else None)
+            except: return None
+        if market == "1X2_HOME": return 1 if gh>ga else 0
+        if market == "1X2_AWAY": return 1 if ga>gh else 0
+        return None
+    except: return None
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Model training
-# ──────────────────────────────────────────────────────────────────────────────
-def build_dataset(rows: List[Dict[str,Any]], target: str) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    X_list: List[Dict[str,float]] = []
-    y_list: List[int] = []
-    for r in rows:
-        y = make_label(r, target)
+# ───────────────── Feature matrix ─────────────────
+def prepare_xy(training: List[Dict], market: str, suggestion: str) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    feats: List[Dict[str,float]] = []; labels: List[int] = []
+    for row in training:
+        y = calculate_outcome(row["match"], market, suggestion)
         if y is None: continue
-        X_list.append(r["features"])
-        y_list.append(int(y))
-    if not X_list: return np.zeros((0,0)), np.zeros((0,)), []
+        feats.append(row["features"]); labels.append(int(y))
+    if not feats: return np.zeros((0,0)), np.zeros((0,)), []
+    # gather names
+    names = sorted({k for d in feats for k in d.keys()})
+    X = np.array([[float(d.get(n,0.0)) for n in names] for d in feats], dtype=float)
+    y = np.array(labels, dtype=int)
+    # drop zero-variance columns
+    var = X.var(axis=0)
+    keep = var > 1e-12
+    if not np.any(keep): return np.zeros((0,0)), np.zeros((0,)), []
+    X = X[:, keep]
+    names = [n for n, k in zip(names, keep) if k]
+    return X, y, names
 
-    names = sorted({k for d in X_list for k in d.keys()})
-    vals = np.array([[float(d.get(n,0.0)) for n in names] for d in X_list], dtype=float)
-    vari = np.var(vals, axis=0)
-    mask = vari > 1e-8
-    names_filtered = [n for n, m in zip(names, mask) if m]
-    if not names_filtered:
-        return np.zeros((0,0)), np.zeros((0,)), []
-    X = vals[:, mask]
-    y = np.array(y_list, dtype=int)
-    return X, y, names_filtered
+# ───────────────── Fit (with scaling + fallback) ─────────────────
+def _fit_logreg_scaled(X: np.ndarray, y: np.ndarray, max_iter: int = 5000, solver: str = "lbfgs") -> Tuple[LogisticRegression, np.ndarray, np.ndarray]:
+    # Standardize per-feature on train only
+    mu = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma[sigma==0] = 1.0
+    Xs = (X - mu) / sigma
+    model = LogisticRegression(
+        random_state=42, max_iter=max_iter, solver=solver,
+        class_weight="balanced", n_jobs=None if solver!="saga" else -1
+    )
+    model.fit(Xs, y)
+    # If solver hit cap, retry with saga
+    hit_cap = False
+    try:
+        iters = int(np.max(model.n_iter_)) if hasattr(model, "n_iter_") else 0
+        hit_cap = iters >= max_iter
+    except: pass
+    if hit_cap and solver != "saga":
+        log.warning("lbfgs hit max_iter; retrying with saga")
+        return _fit_logreg_scaled(X, y, max_iter=max_iter, solver="saga")
+    return model, mu, sigma
 
-def train_logreg_balanced(X: np.ndarray, y: np.ndarray) -> Tuple[LogisticRegression, Dict[str,float]]:
-    model = LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced')
-    model.fit(X, y)
-    y_pred = model.predict(X)
-    acc = float((y_pred == y).mean())
-    pos = int(y.sum()); n = int(len(y))
-    return model, {"acc_train": acc, "n": n, "pos": pos}
+def _bake_scaler_into_weights(model: LogisticRegression, mu: np.ndarray, sigma: np.ndarray) -> Tuple[np.ndarray, float]:
+    # Convert z = (x-mu)/sigma ↦ logit = i + w·z  =>  i' = i - Σ(w*mu/sigma), w' = w/sigma
+    w = model.coef_.reshape(-1)
+    i = float(model.intercept_.reshape(-1)[0])
+    w_prime = w / sigma
+    i_prime = i - float(np.sum(w * (mu / sigma)))
+    return w_prime, i_prime
 
-def to_model_blob(model: LogisticRegression, feature_names: List[str], metrics: Dict[str, float]) -> Dict[str, Any]:
-    weights = {name: float(w) for name, w in zip(feature_names, model.coef_[0])}
-    intercept = float(model.intercept_[0])
-    return {
+# ───────────────── Train per target ─────────────────
+def _pretty_name_and_suggestion(key: str) -> Tuple[str, str]:
+    if key == "BTTS": return ("BTTS", "BTTS: Yes")
+    if key == "OU_2.5": return ("OU_2.5", "Over 2.5 Goals")
+    if key == "OU_3.5": return ("OU_3.5", "Over 3.5 Goals")
+    if key == "1X2_HOME": return ("1X2_HOME", "Home Win")
+    if key == "1X2_AWAY": return ("1X2_AWAY", "Away Win")
+    return (key, "")
+
+def train_one(training: List[Dict], key: str) -> Optional[Dict[str,Any]]:
+    market, suggestion = _pretty_name_and_suggestion(key)
+    X, y, names = prepare_xy(training, market, suggestion)
+    if X.shape[0] < 150 or X.shape[1] < 3:
+        log.warning("Insufficient data for %s (n=%d, d=%d)", key, X.shape[0], X.shape[1])
+        return None
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    model, mu, sigma = _fit_logreg_scaled(X_train, y_train)
+    # metrics (on standardized space)
+    Xtr_s = (X_train - mu)/sigma; Xte_s = (X_test - mu)/sigma
+    train_score = float(model.score(Xtr_s, y_train))
+    test_score  = float(model.score(Xte_s, y_test))
+    # bake scaler into weights for main.py
+    w_prime, i_prime = _bake_scaler_into_weights(model, mu, sigma)
+    weights = {n: float(v) for n, v in zip([*names], w_prime)}
+    model_blob = {
         "weights": weights,
-        "intercept": intercept,
-        "feature_names": feature_names,
-        "train_acc": metrics.get("acc_train", 0.0),
-        "samples": int(metrics.get("n", 0)),
-        "positive_samples": int(metrics.get("pos", 0)),
-        "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0},
-        "created_ts": int(time.time())
+        "intercept": float(i_prime),
+        "train_score": train_score,
+        "test_score": test_score,
+        "samples": int(X_train.shape[0]),
+        "positive_samples": int(int(y_train.sum())),
+        "created_ts": int(time.time()),
+        # Keep identity calibration; main.py supports {"method":"sigmoid","a","b"} if you add Platt later.
+        "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0}
     }
+    log.info("✅ %s trained (n=%d, d=%d, test=%.3f)", key, X_train.shape[0], X_train.shape[1], test_score)
+    return model_blob
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Threshold auto-tune (lightweight by test score buckets)
-# ──────────────────────────────────────────────────────────────────────────────
-def simple_tune_thresholds(test_scores: Dict[str, float], default_thr: float) -> Dict[str, float]:
-    tuned: Dict[str, float] = {}
-    for name, score in test_scores.items():
-        if score >= 0.68: tuned[name] = min(85.0, default_thr + 5.0)
-        elif score <= 0.55: tuned[name] = max(65.0, default_thr - 10.0)
-        else: tuned[name] = default_thr
+def _save_model_under_aliases(key: str, blob: Dict[str,Any]) -> None:
+    # Save as both raw name and model_v2:{name}
+    set_setting(key, json.dumps(blob, separators=(",",":")))
+    set_setting(f"model_v2:{key}", json.dumps(blob, separators=(",",":")))
+    log.info("✅ %s saved as model_v2:%s (n=%s, d=%s, test=%.3f)",
+             key, key, blob.get("samples","?"),
+             len((blob.get("weights") or {})), blob.get("test_score",0.0))
+
+# ───────────────── Auto-tune thresholds (light) ─────────────────
+def auto_tune_thresholds(model_details: Dict[str, Dict[str,Any]]) -> Dict[str, float]:
+    default_thr = float(os.getenv("CONF_THRESHOLD", "75"))
+    tuned: Dict[str,float] = {}
+    for key, det in model_details.items():
+        t = float(det.get("test_score", 0.5)); n = int(det.get("samples", 0))
+        if t > 0.70 and n > 300: tuned[key] = min(85.0, default_thr + 5.0)
+        elif t < 0.55:          tuned[key] = max(65.0, default_thr - 10.0)
+        else:                    tuned[key] = default_thr
+        set_setting(f"conf_threshold:{_threshold_market_name(key)}", str(tuned[key]))
     return tuned
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main training entry
-# ──────────────────────────────────────────────────────────────────────────────
-def train_models(days: int = 60, min_minute: int = 20) -> Dict[str, Any]:
-    log.info("Starting model training (days=%d, min_minute=%d)", days, min_minute)
-    if not _db_ping():
-        return {"ok": False, "error": "Database unavailable"}
+def _threshold_market_name(key: str) -> str:
+    if key.startswith("OU_"):
+        return f"Over/Under {key.split('_',1)[1]}"
+    if key.startswith("1X2"): return "1X2"
+    return key
 
-    rows = load_training_rows(days=days, min_minute=min_minute)
-    if not rows:
-        return {"ok": False, "error": "No graded snapshots available (ensure match_results is populated)"}
+# ───────────────── Orchestrator ─────────────────
+def train_models(days: int = 60) -> Dict[str, Any]:
+    if not _db_ping(): return {"ok": False, "error": "Database unavailable"}
+    training = load_training_data(days=days, min_minute=int(os.getenv("TRAIN_MIN_MINUTE","15")))
+    if not training:  return {"ok": False, "error": "No training data"}
+    to_train = ["BTTS","OU_2.5","OU_3.5","1X2_HOME","1X2_AWAY"]
 
-    targets = ["BTTS", "OU_2.5", "OU_3.5", "1X2_HOME", "1X2_AWAY"]
-    trained: Dict[str, bool] = {}
-    details: Dict[str, Any] = {}
-    test_scores: Dict[str, float] = {}
-
-    for name in targets:
-        if ShutdownManager.is_shutdown_requested():
-            log.warning("Training interrupted"); break
-
-        X, y, feat_names = build_dataset(rows, name)
-        n = len(y)
-        if n < 150 or X.shape[1] < 5:
-            log.warning("Insufficient data for %s: n=%d, d=%d", name, n, X.shape[1] if n else 0)
-            trained[name] = False
-            continue
-
+    trained: Dict[str,bool] = {}
+    details: Dict[str,Dict[str,Any]] = {}
+    for key in to_train:
+        if ShutdownManager.is_shutdown_requested(): break
         try:
-            X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+            blob = train_one(training, key)
+            if blob:
+                _save_model_under_aliases(key, blob)
+                trained[key] = True
+                details[key] = {
+                    "samples": blob.get("samples",0),
+                    "test_score": blob.get("test_score",0.0)
+                }
+            else:
+                trained[key] = False
         except Exception as e:
-            log.warning("Split failed for %s: %s", name, e); trained[name]=False; continue
+            log.exception("Training error for %s: %s", key, e)
+            trained[key] = False
 
-        model, mtr = train_logreg_balanced(X_tr, y_tr)
-        y_hat = model.predict(X_te)
-        test_acc = float((y_hat == y_te).mean())
-        test_scores[name] = test_acc
-
-        blob = to_model_blob(model, feat_names, mtr | {"acc_test": test_acc})
-        key = f"model_v2:{name}"
-        try:
-            set_setting(key, json.dumps(blob, separators=(",", ":")))
-            trained[name] = True
-            details[name] = {"n": int(n), "d": int(X.shape[1]), "test_acc": round(test_acc,3)}
-            log.info("✅ %s saved as %s (n=%d, d=%d, test=%.3f)", name, key, n, X.shape[1], test_acc)
-        except Exception as e:
-            trained[name] = False
-            log.error("Save failed for %s: %s", name, e)
-
-    default_thr = float(os.getenv("CONF_THRESHOLD", "75"))
-    tuned = simple_tune_thresholds(test_scores, default_thr)
-    for mk, thr in tuned.items():
-        try:
-            store_key = {
-                "BTTS": "BTTS",
-                "OU_2.5": "Over/Under 2.5",
-                "OU_3.5": "Over/Under 3.5",
-                "1X2_HOME": "1X2",
-                "1X2_AWAY": "1X2",
-            }.get(mk, mk)
-            set_setting(f"conf_threshold:{store_key}", f"{thr}")
-        except Exception as e:
-            log.warning("Failed to save threshold for %s: %s", mk, e)
-
+    tuned = auto_tune_thresholds(details) if trained else {}
     ok = any(trained.values())
-    return {
-        "ok": bool(ok),
-        "trained": trained,
-        "model_details": details,
-        "tuned_thresholds": tuned,
-        "total_rows": len(rows)
-    }
+    return {"ok": ok, "trained": trained, "model_details": details, "tuned_thresholds": tuned}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI wrapper
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────── Shutdown hooks ─────────────────
 def cleanup():
     global POOL
     if POOL:
-        try:
-            POOL.closeall()
-            log.info("[TRAIN_DB] Closed pool")
-        except Exception as e:
-            log.warning("[TRAIN_DB] Close pool: %s", e)
+        try: POOL.closeall(); log.info("[TRAIN_DB] pool closed")
+        except Exception as e: log.warning("[TRAIN_DB] pool close err: %s", e)
 
-def shutdown_handler(signum=None, frame=None):
-    log.info("Shutdown signal received; cleaning up...")
-    ShutdownManager.request_shutdown()
-    cleanup()
-    sys.exit(0)
+def _shutdown(signum=None, frame=None):
+    log.info("Shutdown signal received"); ShutdownManager.request_shutdown(); cleanup(); sys.exit(0)
 
-if __name__ == "__main__":
-    import signal, atexit, json as _json
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
+def register_shutdown_handlers():
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
     atexit.register(cleanup)
 
-    log.info("Starting training process...")
-    res = train_models()
-    print(_json.dumps(res, indent=2))
-    if not res.get("ok", False):
-        log.error("Training failed/skipped: %s", res.get("error", "unknown"))
-        sys.exit(1)
-    log.info("Training completed OK")
+# ───────────────── Entrypoint ─────────────────
+if __name__ == "__main__":
+    # Convert ConvergenceWarning to log only (not exception)
+    warnings.simplefilter("always", category=ConvergenceWarning)
+    register_shutdown_handlers()
+    try:
+        log.info("Starting training...")
+        res = train_models()
+        print(json.dumps(res, indent=2))
+        if not res.get("ok"): sys.exit(1)
+        log.info("Training completed.")
+    except KeyboardInterrupt:
+        log.info("Interrupted"); sys.exit(1)
+    except Exception as e:
+        log.exception("Fatal: %s", e); sys.exit(1)
+    finally:
+        cleanup()
