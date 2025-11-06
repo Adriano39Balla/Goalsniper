@@ -1,7 +1,3 @@
-31 August 
-
-
-
 # file: main.py
 """
 goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate.
