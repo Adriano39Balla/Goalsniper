@@ -1,8 +1,3 @@
-31 August 
-
-
-
-
 # file: train_models.py
 """
 Postgres-only training with Platt calibration + per-market auto-thresholding.
