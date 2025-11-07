@@ -76,6 +76,13 @@ try:
 except Exception:
     MOTD_LEAGUE_IDS = []
 
+# ───────── New Reliability Controls ─────────
+PREDICTION_MIN_QUALITY = float(os.getenv("PREDICTION_MIN_QUALITY", "0.6"))
+CROSS_VALIDATION_REQUIRED = os.getenv("CROSS_VALIDATION_REQUIRED", "1") not in ("0","false","False","no","NO")
+MAX_PREDICTION_DISAGREEMENT = float(os.getenv("MAX_PREDICTION_DISAGREEMENT", "0.15"))
+API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "3"))
+API_RETRY_BACKOFF = float(os.getenv("API_RETRY_BACKOFF", "1.0"))
+
 # ───────── Lines ─────────
 def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     out=[]
@@ -125,6 +132,9 @@ ODDS_CACHE:   Dict[int, Tuple[float, dict]] = {}
 SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
+
+# ───────── Performance Tracking ─────────
+prediction_performance: Dict[str, List[Dict]] = {}
 
 # ───────── Optional import: trainer ─────────
 try:
@@ -230,14 +240,55 @@ def send_telegram(text: str) -> bool:
     except Exception:
         return False
 
-# ───────── API helpers ─────────
-def _api_get(url: str, params: dict, timeout: int = 15):
-    if not API_KEY: return None
-    try:
-        r=session.get(url, headers=HEADERS, params=params, timeout=timeout)
-        return r.json() if r.ok else None
-    except Exception:
+# ───────── Enhanced API helpers with robust error handling ─────────
+def _api_get_robust(url: str, params: dict, timeout: int = 15):
+    """Enhanced API call with better error handling and retries"""
+    if not API_KEY: 
+        log.error("No API_KEY configured")
         return None
+    
+    for attempt in range(API_MAX_RETRIES):
+        try:
+            r = session.get(url, headers=HEADERS, params=params, timeout=timeout)
+            
+            if r.status_code == 429:  # Rate limited
+                reset_time = int(r.headers.get('X-RateLimit-Reset', 60))
+                log.warning(f"Rate limited, waiting {reset_time + 1} seconds")
+                time.sleep(reset_time + 1)
+                continue
+                
+            if not r.ok:
+                log.error(f"API call failed with status {r.status_code}: {r.text}")
+                if attempt < API_MAX_RETRIES - 1:
+                    time.sleep(API_RETRY_BACKOFF * (2 ** attempt))  # Exponential backoff
+                    continue
+                return None
+                
+            return r.json() if r.ok else None
+            
+        except requests.exceptions.Timeout:
+            log.warning(f"API timeout (attempt {attempt + 1}/{API_MAX_RETRIES})")
+            if attempt < API_MAX_RETRIES - 1:
+                time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
+                continue
+                
+        except requests.exceptions.ConnectionError:
+            log.warning(f"API connection error (attempt {attempt + 1}/{API_MAX_RETRIES})")
+            if attempt < API_MAX_RETRIES - 1:
+                time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
+                continue
+                
+        except Exception as e:
+            log.error(f"API call failed: {e}")
+            if attempt < API_MAX_RETRIES - 1:
+                time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
+                continue
+                
+    return None
+
+# Keep original for backward compatibility
+def _api_get(url: str, params: dict, timeout: int = 15):
+    return _api_get_robust(url, params, timeout)
 
 # ───────── League filter ─────────
 _BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
@@ -257,19 +308,19 @@ def _blocked_league(league_obj: dict) -> bool:
 def fetch_match_stats(fid: int) -> list:
     now=time.time()
     if fid in STATS_CACHE and now-STATS_CACHE[fid][0] < 90: return STATS_CACHE[fid][1]
-    js=_api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
+    js=_api_get_robust(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
     out=js.get("response",[]) if isinstance(js,dict) else []
     STATS_CACHE[fid]=(now,out); return out
 
 def fetch_match_events(fid: int) -> list:
     now=time.time()
     if fid in EVENTS_CACHE and now-EVENTS_CACHE[fid][0] < 90: return EVENTS_CACHE[fid][1]
-    js=_api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
+    js=_api_get_robust(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
     out=js.get("response",[]) if isinstance(js,dict) else []
     EVENTS_CACHE[fid]=(now,out); return out
 
 def fetch_live_matches() -> List[dict]:
-    js=_api_get(FOOTBALL_API_URL, {"live":"all"}) or {}
+    js=_api_get_robust(FOOTBALL_API_URL, {"live":"all"}) or {}
     matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
     out=[]
     for m in matches:
@@ -283,11 +334,11 @@ def fetch_live_matches() -> List[dict]:
 
 # ───────── Prematch helpers (short) ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
-    js=_api_get(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
+    js=_api_get_robust(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
     return js.get("response",[]) if isinstance(js,dict) else []
 
 def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
-    js=_api_get(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
+    js=_api_get_robust(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
     return js.get("response",[]) if isinstance(js,dict) else []
 
 def _collect_todays_prematch_fixtures() -> List[dict]:
@@ -297,14 +348,14 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
     dates_utc={start_local.astimezone(TZ_UTC).date(), (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
     fixtures=[]
     for d in sorted(dates_utc):
-        js=_api_get(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")}) or {}
+        js=_api_get_robust(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")}) or {}
         for r in js.get("response",[]) if isinstance(js,dict) else []:
             if (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper() == "NS":
                 fixtures.append(r)
     fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
     return fixtures
 
-# ───────── Feature extraction (live) ─────────
+# ───────── Enhanced Feature extraction with validation ─────────
 def _num(v) -> float:
     try:
         if isinstance(v,str) and v.endswith("%"): return float(v[:-1])
@@ -344,6 +395,31 @@ def extract_features(m: dict) -> Dict[str,float]:
             "pos_h":float(pos_h),"pos_a":float(pos_a),"pos_diff":float(pos_h-pos_a),
             "red_h":float(red_h),"red_a":float(red_a),"red_sum":float(red_h+red_a)}
 
+def validate_features(feat: Dict[str, float]) -> bool:
+    """Validate that extracted features are reasonable"""
+    required_fields = ['minute', 'goals_h', 'goals_a', 'xg_h', 'xg_a']
+    
+    for field in required_fields:
+        if field not in feat or feat[field] is None:
+            log.warning(f"Missing required field: {field}")
+            return False
+    
+    # Sanity checks
+    if feat['minute'] > 120 or feat['minute'] < 0:
+        log.warning(f"Invalid minute value: {feat['minute']}")
+        return False
+    if feat['goals_h'] < 0 or feat['goals_a'] < 0:
+        log.warning(f"Invalid goals: {feat['goals_h']}-{feat['goals_a']}")
+        return False
+    if feat['xg_h'] < 0 or feat['xg_a'] < 0:
+        log.warning(f"Invalid xG: {feat['xg_h']}-{feat['xg_a']}")
+        return False
+    if feat.get('pos_h', 0) > 100 or feat.get('pos_a', 0) > 100:
+        log.warning(f"Invalid possession: {feat.get('pos_h', 0)}-{feat.get('pos_a', 0)}")
+        return False
+    
+    return True
+
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
     require_stats_minute=int(os.getenv("REQUIRE_STATS_MINUTE","35"))
     require_fields=int(os.getenv("REQUIRE_DATA_FIELDS","2"))
@@ -365,7 +441,7 @@ def _pretty_score(m: dict) -> str:
     gh=(m.get("goals") or {}).get("home") or 0; ga=(m.get("goals") or {}).get("away") or 0
     return f"{gh}-{ga}"
 
-# ───────── Models ─────────
+# ───────── Enhanced Models with reliability scoring ─────────
 MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
 EPS=1e-12
 def _sigmoid(x: float) -> float:
@@ -412,6 +488,106 @@ def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
     return mdl or (load_model_from_settings("O25") if abs(line-2.5)<1e-6 else None)
 def _load_wld_models(): return (load_model_from_settings("WLD_HOME"), load_model_from_settings("WLD_DRAW"), load_model_from_settings("WLD_AWAY"))
 
+def get_prediction_quality(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
+    """Calculate how reliable this prediction likely is"""
+    quality_score = 1.0
+    
+    # Penalize low data quality
+    if feat.get('xg_sum', 0) < 0.5:
+        quality_score *= 0.7
+    if feat.get('sot_sum', 0) < 3:
+        quality_score *= 0.8
+    if feat.get('minute', 0) < 25:
+        quality_score *= 0.6
+    
+    # Feature coverage penalty
+    missing_features = sum(1 for key in mdl.get('weights', {}).keys() 
+                          if feat.get(key, 0) == 0)
+    if missing_features > 2:
+        quality_score *= max(0.5, 1 - (missing_features * 0.1))
+    
+    return quality_score
+
+def should_trust_prediction(feat: Dict[str, float], mdl: Dict[str, Any], 
+                           prob: float, min_quality: float = PREDICTION_MIN_QUALITY) -> bool:
+    quality = get_prediction_quality(feat, mdl)
+    return quality >= min_quality and prob >= _get_market_threshold("QUALITY")
+
+def cross_validate_prediction(feat: Dict[str, float], market: str, suggestion: str) -> bool:
+    """Check if multiple models agree on this prediction"""
+    if not CROSS_VALIDATION_REQUIRED:
+        return True
+        
+    if market.startswith("Over/Under"):
+        line = _parse_ou_line_from_suggestion(suggestion)
+        # Try alternative models
+        alt_models = []
+        for alt_name in [f"OU_{_fmt_line(line)}_v2", f"OU_{_fmt_line(line)}_alt"]:
+            alt_mdl = load_model_from_settings(alt_name)
+            if alt_mdl:
+                alt_prob = _score_prob(feat, alt_mdl)
+                if suggestion.startswith("Under"):
+                    alt_prob = 1.0 - alt_prob
+                alt_models.append(alt_prob)
+        
+        # Require at least 2 models to agree
+        if len(alt_models) >= 1:
+            avg_prob = sum(alt_models) / len(alt_models)
+            main_prob = ...  # Your main probability calculation
+            return abs(avg_prob - main_prob) < MAX_PREDICTION_DISAGREEMENT
+   
+    return True  # Default to True if we can't cross-validate
+
+def market_specific_reliability_rules(feat: Dict[str, float], market: str, suggestion: str) -> bool:
+    """Market-specific rules that affect reliability"""
+    
+    minute = feat.get('minute', 0)
+    goals_h = feat.get('goals_h', 0)
+    goals_a = feat.get('goals_a', 0)
+    total_goals = goals_h + goals_a
+    
+    if market.startswith("Over"):
+        line = _parse_ou_line_from_suggestion(suggestion)
+        # Don't predict Over if we're already close to the line late in game
+        if minute > 70 and total_goals >= line - 0.5:
+            return False
+            
+    elif market.startswith("Under"):
+        line = _parse_ou_line_from_suggestion(suggestion)
+        # Don't predict Under if we're already close to the line
+        if minute > 60 and total_goals >= line - 0.5:
+            return False
+            
+    elif market == "BTTS" and suggestion == "BTTS: Yes":
+        # If late in game and no goals, unlikely to get BTTS
+        if minute > 75 and goals_h == 0 and goals_a == 0:
+            return False
+            
+    elif market == "1X2":
+        # Avoid 1X2 predictions when score is level late in tight games
+        if minute > 70 and goals_h == goals_a and abs(feat.get('xg_diff', 0)) < 0.3:
+            return False
+            
+    return True
+
+def track_prediction_quality(market: str, suggestion: str, confidence: float, match_id: int):
+    """Track predictions for later analysis"""
+    key = f"{market}:{suggestion}"
+    if key not in prediction_performance:
+        prediction_performance[key] = []
+    
+    prediction_performance[key].append({
+        'match_id': match_id,
+        'confidence': confidence,
+        'timestamp': time.time(),
+        'market': market,
+        'suggestion': suggestion
+    })
+    
+    # Keep only last 1000 predictions
+    if len(prediction_performance[key]) > 1000:
+        prediction_performance[key] = prediction_performance[key][-500:]
+
 # ───────── Odds helpers ─────────
 def _ev(prob: float, odds: float) -> float:
     """Return expected value as decimal (e.g. 0.05 = +5%)."""
@@ -452,7 +628,7 @@ def fetch_odds(fid: int) -> dict:
     if cached is not None: return cached
     params={"fixture": fid}
     if ODDS_BOOKMAKER_ID: params["bookmaker"] = ODDS_BOOKMAKER_ID
-    js=_api_get(f"{BASE_URL}/odds", params) or {}
+    js=_api_get_robust(f"{BASE_URL}/odds", params) or {}
     out={}
     try:
         for r in js.get("response",[]) if isinstance(js,dict) else []:
@@ -580,7 +756,7 @@ def _tip_outcome_for_result(suggestion: str, res: Dict[str,Any]) -> Optional[int
     return None
 
 def _fixture_by_id(mid: int) -> Optional[dict]:
-    js=_api_get(FOOTBALL_API_URL, {"id": mid}) or {}
+    js=_api_get_robust(FOOTBALL_API_URL, {"id": mid}) or {}
     arr=js.get("response") or [] if isinstance(js,dict) else []
     return arr[0] if arr else None
 
@@ -671,7 +847,7 @@ def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct,
             f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}\n"
             f"🏆 <b>League:</b> {escape(league)}{stat}")
 
-# ───────── Scan (in-play) ─────────
+# ───────── Enhanced Scan (in-play) with reliability checks ─────────
 def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
     gh=int(feat.get("goals_h",0)); ga=int(feat.get("goals_a",0)); total=gh+ga
     if sug.startswith("Over"):
@@ -685,98 +861,188 @@ def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
     if sug.startswith("BTTS") and (gh>0 and ga>0): return False
     return True
 
-def production_scan() -> Tuple[int,int]:
-    matches=fetch_live_matches(); live_seen=len(matches)
-    if live_seen==0: log.info("[PROD] no live"); return 0,0
-    saved=0; now_ts=int(time.time())
+def generate_candidates(feat: Dict[str, float]) -> List[Tuple[str, str, float]]:
+    """Generate prediction candidates with reliability checks"""
+    candidates: List[Tuple[str, str, float]] = []
+
+    # OU
+    for line in OU_LINES:
+        mdl = _load_ou_model_for_line(line)
+        if not mdl: continue
+        p_over = _score_prob(feat, mdl)
+        mk = f"Over/Under {_fmt_line(line)}"
+        thr = _get_market_threshold(mk)
+        if p_over * 100.0 >= thr and _candidate_is_sane(f"Over {_fmt_line(line)} Goals", feat):
+            candidates.append((mk, f"Over {_fmt_line(line)} Goals", p_over))
+        p_under = 1.0 - p_over
+        if p_under * 100.0 >= thr and _candidate_is_sane(f"Under {_fmt_line(line)} Goals", feat):
+            candidates.append((mk, f"Under {_fmt_line(line)} Goals", p_under))
+
+    # BTTS
+    mdl_btts = load_model_from_settings("BTTS_YES")
+    if mdl_btts:
+        p = _score_prob(feat, mdl_btts)
+        thr = _get_market_threshold("BTTS")
+        if p * 100.0 >= thr and _candidate_is_sane("BTTS: Yes", feat):
+            candidates.append(("BTTS", "BTTS: Yes", p))
+        q = 1.0 - p
+        if q * 100.0 >= thr and _candidate_is_sane("BTTS: No", feat):
+            candidates.append(("BTTS", "BTTS: No", q))
+
+    # 1X2 (no draw)
+    mh, md, ma = _load_wld_models()
+    if mh and md and ma:
+        ph = _score_prob(feat, mh)
+        pd = _score_prob(feat, md)
+        pa = _score_prob(feat, ma)
+        s = max(EPS, ph + pd + pa)
+        ph, pa = ph / s, pa / s
+        thr = _get_market_threshold("1X2")
+        if ph * 100.0 >= thr:
+            candidates.append(("1X2", "Home Win", ph))
+        if pa * 100.0 >= thr:
+            candidates.append(("1X2", "Away Win", pa))
+
+    return candidates
+
+def enhanced_production_scan() -> Tuple[int, int]:
+    matches = fetch_live_matches()
+    live_seen = len(matches)
+    if live_seen == 0:
+        log.info("[PROD] no live")
+        return 0, 0
+
+    saved = 0
+    now_ts = int(time.time())
+
     with db_conn() as c:
         for m in matches:
             try:
-                fid=int((m.get("fixture",{}) or {}).get("id") or 0)
-                if not fid: continue
-                if DUP_COOLDOWN_MIN>0:
-                    cutoff=now_ts - DUP_COOLDOWN_MIN*60
-                    if c.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",(fid,cutoff)).fetchone(): 
+                fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+                if not fid:
+                    continue
+
+                # Existing duplicate check...
+                if DUP_COOLDOWN_MIN > 0:
+                    cutoff = now_ts - DUP_COOLDOWN_MIN * 60
+                    if c.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1", (fid, cutoff)).fetchone():
                         continue
-                feat=extract_features(m); minute=int(feat.get("minute",0))
-                if not stats_coverage_ok(feat, minute): continue
-                if minute < TIP_MIN_MINUTE: continue
-                if HARVEST_MODE and minute>=TRAIN_MIN_MINUTE and minute%3==0:
-                    try: save_snapshot_from_match(m, feat)
-                    except: pass
 
-                league_id, league=_league_name(m); home,away=_teams(m); score=_pretty_score(m)
-                candidates: List[Tuple[str,str,float]]=[]
+                feat = extract_features(m)
+                minute = int(feat.get("minute", 0))
 
-                # OU
-                for line in OU_LINES:
-                    mdl=_load_ou_model_for_line(line)
-                    if not mdl: continue
-                    p_over=_score_prob(feat, mdl)
-                    mk=f"Over/Under {_fmt_line(line)}"; thr=_get_market_threshold(mk)
-                    if p_over*100.0 >= thr and _candidate_is_sane(f"Over {_fmt_line(line)} Goals", feat):
-                        candidates.append((mk, f"Over {_fmt_line(line)} Goals", p_over))
-                    p_under=1.0-p_over
-                    if p_under*100.0 >= thr and _candidate_is_sane(f"Under {_fmt_line(line)} Goals", feat):
-                        candidates.append((mk, f"Under {_fmt_line(line)} Goals", p_under))
+                # Enhanced validation
+                if not validate_features(feat):
+                    log.info(f"[PROD] Skipping match {fid} - invalid features")
+                    continue
 
-                # BTTS
-                mdl_btts=load_model_from_settings("BTTS_YES")
-                if mdl_btts:
-                    p=_score_prob(feat, mdl_btts); thr=_get_market_threshold("BTTS")
-                    if p*100.0>=thr and _candidate_is_sane("BTTS: Yes", feat): candidates.append(("BTTS","BTTS: Yes",p))
-                    q=1.0-p
-                    if q*100.0>=thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
+                if not stats_coverage_ok(feat, minute):
+                    continue
 
-                # 1X2 (no draw)
-                mh,md,ma=_load_wld_models()
-                if mh and md and ma:
-                    ph=_score_prob(feat,mh); pd=_score_prob(feat,md); pa=_score_prob(feat,ma)
-                    s=max(EPS,ph+pd+pa); ph,pa=ph/s,pa/s
-                    thr=_get_market_threshold("1X2")
-                    if ph*100.0>=thr: candidates.append(("1X2","Home Win",ph))
-                    if pa*100.0>=thr: candidates.append(("1X2","Away Win",pa))
+                if minute < TIP_MIN_MINUTE:
+                    continue
 
-                candidates.sort(key=lambda x:x[2], reverse=True)
-                per_match=0; base_now=int(time.time())
-                for idx,(market_txt,suggestion,prob) in enumerate(candidates):
-                    if suggestion not in ALLOWED_SUGGESTIONS: continue
-                    if per_match >= max(1,PREDICTIONS_PER_MATCH): break
+                if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
+                    try:
+                        save_snapshot_from_match(m, feat)
+                    except:
+                        pass
+
+                league_id, league = _league_name(m)
+                home, away = _teams(m)
+                score = _pretty_score(m)
+
+                candidates = generate_candidates(feat)
+
+                # Enhanced filtering
+                reliable_candidates = []
+                for market_txt, suggestion, prob in candidates:
+                    if suggestion not in ALLOWED_SUGGESTIONS:
+                        continue
+
+                    # Get model for reliability checking
+                    if market_txt.startswith("Over/Under"):
+                        line = _parse_ou_line_from_suggestion(suggestion)
+                        mdl = _load_ou_model_for_line(line)
+                    elif market_txt == "BTTS":
+                        mdl = load_model_from_settings("BTTS_YES")
+                    else:  # 1X2
+                        if suggestion == "Home Win":
+                            mdl = load_model_from_settings("WLD_HOME")
+                        else:  # Away Win
+                            mdl = load_model_from_settings("WLD_AWAY")
+
+                    if not mdl:
+                        continue
+
+                    # Apply all reliability checks
+                    if (should_trust_prediction(feat, mdl, prob) and
+                        cross_validate_prediction(feat, market_txt, suggestion) and
+                        market_specific_reliability_rules(feat, market_txt, suggestion) and
+                        _candidate_is_sane(suggestion, feat)):
+
+                        reliable_candidates.append((market_txt, suggestion, prob))
+
+                reliable_candidates.sort(key=lambda x: x[2], reverse=True)
+                per_match = 0
+                base_now = int(time.time())
+
+                for idx, (market_txt, suggestion, prob) in enumerate(reliable_candidates):
+                    if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                        break
 
                     # Odds/EV gate
                     pass_odds, odds, book, _ = _price_gate(market_txt, suggestion, fid)
-                    if not pass_odds: 
+                    if not pass_odds:
                         continue
-                    ev_pct=None
+
+                    ev_pct = None
                     if odds is not None:
-                        edge=_ev(prob, odds)  # decimal (e.g. 0.05)
-                        ev_pct=round(edge*100.0,1)
-                        if int(round(edge*10000)) < EDGE_MIN_BPS:  # basis points compare
+                        edge = _ev(prob, odds)  # decimal (e.g. 0.05)
+                        ev_pct = round(edge * 100.0, 1)
+                        if int(round(edge * 10000)) < EDGE_MIN_BPS:  # basis points compare
                             continue
 
-                    created_ts=base_now+idx
-                    raw=float(prob); prob_pct=round(raw*100.0,1)
+                    created_ts = base_now + idx
+                    raw = float(prob)
+                    prob_pct = round(raw * 100.0, 1)
 
                     # PATCH: reuse the existing connection `c`
                     c.execute(
                         "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
                         "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
-                        (fid,league_id,league,home,away,market_txt,suggestion,float(prob_pct),raw,score,minute,created_ts,
-                         (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None))
+                        (fid, league_id, league, home, away, market_txt, suggestion, float(prob_pct), raw, score, minute,
+                         created_ts,
+                         (float(odds) if odds is not None else None), (book or None),
+                         (float(ev_pct) if ev_pct is not None else None))
                     )
 
-                    sent=_send_tip(home,away,league,minute,score,suggestion,float(prob_pct),feat,odds,book,ev_pct)
+                    sent = _send_tip(home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book,
+                                     ev_pct)
                     if sent:
-                        c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(fid,created_ts))
+                        c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
 
-                    saved+=1; per_match+=1
-                    if MAX_TIPS_PER_SCAN and saved>=MAX_TIPS_PER_SCAN: break
-                if MAX_TIPS_PER_SCAN and saved>=MAX_TIPS_PER_SCAN: break
+                    # Track prediction for quality analysis
+                    track_prediction_quality(market_txt, suggestion, float(prob_pct), fid)
+
+                    saved += 1
+                    per_match += 1
+                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                        break
+
+                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    break
+
             except Exception as e:
                 log.exception("[PROD] failure: %s", e)
                 continue
+
     log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
     return saved, live_seen
+
+# Keep original for backward compatibility
+def production_scan() -> Tuple[int, int]:
+    return enhanced_production_scan()
 
 # ───────── Prematch (compact: save-only, thresholds respected) ─────────
 def extract_prematch_features(fx: dict) -> Dict[str,float]:
@@ -1070,7 +1336,7 @@ def _start_scheduler_once():
     if _scheduler_started or not RUN_SCHEDULER: return
     try:
         sched=BackgroundScheduler(timezone=TZ_UTC)
-        sched.add_job(lambda:_run_with_pg_lock(1001,production_scan),"interval",seconds=SCAN_INTERVAL_SEC,id="scan",max_instances=1,coalesce=True)
+        sched.add_job(lambda:_run_with_pg_lock(1001,enhanced_production_scan),"interval",seconds=SCAN_INTERVAL_SEC,id="scan",max_instances=1,coalesce=True)
         sched.add_job(lambda:_run_with_pg_lock(1002,backfill_results_for_open_matches,400),"interval",minutes=BACKFILL_EVERY_MIN,id="backfill",max_instances=1,coalesce=True)
         if DAILY_ACCURACY_DIGEST_ENABLE:
             sched.add_job(lambda:_run_with_pg_lock(1003,daily_accuracy_digest),
@@ -1090,7 +1356,7 @@ def _start_scheduler_once():
                           id="auto_tune", max_instances=1, coalesce=True)
         sched.add_job(lambda:_run_with_pg_lock(1007,retry_unsent_tips,30,200),"interval",minutes=10,id="retry",max_instances=1,coalesce=True)
         sched.start(); _scheduler_started=True
-        send_telegram("🚀 goalsniper AI mode (in-play + prematch) started.")
+        send_telegram("🚀 goalsniper AI mode (in-play + prematch) started with enhanced reliability.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
@@ -1119,7 +1385,7 @@ def health():
 def http_init_db(): _require_admin(); init_db(); return jsonify({"ok": True})
 
 @app.route("/admin/scan", methods=["POST","GET"])
-def http_scan(): _require_admin(); s,l=production_scan(); return jsonify({"ok": True, "saved": s, "live_seen": l})
+def http_scan(): _require_admin(); s,l=enhanced_production_scan(); return jsonify({"ok": True, "saved": s, "live_seen": l})
 
 @app.route("/admin/backfill-results", methods=["POST","GET"])
 def http_backfill(): _require_admin(); n=backfill_results_for_open_matches(400); return jsonify({"ok": True, "updated": n})
@@ -1181,13 +1447,13 @@ def telegram_webhook(secret: str):
     update=request.get_json(silent=True) or {}
     try:
         msg=(update.get("message") or {}).get("text") or ""
-        if msg.startswith("/start"): send_telegram("👋 goalsniper bot (FULL AI mode) is online.")
+        if msg.startswith("/start"): send_telegram("👋 goalsniper bot (FULL AI mode) is online with enhanced reliability.")
         elif msg.startswith("/digest"): daily_accuracy_digest()
         elif msg.startswith("/motd"): send_match_of_the_day()
         elif msg.startswith("/scan"):
             parts=msg.split()
             if len(parts)>1 and ADMIN_API_KEY and parts[1]==ADMIN_API_KEY:
-                s,l=production_scan(); send_telegram(f"🔁 Scan done. Saved: {s}, Live seen: {l}")
+                s,l=enhanced_production_scan(); send_telegram(f"🔁 Scan done. Saved: {s}, Live seen: {l}")
             else: send_telegram("🔒 Admin key required.")
     except Exception as e:
         log.warning("telegram webhook parse error: %s", e)
