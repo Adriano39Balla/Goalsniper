@@ -67,7 +67,7 @@ MIN_THRESH              = float(os.getenv("MIN_THRESH", "55"))
 MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
 MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
-MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO"))
+MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
 MOTD_HOUR               = int(os.getenv("MOTD_HOUR", "19"))
 MOTD_MINUTE             = int(os.getenv("MOTD_MINUTE", "15"))
 MOTD_CONF_MIN           = float(os.getenv("MOTD_CONF_MIN", "70"))
