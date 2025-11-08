@@ -895,6 +895,28 @@ class AdvancedEnsemblePredictor:
 
 ensemble_predictor = AdvancedEnsemblePredictor()
 
+def get_league_quality(league_name: str) -> float:
+    """Rate league quality for filtering"""
+    league_lower = league_name.lower()
+    
+    quality_scores = {
+        "premier league": 9.0, "la liga": 9.0, "bundesliga": 9.0,
+        "serie a": 8.5, "ligue 1": 8.0, "primeira liga": 7.5,
+        "eredivisie": 7.5, "super lig": 7.0, "first division": 6.5,
+        "superliga": 6.0, "iii liga": 3.0, "campionato": 4.0
+    }
+    
+    for key, score in quality_scores.items():
+        if key in league_lower:
+            return score
+            
+    return 5.0  # Default medium quality
+
+def is_acceptable_league(league_name: str) -> bool:
+    """Filter out very low quality leagues"""
+    quality = get_league_quality(league_name)
+    return quality >= 4.0  # Only leagues with decent quality
+
 # ───────── Feature extraction ─────────
 def _num(v) -> float:
     try:
@@ -1040,6 +1062,34 @@ def extract_enhanced_features(m: dict) -> Dict[str, float]:
         "defensive_stability": _defensive_stability(base_feat)
     })
     return base_feat
+
+def is_high_quality_prediction(features: Dict[str, float], minute: int, market: str) -> bool:
+    """Verify game has sufficient quality for reliable predictions"""
+    
+    # Data quality checks
+    if features.get('xg_sum', 0) < 1.0 and minute > 30:
+        return False
+        
+    if features.get('sot_sum', 0) < 4 and minute > 35:
+        return False
+        
+    # Game activity check
+    recent_events = (features.get('shots_last_15', 0) + 
+                    features.get('goals_last_15', 0) + 
+                    features.get('cards_last_15', 0))
+    
+    if minute > 25 and recent_events < 2:
+        return False
+        
+    # For home win predictions, require clear dominance
+    if market == "1X2":
+        pressure_diff = features.get('pressure_home', 0) - features.get('pressure_away', 0)
+        xg_diff = features.get('xg_h', 0) - features.get('xg_a', 0)
+        
+        if pressure_diff < 15 and xg_diff < 0.5:
+            return False
+            
+    return True
 
 class AdvancedFeatureEngineer:
     def __init__(self):
@@ -1332,6 +1382,51 @@ class AdaptiveLearningSystem:
         return trends
 
 adaptive_learner = AdaptiveLearningSystem()
+
+def calibrate_win_probability(features: Dict[str, float], minute: int, original_prob: float) -> float:
+    """Calibrate win probability based on game context and comeback risks"""
+    calibrated = original_prob
+    
+    # Reduce probability for comeback situations
+    goal_diff = features.get("goals_h", 0) - features.get("goals_a", 0)
+    
+    # If home team leads by 1 goal
+    if goal_diff == 1:
+        # Factors that increase comeback risk
+        away_pressure = features.get("pressure_away", 0)
+        away_xg = features.get("xg_a", 0)
+        home_xg_eff = features.get("goals_h", 0) / max(0.1, features.get("xg_h", 0.1))
+        
+        comeback_risk = 0.0
+        
+        # High away pressure increases risk
+        if away_pressure > 60:
+            comeback_risk += 0.15
+            
+        # High away xG increases risk  
+        if away_xg > features.get("xg_h", 0):
+            comeback_risk += 0.20
+            
+        # Low home efficiency increases risk
+        if home_xg_eff < 0.3:
+            comeback_risk += 0.10
+            
+        # Late game reduces risk (less time for comeback)
+        time_factor = max(0, (90 - minute) / 90)
+        comeback_risk *= time_factor
+        
+        calibrated = original_prob * (1 - min(comeback_risk, 0.40))
+    
+    # If score is tied, be more conservative
+    elif goal_diff == 0:
+        # Require stronger dominance for high probabilities
+        pressure_ratio = features.get("pressure_home", 1) / max(1, features.get("pressure_away", 1))
+        xg_ratio = features.get("xg_h", 0.1) / max(0.1, features.get("xg_a", 0.1))
+        
+        if pressure_ratio < 1.5 or xg_ratio < 1.8:
+            calibrated = original_prob * 0.85
+    
+    return max(0.0, min(1.0, calibrated))
 
 def _apply_tune_thresholds(days: int = 14) -> Dict[str, float]:
     log.info(f"[AUTO-TUNE] Starting threshold tuning for {days} days of data")
