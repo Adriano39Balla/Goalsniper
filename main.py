@@ -1091,6 +1091,82 @@ def is_high_quality_prediction(features: Dict[str, float], minute: int, market: 
             
     return True
 
+class ContextAwareLogisticPredictor:
+    def __init__(self):
+        self.feature_importance = {
+            'score_context': 0.25,
+            'momentum_features': 0.20,
+            'quality_metrics': 0.30,
+            'time_factors': 0.15,
+            'pressure_metrics': 0.10
+        }
+    
+    def predict_with_context(self, features: Dict[str, float], 
+                           minute: int, market: str) -> Tuple[float, float]:
+        """Enhanced prediction with football context for ALL markets"""
+        
+        # Get base prediction from existing model
+        if market.startswith("OU_"):
+            # Handle Over/Under markets specifically
+            base_prob, base_conf = market_predictor.predict_for_market(features, market, minute)
+        else:
+            base_prob, base_conf = market_predictor.predict_for_market(features, market, minute)
+        
+        if base_prob <= 0:
+            return 0.0, 0.0
+        
+        # Apply Bayesian calibration
+        market_type = "OU" if market.startswith("OU_") else market
+        calibrated_prob = bayesian_predictor.calibrate_probability(
+            base_prob, features, minute, market_type
+        )
+        
+        # Adjust confidence based on data quality
+        calibrated_conf = self._adjust_confidence(base_conf, features, minute, market_type)
+        
+        return calibrated_prob, calibrated_conf
+    
+    def _adjust_confidence(self, base_conf: float, features: Dict[str, float], 
+                          minute: int, market: str) -> float:
+        """Adjust confidence based on data reliability for ALL markets"""
+        
+        confidence = base_conf
+        
+        # Penalize low data quality (affects all markets)
+        if features.get('xg_sum', 0) < 0.3 and minute > 20:
+            confidence *= 0.6
+            
+        # Penalize stagnant games (affects scoring markets more)
+        if features.get('shots_last_15', 0) == 0 and minute > 30:
+            if market in ["BTTS", "OU"]:
+                confidence *= 0.6
+            else:
+                confidence *= 0.8
+            
+        # Reward high-quality data (helps all markets)
+        if features.get('xg_sum', 0) > 1.5 and features.get('sot_sum', 0) > 6:
+            confidence *= 1.2
+            
+        # Market-specific confidence adjustments
+        if market == "1X2":
+            # 1X2 requires clearer signals
+            pressure_diff = abs(features.get("pressure_home", 0) - features.get("pressure_away", 0))
+            if pressure_diff < 20:
+                confidence *= 0.8  # Low confidence in balanced games
+                
+        elif market in ["BTTS", "OU"]:
+            # Scoring markets benefit from high activity
+            if features.get("goals_last_15", 0) >= 1:
+                confidence *= 1.1
+            elif features.get("shots_last_15", 0) >= 4:
+                confidence *= 1.05
+            
+        return max(0.1, min(1.0, confidence))
+
+# Initialize the predictors
+bayesian_predictor = BayesianFootballPredictor()
+context_predictor = ContextAwareLogisticPredictor()
+
 class AdvancedFeatureEngineer:
     def __init__(self):
         self.feature_cache = {}
@@ -2043,19 +2119,229 @@ def _get_market_threshold_pre(market: str) -> float:
         return CONF_THRESHOLD + 5.0
 
 # ───────── Bayesian / GameState / Odds Quality ─────────
-class BayesianUpdater:
+class BayesianFootballPredictor:
     def __init__(self):
-        self.prior_strength = 0.3
-    def update_probability(self, prior_prob: float, live_prob: float, minute: int) -> float:
-        live_weight = min(minute / 90.0, 1.0) * (1 - self.prior_strength)
-        prior_weight = self.prior_strength * (1 - live_weight)
-        return float((prior_prob * prior_weight + live_prob * live_weight) / max(1e-9, (prior_weight + live_weight)))
-    def calculate_confidence_interval(self, prob: float, sample_size: int) -> Tuple[float, float]:
-        import math
-        z = 1.96
-        if sample_size == 0: return float(prob), float(prob)
-        margin = z * math.sqrt((prob * (1 - prob)) / sample_size)
-        return max(0.0, prob - margin), min(1.0, prob + margin)
+        self.prior_strength = 0.4
+        self.context_weights = {
+            'score_impact': 0.25,
+            'momentum_impact': 0.20,
+            'quality_impact': 0.30,
+            'time_impact': 0.15,
+            'randomness_impact': 0.10
+        }
+    
+    def calibrate_probability(self, raw_prob: float, features: Dict[str, float], 
+                            minute: int, market: str) -> float:
+        """Bayesian calibration for ALL markets"""
+        
+        # Base prior from historical data
+        base_prior = self._get_base_prior(market, minute, features)
+        
+        # Contextual likelihood adjustments
+        likelihood = self._calculate_context_likelihood(features, minute, market)
+        
+        # Bayesian update
+        calibrated = (base_prior * self.prior_strength + 
+                     raw_prob * likelihood * (1 - self.prior_strength))
+        
+        # Apply realistic caps
+        calibrated = self._apply_realistic_caps(calibrated, minute, market, features)
+        
+        return calibrated
+    
+    def _get_base_prior(self, market: str, minute: int, features: Dict[str, float]) -> float:
+        """Base probabilities from football reality for all markets"""
+        
+        if market == "1X2":
+            if minute < 30:
+                return 0.33  # Early game: more uncertainty
+            elif minute < 60:
+                return 0.40  # Mid game: some clarity
+            else:
+                return 0.45  # Late game: more certainty
+                
+        elif market == "BTTS":
+            # Adjust BTTS prior based on current goals
+            current_goals = features.get("goals_sum", 0)
+            if current_goals == 0 and minute > 40:
+                return 0.40  # Less likely if no goals late
+            elif current_goals >= 2:
+                return 0.65  # More likely if already goals
+            else:
+                return 0.52  # Historical average
+                
+        elif market == "OU":  # Over/Under markets
+            # Base on current goals and tempo
+            current_goals = features.get("goals_sum", 0)
+            xg_per_minute = features.get("xg_sum", 0) / max(1, minute)
+            
+            if xg_per_minute > 0.05:  # High-tempo game
+                return 0.58
+            elif xg_per_minute < 0.02:  # Low-tempo game  
+                return 0.42
+            else:
+                return 0.50  # Balanced game
+                
+        else:
+            return 0.50  # Default prior
+    
+    def _calculate_context_likelihood(self, features: Dict[str, float], 
+                                    minute: int, market: str) -> float:
+        """Calculate context adjustment for ALL markets"""
+        
+        likelihood = 1.0
+        
+        # Score context affects all markets
+        goal_diff = features.get("goals_h", 0) - features.get("goals_a", 0)
+        total_goals = features.get("goals_sum", 0)
+        likelihood *= self._score_context_factor(goal_diff, total_goals, minute, market)
+        
+        # Momentum context
+        likelihood *= self._momentum_context_factor(features, minute, market)
+        
+        # Quality context
+        likelihood *= self._quality_context_factor(features, market)
+        
+        # Time context
+        likelihood *= self._time_context_factor(minute, market)
+        
+        # Randomness factor (football is unpredictable!)
+        likelihood *= 0.85  # Always account for randomness
+        
+        return max(0.1, min(2.0, likelihood))
+    
+    def _score_context_factor(self, goal_diff: float, total_goals: float, 
+                            minute: int, market: str) -> float:
+        """Adjust for current scoreline - ALL markets"""
+        
+        if market == "1X2":
+            if goal_diff == 0:  # Tied game
+                return 0.8 if minute < 60 else 0.9
+            elif abs(goal_diff) == 1:  # One goal lead
+                return 1.2 if minute > 70 else 1.0
+            elif abs(goal_diff) >= 2:  # Comfortable lead
+                return 1.5 if minute > 60 else 1.2
+                
+        elif market == "BTTS":
+            if total_goals == 0:
+                return 0.7 if minute > 50 else 0.9  # Less likely BTTS if no goals late
+            elif total_goals >= 2:
+                return 1.3  # More likely BTTS if goals already
+            else:
+                return 1.0
+                
+        elif market == "OU":  # Over/Under
+            if total_goals == 0:
+                return 0.8 if minute > 40 else 1.0  # Less likely Over if no goals late
+            elif total_goals >= 3:
+                return 1.4  # More likely additional goals
+            else:
+                return 1.0
+                
+        return 1.0
+    
+    def _momentum_context_factor(self, features: Dict[str, float], 
+                               minute: int, market: str) -> float:
+        """Adjust for recent momentum - ALL markets"""
+        factor = 1.0
+        
+        # Recent goals affect all markets
+        recent_goals = features.get("goals_last_15", 0)
+        if recent_goals >= 2:
+            factor *= 1.4  # High-scoring momentum (helps BTTS and Over)
+        elif recent_goals == 0 and minute > 30:
+            factor *= 0.7  # Stagnant game (hurts BTTS and Over)
+            
+        # Shot momentum
+        recent_shots = features.get("shots_last_15", 0)
+        if recent_shots >= 5:
+            if market in ["BTTS", "OU"]:
+                factor *= 1.3  # High activity helps scoring markets
+        elif recent_shots <= 1 and minute > 25:
+            if market in ["BTTS", "OU"]:
+                factor *= 0.6  # Low activity hurts scoring markets
+            
+        return factor
+    
+    def _quality_context_factor(self, features: Dict[str, float], market: str) -> float:
+        """Adjust for data quality and reliability - ALL markets"""
+        factor = 1.0
+        
+        # xG reliability affects all predictions
+        xg_sum = features.get("xg_sum", 0)
+        if xg_sum < 0.5:
+            factor *= 0.6  # Low reliability for all markets
+        elif xg_sum > 2.0:
+            factor *= 1.2  # High reliability for all markets
+            
+        # Pressure balance affects 1X2 more
+        pressure_diff = abs(features.get("pressure_home", 0) - features.get("pressure_away", 0))
+        if market == "1X2":
+            if pressure_diff > 40:
+                factor *= 1.3  # Clear dominance helps 1X2
+            elif pressure_diff < 15:
+                factor *= 0.8  # Balanced game makes 1X2 harder
+                
+        return factor
+    
+    def _time_context_factor(self, minute: int, market: str) -> float:
+        """Adjust for game time - ALL markets"""
+        if market == "1X2":
+            if minute < 25:
+                return 0.6  # Early game very uncertain
+            elif minute < 60:
+                return 0.8  # Mid game somewhat clear
+            else:
+                return 1.2  # Late game more certain
+                
+        elif market == "BTTS":
+            if minute < 25:
+                return 0.7  # Early BTTS uncertain
+            elif minute > 75:
+                return 0.6  # Late BTTS less likely
+            else:
+                return 1.0
+                
+        elif market == "OU":
+            if minute < 25:
+                return 0.7  # Early totals uncertain
+            elif minute > 70:
+                return 0.8  # Late totals somewhat clear
+            else:
+                return 1.0
+                
+        return 1.0
+    
+    def _apply_realistic_caps(self, prob: float, minute: int, 
+                            market: str, features: Dict[str, float]) -> float:
+        """Apply absolute realistic probability caps for ALL markets"""
+        
+        # Base caps by game time
+        if minute < 30:
+            base_cap = 0.75  # No early game certainty
+        elif minute < 70:
+            base_cap = 0.85  # Moderate mid-game certainty
+        else:
+            base_cap = 0.92  # Max even for sure things
+        
+        # Market-specific adjustments
+        if market == "1X2":
+            # 1X2 has more uncertainty
+            base_cap = min(base_cap, 0.88)
+            
+        elif market == "BTTS":
+            # BTTS is inherently volatile
+            base_cap = min(base_cap, 0.85)
+            
+        elif market == "OU":
+            # Totals can be more predictable but still uncertain
+            base_cap = min(base_cap, 0.90)
+        
+        # Additional cap for tied games
+        if features.get("goals_sum", 0) == 0 and minute > 40:
+            base_cap = min(base_cap, 0.80)
+            
+        return min(prob, base_cap)
 
 class GameStateAnalyzer:
     def __init__(self):
@@ -2473,159 +2759,65 @@ def enhanced_production_scan() -> Tuple[int, int]:
                     score = _pretty_score(m)
                     candidates: List[Tuple[str, str, float, float]] = []
                     
-                    # 1) BTTS - Higher threshold
+                    # 1) BTTS - WITH BAYESIAN CALIBRATION
                     try:
-                        btts_prob, btts_conf = market_predictor.predict_for_market(feat, "BTTS", minute)
-                        if btts_prob > 0 and btts_conf >= 0.65:  # Stricter confidence
-                            preds = {"BTTS: Yes": btts_prob, "BTTS: No": max(0.0, 1 - btts_prob)}
-                            for suggestion, p in preds.items():
-                                if p >= 0.72:  # Higher probability threshold
-                                    candidates.append(("BTTS", suggestion, p, btts_conf))
+                        btts_prob, btts_conf = context_predictor.predict_with_context(feat, minute, "BTTS")
+                        if btts_prob > 0 and btts_conf >= 0.75:
+                            calibrated_prob = bayesian_predictor.calibrate_probability(btts_prob, feat, minute, "BTTS")
+                            if calibrated_prob >= 0.72:
+                                preds = {"BTTS: Yes": calibrated_prob, "BTTS: No": max(0.0, 1 - calibrated_prob)}
+                                for suggestion, p in preds.items():
+                                    if p >= 0.72 and market_cutoff_ok(minute, "BTTS", suggestion):
+                                        if _candidate_is_sane(suggestion, feat):
+                                            candidates.append(("BTTS", suggestion, p, btts_conf))
                     except Exception as e:
                         _dbg("btts_predict_error", err=str(e))
 
-                    # 2) OU - Higher thresholds  
+                    # 2) OVER/UNDER - WITH BAYESIAN CALIBRATION
                     for line in OU_LINES:
                         mkkey = f"Over/Under {_fmt_line(line)}"
                         try:
-                            ou_prob, ou_conf = market_predictor.predict_for_market(feat, f"OU_{_fmt_line(line)}", minute)
-                            if ou_prob > 0 and ou_conf >= 0.65:
-                                preds = {f"Over {_fmt_line(line)} Goals": ou_prob, f"Under {_fmt_line(line)} Goals": max(0.0, 1 - ou_prob)}
-                                for suggestion, p in preds.items():
-                                    if p >= 0.75:  # Higher threshold
-                                        candidates.append((mkkey, suggestion, p, ou_conf))
+                            ou_prob, ou_conf = context_predictor.predict_with_context(feat, minute, f"OU_{_fmt_line(line)}")
+                            if ou_prob > 0 and ou_conf >= 0.75:
+                                calibrated_prob = bayesian_predictor.calibrate_probability(ou_prob, feat, minute, "OU")
+                                if calibrated_prob >= 0.75:
+                                    preds = {
+                                        f"Over {_fmt_line(line)} Goals": calibrated_prob, 
+                                        f"Under {_fmt_line(line)} Goals": max(0.0, 1 - calibrated_prob)
+                                    }
+                                    for suggestion, p in preds.items():
+                                        if p >= 0.75 and market_cutoff_ok(minute, mkkey, suggestion):
+                                            if _candidate_is_sane(suggestion, feat):
+                                                candidates.append((mkkey, suggestion, p, ou_conf))
                         except Exception as e:
                             _dbg("ou_predict_error", line=_fmt_line(line), err=str(e))
 
-                    # 3) 1X2 - Much stricter
+                    # 3) 1X2 - WITH BAYESIAN CALIBRATION
                     try:
-                        ph, pa, c1 = market_predictor._predict_1x2_advanced(feat, minute)
-                        if c1 >= 0.70:  # Higher confidence
+                        # Use context-aware prediction for both home and away
+                        ph, conf_h = context_predictor.predict_with_context(feat, minute, "1X2_HOME")
+                        pa, conf_a = context_predictor.predict_with_context(feat, minute, "1X2_AWAY")
+    
+                        # Normalize probabilities to sum to 1
+                        total = ph + pa
+                        if total > 0:
+                            ph, pa = ph/total, pa/total
+    
+                        # Use the higher confidence of the two
+                        win_conf = max(conf_h, conf_a)
+    
+                        if win_conf >= 0.80:
                             if ph >= 0.78:
-                                candidates.append(("1X2", "Home Win", ph, c1))
-                            elif pa >= 0.78:  
-                                candidates.append(("1X2", "Away Win", pa, c1))
+                                if market_cutoff_ok(minute, "1X2", "Home Win"):
+                                    if _inplay_1x2_sanity_ok("Home Win", feat, None):
+                                        candidates.append(("1X2", "Home Win", ph, win_conf))
+                            elif pa >= 0.78:
+                                if market_cutoff_ok(minute, "1X2", "Away Win"):
+                                    if _inplay_1x2_sanity_ok("Away Win", feat, None):
+                                        candidates.append(("1X2", "Away Win", pa, win_conf))
+                    
                     except Exception as e:
                         _dbg("wld_predict_error", err=str(e))
-
-                    if not candidates:
-                        _dbg("no_candidates_post_threshold", fid=fid, minute=minute); continue
-
-                    odds_map = fetch_odds(fid) if API_KEY else {}
-                    ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
-
-                    for mk, sug, prob, conf in candidates:
-                        if sug not in ALLOWED_SUGGESTIONS:
-                            continue
-                            
-                        # STRICTER: Higher confidence requirement
-                        if conf < 0.65:
-                            continue
-                            
-                        okey = _odds_key_for_market(mk, sug)
-                        hint_map: dict[str, float] = {}
-                        if mk == "BTTS":
-                            yes_prob = prob if sug.endswith("Yes") else (1.0 - prob)
-                            hint_map["BTTS: Yes"] = float(yes_prob)
-                        elif mk == "1X2":
-                            hint_map[sug] = float(prob)
-                        elif mk.startswith("Over/Under"):
-                            ln = _parse_ou_line_from_suggestion(sug)
-                            if ln is not None:
-                                over_key = f"Over {_fmt_line(ln)} Goals"
-                                over_prob = prob if sug.startswith("Over") else (1.0 - prob)
-                                hint_map[over_key] = float(over_prob)
-                                
-                        oa = SmartOddsAnalyzer(threshold=0.60)  # Higher quality threshold
-                        oq = oa.analyze_odds_quality(odds_map, hint_map, target_market_key=okey)
-                        if oq < 0.60:
-                            _dbg("odds_quality_block", market=mk, sug=sug, quality=round(oq,3)); continue
-                            
-                        pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
-                        if not pass_odds:
-                            continue
-                            
-                        # STRICTER EV requirement
-                        ev_pct = None
-                        if odds is not None:
-                            edge = _ev(prob, float(odds))
-                            ev_bps = int(round(edge * 10000))
-                            ev_pct = round(edge * 100.0, 1)
-                            if ev_bps < 1200:  # Higher EV requirement
-                                _dbg("ev_block", market=mk, sug=sug, ev_bps=ev_bps); continue
-                        elif not ALLOW_TIPS_WITHOUT_ODDS:
-                            continue
-                            
-                        rank_score = (prob ** 1.5) * (1 + (ev_pct or 0) / 100.0) * max(0.0, conf)
-                        ranked.append((mk, sug, prob, odds, book, ev_pct, rank_score, conf))
-
-                    if not ranked:
-                        _dbg("ranked_empty_after_gates", fid=fid, minute=minute); continue
-                        
-                    ranked.sort(key=lambda x: x[6], reverse=True)
-                    
-                    # STRICTER: Only take top 1-2 candidates per match
-                    per_match = 0
-                    base_now = int(time.time())
-                    
-                    for idx, (market_txt, suggestion, prob, odds, book, ev_pct, _rank, conf) in enumerate(ranked):
-                        if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
-                            break
-                        if per_match >= 1:  # Only 1 tip per match max
-                            break
-                            
-                        created_ts = base_now + idx
-                        raw = float(prob)
-                        prob_pct = round(raw * 100.0, 1)
-                        
-                        try:
-                            with db_conn() as c2:
-                                c2.execute(
-                                    "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,"
-                                    "confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok"
-                                    ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                                    (fid, league_id, league, home, away, market_txt, suggestion,
-                                     float(prob_pct), raw, score, minute, created_ts,
-                                     float(odds) if odds is not None else None,
-                                     book or None,
-                                     float(ev_pct) if ev_pct is not None else None, 0)
-                                )
-                                
-                            sent = send_telegram(_format_enhanced_tip_message(
-                                home, away, league, minute, score, suggestion,
-                                float(prob_pct), feat, odds, book, ev_pct, conf
-                            ))
-                            
-                            if sent:
-                                with db_conn() as c3:
-                                    c3.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
-                                              (fid, created_ts))
-                                
-                            saved += 1
-                            per_match += 1
-                            per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
-                            
-                        except Exception as e:
-                            log.exception("[ENHANCED_PROD] insert/send failed: %s", e)
-                            continue
-                            
-                        if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                            break
-                            
-                    if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                        break
-                        
-                except Exception as e:
-                    log.exception("[ENHANCED_PROD] match loop failed: %s", e)
-                    continue
-                    
-        log.info("[ENHANCED_PROD] saved=%d live_seen=%d", saved, live_seen)
-        _metric_inc("tips_generated_total", n=saved)
-        return saved, live_seen
-        
-    except Exception as e:
-        log.exception("[ENHANCED_PROD] Global scan error: %s", e)
-        return (0, 0)
 
 # ───────── Model loader ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
