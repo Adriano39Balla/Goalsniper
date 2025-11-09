@@ -1161,7 +1161,8 @@ class MarketSpecificPredictor:
     def predict_for_market(self, features: Dict[str, float], market: str, minute: int) -> Tuple[float, float]:
         """Market-specific prediction with advanced features"""
         if market.startswith("OU_"):
-            return self._predict_ou_advanced(features, minute)
+            # pass full market key so the OU line is honored
+            return self._predict_ou_advanced(features, minute, market)
         elif market in self.market_strategies:
             return self.market_strategies[market](features, minute)
         else:
@@ -1199,43 +1200,24 @@ class MarketSpecificPredictor:
         
         return max(0.0, min(1.0, adjusted_prob)), max(0.0, min(1.0, confidence))
     
-    def _predict_ou_advanced(self, features: Dict[str, float], minute: int) -> Tuple[float, float]:
-        """Advanced Over/Under prediction with proper model loading"""
-        # Try multiple approaches to get base probability
-        base_prob, base_conf = 0.0, 0.0
-        
-        # Approach 1: Use ensemble prediction
+    def _predict_ou_advanced(self, features: Dict[str, float], minute: int, market: str) -> Tuple[float, float]:
+        """OU prediction for a specific line from the correct model."""
         try:
-            ensemble_prob, ensemble_conf = ensemble_predictor.predict_ensemble(features, "OU", minute)
-            if ensemble_prob > base_prob:
-                base_prob, base_conf = ensemble_prob, ensemble_conf
-        except Exception as e:
-            log.warning(f"[OU_PREDICT] Ensemble failed: {e}")
-        
-        # Approach 2: Fallback to direct model prediction
-        if base_prob <= 0:
-            for line in OU_LINES:
-                market_key = f"OU_{_fmt_line(line)}"
-                mdl = ensemble_predictor._load_ou_model_for_line(line)
-                if mdl:
-                    prob = predict_from_model(mdl, features)
-                    confidence = 0.8  # Base confidence for direct model
-                    if prob > base_prob:
-                        base_prob, base_conf = prob, confidence
-                    break  # Use first available model
-        
-        if base_prob <= 0:
+            ln = float(market.split("_", 1)[1])
+        except Exception:
             return 0.0, 0.0
-        
-        # Apply OU-specific adjustments
-        adjustments = self._calculate_ou_adjustments(features, minute)
-        adjusted_prob = max(0.0, min(1.0, base_prob * (1 + adjustments)))
-        
-        # Adjust confidence based on game state
-        confidence_factor = self._calculate_ou_confidence_factor(features, minute)
-        final_confidence = max(0.0, min(1.0, base_conf * confidence_factor))
-        
-        return adjusted_prob, final_confidence
+
+        mdl = _load_ou_model_for_line(ln)
+        if not mdl:
+            return 0.0, 0.0
+
+        p_over = _score_prob(features, mdl)  # calibrated probability
+        # bounded contextual adjustment
+        adj = min(0.20, max(-0.20, self._calculate_ou_adjustments(features, minute)))
+        p_over = min(1.0, max(0.0, p_over * (1.0 + adj)))
+
+        conf = self._calculate_ou_confidence_factor(features, minute)
+        return p_over, conf
     
     def _calculate_ou_adjustments(self, features: Dict[str, float], minute: int) -> float:
         """Calculate OU-specific probability adjustments"""
@@ -1435,6 +1417,8 @@ class AdaptiveLearningSystem:
         prediction_correct = 1 if (probability > 0.5 and outcome == 1) or (probability <= 0.5 and outcome == 0) else 0
         
         for feature_name, feature_value in features.items():
+            if isinstance(feature_value, (int, float)) is False:
+                continue  # guard weird values
             if feature_name not in self.feature_importance:
                 self.feature_importance[feature_name] = {
                     'total_uses': 0,
@@ -1810,6 +1794,7 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 score = _pretty_score(m)
 
                 candidates: List[Tuple[str, str, float, float]] = []
+                last_1x2_probs: Optional[Dict[str, float]] = None
 
                 # PREDICT ALL MARKETS: BTTS, OU, 1X2
                 log.info(f"[MARKET_SCAN] Processing {home} vs {away} at minute {minute}")
@@ -1847,30 +1832,23 @@ def enhanced_production_scan() -> Tuple[int, int]:
                                 candidates.append((f"Over/Under {_fmt_line(line)}", suggestion, adj_prob, ou_confidence))
                                 log.info(f"[OU_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {ou_confidence:.3f})")
 
-                # 3. 1X2 Market (Draw suppressed)
+                # 3. 1X2 Market (proper WLD heads → draw-suppressed 12)
                 try:
-                    prob_h, prob_a, confidence_1x2 = market_predictor.predict_for_market(feat, "1X2", minute)
-                    
-                    if prob_h > 0 and prob_a > 0 and confidence_1x2 > 0.5:
-                        # Normalize probabilities (suppress draw)
-                        total = prob_h + prob_a
-                        if total > 0:
-                            prob_h /= total
-                            prob_a /= total
-                            
-                        predictions_1X2 = {
-                            "Home Win": prob_h,
-                            "Away Win": prob_a
-                        }
+                    p12 = compute_12_probs(feat)
+                    if p12:
+                        prob_h, prob_a = p12
+                        last_1x2_probs = {"Home Win": prob_h, "Away Win": prob_a}
+
+                        predictions_1X2 = {"Home Win": prob_h, "Away Win": prob_a}
                         adjusted_1x2 = game_state_analyzer.adjust_predictions(predictions_1X2, game_state)
                         
                         for suggestion, adj_prob in adjusted_1x2.items():
                             threshold = _get_market_threshold("1X2")
                             if adj_prob * 100 >= threshold:
-                                candidates.append(("1X2", suggestion, adj_prob, confidence_1x2))
-                                log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f} (conf: {confidence_1x2:.3f})")
+                                candidates.append(("1X2", suggestion, adj_prob, 0.75))
+                                log.info(f"[1X2_CANDIDATE] {suggestion}: {adj_prob:.3f}")
                 except Exception as e:
-                    log.warning(f"[1X2_PREDICT] Failed for {home} vs {away}: {e}")
+                    log.warning(f"[1X2_PREDICT] WLD pipeline failed: {e}")
 
                 if not candidates:
                     log.info(f"[NO_CANDIDATES] No qualified tips for {home} vs {away}")
@@ -1906,7 +1884,17 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
                     # Enhanced odds analysis
                     odds_analyzer = SmartOddsAnalyzer()
-                    odds_quality = odds_analyzer.analyze_odds_quality(odds_map, {mk: prob})
+                    # Side-aware prob hints for 1X2 (Home/Away) if available
+                    prob_hints_for_quality: Dict[str, Any] = {}
+                    if mk == "1X2" and last_1x2_probs:
+                        prob_hints_for_quality["1X2"] = {
+                            "Home": last_1x2_probs.get("Home Win", 0.5),
+                            "Away": last_1x2_probs.get("Away Win", 0.5),
+                        }
+                    else:
+                        prob_hints_for_quality[mk] = prob
+
+                    odds_quality = odds_analyzer.analyze_odds_quality(odds_map, prob_hints_for_quality)
                     
                     if odds_quality < odds_analyzer.odds_quality_threshold:
                         continue
@@ -1941,7 +1929,18 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
                     ev_pct = None
                     if odds is not None:
-                        edge = _ev(prob, float(odds))
+                        # shrink 1X2 prob toward fair before EV if market disagrees heavily
+                        p_for_ev = prob
+                        if mk == "1X2" and odds_map.get("1X2"):
+                            other = "Away" if sug == "Home Win" else "Home"
+                            try:
+                                d1x2 = odds_map.get("1X2", {})
+                                odds_opp = (d1x2.get(other) or {}).get("odds")
+                                p_for_ev = shrink_prob_toward_fair(prob, odds, odds_opp, minute)
+                            except Exception:
+                                pass
+
+                        edge = _ev(p_for_ev, float(odds))
                         ev_pct = round(edge * 100.0, 1)
                         if int(round(edge * 10000)) < EDGE_MIN_BPS:
                             continue
@@ -2175,26 +2174,32 @@ class SmartOddsAnalyzer:
         
         return sum(quality_metrics) / len(quality_metrics) if quality_metrics else 0.0
     
-    def _market_odds_quality(self, sides: dict, prob_hint: float) -> float:
-        """Calculate quality for a specific market"""
+    def _market_odds_quality(self, sides: dict, prob_hint) -> float:
+        """Quality for a specific market; prob_hint can be a dict per side."""
         if len(sides) < 2:
             return 0.0
         
-        # Check implied probabilities
-        total_implied = sum(1.0 / data['odds'] for data in sides.values())
-        overround = total_implied - 1.0
+        # Check implied probabilities & overround
+        total_implied = sum(1.0 / max(1e-9, data['odds']) for data in sides.values())
+        overround = max(0.0, total_implied - 1.0)
         
-        # Quality decreases with higher overround
-        overround_quality = max(0, 1.0 - overround * 5)
+        # Quality decreases with higher overround (soften penalty)
+        overround_quality = max(0.0, 1.0 - overround * 3.0)
         
-        # Compare with model probabilities if available
+        # Compare model to the best-priced side if side-specific hint provided
         model_quality = 1.0
-        if prob_hint:
-            best_side = max(sides.items(), key=lambda x: x[1]['odds'])
-            model_ev = _ev(prob_hint, best_side[1]['odds'])
-            model_quality = min(1.0, max(0.0, model_ev + 1.0))
+        try:
+            if isinstance(prob_hint, dict):
+                # sides keys like "Home"/"Away", "Over"/"Under", "Yes"/"No"
+                best_side_lbl, best_side = max(sides.items(), key=lambda x: x[1]['odds'])
+                p = prob_hint.get(best_side_lbl)
+                if p is not None and 0.05 <= p <= 0.95:
+                    model_ev = _ev(float(p), float(best_side['odds']))
+                    model_quality = min(1.0, max(0.0, 0.5 + 0.5 * model_ev))
+        except Exception:
+            pass
         
-        return (overround_quality + model_quality) / 2
+        return (overround_quality + model_quality) / 2.0
 
 # Prematch feature extraction (keep original for now)
 def extract_prematch_features(f: dict) -> Dict[str, float]:
@@ -2258,16 +2263,10 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     if mdl is not None: _MODELS_CACHE.set(name, mdl)
     return mdl
 
-# ───────── Logistic predict ─────────
+# ───────── Logistic predict (fixed: always use calibrated scorer) ─────────
 def predict_from_model(mdl: Dict[str, Any], features: Dict[str, float]) -> float:
-    w=mdl.get("weights") or {}; s=mdl.get("intercept",0.0)
-    for k,v in w.items(): s+=v*features.get(k,0.0)
-    prob=1/(1+np.exp(-s))
-    cal=mdl.get("calibration") or {}
-    if isinstance(cal,dict) and cal.get("method")=="sigmoid":
-        a=cal.get("a",1.0); b=cal.get("b",0.0)
-        prob=1/(1+np.exp(-(a*prob+b)))
-    return float(prob)
+    # Always use the robust scorer that applies Platt (or sigmoid) correctly
+    return _score_prob(features, mdl)
 
 # ───────── Odds fetch + aggregation (with negative cache) ─────────
 def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
@@ -2345,7 +2344,14 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
                 if mkey == "BTTS":
                     hint = prob_hints.get("BTTS: Yes") if side == "Yes" else (1.0 - (prob_hints.get("BTTS: Yes") or 0.0))
                 elif mkey == "1X2":
-                    hint = prob_hints.get("Home Win") if side == "Home" else (prob_hints.get("Away Win") if side == "Away" else None)
+                    # prob_hints can be side-aware dict: {"Home": pH, "Away": pA}
+                    try:
+                        if isinstance(prob_hints.get("1X2", None), dict):
+                            hint = prob_hints["1X2"].get(side)
+                        else:
+                            hint = prob_hints.get("Home Win") if side == "Home" else prob_hints.get("Away Win")
+                    except Exception:
+                        pass
                 elif mkey.startswith("OU_"):
                     try:
                         ln = float(mkey.split("_", 1)[1])
@@ -2429,6 +2435,68 @@ def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
 
 def _load_wld_models(): 
     return (load_model_from_settings("WLD_HOME"), load_model_from_settings("WLD_DRAW"), load_model_from_settings("WLD_AWAY"))
+
+# ───────── 1X2 helpers: WLD→12 + fair shrink guardrails ─────────
+def _de_vig_two_sides(price_a: float, price_b: float) -> tuple[Optional[float], Optional[float]]:
+    try:
+        pa, pb = 1.0/float(price_a), 1.0/float(price_b)
+        s = pa + pb
+        if s <= 0: return None, None
+        return pa/s, pb/s
+    except Exception:
+        return None, None
+
+def compute_12_probs(feat: Dict[str, float]) -> Optional[tuple[float, float]]:
+    mh, md, ma = _load_wld_models()
+    if not (mh and md and ma):
+        return None
+    ph = _score_prob(feat, mh)
+    pd = _score_prob(feat, md)
+    pa = _score_prob(feat, ma)
+
+    # normalize WLD then suppress draw
+    s = max(EPS, ph + pd + pa)
+    ph, pd, pa = ph/s, pd/s, pa/s
+    pd = min(pd, 0.99)
+    ph12, pa12 = ph/(1.0 - pd), pa/(1.0 - pd)
+
+    # optional 12 calibrator blob
+    cal_raw = get_setting_cached("model_latest:CAL_12") or get_setting_cached("model:CAL_12")
+    if cal_raw:
+        try:
+            blob = json.loads(cal_raw)
+            cal = (blob.get("calibration") or blob)
+            a = float(cal.get("a", 1.0)); b = float(cal.get("b", 0.0))
+            ph12 = _sigmoid(a*_logit(ph12) + b)
+            pa12 = _sigmoid(a*_logit(pa12) + b)
+        except Exception:
+            pass
+
+    # minute-based clamp
+    minute = int(feat.get("minute", 0))
+    hi = 0.95 if minute < 60 else 0.98
+    ph12 = min(max(ph12, 0.02), hi)
+    pa12 = min(max(pa12, 0.02), hi)
+
+    s = max(EPS, ph12 + pa12)
+    return ph12/s, pa12/s
+
+def shrink_prob_toward_fair(prob: float, odds_this: Optional[float], odds_opp: Optional[float], minute: int) -> float:
+    if not (odds_this and odds_opp):
+        return float(prob)
+    fair_a, fair_b = _de_vig_two_sides(float(odds_this), float(odds_opp))
+    if fair_a is None or fair_b is None:
+        return float(prob)
+
+    p_fair = fair_a  # caller passes "this" as first side
+    gap = abs(prob - p_fair)
+
+    if gap > 0.35:
+        alpha = min(1.0, (gap - 0.35) / 0.25)  # 0 at 0.35 → 1 at 0.60
+        prob = (1 - alpha)*prob + alpha*p_fair
+
+    hi = 0.95 if minute < 60 else 0.98
+    return float(min(max(prob, 0.02), hi))
 
 # ───────── Odds helpers (preserved & robust) ─────────
 def _ev(prob: float, odds: float) -> float:
