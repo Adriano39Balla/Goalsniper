@@ -346,6 +346,8 @@ class PooledConn:
         self.conn = None
         self.cur = None
         
+    POOL: Optional[SimpleConnectionPool] = None
+        
     def __enter__(self):
         if ShutdownManager.is_shutdown_requested():
             raise Exception("Database connection refused - shutdown in progress")
@@ -3611,11 +3613,20 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
 def shutdown_handler(signum=None, frame=None, *, allow_exit: bool = True):
     log.info("Received shutdown signal, cleaning up...")
     ShutdownManager.request_shutdown()
-    if POOL:
-        try:
-            POOL.closeall()
-        except Exception as e:
-            log.warning("Error closing pool during shutdown: %s", e)
+
+    # POOL may not be defined if import/boot failed early or during interpreter shutdown
+    pool = globals().get("POOL", None)
+    try:
+        if pool:
+            try:
+                pool.closeall()
+            except Exception as e:
+                log.warning("Error closing pool during shutdown: %s", e)
+    except Exception as e:
+        # Final safeguard against NameError or globals teardown
+        log.debug("Shutdown cleanup skipped (globals teardown): %s", e)
+
+    # On real signal, exit; during atexit we don't exit again
     if allow_exit and signum is not None:
         try:
             sys.exit(0)
@@ -3623,10 +3634,10 @@ def shutdown_handler(signum=None, frame=None, *, allow_exit: bool = True):
             pass
 
 def register_shutdown_handlers():
-    # Signals -> exit
+    # Signals -> full shutdown (cleanup + exit)
     signal.signal(signal.SIGINT,  lambda s, f: shutdown_handler(s, f, allow_exit=True))
     signal.signal(signal.SIGTERM, lambda s, f: shutdown_handler(s, f, allow_exit=True))
-    # atexit -> cleanup only (no sys.exit to avoid noisy traceback)
+    # atexit -> cleanup only (no sys.exit and robust against missing globals)
     atexit.register(lambda: shutdown_handler(None, None, allow_exit=False))
 
 # ───────── Scheduler (preserved; wiring fixed for auto-tune) ─────────
