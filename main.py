@@ -223,7 +223,7 @@ ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))# min distinct
 ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))# cap vs fair (1/p)
 
 # ───────── Markets allow-list (draw suppressed) ─────────
-ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
+ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win", "Over/Under"}
 def _fmt_line(line: float) -> str: return f"{line}".rstrip("0").rstrip(".")
 for _ln in OU_LINES:
     s=_fmt_line(_ln); ALLOWED_SUGGESTIONS.add(f"Over {s} Goals"); ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
@@ -306,22 +306,39 @@ except Exception as e:
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
 # ───────── DB pool & helpers ─────────
-POOL: Optional[SimpleConnectionPool] = None
+def _normalize_dsn(url: str) -> str:
+    """
+    Ensure sslmode=require is present. Supabase usually needs it.
+    """
+    if not url:
+        return url
+    dsn = url.strip()
+    if "sslmode=" not in dsn:
+        dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
+    return dsn
 
 def _init_pool():
-    """Initialize the database connection pool"""
+    """Initialize the database connection pool (Supabase-safe)."""
     global POOL
-    if not POOL:
-        try:
-            POOL = SimpleConnectionPool(
-                minconn=1,
-                maxconn=10,
-                dsn=DATABASE_URL
-            )
-            log.info("[DB] Connection pool initialized")
-        except Exception as e:
-            log.error("[DB] Failed to initialize connection pool: %s", e)
-            raise
+    if POOL:
+        return
+    try:
+        maxconn = int(os.getenv("PG_MAXCONN", "10"))
+        timeout = int(os.getenv("PG_CONNECT_TIMEOUT", "10"))
+        dsn = _normalize_dsn(DATABASE_URL)
+    
+
+        POOL = SimpleConnectionPool(
+            minconn=1,
+            maxconn=maxconn,
+            dsn=dsn,
+            connect_timeout=timeout,
+            application_name="goalsniper"
+        )
+        log.info("[DB] Connection pool initialized (maxconn=%s, timeout=%ss)", maxconn, timeout)
+    except Exception as e:
+        log.error("[DB] Failed to initialize connection pool: %s", e)
+        raise
 
 class PooledConn:
     def __init__(self, pool): 
@@ -3591,7 +3608,7 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
     return retried
 
 # ───────── Shutdown Handlers ─────────
-def shutdown_handler(signum=None, frame=None):
+def shutdown_handler(signum=None, frame=None, *, allow_exit: bool = True):
     log.info("Received shutdown signal, cleaning up...")
     ShutdownManager.request_shutdown()
     if POOL:
@@ -3599,12 +3616,18 @@ def shutdown_handler(signum=None, frame=None):
             POOL.closeall()
         except Exception as e:
             log.warning("Error closing pool during shutdown: %s", e)
-    sys.exit(0)
+    if allow_exit and signum is not None:
+        try:
+            sys.exit(0)
+        except SystemExit:
+            pass
 
 def register_shutdown_handlers():
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    atexit.register(shutdown_handler)
+    # Signals -> exit
+    signal.signal(signal.SIGINT,  lambda s, f: shutdown_handler(s, f, allow_exit=True))
+    signal.signal(signal.SIGTERM, lambda s, f: shutdown_handler(s, f, allow_exit=True))
+    # atexit -> cleanup only (no sys.exit to avoid noisy traceback)
+    atexit.register(lambda: shutdown_handler(None, None, allow_exit=False))
 
 # ───────── Scheduler (preserved; wiring fixed for auto-tune) ─────────
 _scheduler_started=False
