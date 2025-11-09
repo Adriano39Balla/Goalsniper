@@ -17,7 +17,7 @@ Data sources:
   • Prematch  -> prematch_snapshots (one snapshot per match)
 
 Models & thresholds written to `settings`:
-  • model_latest:* and model:* keys (JSON: intercept, weights, calibration)
+  • model_v2:*, model_latest:* and model:* keys (JSON: intercept, weights, calibration)
   • conf_threshold:* per market (percent; serving uses if present)
 
 Environment knobs:
@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 # ───────────────────────── Feature sets ───────────────────────── #
 
-# Must match main.py extract_features()
+# Must match what main.py uses live (subset is fine; missing features default to 0.0 at serve)
 FEATURES: List[str] = [
     "minute",
     "goals_h", "goals_a", "goals_sum", "goals_diff",
@@ -72,14 +72,12 @@ FEATURES: List[str] = [
     "red_h", "red_a", "red_sum",
 ]
 
-# Must match main.py extract_prematch_features()
+# Prematch features must match what main.py persists in save_prematch_snapshot(extract_prematch_features)
+# (main.py stores: avg_goals_h, avg_goals_a, avg_goals_h2h, rest_days_h, rest_days_a)
+# We keep live keys as zeros for scoring compatibility at serve time.
 PRE_FEATURES: List[str] = [
-    "pm_gf_h","pm_ga_h","pm_win_h",
-    "pm_gf_a","pm_ga_a","pm_win_a",
-    "pm_ov25_h","pm_ov35_h","pm_btts_h",
-    "pm_ov25_a","pm_ov35_a","pm_btts_a",
-    "pm_ov25_h2h","pm_ov35_h2h","pm_btts_h2h",
-    "pm_rest_diff",
+    "avg_goals_h", "avg_goals_a", "avg_goals_h2h",
+    "rest_days_h", "rest_days_a",
     # keep live keys 0.0 for compatibility at serve time
     "minute","goals_h","goals_a","goals_sum","goals_diff",
     "xg_h","xg_a","xg_sum","xg_diff","sot_h","sot_a","sot_sum",
@@ -400,7 +398,8 @@ def _train_binary_head(
     p_cal = 1.0 / (1.0 + np.exp(-(a * z + b)))
 
     blob = build_model_blob(m, feature_names, (a, b))
-    for k in (f"model_latest:{model_key}", f"model:{model_key}"):
+    # Write to model_v2:* (preferred by main.py) and legacy keys
+    for k in (f"model_v2:{model_key}", f"model_latest:{model_key}", f"model:{model_key}"):
         _set_setting(conn, k, json.dumps(blob))
 
     mets = {
@@ -494,10 +493,14 @@ def train_models(
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
-                    if abs(line - 2.5) < 1e-6:  # alias for serve compatibility
-                        blob = _get_setting_json(conn, f"model_latest:{name}")
-                        if blob is not None:
-                            for k in ("model_latest:O25", "model:O25"):
+                    # ── Aliases for serve compatibility (main.py may fallback to O25/O35) ──
+                    blob = _get_setting_json(conn, f"model_v2:{name}") or _get_setting_json(conn, f"model_latest:{name}")
+                    if blob is not None:
+                        if abs(line - 2.5) < 1e-6:
+                            for k in ("model_v2:O25", "model_latest:O25", "model:O25"):
+                                _set_setting(conn, k, json.dumps(blob))
+                        if abs(line - 3.5) < 1e-6:
+                            for k in ("model_v2:O35", "model_latest:O35", "model:O35"):
                                 _set_setting(conn, k, json.dumps(blob))
 
             # 1X2 (OvR heads; serving suppresses draw)
