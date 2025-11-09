@@ -2821,34 +2821,46 @@ def enhanced_production_scan() -> Tuple[int, int]:
 
 # ───────── Model loader ─────────
 def _validate_model_blob(name: str, tmp: dict) -> bool:
-    if not isinstance(tmp, dict): return False
-    if "weights" not in tmp or "intercept" not in tmp: return False
-    if not isinstance(tmp["weights"], dict): return False
-    if len(tmp["weights"]) > 2000: return False
+    if not isinstance(tmp, dict): 
+        return False
+    if "weights" not in tmp or "intercept" not in tmp: 
+        return False
+    if not isinstance(tmp["weights"], dict): 
+        return False
+    if len(tmp["weights"]) > 2000: 
+        return False
     return True
 
 MODEL_KEYS_ORDER = ["model_v2:{name}", "model_latest:{name}", "model:{name}", "pre_{name}"]
 
 def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
-    cached=_MODELS_CACHE.get(name)
-    if cached is not None: return cached
-    mdl=None
+    cached = _MODELS_CACHE.get(name)
+    if cached is not None: 
+        return cached
+    mdl = None
     for pat in MODEL_KEYS_ORDER:
-        raw=get_setting_cached(pat.format(name=name))
-        if not raw: continue
+        raw = get_setting_cached(pat.format(name=name))
+        if not raw: 
+            continue
         try:
-            tmp=json.loads(raw)
-            if not _validate_model_blob(name,tmp):
-                log.warning("[MODEL] invalid schema for %s", name); continue
-            tmp.setdefault("intercept",0.0); tmp.setdefault("weights",{})
-            cal=tmp.get("calibration") or {}
-            if isinstance(cal,dict):
-                cal.setdefault("method","sigmoid"); cal.setdefault("a",1.0); cal.setdefault("b",0.0)
-                tmp["calibration"]=cal
-            mdl=tmp; break
+            tmp = json.loads(raw)
+            if not _validate_model_blob(name, tmp):
+                log.warning("[MODEL] invalid schema for %s", name)
+                continue
+            tmp.setdefault("intercept", 0.0)
+            tmp.setdefault("weights", {})
+            cal = tmp.get("calibration") or {}
+            if isinstance(cal, dict):
+                cal.setdefault("method", "sigmoid")
+                cal.setdefault("a", 1.0)
+                cal.setdefault("b", 0.0)
+                tmp["calibration"] = cal
+            mdl = tmp
+            break
         except Exception as e:
             log.warning("[MODEL] parse %s failed: %s", name, e)
-    if mdl is not None: _MODELS_CACHE.set(name, mdl)
+    if mdl is not None:
+        _MODELS_CACHE.set(name, mdl)
     return mdl
 
 # ───────── Outcomes/backfill/digest ─────────
