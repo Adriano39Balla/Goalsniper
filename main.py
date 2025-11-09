@@ -2199,6 +2199,8 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
                                 by_market.setdefault("1X2", {}).setdefault("Home", []).append((float(v.get("odd") or 0), book_name))
                             elif lbl in ("away","2"):
                                 by_market.setdefault("1X2", {}).setdefault("Away", []).append((float(v.get("odd") or 0), book_name))
+                            elif lbl in ("draw","x"):
+                                by_market.setdefault("1X2", {}).setdefault("Draw", []).append((float(v.get("odd") or 0), book_name))
                     elif mname == "OU":
                         for v in vals:
                             lbl = (v.get("value") or "").lower()
@@ -2251,6 +2253,24 @@ def fetch_odds(fid: int, prob_hints: Optional[dict[str, float]] = None) -> dict:
     ODDS_CACHE[fid] = (time.time(), out)
     if not out: NEG_CACHE[k] = (now, True)
     return out
+
+def _de_vig_three(oh, od, oa):
+    ip_h, ip_d, ip_a = 1/max(1e-9,oh), 1/max(1e-9,od), 1/max(1e-9,oa)
+    s = ip_h + ip_d + ip_a
+    return ip_h/s, ip_d/s, ip_a/s
+
+# When computing EV for Home Win:
+oh = odds_map["1X2"]["Home"]["odds"]
+od = odds_map["1X2"]["Draw"]["odds"]
+oa = odds_map["1X2"]["Away"]["odds"]
+fh, fd, fa = _de_vig_three(oh, od, oa)       # fair market probs (3-way)
+p_model = P_home                              # full 1X2 model prob (not 12)
+# optional shrink toward fair if huge disagreement:
+gap = abs(p_model - fh)
+if gap > 0.25:
+    alpha = min(1.0, (gap - 0.25)/0.35)
+    p_model = (1 - alpha)*p_model + alpha*fh
+ev = p_model * oh - 1.0
 
 def _market_name_normalize(s: str) -> str:
     s=(s or "").lower()
