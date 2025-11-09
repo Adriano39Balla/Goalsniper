@@ -306,6 +306,8 @@ except Exception as e:
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
 # ───────── DB pool & helpers ─────────
+POOL: Optional[SimpleConnectionPool] = None  # GLOBAL POOL DEFINITION
+
 def _normalize_dsn(url: str) -> str:
     """
     Ensure sslmode=require is present. Supabase usually needs it.
@@ -319,7 +321,7 @@ def _normalize_dsn(url: str) -> str:
 
 def _init_pool():
     """Initialize the database connection pool (Supabase-safe)."""
-    global POOL
+    global POOL  # REFERENCE GLOBAL POOL
     if POOL:
         return
     try:
@@ -327,7 +329,6 @@ def _init_pool():
         timeout = int(os.getenv("PG_CONNECT_TIMEOUT", "10"))
         dsn = _normalize_dsn(DATABASE_URL)
     
-
         POOL = SimpleConnectionPool(
             minconn=1,
             maxconn=maxconn,
@@ -345,8 +346,6 @@ class PooledConn:
         self.pool = pool
         self.conn = None
         self.cur = None
-        
-    POOL: Optional[SimpleConnectionPool] = None
         
     def __enter__(self):
         if ShutdownManager.is_shutdown_requested():
@@ -405,10 +404,13 @@ class PooledConn:
             return []
 
 def db_conn(): 
-    if not POOL: _init_pool()
+    global POOL  # REFERENCE GLOBAL POOL
+    if not POOL: 
+        _init_pool()
     return PooledConn(POOL)  # type: ignore
 
 def _db_ping() -> bool:
+    global POOL  # REFERENCE GLOBAL POOL
     if ShutdownManager.is_shutdown_requested():
         return False
     try:
@@ -3614,8 +3616,10 @@ def shutdown_handler(signum=None, frame=None, *, allow_exit: bool = True):
     log.info("Received shutdown signal, cleaning up...")
     ShutdownManager.request_shutdown()
 
-    # POOL may not be defined if import/boot failed early or during interpreter shutdown
-    pool = globals().get("POOL", None)
+    # Safely access POOL with global reference
+    global POOL
+    pool = POOL
+    
     try:
         if pool:
             try:
