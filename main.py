@@ -1084,28 +1084,50 @@ def start_scheduler():
 # Optional training hook
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train_models_hook():
-    if not TRAIN_ENABLE:
-        return send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
+def train_models_hook(force: bool = False):
+    if not force and not TRAIN_ENABLE:
+        send_telegram("🤖 Training skipped: TRAIN_ENABLE=0 (use /admin/train?force=1)")
+        return {"ok": False, "reason": "TRAIN_ENABLE=0"}
+
     try:
-        import train_models as _tm  # your own module
+        import train_models as _tm  # your local training module
+    except Exception as e:
+        msg = f"❌ Training module missing: {e}"
+        log.warning(msg)
+        send_telegram(msg)
+        return {"ok": False, "error": str(e)}
+
+    try:
         res = _tm.train_models() or {}
-        ok = bool(res.get("ok"))
+        ok = bool(res.get("ok", True))  # treat empty dict as OK
         if ok:
             send_telegram("🤖 Model training OK")
+            return {"ok": True, "res": res}
         else:
-            send_telegram(f"⚠️ Training skipped: {escape(str(res))}")
+            send_telegram(f"⚠️ Training returned non-ok: {escape(str(res))}")
+            return {"ok": False, "res": res}
     except Exception as e:
         send_telegram(f"❌ Training failed: {escape(str(e))}")
+        return {"ok": False, "error": str(e)}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flask endpoints (admin + status)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _require_admin():
-    key = request.headers.get("X-API-Key") or request.args.get("key") or ((request.json or {}).get("key") if request.is_json else None)
-    if not ADMIN_API_KEY or key != ADMIN_API_KEY:
-        abort(401)
+    key_env = (ADMIN_API_KEY or "").strip()
+    key_req = (request.headers.get("X-API-Key") or
+               request.args.get("key") or
+               ((request.json or {}).get("key") if request.is_json else None) or
+               "").strip()
+    if key_env:
+        if key_req != key_env:
+            abort(401)
+    else:
+        # No admin key configured: allow access but warn once
+        if not getattr(app, "_no_admin_warned", False):
+            log.warning("ADMIN_API_KEY not set; admin endpoints are OPEN.")
+            app._no_admin_warned = True
 
 @app.route("/")
 def root():
@@ -1124,6 +1146,14 @@ def http_pre_scan():
     _require_admin()
     n = prematch_scan_ou25()
     return jsonify({"ok": True, "saved": int(n)})
+
+@app.route("/admin/scan", methods=["POST","GET"])
+def http_scan_alias():
+    return http_pre_scan()
+
+@app.route("/admin/training", methods=["POST","GET"])
+def http_training_alias():
+    return http_train()
 
 @app.route("/admin/backfill-results", methods=["POST","GET"])
 def http_backfill():
@@ -1145,8 +1175,12 @@ def http_retry_unsent():
 @app.route("/admin/train", methods=["POST","GET"])
 def http_train():
     _require_admin()
-    train_models_hook()
-    return jsonify({"ok": True})
+    force_raw = request.args.get("force")
+    if force_raw is None and request.is_json:
+        force_raw = (request.json or {}).get("force")
+    force = str(force_raw).lower() in ("1","true","yes")
+    res = train_models_hook(force=force)
+    return jsonify({"ok": bool(res.get("ok")), "res": res})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
 def http_auto_tune():
