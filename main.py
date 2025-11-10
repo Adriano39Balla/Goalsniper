@@ -330,6 +330,27 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
 def _load_ou25_model() -> Optional[Dict[str,Any]]:
     return load_model_from_settings("OU_2.5") or load_model_from_settings("O25")
 
+def _ou25_live_odds_plausible(odds: Optional[float], minute: int, goals_sum: int) -> bool:
+    """Quick plausibility guard for Over 2.5 prices in-play."""
+    if odds is None:
+        return False
+    try:
+        m = int(minute); g = int(goals_sum)
+    except Exception:
+        return True  # don't block if we can't parse
+
+    # Very early 2–0 → price must be very short
+    if g >= 2 and m <= 30:
+        return odds <= 1.30
+    # Late first half 2–0 → even shorter
+    if g >= 2 and m <= 45:
+        return odds <= 1.20
+    # Early 1–0 → still fairly short on O2.5 in many leagues
+    if g == 1 and m <= 20:
+        return odds <= 1.80
+
+    return True
+
 # ───────── Odds aggregation (OU 2.5 only) ─────────
 def _market_name_normalize(s: str) -> str:
     s=(s or "").lower()
@@ -585,6 +606,9 @@ def production_scan() -> Tuple[int, int]:
                         continue
                     if int(round(_ev(prob, odds)*10000)) < EDGE_MIN_BPS:
                         continue
+                    if mk.startswith("Over/Under") and suggestion.startswith("Over 2.5") and odds is not None:
+                        if not _ou25_live_odds_plausible(float(odds), minute, int(feat.get("goals_sum", 0))):
+                            continue
 
                 league_id, league = _league_name(m)
                 if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
