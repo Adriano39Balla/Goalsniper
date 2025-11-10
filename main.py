@@ -58,9 +58,15 @@ DATABASE_URL       = _required("DATABASE_URL")
 ADMIN_API_KEY      = os.getenv("ADMIN_API_KEY", "")
 RUN_SCHEDULER      = os.getenv("RUN_SCHEDULER", "1").lower() not in ("0","false","no")
 
-# Core model thresholds (singles)
-CONF_THRESHOLD_PREMATCH = float(os.getenv("CONF_THRESHOLD_PRE_OU25", "62"))  # %
-CONF_THRESHOLD_LIVE     = float(os.getenv("CONF_THRESHOLD_LIVE_OU25", "68")) # %
+# Thresholds (singles). Scanner will read a live override from settings if present
+CONF_THRESHOLD_PREMATCH_DEFAULT = float(os.getenv("CONF_THRESHOLD_PRE_OU25", "62"))  # %
+CONF_THRESHOLD_LIVE             = float(os.getenv("CONF_THRESHOLD_LIVE_OU25", "68")) # % (not used unless you add live)
+
+# Auto-tune knobs
+TARGET_PRECISION        = float(os.getenv("TARGET_PRECISION", "0.60"))
+THRESH_MIN_PREDICTIONS  = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
+MIN_THRESH              = float(os.getenv("MIN_THRESH", "55"))
+MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
 # Odds / EV filters for singles
 MIN_ODDS_OU       = float(os.getenv("MIN_ODDS_OU", "1.50"))
@@ -68,7 +74,7 @@ MAX_ODDS_ALL      = float(os.getenv("MAX_ODDS_ALL", "20.0"))
 EDGE_MIN_BPS      = int(os.getenv("EDGE_MIN_BPS", "800"))   # +8.00% min EV per leg for singles
 
 # Scanner pacing
-SCAN_INTERVAL_LIVE_SEC  = int(os.getenv("SCAN_INTERVAL_LIVE_SEC", "180"))  # live scan cadence
+SCAN_INTERVAL_LIVE_SEC  = int(os.getenv("SCAN_INTERVAL_LIVE_SEC", "180"))  # live scan cadence (unused if no live)
 PREDICTIONS_PER_MATCH   = int(os.getenv("PREDICTIONS_PER_MATCH", "1"))
 MAX_TIPS_PER_SCAN       = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 
@@ -170,7 +176,7 @@ class Pooled:
 
 def init_db():
     with Pooled() as p:
-        # Singles (same as earlier tips schema; only OU 2.5 used)
+        # Singles (tips)
         p.execute("""
         CREATE TABLE IF NOT EXISTS tips (
             match_id BIGINT,
@@ -226,12 +232,12 @@ def init_db():
         )""")
         p.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_match ON odds_history (match_id, captured_ts DESC)")
 
-        # NEW: Parlays (prematch only)
+        # Parlays (prematch only)
         p.execute("""
         CREATE TABLE IF NOT EXISTS parlays (
             id BIGSERIAL PRIMARY KEY,
             created_ts BIGINT,
-            legs JSONB,            -- [{match_id, league_id, league, home, away, kickoff, suggestion, prob, odds, book, ev_pct}]
+            legs JSONB,
             legs_count INTEGER,
             combined_odds DOUBLE PRECISION,
             combined_prob DOUBLE PRECISION,
@@ -241,7 +247,7 @@ def init_db():
         )""")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Settings cache
+# Settings helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_setting(key: str) -> Optional[str]:
@@ -256,6 +262,17 @@ def set_setting(key: str, value: str) -> None:
             "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
             (key, value)
         )
+
+def get_conf_threshold_prematch() -> float:
+    # live override from settings if present
+    k = "conf_threshold:PRE Over/Under 2.5"
+    v = get_setting(k)
+    try:
+        if v is not None:
+            return float(v)
+    except Exception:
+        pass
+    return CONF_THRESHOLD_PREMATCH_DEFAULT
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram
@@ -275,10 +292,6 @@ def send_telegram(text: str) -> bool:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Models (OU 2.5 only)
-# Expect JSON in settings under keys (searched in order):
-#   model_v2:PRE_OU_2.5, model_latest:PRE_OU_2.5, model:PRE_OU_2.5
-#   model_v2:OU_2.5,     model_latest:OU_2.5,     model:OU_2.5
-# Each blob: {"weights": {feat: w, ...}, "intercept": b, "calibration": {"method":"sigmoid|platt","a":1,"b":0}}
 # ──────────────────────────────────────────────────────────────────────────────
 
 MODEL_KEYS_ORDER = [
@@ -332,8 +345,6 @@ def _score_linear(feat: Dict[str, float], weights: Dict[str, float], intercept: 
 def _calibrate(p: float, cal: Dict[str, Any]) -> float:
     m = (cal or {}).get("method", "sigmoid").lower()
     a = float((cal or {}).get("a", 1.0)); b = float((cal or {}).get("b", 0.0))
-    if m == "platt":
-        return _sigmoid(a*_logit(p) + b)
     return _sigmoid(a*_logit(p) + b)
 
 def score_prob(mdl: Dict[str, Any], feat: Dict[str, float]) -> float:
@@ -354,12 +365,10 @@ def _pos_pct(v) -> float:
     except: return 0.0
 
 def extract_prematch_features(fx: dict) -> Dict[str, float]:
-    # Keep it simple: team recent goals + H2H can be added later
-    # For now we just feed fixture id to keep model interface; real features should be precomputed offline
+    # Simple placeholder (your real prematch features can be used here)
     return {"fid": float(((fx.get("fixture") or {}).get("id") or 0))}
 
 def extract_live_features(m: dict) -> Dict[str, float]:
-    # Minimal live: minute, xG, SOT, corners, possession
     feat: Dict[str, float] = {}
     minute = int((((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0) or 0)
     feat["minute"] = float(minute)
@@ -378,7 +387,6 @@ def extract_live_features(m: dict) -> Dict[str, float]:
     xg_h = float(sh.get("Expected Goals", 0) or 0.0)
     xg_a = float(sa.get("Expected Goals", 0) or 0.0)
     feat["xg_sum"] = float(xg_h + xg_a)
-
     feat["sot_sum"] = float((sh.get("Shots on Target", sh.get("Shots on Goal", 0)) or 0) +
                              (sa.get("Shots on Target", sa.get("Shots on Goal", 0)) or 0))
     feat["cor_sum"] = float((sh.get("Corner Kicks", 0) or 0) + (sa.get("Corner Kicks", 0) or 0))
@@ -397,7 +405,6 @@ def extract_live_features(m: dict) -> Dict[str, float]:
 
 def _today_utc_dates() -> List[str]:
     today_local = datetime.now(BERLIN_TZ).date()
-    # fetch for local day
     return [today_local.strftime("%Y-%m-%d")]
 
 def _collect_todays_prematch_fixtures() -> List[dict]:
@@ -445,8 +452,7 @@ def fetch_odds_prematch(fid: int) -> dict:
                 continue
             import statistics
             med = statistics.median(xs)
-            # pick the quote closest to median (stable)
-            pick = min(lst, key=lambda t: abs(t[0]-med))
+            pick = min(lst, key=lambda t: abs(t[0]-med))  # median quote
             out["OU_2.5"][side] = {"odds": float(pick[0]), "book": f"{pick[1]} (median {len(xs)})"}
     return out
 
@@ -465,6 +471,17 @@ def ev(prob: float, odds: float) -> float:
 def _load_model_pre_ou25() -> Optional[dict]:
     return load_model_from_settings("PRE_OU_2.5") or load_model_from_settings("OU_2.5")
 
+def _format_tip_msg_prematch(home, away, league, suggestion, pct, odds, book, ev_pct):
+    return (
+        "⚽️ <b>Prematch Tip</b>\n"
+        f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
+        f"<b>Market:</b> Over/Under 2.5\n"
+        f"<b>Tip:</b> {escape(suggestion)}\n"
+        f"📈 <b>Confidence:</b> {pct:.1f}%\n"
+        f"💰 <b>Odds:</b> {odds:.2f} @ {escape(book or 'Book')}  •  <b>EV:</b> {ev_pct:+.1f}%\n"
+        f"🏆 <b>League:</b> {escape(league)}"
+    )
+
 def prematch_scan_ou25() -> int:
     """Score all today's 'NS' fixtures for OU 2.5, send singles meeting gates."""
     mdl = _load_model_pre_ou25()
@@ -472,6 +489,7 @@ def prematch_scan_ou25() -> int:
         log.warning("[PRE] model PRE_OU_2.5 not found")
         return 0
 
+    thr_pct = get_conf_threshold_prematch()
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
         return 0
@@ -503,7 +521,7 @@ def prematch_scan_ou25() -> int:
             under_book = (odds_map.get("Under") or {}).get("book")
 
             def _maybe_send(suggestion: str, prob: float, odds: Optional[float], book: Optional[str]) -> bool:
-                if prob * 100.0 < CONF_THRESHOLD_PREMATCH:
+                if prob * 100.0 < thr_pct:
                     return False
                 if not odds or not (MIN_ODDS_OU <= odds <= MAX_ODDS_ALL):
                     return False
@@ -521,23 +539,13 @@ def prematch_scan_ou25() -> int:
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'0-0',0,%s,%s,%s,%s,0)
                     """, (fid, league_id, league, home, away, "PRE Over/Under 2.5", suggestion,
                           pct, prob, now, float(odds), book or None, ev_pct))
-                msg = (
-                    "⚽️ <b>Prematch Tip</b>\n"
-                    f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
-                    f"<b>Market:</b> Over/Under 2.5\n"
-                    f"<b>Tip:</b> {escape(suggestion)}\n"
-                    f"📈 <b>Confidence:</b> {pct:.1f}%\n"
-                    f"💰 <b>Odds:</b> {odds:.2f} @ {escape(book or 'Book')}  •  <b>EV:</b> {ev_pct:+.1f}%\n"
-                    f"🏆 <b>League:</b> {escape(league)}"
-                )
-                ok = send_telegram(msg)
+                ok = send_telegram(_format_tip_msg_prematch(home, away, league, suggestion, pct, odds, book, ev_pct))
                 if ok:
                     with Pooled() as p:
                         p.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, now))
                 return ok
 
             sent_any = False
-            # Try both sides; strongest first
             over_first = (p_over >= q_under)
             if over_first:
                 sent_any |= _maybe_send("Over 2.5 Goals", p_over, over_odds, over_book)
@@ -672,7 +680,6 @@ def _gather_parlay_legs() -> List[Leg]:
             over_book = (odds_map.get("Over") or {}).get("book")
             under_book = (odds_map.get("Under") or {}).get("book")
 
-            # Create leg candidates inside prob band + EV + min odds
             def _push(side: str, prob: float, odds: Optional[float], book: Optional[str]):
                 if odds is None or odds < MIN_ODDS_OU or odds > MAX_ODDS_ALL:
                     return
@@ -689,7 +696,6 @@ def _gather_parlay_legs() -> List[Leg]:
                     ev_pct=round(edge*100.0, 1)
                 ))
 
-            # Prefer Over; allow Under if enabled
             _push("Over", p_over, over_odds, over_book)
             if PARLAY_INCLUDE_UNDER:
                 _push("Under", p_under, under_odds, under_book)
@@ -697,14 +703,13 @@ def _gather_parlay_legs() -> List[Leg]:
         except Exception as e:
             log.debug("parlay leg error: %s", e)
             continue
-    # de-dup on match_id (pick best ev)
+    # Deduplicate per match (keep best EV)
     best_by_match: Dict[int, Leg] = {}
     for leg in legs:
         cur = best_by_match.get(leg.match_id)
         if (cur is None) or (leg.ev_pct > cur.ev_pct):
             best_by_match[leg.match_id] = leg
     legs = list(best_by_match.values())
-    # sort by leg EV descending
     legs.sort(key=lambda L: L.ev_pct, reverse=True)
     return legs
 
@@ -712,7 +717,7 @@ def _combine_legs(legs: List[Leg], k: int) -> List[List[Leg]]:
     from itertools import combinations
     combos = []
     for comb in combinations(legs, k):
-        # diversity
+        # league diversity if enabled
         if PARLAY_LEAGUE_DIVERSITY:
             leagues = {c.league_id for c in comb}
             if len(leagues) < len(comb):
@@ -752,7 +757,6 @@ def build_and_send_prematch_parlays() -> int:
         log.info("[PARLAY] no combos met combined EV")
         return 0
 
-    # sort by (combined EV, then combined odds) desc
     best_parlays.sort(key=lambda x: (x[3], x[1]), reverse=True)
     picked = best_parlays[:max(1, PARLAY_MAX_PER_DAY)]
 
@@ -802,7 +806,7 @@ def build_and_send_prematch_parlays() -> int:
     return sent
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Daily digest (singles only; parlays summarized if any)
+# Outcomes / backfill / digest
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _tip_outcome_for_result(suggestion: str, gh: int, ga: int) -> Optional[int]:
@@ -820,7 +824,6 @@ def _tip_outcome_for_result(suggestion: str, gh: int, ga: int) -> Optional[int]:
 def backfill_results_for_open_matches(max_rows: int = 300) -> int:
     now_ts = int(time.time())
     cutoff = now_ts - 14*24*3600
-    # Look up recent match_id used in tips
     with Pooled() as p:
         rows = p.execute("""
             WITH last AS (SELECT match_id, MAX(created_ts) last_ts FROM tips WHERE created_ts >= %s GROUP BY match_id)
@@ -885,7 +888,6 @@ def daily_accuracy_digest() -> Optional[str]:
         wins += int(out == 1)
         total += 1
 
-    # Parlay summary (sent today)
     with Pooled() as p:
         pr = p.execute("""
             SELECT legs_count, combined_odds, combined_prob, ev_pct
@@ -907,22 +909,130 @@ def daily_accuracy_digest() -> Optional[str]:
     return msg
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional training hook
+# Retry unsent tips (manual)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train_models_hook():
-    if not TRAIN_ENABLE:
-        return send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
-    try:
-        import train_models as _tm  # your own module
-        res = _tm.train_models() or {}
-        ok = bool(res.get("ok"))
-        if ok:
-            send_telegram("🤖 Model training OK")
+def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
+    cutoff = int(time.time()) - minutes*60
+    retried = 0
+    with Pooled() as p:
+        rows = p.execute(
+            "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct "
+            "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",
+            (cutoff, limit)
+        ).fetchall()
+
+    for (mid, league, home, away, market, sugg, conf, conf_raw, score, minute, cts, odds, book, ev_pct) in rows:
+        try:
+            pct = float(conf or 0.0)
+            msg = _format_tip_msg_prematch(home, away, league, sugg, pct, float(odds or 0.0), book or "Book", float(ev_pct or 0.0))
+            ok = send_telegram(msg)
+            if ok:
+                with Pooled() as p:
+                    p.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
+                retried += 1
+        except Exception:
+            continue
+    if retried:
+        log.info("[RETRY] resent %d", retried)
+    return retried
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ROI-aware Auto-tune (prematch OU 2.5)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
+    cutoff = int(time.time()) - days * 24 * 3600
+    with Pooled() as p:
+        rows = p.execute(
+            """
+            SELECT t.suggestion,
+                   COALESCE(t.confidence_raw, t.confidence/100.0) AS prob,
+                   t.odds,
+                   r.final_goals_h, r.final_goals_a
+            FROM tips t
+            JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts >= %s
+              AND t.market = 'PRE Over/Under 2.5'
+              AND t.odds IS NOT NULL
+              AND t.sent_ok = 1
+            """,
+            (cutoff,),
+        ).fetchall()
+
+    items: List[Tuple[float, int, float]] = []
+    for (sugg, prob, odds, gh, ga) in rows:
+        try:
+            prob = float(prob or 0.0); odds = float(odds or 0.0)
+        except Exception:
+            continue
+        if not (1.01 <= odds <= MAX_ODDS_ALL):
+            continue
+        out = _tip_outcome_for_result(sugg, int(gh), int(ga))
+        if out is None:
+            continue
+        items.append((prob, int(out), odds))
+
+    if len(items) < THRESH_MIN_PREDICTIONS:
+        send_telegram("🔧 Auto-tune: not enough labeled prematch OU 2.5 tips.")
+        return {}
+
+    def _eval(thr_prob: float) -> Tuple[int, float, float]:
+        sel = [(p, y, o) for (p, y, o) in items if p >= thr_prob]
+        n = len(sel)
+        if n == 0: return 0, 0.0, 0.0
+        wins = sum(y for (_, y, _) in sel); prec = wins / n
+        roi = sum((y * (odds - 1.0) - (1 - y)) for (_, y, odds) in sel) / n
+        return n, float(prec), float(roi)
+
+    best = None
+    feasible_any = False
+    candidates_pct = list(np.arange(MIN_THRESH, MAX_THRESH + 1e-9, 1.0))
+    for thr_pct in candidates_pct:
+        thr_prob = float(thr_pct / 100.0)
+        n, prec, roi = _eval(thr_prob)
+        if n < THRESH_MIN_PREDICTIONS:
+            continue
+        if prec >= TARGET_PRECISION:
+            feasible_any = True
+            score = (roi, prec, n)
+            if (best is None) or (score > (best[0], best[1], best[2])):
+                best = (roi, prec, n, thr_pct)
+
+    if not feasible_any:
+        # fallback: allow precision within -0.03 and positive ROI
+        for thr_pct in candidates_pct:
+            thr_prob = float(thr_pct / 100.0)
+            n, prec, roi = _eval(thr_prob)
+            if n < THRESH_MIN_PREDICTIONS:
+                continue
+            if (prec >= max(0.0, TARGET_PRECISION - 0.03)) and (roi > 0.0):
+                score = (roi, prec, n)
+                if (best is None) or (score > (best[0], best[1], best[2])):
+                    best = (roi, prec, n, thr_pct)
+
+    if best is None:
+        # last resort: highest precision then volume
+        fallback = None
+        for thr_pct in candidates_pct:
+            thr_prob = float(thr_pct / 100.0)
+            n, prec, roi = _eval(thr_prob)
+            if n < THRESH_MIN_PREDICTIONS:
+                continue
+            score = (prec, n, roi)
+            if (fallback is None) or (score > (fallback[0], fallback[1], fallback[2])):
+                fallback = (prec, n, roi, thr_pct)
+        if fallback is not None:
+            tuned_pct = float(fallback[3])
         else:
-            send_telegram(f"⚠️ Training skipped: {escape(str(res))}")
-    except Exception as e:
-        send_telegram(f"❌ Training failed: {escape(str(e))}")
+            send_telegram("🔧 Auto-tune: unable to select a threshold.")
+            return {}
+    else:
+        tuned_pct = float(best[3])
+
+    set_setting("conf_threshold:PRE Over/Under 2.5", f"{tuned_pct:.2f}")
+    send_telegram(f"🔧 Auto-tune updated: PRE Over/Under 2.5 → {tuned_pct:.1f}%")
+    return {"PRE Over/Under 2.5": tuned_pct}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Scheduler
@@ -939,7 +1049,7 @@ def start_scheduler():
         return
     _s = BackgroundScheduler(timezone=UTC_TZ)
 
-    # Prematch singles: run every 20 min to catch new odds (optional)
+    # Prematch singles: run every 20 min
     _s.add_job(prematch_scan_ou25, "interval", minutes=20, id="pre_singles", max_instances=1, coalesce=True)
 
     # MOTD at 10:15 Berlin
@@ -953,7 +1063,7 @@ def start_scheduler():
     # Auto-train (optional)
     if TRAIN_ENABLE:
         _s.add_job(
-            train_models_hook,
+            lambda: train_models_hook(),
             CronTrigger(hour=TRAIN_HOUR_UTC, minute=TRAIN_MINUTE_UTC, timezone=UTC_TZ),
             id="train", max_instances=1, coalesce=True
         )
@@ -969,6 +1079,24 @@ def start_scheduler():
     _s.start()
     send_telegram("🚀 OU 2.5 engine started (prematch singles + MOTD + prematch parlays).")
     log.info("[SCHED] started")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional training hook
+# ──────────────────────────────────────────────────────────────────────────────
+
+def train_models_hook():
+    if not TRAIN_ENABLE:
+        return send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
+    try:
+        import train_models as _tm  # your own module
+        res = _tm.train_models() or {}
+        ok = bool(res.get("ok"))
+        if ok:
+            send_telegram("🤖 Model training OK")
+        else:
+            send_telegram(f"⚠️ Training skipped: {escape(str(res))}")
+    except Exception as e:
+        send_telegram(f"❌ Training failed: {escape(str(e))}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flask endpoints (admin + status)
@@ -989,17 +1117,42 @@ def http_init_db():
     init_db()
     return jsonify({"ok": True})
 
+# Manual controls (GET or POST)
+
 @app.route("/admin/prematch-scan", methods=["POST","GET"])
 def http_pre_scan():
     _require_admin()
     n = prematch_scan_ou25()
     return jsonify({"ok": True, "saved": int(n)})
 
-@app.route("/admin/motd", methods=["POST","GET"])
-def http_motd():
+@app.route("/admin/backfill-results", methods=["POST","GET"])
+def http_backfill():
     _require_admin()
-    ok = send_motd()
-    return jsonify({"ok": bool(ok)})
+    n = backfill_results_for_open_matches(400)
+    return jsonify({"ok": True, "updated": int(n)})
+
+@app.route("/admin/retry-unsent", methods=["POST","GET"])
+def http_retry_unsent():
+    _require_admin()
+    try:
+        minutes = int(request.args.get("minutes", "30"))
+        limit = int(request.args.get("limit", "200"))
+    except Exception:
+        minutes, limit = 30, 200
+    n = retry_unsent_tips(minutes, limit)
+    return jsonify({"ok": True, "resent": int(n)})
+
+@app.route("/admin/train", methods=["POST","GET"])
+def http_train():
+    _require_admin()
+    train_models_hook()
+    return jsonify({"ok": True})
+
+@app.route("/admin/auto-tune", methods=["POST","GET"])
+def http_auto_tune():
+    _require_admin()
+    tuned = auto_tune_thresholds(14)
+    return jsonify({"ok": True, "tuned": tuned})
 
 @app.route("/admin/parlays", methods=["POST","GET"])
 def http_parlays():
@@ -1007,11 +1160,11 @@ def http_parlays():
     n = build_and_send_prematch_parlays()
     return jsonify({"ok": True, "sent": int(n)})
 
-@app.route("/admin/train", methods=["POST","GET"])
-def http_train():
+@app.route("/admin/motd", methods=["POST","GET"])
+def http_motd():
     _require_admin()
-    train_models_hook()
-    return jsonify({"ok": True})
+    ok = send_motd()
+    return jsonify({"ok": bool(ok)})
 
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest():
@@ -1030,7 +1183,7 @@ def health():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Boot
+# Boot / Shutdown
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _on_boot():
