@@ -1,7 +1,3 @@
-Only O/U 2.5
-
-
-
 # goalsniper — OU 2.5 ONLY (in-play + prematch snapshot) — Railway-ready
 # Lean build: predicts ONLY Over/Under 2.5 with robust odds/EV gating and data-quality guards.
 
