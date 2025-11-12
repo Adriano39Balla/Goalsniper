@@ -23,7 +23,7 @@ services:
       ENVIRONMENT: "production"
     start: "python train_models.py"
     schedule:
-      cron: "0 4 * * 1"     # every Monday 04:00 UTC
+      cron: "0 2 * * *"
     deploy:
       resources:
         cpu: 1
