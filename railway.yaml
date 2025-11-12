@@ -1,4 +1,5 @@
-goalsniper:
+services:
+  goalsniper:
     build:
       dockerfile: Dockerfile
     env:
@@ -13,25 +14,16 @@ goalsniper:
       resources:
         cpu: 1
         memory: 1024
-    start:
-      cmd: "python main.py"
+    start: "python main.py"
 
-  # ---------------------------------------
-  # TRAINING JOB (CRON)
-  # ---------------------------------------
   train-models:
     build:
       dockerfile: Dockerfile
     env:
       ENVIRONMENT: "production"
-
-    start:
-      cmd: "python train_models.py"
-
-    # Run weekly by default
+    start: "python train_models.py"
     schedule:
       cron: "0 4 * * 1"     # every Monday 04:00 UTC
-
     deploy:
       resources:
         cpu: 1
