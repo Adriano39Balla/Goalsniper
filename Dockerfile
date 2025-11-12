@@ -1,23 +1,19 @@
 # -----------------------------------------------------
-# GOALSNIPER-AI DOCKERFILE
+# GOALSNIPER-AI DOCKERFILE (Railway Compatible)
 # -----------------------------------------------------
 
 FROM python:3.10-slim
 
-# Set working directory
 WORKDIR /app
 
 # -----------------------------------------------------
-# Install system dependencies for numpy, pandas, pymc
+# Install system dependencies (Railway Safe)
 # -----------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
     g++ \
-    libatlas-base-dev \
-    liblapack-dev \
-    libblas-dev \
-    libgfortran5 \
+    gfortran \
     git \
     && rm -rf /var/lib/apt/lists/*
 
@@ -29,14 +25,13 @@ RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # -----------------------------------------------------
-# Copy project
+# Copy project files
 # -----------------------------------------------------
 COPY . .
 
-# Expose port for Flask (main.py binds to 8000)
 EXPOSE 8000
 
 # -----------------------------------------------------
-# Start the prediction engine
+# Start ML prediction engine
 # -----------------------------------------------------
 CMD ["python", "main.py"]
