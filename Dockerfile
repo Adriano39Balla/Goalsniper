@@ -1,5 +1,5 @@
 # -----------------------------------------------------
-# GOALSNIPER-AI DOCKERFILE (Railway Compatible)
+# GOALSNIPER-AI DOCKERFILE (Final + Stable for Railway)
 # -----------------------------------------------------
 
 FROM python:3.10-slim
@@ -7,13 +7,14 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # -----------------------------------------------------
-# Install system dependencies (Railway Safe)
+# Install system libraries (Aesara + PyMC Safe)
 # -----------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
     g++ \
     gfortran \
+    libopenblas-dev \
     git \
     && rm -rf /var/lib/apt/lists/*
 
@@ -25,13 +26,10 @@ RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # -----------------------------------------------------
-# Copy project files
+# Copy project
 # -----------------------------------------------------
 COPY . .
 
 EXPOSE 8000
 
-# -----------------------------------------------------
-# Start ML prediction engine
-# -----------------------------------------------------
 CMD ["python", "main.py"]
