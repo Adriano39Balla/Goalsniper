@@ -1,8 +1,38 @@
-# railway.yaml
-services:
-  api:
+goalsniper:
     build:
-      builder: python:3.11
-      buildCommand: pip install -r requirements.txt
-      startCommand: python main.py
-    
+      dockerfile: Dockerfile
+    env:
+      PORT: 8000
+    healthcheck:
+      path: /health
+      interval: 10
+      timeout: 4
+      retries: 3
+    deploy:
+      restart_policy: always
+      resources:
+        cpu: 1
+        memory: 1024
+    start:
+      cmd: "python main.py"
+
+  # ---------------------------------------
+  # TRAINING JOB (CRON)
+  # ---------------------------------------
+  train-models:
+    build:
+      dockerfile: Dockerfile
+    env:
+      ENVIRONMENT: "production"
+
+    start:
+      cmd: "python train_models.py"
+
+    # Run weekly by default
+    schedule:
+      cron: "0 4 * * 1"     # every Monday 04:00 UTC
+
+    deploy:
+      resources:
+        cpu: 1
+        memory: 1024
