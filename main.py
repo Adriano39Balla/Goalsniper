@@ -1899,9 +1899,29 @@ def enhanced_production_scan() -> Tuple[int, int]:
                 odds_map = fetch_odds(fid) if API_KEY else {}
                 ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float, float]] = []
 
-                for mk, sug, prob, confidence in enhanced_candidates:
+                for idx, (mk, sug, prob) in enumerate(candidates):
                     if sug not in ALLOWED_SUGGESTIONS:
-                        continue
+                       log.debug("[FILTER] Suggestion not allowed: %s", sug)
+                       continue
+
+                   if per_match >= max(1, PREDICTIONS_PER_MATCH):
+                       log.debug("[FILTER] Reached per-match prediction limit.")
+                       break
+
+                   pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ", ""), sug, fid)
+                   if not pass_odds:
+                       log.debug("[FILTER] Odds gate failed for: %s (mk=%s, match=%s)", sug, mk, fid)
+                       continue
+
+                   if odds is None:
+                       log.debug("[FILTER] No odds available: %s", sug)
+                       continue
+
+                   edge = _ev(prob, odds)
+                   ev_bps = int(round(edge * 10000))
+                   if ev_bps < EDGE_MIN_BPS:
+                       log.debug("[FILTER] EV too low (%d bps): %s", ev_bps, sug)
+                       continue
 
                     # Enhanced odds analysis
                     odds_analyzer = SmartOddsAnalyzer()
