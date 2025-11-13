@@ -14,7 +14,7 @@ services:
       resources:
         cpu: 1
         memory: 1024
-    start: "python main.py"
+    start: "python train_models.py"
 
   train-models:
     build:
