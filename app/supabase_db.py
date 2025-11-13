@@ -1,18 +1,18 @@
 from supabase import create_client, Client
-from typing import Dict, List, Any
+from typing import Dict, Any, Optional
 from datetime import datetime
+
 from app.config import (
     SUPABASE_URL,
     SUPABASE_KEY,
     TABLE_FIXTURES,
-    TABLE_ODDS,
     TABLE_STATS,
-    TABLE_TIPS,
-    TABLE_RESULTS
+    TABLE_ODDS,
+    TABLE_RESULTS,
 )
 
 # ---------------------------------------------------------
-# Initialize Supabase Client
+# INITIALIZE CLIENT
 # ---------------------------------------------------------
 
 def get_supabase() -> Client:
@@ -20,116 +20,142 @@ def get_supabase() -> Client:
 
 sb = get_supabase()
 
+def log(msg: str):
+    print(f"[SUPABASE] {msg}")
+
 
 # ---------------------------------------------------------
-# INSERT DATA
+# INSERT FIXTURE SNAPSHOT
 # ---------------------------------------------------------
 
-def insert_fixture(f: Dict[str, Any]):
-    return sb.table(TABLE_FIXTURES).insert(f).execute()
+def upsert_fixture(fix: Dict[str, Any]):
+    """
+    Stores each live snapshot of the fixture.
+    Upsert = no duplicate rows for same fixture_id.
+    """
+    fix["created_at"] = datetime.utcnow().isoformat()
+
+    try:
+        sb.table(TABLE_FIXTURES).upsert(fix, on_conflict="fixture_id").execute()
+        log(f"Fixture {fix['fixture_id']} upserted.")
+    except Exception as e:
+        log(f"Error upserting fixture: {e}")
 
 
-def insert_odds(o: Dict[str, Any]):
-    return sb.table(TABLE_ODDS).insert(o).execute()
+# ---------------------------------------------------------
+# INSERT STATS SNAPSHOT
+# ---------------------------------------------------------
+
+def insert_stats_snapshot(fixture_id: int, stats: Dict[str, Any]):
+    """
+    Save each stats snapshot. Do NOT upsert —  
+    we keep historical timeline of stats for training time decay.
+    """
+    row = {
+        "fixture_id": fixture_id,
+        "snapshot": stats,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        sb.table(TABLE_STATS).insert(row).execute()
+        log(f"Stats inserted for fixture {fixture_id}.")
+    except Exception as e:
+        log(f"Error inserting stats: {e}")
 
 
-def insert_stats(s: Dict[str, Any]):
-    return sb.table(TABLE_STATS).insert(s).execute()
+# ---------------------------------------------------------
+# INSERT ODDS SNAPSHOT
+# ---------------------------------------------------------
 
+def insert_odds_snapshot(fixture_id: int, odds: Dict[str, Any]):
+    """
+    Save each odds snapshot (1X2, OU25, BTTS).
+    """
+    row = {
+        "fixture_id": fixture_id,
+        "odds_1x2": odds.get("1x2"),
+        "odds_ou25": odds.get("ou25"),
+        "odds_btts": odds.get("btts"),
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        sb.table(TABLE_ODDS).insert(row).execute()
+        log(f"Odds inserted for fixture {fixture_id}.")
+    except Exception as e:
+        log(f"Error inserting odds: {e}")
+
+
+# ---------------------------------------------------------
+# INSERT PREDICTION (ALREADY EXISTS)
+# ---------------------------------------------------------
 
 def insert_tip(t: Dict[str, Any]):
-    """
-    Insert a prediction/tip into Supabase. Called from main.py after
-    we generate predictions and pass filters.
-    """
     t["created_at"] = datetime.utcnow().isoformat()
-    return sb.table(TABLE_TIPS).insert(t).execute()
-
-
-def insert_result(r: Dict[str, Any]):
-    """
-    Insert the result of a tip after the match ends.
-    """
-    r["resolved_at"] = datetime.utcnow().isoformat()
-    return sb.table(TABLE_RESULTS).insert(r).execute()
+    try:
+        sb.table("tips").insert(t).execute()
+    except Exception as e:
+        log(f"Error inserting tip: {e}")
 
 
 # ---------------------------------------------------------
-# QUERY DATA FOR TRAINING (train_models.py)
+# FETCH FINAL MATCH RESULT & CREATE LABELS
+# ---------------------------------------------------------
+
+def create_labels_from_result(home_goals: int, away_goals: int):
+    """Generate ML labels."""
+    # 1X2 label
+    if home_goals > away_goals:
+        l1 = 0       # home
+    elif home_goals == away_goals:
+        l1 = 1       # draw
+    else:
+        l1 = 2       # away
+
+    # OU 2.5 label
+    total = home_goals + away_goals
+    lou = 1 if total > 2 else 0    # over = 1, under = 0
+
+    # BTTS label
+    lbtts = 1 if (home_goals > 0 and away_goals > 0) else 0
+
+    return l1, lou, lbtts
+
+
+def insert_match_result(fixture_id: int, home_goals: int, away_goals: int):
+    l1, lou, lbtts = create_labels_from_result(home_goals, away_goals)
+
+    row = {
+        "fixture_id": fixture_id,
+        "final_home_goals": home_goals,
+        "final_away_goals": away_goals,
+        "label_1x2": l1,
+        "label_ou25": lou,
+        "label_btts": lbtts,
+        "resolved_at": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        sb.table(TABLE_RESULTS).upsert(row, on_conflict="fixture_id").execute()
+        log(f"Result + labels saved for fixture {fixture_id}.")
+    except Exception as e:
+        log(f"Error inserting result: {e}")
+
+
+# ---------------------------------------------------------
+# TRAINING DATA FETCHING (used by train_models.py)
 # ---------------------------------------------------------
 
 def fetch_training_fixtures(limit: int = 50000):
-    """
-    Fetch historical fixtures for ML training.
-    """
-    return (
-        sb.table(TABLE_FIXTURES)
-        .select("*")
-        .order("timestamp", desc=False)
-        .limit(limit)
-        .execute()
-        .data
-    )
+    resp = sb.table(TABLE_FIXTURES) \
+             .select("*") \
+             .order("timestamp", desc=False) \
+             .limit(limit) \
+             .execute()
+    return resp.data or []
 
 
-def fetch_training_tips():
-    """
-    Fetch all tips with their results for supervised learning.
-    """
-    return (
-        sb.table(TABLE_TIPS)
-        .select("*, tip_results(*)")
-        .execute()
-        .data
-    )
-
-
-# ---------------------------------------------------------
-# MATCH RESULT RESOLUTION (main.py)
-# ---------------------------------------------------------
-
-def unresolved_tips():
-    """
-    Return all tips that need resolution (their fixture is finished).
-    """
-    return (
-        sb.table(TABLE_TIPS)
-        .select("*")
-        .is_("resolved", None)
-        .execute()
-        .data
-    )
-
-
-def mark_tip_resolved(tip_id: int):
-    return (
-        sb.table(TABLE_TIPS)
-        .update({"resolved": True})
-        .eq("id", tip_id)
-        .execute()
-    )
-
-
-# ---------------------------------------------------------
-# MODEL VERSIONING (optional but recommended)
-# ---------------------------------------------------------
-
-def record_model_version(version: str, notes: str = ""):
-    return sb.table("model_versions").insert({
-        "version": version,
-        "notes": notes,
-        "created_at": datetime.utcnow().isoformat()
-    }).execute()
-
-
-def get_latest_model_version():
-    resp = (
-        sb.table("model_versions")
-        .select("*")
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if resp.data:
-        return resp.data[0]["version"]
-    return None
+def fetch_training_results():
+    resp = sb.table(TABLE_RESULTS).select("*").execute()
+    return resp.data or []
