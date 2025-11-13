@@ -3,17 +3,21 @@ import time
 from typing import Optional
 from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-TG_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+def telegram_url():
+    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 
 # --------------------------------------------------------
-# BASIC SEND MESSAGE
+# BASIC SEND MESSAGE (UPGRADED)
 # --------------------------------------------------------
 
-def send_telegram(text: str, retries: int = 2) -> bool:
+def send_telegram(text: str, retries: int = 3) -> bool:
     """
-    Sends a Telegram message with retry handling.
-    Never throws; always returns True/False.
+    Sends a Telegram message with retry handling, including:
+    - rate limit handling (429)
+    - bot blocked (403)
+    - safe logging
     """
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -27,13 +31,31 @@ def send_telegram(text: str, retries: int = 2) -> bool:
         "disable_web_page_preview": True,
     }
 
-    for attempt in range(1, retries + 2):
+    url = telegram_url()
+
+    for attempt in range(1, retries + 1):
+
         try:
-            r = requests.post(TG_URL, data=payload, timeout=5)
+            r = requests.post(url, data=payload, timeout=5)
+
+            # success
             if r.status_code == 200:
                 return True
 
-            print(f"[TELEGRAM] Error {r.status_code}: {r.text}")
+            # rate limit
+            if r.status_code == 429:
+                retry_after = r.json().get("parameters", {}).get("retry_after", 1)
+                print(f"[TELEGRAM] Rate limited. Waiting {retry_after}s...")
+                time.sleep(retry_after)
+                continue
+
+            # bot blocked
+            if r.status_code == 403:
+                print("[TELEGRAM] Bot blocked or chat_id invalid.")
+                return False
+
+            # other errors
+            print(f"[TELEGRAM] HTTP {r.status_code}: {r.text}")
 
         except Exception as e:
             print(f"[TELEGRAM] Exception: {e}")
@@ -44,49 +66,31 @@ def send_telegram(text: str, retries: int = 2) -> bool:
 
 
 # --------------------------------------------------------
-# FORMAT A SINGLE PREDICTION AS TELEGRAM MESSAGE
+# FORMAT A SINGLE PREDICTION
 # --------------------------------------------------------
 
 def format_prediction(pred) -> str:
-    """
-    Expected input: Prediction dataclass instance.
-    """
-
-    fid = pred.fixture_id
-    market = pred.market
-    selection = pred.selection.upper()
-
-    p = pred.prob
-    o = pred.odds
-    ev = pred.ev
-    minute = pred.aux.get("minute", 0)
 
     return (
         f"⚽ <b>GOALSNIPER AI</b>\n"
-        f"📌 <b>Fixture ID:</b> {fid}\n"
-        f"⏱ <b>Minute:</b> {minute}'\n\n"
-        f"🎯 <b>Market:</b> {market}\n"
-        f"🟩 <b>Bet:</b> {selection}\n\n"
-        f"📈 <b>Probability:</b> {p*100:.1f}%\n"
-        f"💸 <b>Odds:</b> {o:.2f}\n"
-        f"📊 <b>EV:</b> {ev*100:.1f}%\n"
+        f"📌 <b>Fixture ID:</b> {pred.fixture_id}\n"
+        f"⏱ <b>Minute:</b> {pred.aux.get('minute', 0)}'\n\n"
+        f"🎯 <b>Market:</b> {pred.market}\n"
+        f"🟩 <b>Bet:</b> {pred.selection.upper()}\n\n"
+        f"📈 <b>Probability:</b> {pred.prob*100:.1f}%\n"
+        f"💸 <b>Odds:</b> {pred.odds:.2f}\n"
+        f"📊 <b>EV:</b> {pred.ev*100:.1f}%\n"
     )
 
 
 # --------------------------------------------------------
-# SEND A LIST OF PREDICTIONS
+# SEND MULTIPLE PREDICTIONS
 # --------------------------------------------------------
 
 def send_predictions(pred_list):
-    """
-    Takes a list of Prediction objects and sends each to Telegram.
-    Returns number of successful messages.
-    """
     count = 0
-
     for pred in pred_list:
         msg = format_prediction(pred)
         if send_telegram(msg):
             count += 1
-
     return count
