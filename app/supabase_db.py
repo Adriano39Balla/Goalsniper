@@ -1,23 +1,44 @@
+import os
 import json
 import time
 from supabase import create_client, Client
 
+# ============================================================
+# ENV → LAZY LOAD CLIENT
+# ============================================================
 
-SUPABASE_URL = "YOUR_URL"
-SUPABASE_KEY = "YOUR_SERVICE_ROLE_KEY"
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+_supabase: Client | None = None
+
+def get_supabase() -> Client:
+    global _supabase
+
+    if _supabase is None:
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+
+        if not url or not key:
+            raise ValueError(
+                f"[Supabase] Missing environment variables. "
+                f"SUPABASE_URL={url}, KEY={'SET' if key else 'MISSING'}"
+            )
+
+        _supabase = create_client(url, key)
+        print("[SUPABASE] Client initialized.")
+
+    return _supabase
 
 
-# =========================================================
+# ============================================================
 # FIXTURES
-# =========================================================
+# ============================================================
 
-def upsert_fixture(data):
+def upsert_fixture(data: dict):
     """
-    Inserts or updates the fixture record.
-    Matches your clean new table structure.
+    Inserts/updates fixtures in the clean fixtures table.
     """
     try:
+        supabase = get_supabase()
+
         payload = {
             "fixture_id": data["fixture_id"],
             "league_id": data.get("league_id"),
@@ -30,37 +51,25 @@ def upsert_fixture(data):
             "timestamp": data.get("timestamp"),
         }
 
-        res = (
-            supabase.table("fixtures")
-            .upsert(payload, on_conflict="fixture_id")
-            .execute()
-        )
+        supabase.table("fixtures").upsert(
+            payload, on_conflict="fixture_id"
+        ).execute()
+
         print(f"[SUPABASE] Fixture {data['fixture_id']} upserted.")
-        return res
 
     except Exception as e:
         print("[SUPABASE] Error upserting fixture:", e)
-        return None
 
 
-# =========================================================
+# ============================================================
 # ODDS
-# =========================================================
+# ============================================================
 
 def insert_odds(fixture_id: int, odds_data: dict):
     """
-    Inserts odds into the new clean odds table.
-
-    odds_data format MUST be:
-    {
-        "bet365": {
-            "1X2": {"HOME": 1.80, "DRAW": 3.60, "AWAY": 4.20},
-            "BTTS": {"YES": 1.95, "NO": 1.80},
-            "OU_2.5": {"OVER": 2.10, "UNDER": 1.65}
-        }
-    }
+    Inserts flattened odds rows into the new odds table.
     """
-
+    supabase = get_supabase()
     rows = []
 
     for bookmaker, markets in odds_data.items():
@@ -68,6 +77,7 @@ def insert_odds(fixture_id: int, odds_data: dict):
             for selection, odd in selections.items():
                 if odd is None:
                     continue
+
                 rows.append({
                     "fixture_id": fixture_id,
                     "bookmaker": bookmaker,
@@ -87,24 +97,17 @@ def insert_odds(fixture_id: int, odds_data: dict):
         print("[SUPABASE] Error inserting odds:", e)
 
 
-# =========================================================
-# LIVE MATCH STATS
-# =========================================================
+# ============================================================
+# LIVE STATS
+# ============================================================
 
 def insert_stats(fixture_id: int, stats: dict):
     """
-    Inserts live stats into the new stats table.
-
-    stats format:
-    {
-        "minute": 55,
-        "home_shots_on": 4,
-        "away_shots_on": 2,
-        "home_attacks": 63,
-        "away_attacks": 51
-    }
+    Inserts live match stats into clean stats table.
     """
     try:
+        supabase = get_supabase()
+
         payload = {
             "fixture_id": fixture_id,
             "minute": stats.get("minute"),
@@ -117,70 +120,62 @@ def insert_stats(fixture_id: int, stats: dict):
         }
 
         supabase.table("stats").insert(payload).execute()
+
         print(f"[SUPABASE] Stats inserted for fixture {fixture_id}")
 
     except Exception as e:
         print("[SUPABASE] Error inserting stats:", e)
 
 
-# =========================================================
-# TIPS
-# =========================================================
+# ============================================================
+# TIPS — BETS SENT BY THE BOT
+# ============================================================
 
 def insert_tip(tip: dict):
-    """
-    Saves bot tips.
-    These are the bets evaluated in ROI.
-    """
-
     try:
-        res = supabase.table("tips").insert(tip).execute()
+        supabase = get_supabase()
+        supabase.table("tips").insert(tip).execute()
+
         print(f"[SUPABASE] Tip inserted: {tip}")
-        return res
+
     except Exception as e:
         print("[SUPABASE] Error inserting tip:", e)
-        return None
 
 
-# =========================================================
-# TIP RESULTS (grading)
-# =========================================================
+# ============================================================
+# TIP RESULTS — BET GRADING
+# ============================================================
 
 def insert_tip_result(result: dict):
-    """
-    Every graded bet is saved here:
-    {
-        "tip_id": 123,
-        "fixture_id": 1483272,
-        "result": "WIN/LOSS/PUSH",
-        "stake": 1,
-        "odds": 1.85,
-        "pnl": +0.85
-    }
-    """
-
     try:
-        res = supabase.table("tip_results").insert(result).execute()
-        print(f"[SUPABASE] Tip result saved.")
-        return res
+        supabase = get_supabase()
+        supabase.table("tip_results").insert(result).execute()
+
+        print("[SUPABASE] Tip result saved.")
+
     except Exception as e:
         print("[SUPABASE] Error inserting tip result:", e)
-        return None
 
 
-# =========================================================
+# ============================================================
 # DAILY ROI LOG
-# =========================================================
+# ============================================================
 
 def write_daily_roi(day: str, tips_count: int, pnl: float):
     roi = pnl / max(tips_count, 1)
+
     try:
-        supabase.table("roi_log").upsert({
-            "day": day,
-            "tips_count": tips_count,
-            "pnl": pnl,
-            "roi": roi
-        }, on_conflict="day").execute()
+        supabase = get_supabase()
+
+        supabase.table("roi_log").upsert(
+            {
+                "day": day,
+                "tips_count": tips_count,
+                "pnl": pnl,
+                "roi": roi,
+            },
+            on_conflict="day"
+        ).execute()
 
         print(f"[SUPABASE] Daily ROI logged for {day}")
 
