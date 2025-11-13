@@ -1,5 +1,5 @@
 # ============================================================
-#   GOALSNIPER.AI — MODEL TRAINING ENGINE (FINAL VERSION)
+#   GOALSNIPER.AI — MODEL TRAINING ENGINE (FINAL SAFE VERSION)
 # ============================================================
 
 import os
@@ -34,11 +34,8 @@ print("[TRAIN] Supabase connected.")
 
 def fetch_training_dataset():
     """
-    Loads historical tips with results.
-    Schema:
-        tips.id -> tip_results.tip_id
+    Loads historical tips + results.
     """
-
     print("[TRAIN] Fetching training dataset...")
 
     try:
@@ -58,11 +55,10 @@ def fetch_training_dataset():
     for tip in data:
         results = tip.get("tip_results") or []
         if not results:
-            continue  # No grading yet
+            continue
 
         res = results[0]
 
-        # Skip incomplete rows
         if tip["prob"] is None or tip["odds"] is None:
             continue
         if res["result"] not in ("WIN", "LOSS"):
@@ -80,20 +76,22 @@ def fetch_training_dataset():
         })
 
     df = pd.DataFrame(rows)
-    print(f"[TRAIN] Loaded {len(df)} labelled examples.")
+    print(f"[TRAIN] Loaded {len(df)} labeled examples.")
     return df
 
 
 # ------------------------------------------------------------
-# MARKET PREPROCESSORS
+# MARKET PREPROCESSOR
 # ------------------------------------------------------------
 
 def prep(df, market):
     df = df[df["market"] == market]
     if df.empty:
         return None, None
+
     X = df[["prob", "minute", "odds"]].fillna(0).astype(float).values
     y = df["result"].map({"WIN": 1, "LOSS": 0}).astype(int).values
+
     return X, y
 
 
@@ -102,14 +100,23 @@ def prep(df, market):
 # ------------------------------------------------------------
 
 def train_model(X, y):
-    if len(X) < 30 or len(set(y)) < 2:
-        print("[TRAIN] Not enough samples → fallback dummy.")
+    if len(X) < 40:
+        print("[TRAIN] Too little data → skipping real training.")
         return None
 
-    base = LogisticRegression(max_iter=1000)
-    model = CalibratedClassifierCV(base, cv=3)
-    model.fit(X, y)
-    return model
+    if len(set(y)) < 2:
+        print("[TRAIN] Only one class present → skipping.")
+        return None
+
+    try:
+        base = LogisticRegression(max_iter=1000)
+        model = CalibratedClassifierCV(base, cv=3)
+        model.fit(X, y)
+        return model
+
+    except Exception as e:
+        print("[TRAIN] Model training failed:", e)
+        return None
 
 
 # ------------------------------------------------------------
@@ -125,84 +132,84 @@ def save_model(model, path, storage_name):
     try:
         with open(path, "rb") as f:
             supabase.storage.from_("models").upload(
-                storage_name,
-                f,
+                path=storage_name,
+                file=f,
                 file_options={"content-type": "application/octet-stream"},
                 upsert=True
             )
         print(f"[TRAIN] Uploaded → Supabase Storage/{storage_name}")
+
     except Exception as e:
         print("[TRAIN] Upload failed:", e)
 
 
 # ------------------------------------------------------------
-# DUMMY MODEL (SAFE)
+# SAFE DUMMY MODEL
 # ------------------------------------------------------------
 
 def make_dummy():
-    """
-    Properly fitted dummy model so predict_proba works.
-    """
     X = np.array([[0, 0, 1], [1, 90, 10]])
     y = np.array([0, 1])
 
     base = LogisticRegression(max_iter=200)
     model = CalibratedClassifierCV(base, cv=2)
     model.fit(X, y)
-
     return model
 
 
 def train_dummies():
     print("[TRAIN] Creating dummy models...")
 
-    m = make_dummy()
+    dummy = make_dummy()
 
-    save_model(m, MODEL_1X2, "logreg_1x2.pkl")
-    save_model(m, MODEL_OU25, "logreg_ou25.pkl")
-    save_model(m, MODEL_BTTS, "logreg_btts.pkl")
+    save_model(dummy, MODEL_1X2, "logreg_1x2.pkl")
+    save_model(dummy, MODEL_OU25, "logreg_ou25.pkl")
+    save_model(dummy, MODEL_BTTS, "logreg_btts.pkl")
 
     print("[TRAIN] Dummy models created.")
 
 
 # ------------------------------------------------------------
-# MAIN PIPELINE
+# MAIN TRAINING PIPELINE
 # ------------------------------------------------------------
 
 def main():
-    print("===========================================")
-    print("      GOALSNIPER AI — TRAINING START")
-    print("===========================================")
+    print("============================================")
+    print("        GOALSNIPER AI — TRAINING START")
+    print("============================================")
 
     df = fetch_training_dataset()
 
     if df.empty:
-        print("[TRAIN] No historical data → using dummy models.")
+        print("[TRAIN] No training data → dummy models only.")
         return train_dummies()
 
-    # 1X2
+    # ---- 1X2 ----
     X1, y1 = prep(df, "1X2")
     if X1 is not None:
         m1 = train_model(X1, y1)
-        if m1: save_model(m1, MODEL_1X2, "logreg_1x2.pkl")
+        if m1:
+            save_model(m1, MODEL_1X2, "logreg_1x2.pkl")
 
-    # OU25
+    # ---- OU25 ----
     X2, y2 = prep(df, "OU25")
     if X2 is not None:
         m2 = train_model(X2, y2)
-        if m2: save_model(m2, MODEL_OU25, "logreg_ou25.pkl")
+        if m2:
+            save_model(m2, MODEL_OU25, "logreg_ou25.pkl")
 
-    # BTTS
+    # ---- BTTS ----
     X3, y3 = prep(df, "BTTS")
     if X3 is not None:
         m3 = train_model(X3, y3)
-        if m3: save_model(m3, MODEL_BTTS, "logreg_btts.pkl")
+        if m3:
+            save_model(m3, MODEL_BTTS, "logreg_btts.pkl")
 
     print("[TRAIN] Training complete.")
 
 
 # ------------------------------------------------------------
-# MAIN + MANUAL TRIGGER
+# MANUAL TRIGGER
 # ------------------------------------------------------------
 
 def run_full_training():
