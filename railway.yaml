@@ -39,3 +39,42 @@ services:
       resources:
         cpu: 1
         memory: 1024
+
+  resolve-results:
+    build:
+      dockerfile: Dockerfile
+    env:
+      ENVIRONMENT: "production"
+    start: "python resolve_results.py"
+    schedule:
+      cron: "*/30 * * * *"   # every 30 minutes
+    deploy:
+      resources:
+        cpu: 0.5
+        memory: 512
+
+  log-roi:
+    build:
+      dockerfile: Dockerfile
+    env:
+      ENVIRONMENT: "production"
+    start: "python log_roi.py"
+    schedule:
+      cron: "5 0 * * *"      # daily at 00:05 UTC
+    deploy:
+      resources:
+        cpu: 0.5
+        memory: 256
+
+  update-strength:
+    build:
+      dockerfile: Dockerfile
+    env:
+      ENVIRONMENT: "production"
+    start: "python update_team_strength.py"
+    schedule:
+      cron: "10 0 * * *"     # daily at 00:10 UTC
+    deploy:
+      resources:
+        cpu: 0.5
+        memory: 512
