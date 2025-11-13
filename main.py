@@ -23,11 +23,11 @@ from app.filters import filter_predictions
 # Telegram
 from app.telegram_bot import send_predictions
 
-# Supabase (NOW INCLUDING FULL LOGGING)
+# Supabase (NEW CLEAN INTERFACE)
 from app.supabase_db import (
     upsert_fixture,
-    insert_stats_snapshot,
-    insert_odds_snapshot,
+    insert_stats,
+    insert_odds,
     insert_tip
 )
 
@@ -53,20 +53,27 @@ def health():
 
 def process_fixture(fixture_raw):
     """
-    Takes raw fixture from API-Football, returns predictions.
-    Also logs fixture → Supabase.
+    1. Normalize fixture
+    2. Save fixture to Supabase
+    3. Fetch + log stats
+    4. Fetch + log odds
+    5. Run predictions
     """
 
     fixture = normalize_fixture(fixture_raw)
     fid = fixture["fixture_id"]
 
-    # ---- SAVE FIXTURE SNAPSHOT ----
+    # ---- SAVE FIXTURE ----
     upsert_fixture(fixture)
 
-    # ---- FETCH LIVE STATS ----
+    # =====================================================
+    # FETCH STATS
+    # =====================================================
+
     stats_raw = get_fixture_stats(fid)
 
     stats = {
+        "minute": fixture.get("minute"),
         "home_shots_on": 0,
         "away_shots_on": 0,
         "home_attacks": 0,
@@ -82,33 +89,40 @@ def process_fixture(fixture_raw):
                 t = s.get("type")
                 v = s.get("value") or 0
 
-                # Shots on Goal
                 if t == "Shots on Goal":
                     if tid == fixture["home_team_id"]:
                         stats["home_shots_on"] = v
                     else:
                         stats["away_shots_on"] = v
 
-                # Attacks
                 if t == "Attacks":
                     if tid == fixture["home_team_id"]:
                         stats["home_attacks"] = v
                     else:
                         stats["away_attacks"] = v
 
-    # ---- SAVE STATS SNAPSHOT ----
-    insert_stats_snapshot(fid, stats)
+    # ---- SAVE STATS ----
+    insert_stats(fid, stats)
 
-    # ---- FETCH LIVE ODDS ----
+    # =====================================================
+    # FETCH ODDS
+    # =====================================================
+
     odds_raw = get_live_odds(fid)
 
-    odds_1x2 = {"home": None, "draw": None, "away": None}
-    odds_ou25 = {"over": None, "under": None}
-    odds_btts = {"yes": None, "no": None}
+    odds_1x2 = {"HOME": None, "DRAW": None, "AWAY": None}
+    odds_ou25 = {"OVER": None, "UNDER": None}
+    odds_btts = {"YES": None, "NO": None}
+
+    structured_odds = {}
 
     if odds_raw:
         for item in odds_raw:
+            bookmaker = item.get("bookmaker")
             markets = item.get("bets", [])
+
+            if bookmaker not in structured_odds:
+                structured_odds[bookmaker] = {}
 
             for m in markets:
                 name = m.get("name")
@@ -118,41 +132,49 @@ def process_fixture(fixture_raw):
                 if name == "Match Winner":
                     for v in values:
                         if v["value"] == "Home":
-                            odds_1x2["home"] = float(v["odd"])
+                            odds_1x2["HOME"] = float(v["odd"])
                         if v["value"] == "Draw":
-                            odds_1x2["draw"] = float(v["odd"])
+                            odds_1x2["DRAW"] = float(v["odd"])
                         if v["value"] == "Away":
-                            odds_1x2["away"] = float(v["odd"])
+                            odds_1x2["AWAY"] = float(v["odd"])
 
-                # OU 2.5
+                    structured_odds[bookmaker]["1X2"] = odds_1x2
+
+                # Over/Under 2.5
                 if name == "Over/Under" and "2.5" in str(values):
                     for v in values:
                         if v["value"] == "Over 2.5":
-                            odds_ou25["over"] = float(v["odd"])
+                            odds_ou25["OVER"] = float(v["odd"])
                         if v["value"] == "Under 2.5":
-                            odds_ou25["under"] = float(v["odd"])
+                            odds_ou25["UNDER"] = float(v["odd"])
+
+                    structured_odds[bookmaker]["OU_2.5"] = odds_ou25
 
                 # BTTS
                 if name == "Both Teams To Score":
                     for v in values:
                         if v["value"] == "Yes":
-                            odds_btts["yes"] = float(v["odd"])
+                            odds_btts["YES"] = float(v["odd"])
                         if v["value"] == "No":
-                            odds_btts["no"] = float(v["odd"])
+                            odds_btts["NO"] = float(v["odd"])
 
-    # ---- SAVE ODDS SNAPSHOT ----
-    insert_odds_snapshot(fid, {
-        "1x2": odds_1x2,
-        "ou25": odds_ou25,
-        "btts": odds_btts,
-    })
+                    structured_odds[bookmaker]["BTTS"] = odds_btts
 
-    # ---- PREMATCH PLACEHOLDER (future: use Supabase team ratings) ----
+    # ---- SAVE ODDS ----
+    insert_odds(fid, structured_odds)
+
+    # =====================================================
+    # PREMATCH PLACEHOLDERS
+    # =====================================================
+
     prematch_strength = {"home": 0.0, "away": 0.0}
     prematch_goal_exp = 2.6
     prematch_btts_exp = 0.55
 
-    # ---- ML PREDICTIONS ----
+    # =====================================================
+    # ML PREDICTIONS
+    # =====================================================
+
     preds_1x2 = predict_fixture_1x2(fixture, stats, odds_1x2, prematch_strength)
     preds_ou25 = predict_fixture_ou25(fixture, stats, odds_ou25, prematch_goal_exp)
     preds_btts = predict_fixture_btts(fixture, stats, odds_btts, prematch_btts_exp)
@@ -175,17 +197,17 @@ def live_prediction_cycle():
         preds = process_fixture(fr)
         all_preds.extend(preds)
 
-    # Filter + adaptive filters
+    # FILTER
     final_preds = filter_predictions(all_preds)
 
     if not final_preds:
         print("[GOALSNIPER] No predictions passed filters.")
         return
 
-    # Send to Telegram
+    # SEND TO TELEGRAM
     send_predictions(final_preds)
 
-    # Save Tips
+    # SAVE TIPS
     for p in final_preds:
         insert_tip({
             "fixture_id": p.fixture_id,
