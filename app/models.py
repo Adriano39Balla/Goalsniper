@@ -3,9 +3,7 @@ import pickle
 import joblib
 from typing import Dict, Any
 
-from sklearn.linear_model import LogisticRegression
 import numpy as np
-
 from app.config import (
     MODEL_1X2,
     MODEL_OU25,
@@ -17,65 +15,51 @@ from app.supabase_db import get_supabase
 sb = get_supabase()
 
 
-# ---------------------------------------------------------
-# LOGGING HELPERS
-# ---------------------------------------------------------
-
 def log(msg: str):
     print(f"[MODELS] {msg}")
 
 
 # ---------------------------------------------------------
-# CREATE DUMMY MODELS (FALLBACK)
+# DUMMY MODEL CLASSES (must be top-level for pickle!)
+# ---------------------------------------------------------
+
+class Dummy1X2:
+    def predict_proba(self, X):
+        p = np.array([[0.33, 0.34, 0.33]])
+        return np.repeat(p, X.shape[0], axis=0)
+
+
+class DummyOU25:
+    def predict_proba(self, X):
+        p = np.array([[0.50, 0.50]])
+        return np.repeat(p, X.shape[0], axis=0)
+
+
+class DummyBTTS:
+    def predict_proba(self, X):
+        p = np.array([[0.50, 0.50]])
+        return np.repeat(p, X.shape[0], axis=0)
+
+
+# ---------------------------------------------------------
+# CREATE & SAVE DUMMY MODELS
 # ---------------------------------------------------------
 
 def create_dummy_model_1x2():
-    """
-    Simple 3-class logistic regression-like dummy.
-    Output ~0.33 / 0.33 / 0.33 always.
-    """
     log("Creating dummy 1X2 model...")
-
-    class Dummy1X2:
-        def predict_proba(self, X):
-            p = np.array([[0.33, 0.34, 0.33]])
-            return np.repeat(p, X.shape[0], axis=0)
-
-    model = Dummy1X2()
-    joblib.dump(model, MODEL_1X2)
+    joblib.dump(Dummy1X2(), MODEL_1X2)
     log(f"Dummy 1X2 saved: {MODEL_1X2}")
 
 
 def create_dummy_model_ou25():
-    """
-    Dummy binary classifier for Over/Under 2.5
-    Output ~50/50.
-    """
     log("Creating dummy OU25 model...")
-
-    class DummyOU25:
-        def predict_proba(self, X):
-            p = np.array([[0.50, 0.50]])
-            return np.repeat(p, X.shape[0], axis=0)
-
-    model = DummyOU25()
-    joblib.dump(model, MODEL_OU25)
+    joblib.dump(DummyOU25(), MODEL_OU25)
     log(f"Dummy OU25 saved: {MODEL_OU25}")
 
 
 def create_dummy_model_btts():
-    """
-    Dummy BTTS classifier.
-    """
     log("Creating dummy BTTS model...")
-
-    class DummyBTTS:
-        def predict_proba(self, X):
-            p = np.array([[0.50, 0.50]])
-            return np.repeat(p, X.shape[0], axis=0)
-
-    model = DummyBTTS()
-    joblib.dump(model, MODEL_BTTS)
+    joblib.dump(DummyBTTS(), MODEL_BTTS)
     log(f"Dummy BTTS saved: {MODEL_BTTS}")
 
 
@@ -91,16 +75,12 @@ def create_all_dummy_models():
 # ---------------------------------------------------------
 
 def download_from_storage(remote_name: str, local_path: str) -> bool:
-    """
-    Attempt to download a trained model from Supabase Storage.
-    Returns True if download successful.
-    """
     try:
         log(f"Downloading {remote_name} from Supabase Storage...")
-
         res = sb.storage.from_("models").download(remote_name)
+
         if not res:
-            log(f"Storage returned empty for {remote_name}.")
+            log(f"No file returned from storage for {remote_name}.")
             return False
 
         with open(local_path, "wb") as f:
@@ -115,10 +95,6 @@ def download_from_storage(remote_name: str, local_path: str) -> bool:
 
 
 def sync_models_from_storage():
-    """
-    Attempts to download trained models.
-    Falls back to dummy models if nothing exists yet.
-    """
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     files = {
@@ -130,12 +106,11 @@ def sync_models_from_storage():
     downloaded_any = False
 
     for remote, local in files.items():
-        ok = download_from_storage(remote, local)
-        if ok:
+        if download_from_storage(remote, local):
             downloaded_any = True
 
     if not downloaded_any:
-        log("No trained models found in storage → using dummy models.")
+        log("No trained models found → creating dummy models.")
         create_all_dummy_models()
 
 
@@ -152,16 +127,13 @@ def safe_load(path: str):
 
 
 # ---------------------------------------------------------
-# INITIALIZATION (RUNS ON IMPORT)
+# INITIALIZATION (AUTO RUN AT IMPORT)
 # ---------------------------------------------------------
 
 def initialize_models():
     log("Initializing model system...")
-
-    # Ensure folder exists
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    # Check if all models exist locally
     missing = []
     for p in [MODEL_1X2, MODEL_OU25, MODEL_BTTS]:
         if not os.path.exists(p):
@@ -169,38 +141,35 @@ def initialize_models():
 
     if missing:
         log(f"Missing model files: {missing}")
-        log("Trying to sync from Supabase...")
         sync_models_from_storage()
 
-    # Final check: create dummy if still missing
+    # After sync, check again
     final_missing = []
     for p in [MODEL_1X2, MODEL_OU25, MODEL_BTTS]:
         if not os.path.exists(p):
             final_missing.append(p)
 
     if final_missing:
-        log(f"Final missing models → creating dummy: {final_missing}")
+        log("Still missing → creating dummy models.")
         create_all_dummy_models()
 
     log("Model system ready.")
 
 
-# ---------------------------------------------------------
-# MODEL PREDICT FUNCTIONS
-# ---------------------------------------------------------
-
-# We load models after initialization
+# Run initialization
 initialize_models()
 
+# Load into memory
 MODEL_1X2_OBJ = safe_load(MODEL_1X2)
 MODEL_OU25_OBJ = safe_load(MODEL_OU25)
 MODEL_BTTS_OBJ = safe_load(MODEL_BTTS)
 
 
+# ---------------------------------------------------------
+# PUBLIC PREDICT FUNCTIONS
+# ---------------------------------------------------------
+
 def predict_1x2(features: np.ndarray) -> Dict[str, float]:
-    """
-    Returns: {"home": p1, "draw": p2, "away": p3}
-    """
     proba = MODEL_1X2_OBJ.predict_proba(features.reshape(1, -1))[0]
     return {"home": float(proba[0]), "draw": float(proba[1]), "away": float(proba[2])}
 
