@@ -1,6 +1,8 @@
 import threading
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+from app.models import load_all_models
+from app.train_models import run_full_training
 
 from app.api_football import (
     get_live_fixtures,
@@ -43,6 +45,43 @@ def safe_float(x):
 def health():
     return jsonify({"status": "ok", "service": "goalsniper-ai"})
 
+@app.route("/manual/scan", methods=["GET"])
+def manual_scan():
+    """
+    Manually trigger a live scan without waiting for scheduler.
+    """
+    try:
+        print("[MANUAL] Manual live scan triggered")
+        live_prediction_cycle()
+        return jsonify({"status": "ok", "message": "Live scan completed"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/manual/train", methods=["GET"])
+def manual_training():
+    """
+    Manually retrain all ML models.
+    """
+    try:
+        print("[MANUAL] Manual model training started")
+        run_full_training()
+        return jsonify({"status": "ok", "message": "Training completed"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/manual/reload-models", methods=["GET"])
+def manual_reload_models():
+    """
+    Reload all model .pkl files without restarting the container.
+    """
+    try:
+        load_all_models()
+        print("[MANUAL] Models reloaded.")
+        return jsonify({"status": "ok", "message": "Models reloaded"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # ---------------------------------------------------------
 # INTERNAL: PROCESS A SINGLE FIXTURE
