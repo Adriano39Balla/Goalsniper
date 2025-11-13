@@ -23,17 +23,18 @@ from app.filters import filter_predictions
 # Telegram
 from app.telegram_bot import send_predictions
 
-# Supabase logging — FIXED IMPORTS
+# Supabase logging
 from app.supabase_db import (
     upsert_fixture,
-    insert_stats_snapshot,
-    insert_odds_snapshot,
+    insert_stats,
+    insert_odds,
     insert_tip,
 )
 
-# Manual training
+# Manual training (train_models.py)
 from train_models import run_full_training
 
+# Config
 from app.config import DEBUG_MODE, LIVE_PREDICTION_INTERVAL
 
 
@@ -42,7 +43,7 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH CHECKS
 # ============================================================
 
 @app.route("/health")
@@ -54,9 +55,9 @@ def health():
 def health_full():
     return jsonify({
         "status": "ok",
-        "fixtures_source": "API-FOOTBALL",
-        "models": "loaded",
+        "models_ready": True,
         "scheduler_running": scheduler.running,
+        "api_source": "api-football",
     })
 
 
@@ -66,23 +67,29 @@ def health_full():
 
 @app.route("/manual/train")
 def manual_train():
+    """Manually trigger full model training."""
     run_full_training()
     return jsonify({"status": "training started"})
 
 
 @app.route("/manual/scan")
 def manual_scan():
+    """Manually trigger a single live prediction scan."""
     live_prediction_cycle()
     return jsonify({"status": "scan completed"})
 
 
 # ============================================================
-# ODDS PARSER (UNIVERSAL)
+# UNIVERSAL ODDS PARSER
 # ============================================================
 
 def extract_core_odds(odds_list):
     """
-    Extracts FT 1X2, BTTS, O/U 2.5 from the wild API-Football feed.
+    Extracts only the markets we use:
+      - 1X2 fulltime
+      - BTTS fulltime
+      - Over/Under 2.5
+    API-Football provides hundreds of markets – we sanitize it here.
     """
 
     out_1x2 = {"home": None, "draw": None, "away": None}
@@ -96,64 +103,59 @@ def extract_core_odds(odds_list):
         name = m.get("name", "").lower()
         values = m.get("values", [])
 
-        # ---------- FULLTIME 1X2 ----------
+        # -------------- FULLTIME 1X2 --------------
         if name in ["fulltime result", "match winner", "1x2"]:
             for v in values:
-                label = v.get("value", "").lower()
+                val = v.get("value", "").lower()
                 odd = v.get("odd")
                 if odd is None:
                     continue
-                if label == "home":
-                    out_1x2["home"] = float(odd)
-                elif label == "draw":
-                    out_1x2["draw"] = float(odd)
-                elif label == "away":
-                    out_1x2["away"] = float(odd)
 
-        # ---------- BTTS (Fulltime only) ----------
+                if val == "home": out_1x2["home"] = float(odd)
+                elif val == "draw": out_1x2["draw"] = float(odd)
+                elif val == "away": out_1x2["away"] = float(odd)
+
+        # -------------- BTTS FULLTIME --------------
         if "both teams to score" in name and "half" not in name:
             for v in values:
-                label = v.get("value", "").lower()
+                val = v.get("value", "").lower()
                 odd = v.get("odd")
                 if odd is None:
                     continue
-                if label == "yes":
-                    out_btts["yes"] = float(odd)
-                elif label == "no":
-                    out_btts["no"] = float(odd)
 
-        # ---------- OVER/UNDER 2.5 ----------
+                if val == "yes": out_btts["yes"] = float(odd)
+                elif val == "no": out_btts["no"] = float(odd)
+
+        # -------------- O/U 2.5 --------------
         if "over/under" in name or "line" in name:
             for v in values:
-                hcap = str(v.get("handicap", "")).strip()
                 label = v.get("value", "").lower()
+                handicap = str(v.get("handicap", "")).strip()
                 odd = v.get("odd")
+
                 if odd is None:
                     continue
 
-                if hcap == "2.5":
-                    if "over" in label:
-                        out_ou25["over"] = float(odd)
-                    if "under" in label:
-                        out_ou25["under"] = float(odd)
+                if handicap == "2.5":
+                    if "over" in label: out_ou25["over"] = float(odd)
+                    if "under" in label: out_ou25["under"] = float(odd)
 
     return out_1x2, out_ou25, out_btts
 
 
 # ============================================================
-# PROCESS FIXTURE
+# PROCESS A FIXTURE
 # ============================================================
 
 def process_fixture(f_raw):
     fixture = normalize_fixture(f_raw)
     fid = fixture["fixture_id"]
 
-    # Save fixture snapshot
+    # ------------------- FIXTURE SNAPSHOT -------------------
     upsert_fixture(fixture)
 
-    # ---------------- STATS ----------------
-    stats_raw = get_fixture_stats(fid)
-    stats = {
+    # ------------------- STATS SNAPSHOT ---------------------
+    stats_row = {
         "minute": fixture.get("minute", 0),
         "home_shots_on": 0,
         "away_shots_on": 0,
@@ -161,6 +163,7 @@ def process_fixture(f_raw):
         "away_attacks": 0,
     }
 
+    stats_raw = get_fixture_stats(fid)
     if stats_raw:
         for team in stats_raw:
             tid = team.get("team", {}).get("id")
@@ -170,46 +173,46 @@ def process_fixture(f_raw):
 
                 if t == "Shots on Goal":
                     if tid == fixture["home_team_id"]:
-                        stats["home_shots_on"] = v
+                        stats_row["home_shots_on"] = v
                     else:
-                        stats["away_shots_on"] = v
+                        stats_row["away_shots_on"] = v
 
                 if t == "Attacks":
                     if tid == fixture["home_team_id"]:
-                        stats["home_attacks"] = v
+                        stats_row["home_attacks"] = v
                     else:
-                        stats["away_attacks"] = v
+                        stats_row["away_attacks"] = v
 
-    insert_stats_snapshot(fid, stats)
+    insert_stats(fid, stats_row)
 
-    # ---------------- ODDS ----------------
-    odds_resp = api_get("odds/live", {"fixture": fid})
-    odds_data = odds_resp.get("response", [])
-    odds_list = odds_data[0].get("odds", []) if odds_data else []
+    # ------------------- ODDS SNAPSHOT ----------------------
+    odds_api = api_get("odds/live", {"fixture": fid})
+    odds_resp = odds_api.get("response", [])
+    odds_list = odds_resp[0].get("odds", []) if odds_resp else []
 
     odds_1x2, odds_ou25, odds_btts = extract_core_odds(odds_list)
 
-    insert_odds_snapshot(fid, {
+    insert_odds(fid, {
         "1x2": odds_1x2,
         "ou25": odds_ou25,
         "btts": odds_btts,
     })
 
-    # ---------------- ML PREDICTIONS ----------------
+    # ------------------- ML PREDICTIONS ---------------------
     prematch_strength = {"home": 0.0, "away": 0.0}
     prematch_goal_exp = 2.6
     prematch_btts_exp = 0.55
 
     preds = []
-    preds += predict_fixture_1x2(fixture, stats, odds_1x2, prematch_strength)
-    preds += predict_fixture_ou25(fixture, stats, odds_ou25, prematch_goal_exp)
-    preds += predict_fixture_btts(fixture, stats, odds_btts, prematch_btts_exp)
+    preds += predict_fixture_1x2(fixture, stats_row, odds_1x2, prematch_strength)
+    preds += predict_fixture_ou25(fixture, stats_row, odds_ou25, prematch_goal_exp)
+    preds += predict_fixture_btts(fixture, stats_row, odds_btts, prematch_btts_exp)
 
     return preds
 
 
 # ============================================================
-# LIVE SCAN LOOP
+# MAIN LIVE CYCLE
 # ============================================================
 
 def live_prediction_cycle():
@@ -218,8 +221,8 @@ def live_prediction_cycle():
     fixtures_raw = get_live_fixtures()
     all_preds = []
 
-    for f in fixtures_raw:
-        all_preds.extend(process_fixture(f))
+    for fr in fixtures_raw:
+        all_preds.extend(process_fixture(fr))
 
     final_preds = filter_predictions(all_preds)
 
@@ -229,6 +232,7 @@ def live_prediction_cycle():
 
     send_predictions(final_preds)
 
+    # Store predictions
     for p in final_preds:
         insert_tip({
             "fixture_id": p.fixture_id,
@@ -240,7 +244,7 @@ def live_prediction_cycle():
             "minute": p.aux.get("minute"),
         })
 
-    print("[GOALSNIPER] Predictions sent & stored.")
+    print("[GOALSNIPER] Predictions sent & saved.")
 
 
 # ============================================================
@@ -263,7 +267,7 @@ start_async_scheduler()
 
 
 # ============================================================
-# FLASK ENTRY POINT
+# FLASK ENTRYPOINT
 # ============================================================
 
 if __name__ == "__main__":
