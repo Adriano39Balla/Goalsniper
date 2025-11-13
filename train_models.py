@@ -1,302 +1,176 @@
 import os
-from typing import List, Dict, Any, Tuple
-
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import log_loss
 import joblib
-
-from app.supabase_db import fetch_training_fixtures
+from supabase import create_client
 from app.features import (
     build_features_1x2,
     build_features_ou25,
-    build_features_btts,
+    build_features_btts
 )
+from app.supabase_db import fetch_training_fixtures
 from app.config import (
-    MODEL_DIR,
     MODEL_1X2,
     MODEL_OU25,
     MODEL_BTTS,
 )
 
+# -------------------------
+# Supabase client
+# -------------------------
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------------------------------------------------------
-# UTIL
-# ---------------------------------------------------------
-
-def ensure_model_dir():
-    if not os.path.exists(MODEL_DIR):
-        os.makedirs(MODEL_DIR, exist_ok=True)
+# Ensure models folder exists
+os.makedirs("models", exist_ok=True)
 
 
-# ---------------------------------------------------------
-# BUILD TRAINING DATASETS
-# ---------------------------------------------------------
-
-def build_dataset_1x2(fixtures: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
-    X = []
-    y = []
-
-    for row in fixtures:
-        try:
-            fixture = {
-                "fixture_id": row["id"],
-                "league_id": row.get("league_id"),
-                "home_team_id": row["home_team_id"],
-                "away_team_id": row["away_team_id"],
-                "home_goals": row["home_goals"],
-                "away_goals": row["away_goals"],
-                "status": "FT",
-                "minute": 90,
-                "timestamp": row.get("timestamp"),
+# -------------------------
+# Upload trained models
+# -------------------------
+def upload_model(local_path: str, upload_name: str):
+    print(f"[TRAIN] Uploading {upload_name} to Supabase Storage...")
+    with open(local_path, "rb") as f:
+        supabase.storage.from_("models").upload(
+            upload_name,
+            f.read(),
+            {
+                "content-type": "application/octet-stream",
+                "x-upsert": "true"
             }
-
-            stats = {
-                "home_shots_on": row.get("home_shots_on", 0),
-                "away_shots_on": row.get("away_shots_on", 0),
-                "home_attacks": row.get("home_attacks", 0),
-                "away_attacks": row.get("away_attacks", 0),
-            }
-
-            odds_1x2 = {
-                "home": float(row.get("odds_home_1x2") or 0.0),
-                "draw": float(row.get("odds_draw_1x2") or 0.0),
-                "away": float(row.get("odds_away_1x2") or 0.0),
-            }
-
-            prematch_strength = {
-                "home": float(row.get("home_strength") or 0.0),
-                "away": float(row.get("away_strength") or 0.0),
-            }
-
-            # Skip if odds missing (model needs odds to learn their relation)
-            if not (odds_1x2["home"] and odds_1x2["draw"] and odds_1x2["away"]):
-                continue
-
-            features, _ = build_features_1x2(
-                fixture,
-                stats,
-                odds_1x2,
-                prematch_strength,
-            )
-
-            hg = row["home_goals"]
-            ag = row["away_goals"]
-
-            if hg > ag:
-                label = 0  # home
-            elif hg == ag:
-                label = 1  # draw
-            else:
-                label = 2  # away
-
-            X.append(features)
-            y.append(label)
-
-        except KeyError:
-            continue
-
-    return np.array(X), np.array(y)
+        )
+    print(f"[TRAIN] Uploaded {upload_name}.")
 
 
-def build_dataset_ou25(fixtures: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
-    X = []
-    y = []
-
-    for row in fixtures:
-        try:
-            goals_total = (row["home_goals"] or 0) + (row["away_goals"] or 0)
-
-            fixture = {
-                "fixture_id": row["id"],
-                "home_goals": row["home_goals"],
-                "away_goals": row["away_goals"],
-                "minute": 90,
-            }
-
-            stats = {
-                "home_shots_on": row.get("home_shots_on", 0),
-                "away_shots_on": row.get("away_shots_on", 0),
-                "home_attacks": row.get("home_attacks", 0),
-                "away_attacks": row.get("away_attacks", 0),
-            }
-
-            odds_ou = {
-                "over": float(row.get("odds_over_25") or 0.0),
-                "under": float(row.get("odds_under_25") or 0.0),
-            }
-
-            if not (odds_ou["over"] and odds_ou["under"]):
-                continue
-
-            prematch_goal_expectation = float(row.get("goal_expectation") or 2.6)
-
-            features, _ = build_features_ou25(
-                fixture,
-                stats,
-                odds_ou,
-                prematch_goal_expectation,
-            )
-
-            label = 1 if goals_total > 2 else 0  # 1=over, 0=under
-
-            X.append(features)
-            y.append(label)
-
-        except KeyError:
-            continue
-
-    return np.array(X), np.array(y)
-
-
-def build_dataset_btts(fixtures: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
-    X = []
-    y = []
-
-    for row in fixtures:
-        try:
-            hg = row["home_goals"] or 0
-            ag = row["away_goals"] or 0
-            btts = 1 if (hg > 0 and ag > 0) else 0
-
-            fixture = {
-                "fixture_id": row["id"],
-                "home_goals": hg,
-                "away_goals": ag,
-                "minute": 90,
-            }
-
-            stats = {
-                "home_shots_on": row.get("home_shots_on", 0),
-                "away_shots_on": row.get("away_shots_on", 0),
-                "home_attacks": row.get("home_attacks", 0),
-                "away_attacks": row.get("away_attacks", 0),
-            }
-
-            odds_btts = {
-                "yes": float(row.get("odds_btts_yes") or 0.0),
-                "no": float(row.get("odds_btts_no") or 0.0),
-            }
-
-            if not (odds_btts["yes"] and odds_btts["no"]):
-                continue
-
-            prematch_btts_expectation = float(row.get("btts_expectation") or 0.55)
-
-            features, _ = build_features_btts(
-                fixture,
-                stats,
-                odds_btts,
-                prematch_btts_expectation,
-            )
-
-            X.append(features)
-            y.append(btts)
-
-        except KeyError:
-            continue
-
-    return np.array(X), np.array(y)
-
-
-# ---------------------------------------------------------
-# TRAIN HELPERS
-# ---------------------------------------------------------
-
-def train_logreg_multiclass(X: np.ndarray, y: np.ndarray) -> LogisticRegression:
-    model = LogisticRegression(
-        multi_class="multinomial",
-        solver="lbfgs",
-        max_iter=1000,
-        n_jobs=-1,
-    )
-    model.fit(X, y)
-    return model
-
-
-def train_logreg_binary(X: np.ndarray, y: np.ndarray) -> LogisticRegression:
-    model = LogisticRegression(
-        solver="lbfgs",
-        max_iter=1000,
-        n_jobs=-1,
-    )
-    model.fit(X, y)
-    return model
-
-
-# ---------------------------------------------------------
-# MAIN TRAIN PIPELINE
-# ---------------------------------------------------------
-
+# -------------------------
+# MAIN TRAINING PIPELINE
+# -------------------------
 def main():
-    ensure_model_dir()
 
-    print("[TRAIN] Fetching fixtures from Supabase...")
-    fixtures = fetch_training_fixtures(limit=50000)
+    print("[TRAIN] Fetching training fixtures...")
+    fixtures = fetch_training_fixtures()
 
     if not fixtures:
-        print("[TRAIN] No fixtures returned from Supabase. Aborting.")
+        print("[TRAIN] No fixtures available. Exiting.")
         return
 
-    print(f"[TRAIN] Retrieved {len(fixtures)} fixtures.")
+    df = pd.DataFrame(fixtures)
+    print(f"[TRAIN] Training on {len(df)} fixtures.")
 
-    # 1X2
-    print("[TRAIN] Building dataset for 1X2...")
-    X_1x2, y_1x2 = build_dataset_1x2(fixtures)
-    print(f"[TRAIN] 1X2 dataset: X={X_1x2.shape}, y={y_1x2.shape}")
+    # Safety checks
+    required_cols = [
+        "fixture",
+        "stats",
+        "odds",
+        "prematch_strength",
+        "prematch_goal_expectation",
+        "prematch_btts_expectation",
+        "result_1x2",
+        "result_ou25",
+        "result_btts",
+    ]
+    for c in required_cols:
+        if c not in df.columns:
+            print(f"[TRAIN] Missing column: {c}")
+            return
 
-    if len(y_1x2) > 1000:
-        X_train, X_val, y_train, y_val = train_test_split(X_1x2, y_1x2, test_size=0.2, random_state=42)
-        model_1x2 = train_logreg_multiclass(X_train, y_train)
+    # --------------------------
+    # TRAIN 1X2
+    # --------------------------
+    X_1x2 = []
+    y_1x2 = []
 
-        # Evaluate
-        y_val_proba = model_1x2.predict_proba(X_val)
-        ll = log_loss(y_val, y_val_proba)
-        print(f"[TRAIN] 1X2 log-loss: {ll:.4f}")
+    for _, row in df.iterrows():
+        feats, _ = build_features_1x2(
+            row["fixture"],
+            row["stats"],
+            row["odds"],
+            row["prematch_strength"]
+        )
+        X_1x2.append(feats)
+        y_1x2.append(row["result_1x2"])
 
-        # Save
-        joblib.dump(model_1x2, MODEL_1X2)
-        print(f"[TRAIN] Saved 1X2 model -> {MODEL_1X2}")
-    else:
-        print("[TRAIN] Not enough samples for 1X2, skipping model training.")
+    X_1x2 = np.vstack(X_1x2)
+    y_1x2 = np.array(y_1x2)
 
-    # OU 2.5
-    print("[TRAIN] Building dataset for OU25...")
-    X_ou, y_ou = build_dataset_ou25(fixtures)
-    print(f"[TRAIN] OU25 dataset: X={X_ou.shape}, y={y_ou.shape}")
+    print(f"[TRAIN] Training 1X2 model: X={X_1x2.shape}, y={y_1x2.shape}")
 
-    if len(y_ou) > 1000:
-        X_train, X_val, y_train, y_val = train_test_split(X_ou, y_ou, test_size=0.2, random_state=42)
-        model_ou = train_logreg_binary(X_train, y_train)
-        y_val_proba = model_ou.predict_proba(X_val)
-        ll = log_loss(y_val, y_val_proba)
-        print(f"[TRAIN] OU25 log-loss: {ll:.4f}")
+    clf_1x2 = LogisticRegression(
+        multi_class="multinomial",
+        solver="lbfgs",
+        max_iter=800,
+        n_jobs=-1
+    )
+    clf_1x2.fit(X_1x2, y_1x2)
 
-        joblib.dump(model_ou, MODEL_OU25)
-        print(f"[TRAIN] Saved OU25 model -> {MODEL_OU25}")
-    else:
-        print("[TRAIN] Not enough samples for OU25, skipping model training.")
+    joblib.dump(clf_1x2, MODEL_1X2)
+    upload_model(MODEL_1X2, "logreg_1x2.pkl")
 
-    # BTTS
-    print("[TRAIN] Building dataset for BTTS...")
-    X_btts, y_btts = build_dataset_btts(fixtures)
-    print(f"[TRAIN] BTTS dataset: X={X_btts.shape}, y={y_btts.shape}")
+    # --------------------------
+    # TRAIN OU 2.5
+    # --------------------------
+    X_ou = []
+    y_ou = []
 
-    if len(y_btts) > 1000:
-        X_train, X_val, y_train, y_val = train_test_split(X_btts, y_btts, test_size=0.2, random_state=42)
-        model_btts = train_logreg_binary(X_train, y_train)
-        y_val_proba = model_btts.predict_proba(X_val)
-        ll = log_loss(y_val, y_val_proba)
-        print(f"[TRAIN] BTTS log-loss: {ll:.4f}")
+    for _, row in df.iterrows():
+        feats, _ = build_features_ou25(
+            row["fixture"],
+            row["stats"],
+            row["odds"],
+            row["prematch_goal_expectation"]
+        )
+        X_ou.append(feats)
+        y_ou.append(row["result_ou25"])
 
-        joblib.dump(model_btts, MODEL_BTTS)
-        print(f"[TRAIN] Saved BTTS model -> {MODEL_BTTS}")
-    else:
-        print("[TRAIN] Not enough samples for BTTS, skipping model training.")
+    X_ou = np.vstack(X_ou)
+    y_ou = np.array(y_ou)
 
-    print("[TRAIN] Training complete.")
+    print(f"[TRAIN] Training OU25 model: X={X_ou.shape}, y={y_ou.shape}")
+
+    clf_ou = LogisticRegression(
+        solver="lbfgs",
+        max_iter=800,
+        n_jobs=-1
+    )
+    clf_ou.fit(X_ou, y_ou)
+
+    joblib.dump(clf_ou, MODEL_OU25)
+    upload_model(MODEL_OU25, "logreg_ou25.pkl")
+
+    # --------------------------
+    # TRAIN BTTS
+    # --------------------------
+    X_btts = []
+    y_btts = []
+
+    for _, row in df.iterrows():
+        feats, _ = build_features_btts(
+            row["fixture"],
+            row["stats"],
+            row["odds"],
+            row["prematch_btts_expectation"]
+        )
+        X_btts.append(feats)
+        y_btts.append(row["result_btts"])
+
+    X_btts = np.vstack(X_btts)
+    y_btts = np.array(y_btts)
+
+    print(f"[TRAIN] Training BTTS model: X={X_btts.shape}, y={y_btts.shape}")
+
+    clf_btts = LogisticRegression(
+        solver="lbfgs",
+        max_iter=800,
+        n_jobs=-1
+    )
+    clf_btts.fit(X_btts, y_btts)
+
+    joblib.dump(clf_btts, MODEL_BTTS)
+    upload_model(MODEL_BTTS, "logreg_btts.pkl")
+
+    print("[TRAIN] Training completed successfully.")
 
 
 if __name__ == "__main__":
