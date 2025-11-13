@@ -1,5 +1,6 @@
 import requests
 import time
+import json
 from typing import Dict, List, Any
 from app.config import API_FOOTBALL_KEY, API_FOOTBALL_URL
 
@@ -74,11 +75,17 @@ def get_live_odds(fixture_id: int):
     # Primary live endpoint
     odds = api_get("odds/live", {"fixture": fixture_id})
     if odds:
+        print("\n===== RAW ODDS RESPONSE =====")
+        print(json.dumps(odds, indent=2))
+        print("===== END RAW ODDS =====\n")
         return odds
 
     # Fallback: all odds but filtered
     odds = api_get("odds", {"fixture": fixture_id, "live": "all"})
     if odds:
+        print("\n===== RAW ODDS RESPONSE =====")
+        print(json.dumps(odds, indent=2))
+        print("===== END RAW ODDS =====\n")
         return odds
 
     # Final fallback (rare)
