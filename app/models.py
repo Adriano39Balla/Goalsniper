@@ -17,7 +17,7 @@ from app.config import (
 # ================================================================
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-BUCKET = "models"   # Required Supabase bucket name
+BUCKET = "models"   # REQUIRED Supabase bucket name
 
 
 # ================================================================
@@ -33,38 +33,41 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 def download_model_if_exists(filename):
     """
     Attempts to download a model file from Supabase Storage.
-    If not present → returns False.
+    Returns True if successfully saved locally.
     """
 
+    local_path = os.path.join(MODEL_DIR, filename)
+
     try:
-        path_in_bucket = f"{filename}"
-        local_path = os.path.join(MODEL_DIR, filename)
+        print(f"[MODELS] Checking Supabase for {filename}...")
+        resp = supabase.storage.from_(BUCKET).download(filename)
 
-        print(f"[MODELS] Trying to download {filename} from Supabase...")
+        if resp is None:
+            return False
 
-        resp = supabase.storage.from_(BUCKET).download(path_in_bucket)
+        # Some versions return {"data": bytes}
+        if isinstance(resp, dict) and "data" in resp:
+            resp = resp["data"]
 
-        if resp:
+        if isinstance(resp, (bytes, bytearray)):
             with open(local_path, "wb") as f:
                 f.write(resp)
-            print(f"[MODELS] Downloaded {filename} successfully.")
+            print(f"[MODELS] Downloaded {filename}")
             return True
+
+        return False
 
     except Exception as e:
         print(f"[MODELS] No Supabase version for {filename}: {e}")
-
-    return False
+        return False
 
 
 # ================================================================
-# UPLOAD TO SUPABASE STORAGE
+# UPLOAD MODEL TO SUPABASE STORAGE
 # ================================================================
 
 def upload_model_to_supabase(filename):
-    """
-    Uploads local model file to Supabase Storage.
-    """
-
+    """Uploads local model → Supabase Storage."""
     local_path = os.path.join(MODEL_DIR, filename)
 
     try:
@@ -76,50 +79,61 @@ def upload_model_to_supabase(filename):
                 upsert=True,
             )
         print(f"[MODELS] Uploaded {filename} → Supabase Storage.")
-
     except Exception as e:
-        print(f"[MODELS] Failed to upload {filename}: {e}")
+        print(f"[MODELS] Upload failed for {filename}: {e}")
 
 
 # ================================================================
-# DUMMY MODEL GENERATOR (fallback)
+# DUMMY MODEL (SAFE & FULLY COMPATIBLE)
 # ================================================================
 
-def make_dummy_classifier(num_outputs):
+def make_dummy_classifier(n_outputs):
     """
-    Creates a simple dummy model that always predicts uniform probabilities.
+    Safe dummy classifier that mimics sklearn classifier:
+    - has predict_proba
+    - has classes_
     """
+
     class Dummy:
+        def __init__(self):
+            self.classes_ = np.arange(n_outputs)
+
         def predict_proba(self, X):
             batch = X.shape[0] if len(X.shape) > 1 else 1
-            return np.ones((batch, num_outputs)) / num_outputs
+            return np.ones((batch, n_outputs)) / n_outputs
 
     return Dummy()
 
 
 # ================================================================
-# LOAD / CREATE MODELS
+# LOAD / CREATE MODEL
 # ================================================================
 
 def load_or_create_model(path, outputs, filename):
     """
-    1) Try load local file
-    2) Try download from Supabase
-    3) Generate dummy and upload
+    Try load local -> try download -> fallback dummy -> upload dummy.
     """
 
-    # 1 — local
+    # 1) Local load
     if os.path.exists(path):
-        print(f"[MODELS] Loaded {path}")
-        return joblib.load(path)
+        try:
+            print(f"[MODELS] Loaded local model {filename}")
+            model = joblib.load(path)
+            return model
+        except Exception as e:
+            print(f"[MODELS] Local model corrupted → {e}")
 
-    # 2 — Supabase download
+    # 2) Download from Supabase
     if download_model_if_exists(filename):
-        print(f"[MODELS] Loaded {filename} from Supabase")
-        return joblib.load(path)
+        try:
+            print(f"[MODELS] Loaded Supabase model {filename}")
+            model = joblib.load(path)
+            return model
+        except Exception as e:
+            print(f"[MODELS] Supabase model corrupted → {e}")
 
-    # 3 — Dummy fallback
-    print(f"[MODELS] No model found → creating dummy for {filename}")
+    # 3) Dummy fallback
+    print(f"[MODELS] Creating dummy model: {filename}")
     model = make_dummy_classifier(outputs)
     joblib.dump(model, path)
     upload_model_to_supabase(filename)
@@ -127,7 +141,7 @@ def load_or_create_model(path, outputs, filename):
 
 
 # ================================================================
-# LOAD ALL MODELS (on startup)
+# INITIALIZE ALL MODELS
 # ================================================================
 
 print("[MODELS] Initializing model system...")
@@ -136,66 +150,89 @@ model_1x2 = load_or_create_model(MODEL_1X2, 3, "logreg_1x2.pkl")
 model_ou25 = load_or_create_model(MODEL_OU25, 2, "logreg_ou25.pkl")
 model_btts = load_or_create_model(MODEL_BTTS, 2, "logreg_btts.pkl")
 
-print("[MODELS] Model system ready.")
+print("[MODELS] Models loaded successfully.")
+
+
+# ================================================================
+# NORMALIZATION HELPERS
+# ================================================================
+
+def _normalize(prob_list):
+    s = sum(prob_list)
+    if s <= 0:
+        return [1 / len(prob_list)] * len(prob_list)
+    return [p / s for p in prob_list]
 
 
 # ================================================================
 # PREDICTION FUNCTIONS
+# GUARANTEED TO RETURN VALID PROBABILITIES
 # ================================================================
 
 def predict_1x2(features: np.ndarray):
     """
-    Returns dict: { "home": p, "draw": p, "away": p }
+    Always returns:
+        { "home": p, "draw": p, "away": p }
     """
 
+    X = features.reshape(1, -1)
+
     try:
-        X = features.reshape(1, -1)
-        probs = model_1x2.predict_proba(X)[0]
-
-        return {
-            "home": float(probs[0]),
-            "draw": float(probs[1]),
-            "away": float(probs[2]),
-        }
-
+        probs_raw = model_1x2.predict_proba(X)[0]
     except Exception as e:
-        print("[MODELS] Error in predict_1x2:", e)
-        return {"home": 0.33, "draw": 0.33, "away": 0.33}
+        print("[MODELS] predict_1x2 error → dummy:", e)
+        probs_raw = [1/3, 1/3, 1/3]
+
+    # sklearn orders probs by model.classes_ → FIXED MAP:
+    # 0 = home, 1 = draw, 2 = away
+    probs = _normalize([
+        float(probs_raw[0]),
+        float(probs_raw[1]),
+        float(probs_raw[2]),
+    ])
+
+    return {"home": probs[0], "draw": probs[1], "away": probs[2]}
 
 
 def predict_ou25(features: np.ndarray):
     """
-    Returns dict: { "over": p, "under": p }
+    Always returns:
+        { "over": p, "under": p }
     """
 
+    X = features.reshape(1, -1)
+
     try:
-        X = features.reshape(1, -1)
-        probs = model_ou25.predict_proba(X)[0]
-
-        return {
-            "over": float(probs[0]),
-            "under": float(probs[1]),
-        }
-
+        probs_raw = model_ou25.predict_proba(X)[0]
     except Exception as e:
-        print("[MODELS] Error in predict_ou25:", e)
-        return {"over": 0.5, "under": 0.5}
+        print("[MODELS] predict_ou25 error → dummy:", e)
+        probs_raw = [0.5, 0.5]
+
+    probs = _normalize([
+        float(probs_raw[0]),  # over
+        float(probs_raw[1]),  # under
+    ])
+
+    return {"over": probs[0], "under": probs[1]}
 
 
 def predict_btts(features: np.ndarray):
     """
-    Returns dict: { "yes": p, "no": p }
+    Always returns:
+        { "yes": p, "no": p }
     """
 
+    X = features.reshape(1, -1)
+
     try:
-        X = features.reshape(1, -1)
-        probs = model_btts.predict_proba(X)[0]
-
-        return {
-            "yes": float(probs[0]),
-            "no": float(probs[1]),
-        }
-
+        probs_raw = model_btts.predict_proba(X)[0]
     except Exception as e:
-        print("[MODELS] Error in predict_btts:", e)
-        return {"yes": 0.5, "no": 0.5}
+        print("[MODELS] predict_btts error → dummy:", e)
+        probs_raw = [0.5, 0.5]
+
+    probs = _normalize([
+        float(probs_raw[0]),  # yes
+        float(probs_raw[1]),  # no
+    ])
+
+    return {"yes": probs[0], "no": probs[1]}
