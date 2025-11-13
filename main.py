@@ -23,7 +23,7 @@ from app.filters import filter_predictions
 # Telegram
 from app.telegram_bot import send_predictions
 
-# Supabase (NEW CLEAN INTERFACE)
+# Supabase
 from app.supabase_db import (
     upsert_fixture,
     insert_stats,
@@ -39,35 +39,28 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 
 # ---------------------------------------------------------
-# HEALTH ENDPOINT
+# HEALTH
 # ---------------------------------------------------------
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "goalsniper-ai"})
+    return jsonify({"status": "ok"})
 
 
 # ---------------------------------------------------------
-# INTERNAL: PROCESS A SINGLE FIXTURE
+# PROCESS FIXTURE
 # ---------------------------------------------------------
 
 def process_fixture(fixture_raw):
-    """
-    1. Normalize fixture
-    2. Save fixture to Supabase
-    3. Fetch + log stats
-    4. Fetch + log odds
-    5. Run predictions
-    """
 
     fixture = normalize_fixture(fixture_raw)
     fid = fixture["fixture_id"]
 
-    # ---- SAVE FIXTURE ----
+    # Save fixture
     upsert_fixture(fixture)
 
     # =====================================================
-    # FETCH STATS
+    # FETCH + SAVE STATS
     # =====================================================
 
     stats_raw = get_fixture_stats(fid)
@@ -81,109 +74,110 @@ def process_fixture(fixture_raw):
     }
 
     if stats_raw:
-        for team_stats in stats_raw:
-            tid = team_stats.get("team", {}).get("id")
-            items = team_stats.get("statistics", [])
+        for t in stats_raw:
+            tid = t.get("team", {}).get("id")
+            for item in t.get("statistics", []):
+                tname = item.get("type")
+                val = item.get("value") or 0
 
-            for s in items:
-                t = s.get("type")
-                v = s.get("value") or 0
-
-                if t == "Shots on Goal":
+                if tname == "Shots on Goal":
                     if tid == fixture["home_team_id"]:
-                        stats["home_shots_on"] = v
+                        stats["home_shots_on"] = val
                     else:
-                        stats["away_shots_on"] = v
+                        stats["away_shots_on"] = val
 
-                if t == "Attacks":
+                if tname == "Attacks":
                     if tid == fixture["home_team_id"]:
-                        stats["home_attacks"] = v
+                        stats["home_attacks"] = val
                     else:
-                        stats["away_attacks"] = v
+                        stats["away_attacks"] = val
 
-    # ---- SAVE STATS ----
     insert_stats(fid, stats)
 
     # =====================================================
-    # FETCH ODDS
+    # FETCH + SAVE ODDS
     # =====================================================
 
     odds_raw = get_live_odds(fid)
-
-    odds_1x2 = {"HOME": None, "DRAW": None, "AWAY": None}
-    odds_ou25 = {"OVER": None, "UNDER": None}
-    odds_btts = {"YES": None, "NO": None}
-
     structured_odds = {}
 
     if odds_raw:
         for item in odds_raw:
-            bookmaker = item.get("bookmaker")
-            markets = item.get("bets", [])
+            bookmaker_obj = item.get("bookmaker", {})
+            bookmaker = bookmaker_obj.get("name") or bookmaker_obj.get("id")
+
+            if not bookmaker:
+                continue
 
             if bookmaker not in structured_odds:
                 structured_odds[bookmaker] = {}
 
-            for m in markets:
-                name = m.get("name")
-                values = m.get("values", [])
+            for bet in item.get("bets", []):
+                name = bet.get("name")
 
-                # 1X2
+                # MATCH WINNER
                 if name == "Match Winner":
-                    for v in values:
+                    out = {}
+                    for v in bet.get("values", []):
                         if v["value"] == "Home":
-                            odds_1x2["HOME"] = float(v["odd"])
+                            out["HOME"] = float(v["odd"])
                         if v["value"] == "Draw":
-                            odds_1x2["DRAW"] = float(v["odd"])
+                            out["DRAW"] = float(v["odd"])
                         if v["value"] == "Away":
-                            odds_1x2["AWAY"] = float(v["odd"])
-
-                    structured_odds[bookmaker]["1X2"] = odds_1x2
-
-                # Over/Under 2.5
-                if name == "Over/Under" and "2.5" in str(values):
-                    for v in values:
-                        if v["value"] == "Over 2.5":
-                            odds_ou25["OVER"] = float(v["odd"])
-                        if v["value"] == "Under 2.5":
-                            odds_ou25["UNDER"] = float(v["odd"])
-
-                    structured_odds[bookmaker]["OU_2.5"] = odds_ou25
+                            out["AWAY"] = float(v["odd"])
+                    structured_odds[bookmaker]["1X2"] = out
 
                 # BTTS
                 if name == "Both Teams To Score":
-                    for v in values:
+                    out = {}
+                    for v in bet.get("values", []):
                         if v["value"] == "Yes":
-                            odds_btts["YES"] = float(v["odd"])
+                            out["YES"] = float(v["odd"])
                         if v["value"] == "No":
-                            odds_btts["NO"] = float(v["odd"])
+                            out["NO"] = float(v["odd"])
+                    structured_odds[bookmaker]["BTTS"] = out
 
-                    structured_odds[bookmaker]["BTTS"] = odds_btts
+                # O/U ANY LINE
+                if name == "Over/Under":
+                    out = {}
+                    for v in bet.get("values", []):
+                        if "Over" in v["value"]:
+                            out["OVER"] = float(v["odd"])
+                        if "Under" in v["value"]:
+                            out["UNDER"] = float(v["odd"])
+                    structured_odds[bookmaker]["OU"] = out
 
-    # ---- SAVE ODDS ----
+    # Save to DB
     insert_odds(fid, structured_odds)
 
     # =====================================================
-    # PREMATCH PLACEHOLDERS
+    # RUN PREDICTIONS
     # =====================================================
+
+    # pick ANY bookmaker (priority: bet365)
+    for bookmaker in ["bet365", "Bet365", "bwin", "pinnacle", *structured_odds.keys()]:
+        if bookmaker in structured_odds:
+            m = structured_odds[bookmaker]
+            odds_1x2 = m.get("1X2", {})
+            odds_ou = m.get("OU", {})
+            odds_btts = m.get("BTTS", {})
+            break
+    else:
+        odds_1x2, odds_ou, odds_btts = {}, {}, {}
 
     prematch_strength = {"home": 0.0, "away": 0.0}
     prematch_goal_exp = 2.6
     prematch_btts_exp = 0.55
 
-    # =====================================================
-    # ML PREDICTIONS
-    # =====================================================
-
     preds_1x2 = predict_fixture_1x2(fixture, stats, odds_1x2, prematch_strength)
-    preds_ou25 = predict_fixture_ou25(fixture, stats, odds_ou25, prematch_goal_exp)
+    preds_ou25 = predict_fixture_ou25(fixture, stats, odds_ou, prematch_goal_exp)
     preds_btts = predict_fixture_btts(fixture, stats, odds_btts, prematch_btts_exp)
 
     return preds_1x2 + preds_ou25 + preds_btts
 
 
 # ---------------------------------------------------------
-# MAIN LIVE CYCLE
+# LIVE PREDICTION LOOP
 # ---------------------------------------------------------
 
 def live_prediction_cycle():
@@ -197,17 +191,14 @@ def live_prediction_cycle():
         preds = process_fixture(fr)
         all_preds.extend(preds)
 
-    # FILTER
     final_preds = filter_predictions(all_preds)
 
     if not final_preds:
         print("[GOALSNIPER] No predictions passed filters.")
         return
 
-    # SEND TO TELEGRAM
     send_predictions(final_preds)
 
-    # SAVE TIPS
     for p in final_preds:
         insert_tip({
             "fixture_id": p.fixture_id,
@@ -219,11 +210,11 @@ def live_prediction_cycle():
             "minute": p.aux.get("minute"),
         })
 
-    print(f"[GOALSNIPER] Predictions sent and stored.")
+    print("[GOALSNIPER] Predictions sent and stored.")
 
 
 # ---------------------------------------------------------
-# START SCHEDULER
+# STARTUP
 # ---------------------------------------------------------
 
 def start_scheduler_once():
@@ -241,10 +232,6 @@ def start_async_scheduler():
 
 start_async_scheduler()
 
-
-# ---------------------------------------------------------
-# FLASK ENTRY POINT
-# ---------------------------------------------------------
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=DEBUG_MODE)
