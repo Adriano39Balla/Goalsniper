@@ -29,9 +29,18 @@ def _ev(prob: float, odds: float) -> float:
     """
     EV from bettor perspective: prob * odds - 1
     """
-    if odds <= 1.0:
+    if odds is None or odds <= 1.0:
         return -1.0
     return prob * odds - 1.0
+
+
+def _safe_float(x):
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------
@@ -46,56 +55,67 @@ def predict_fixture_1x2(
 ) -> List[Prediction]:
     """
     Returns up to 3 predictions (home/draw/away) with EV values.
+    If odds are missing or broken, returns [].
     """
-    features, aux = build_features_1x2(fixture, stats, odds_1x2, prematch_team_strength)
-    probs = predict_1x2(features)
 
+    # Validate odds
+    odd_home = _safe_float(odds_1x2.get("home"))
+    odd_draw = _safe_float(odds_1x2.get("draw"))
+    odd_away = _safe_float(odds_1x2.get("away"))
+
+    # Require at least home & away to make sense
+    if not odd_home or not odd_away:
+        return []
+
+    # Build features
+    features, aux = build_features_1x2(
+        fixture, stats, odds_1x2, prematch_team_strength
+    )
+
+    probs = predict_1x2(features)
     preds: List[Prediction] = []
 
     # Home
-    if odds_1x2.get("home"):
+    if odd_home:
         p = probs["home"]
-        o = float(odds_1x2["home"])
         preds.append(
             Prediction(
                 fixture_id=fixture["fixture_id"],
                 market="1X2",
                 selection="home",
                 prob=p,
-                odds=o,
-                ev=_ev(p, o),
+                odds=odd_home,
+                ev=_ev(p, odd_home),
                 aux=aux,
             )
         )
 
-    # Draw
-    if odds_1x2.get("draw"):
+    # Draw (optional if we got it)
+    if odd_draw:
         p = probs["draw"]
-        o = float(odds_1x2["draw"])
         preds.append(
             Prediction(
                 fixture_id=fixture["fixture_id"],
                 market="1X2",
                 selection="draw",
                 prob=p,
-                odds=o,
-                ev=_ev(p, o),
+                odds=odd_draw,
+                ev=_ev(p, odd_draw),
                 aux=aux,
             )
         )
 
     # Away
-    if odds_1x2.get("away"):
+    if odd_away:
         p = probs["away"]
-        o = float(odds_1x2["away"])
         preds.append(
             Prediction(
                 fixture_id=fixture["fixture_id"],
                 market="1X2",
                 selection="away",
                 prob=p,
-                odds=o,
-                ev=_ev(p, o),
+                odds=odd_away,
+                ev=_ev(p, odd_away),
                 aux=aux,
             )
         )
@@ -113,6 +133,17 @@ def predict_fixture_ou25(
     odds_ou: Dict[str, float],
     prematch_goal_expectation: float,
 ) -> List[Prediction]:
+    """
+    Returns predictions for Over/Under 2.5 goals.
+    If over/under odds missing, returns [].
+    """
+
+    odd_over = _safe_float(odds_ou.get("over"))
+    odd_under = _safe_float(odds_ou.get("under"))
+
+    if not odd_over and not odd_under:
+        return []
+
     features, aux = build_features_ou25(
         fixture, stats, odds_ou, prematch_goal_expectation
     )
@@ -120,32 +151,30 @@ def predict_fixture_ou25(
 
     preds: List[Prediction] = []
 
-    if odds_ou.get("over"):
+    if odd_over:
         p = probs["over"]
-        o = float(odds_ou["over"])
         preds.append(
             Prediction(
                 fixture_id=fixture["fixture_id"],
                 market="OU25",
                 selection="over",
                 prob=p,
-                odds=o,
-                ev=_ev(p, o),
+                odds=odd_over,
+                ev=_ev(p, odd_over),
                 aux=aux,
             )
         )
 
-    if odds_ou.get("under"):
+    if odd_under:
         p = probs["under"]
-        o = float(odds_ou["under"])
         preds.append(
             Prediction(
                 fixture_id=fixture["fixture_id"],
                 market="OU25",
                 selection="under",
                 prob=p,
-                odds=o,
-                ev=_ev(p, o),
+                odds=odd_under,
+                ev=_ev(p, odd_under),
                 aux=aux,
             )
         )
@@ -163,6 +192,17 @@ def predict_fixture_btts(
     odds_btts: Dict[str, float],
     prematch_btts_expectation: float,
 ) -> List[Prediction]:
+    """
+    Returns predictions for BTTS yes / no.
+    If yes/no odds missing, returns [].
+    """
+
+    odd_yes = _safe_float(odds_btts.get("yes"))
+    odd_no = _safe_float(odds_btts.get("no"))
+
+    if not odd_yes and not odd_no:
+        return []
+
     features, aux = build_features_btts(
         fixture, stats, odds_btts, prematch_btts_expectation
     )
@@ -170,32 +210,30 @@ def predict_fixture_btts(
 
     preds: List[Prediction] = []
 
-    if odds_btts.get("yes"):
+    if odd_yes:
         p = probs["yes"]
-        o = float(odds_btts["yes"])
         preds.append(
             Prediction(
                 fixture_id=fixture["fixture_id"],
                 market="BTTS",
                 selection="yes",
                 prob=p,
-                odds=o,
-                ev=_ev(p, o),
+                odds=odd_yes,
+                ev=_ev(p, odd_yes),
                 aux=aux,
             )
         )
 
-    if odds_btts.get("no"):
+    if odd_no:
         p = probs["no"]
-        o = float(odds_btts["no"])
         preds.append(
             Prediction(
                 fixture_id=fixture["fixture_id"],
                 market="BTTS",
                 selection="no",
                 prob=p,
-                odds=o,
-                ev=_ev(p, o),
+                odds=odd_no,
+                ev=_ev(p, odd_no),
                 aux=aux,
             )
         )
