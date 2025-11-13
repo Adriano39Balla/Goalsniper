@@ -88,21 +88,28 @@ def upload_model_to_supabase(filename):
 # ================================================================
 
 def make_dummy_classifier(n_outputs):
-    """
-    Safe dummy classifier that mimics sklearn classifier:
-    - has predict_proba
-    - has classes_
-    """
-
-    class Dummy:
-        def __init__(self):
-            self.classes_ = np.arange(n_outputs)
+    return DummyClassifier(n_outputs)
 
         def predict_proba(self, X):
             batch = X.shape[0] if len(X.shape) > 1 else 1
             return np.ones((batch, n_outputs)) / n_outputs
 
     return Dummy()
+
+class DummyClassifier:
+    """
+    Safe sklearn-compatible dummy model that:
+    - has predict_proba()
+    - has classes_
+    - is picklable (global class)
+    """
+    def __init__(self, n_outputs):
+        self.classes_ = np.arange(n_outputs)
+        self.n_outputs = n_outputs
+
+    def predict_proba(self, X):
+        batch = X.shape[0] if len(X.shape) > 1 else 1
+        return np.ones((batch, self.n_outputs)) / self.n_outputs
 
 
 # ================================================================
