@@ -26,8 +26,8 @@ from app.telegram_bot import send_predictions
 # Supabase logging
 from app.supabase_db import (
     upsert_fixture,
-    insert_stats_snapshot,
-    insert_odds_snapshot,
+    insert_stats,
+    insert_odds,
     insert_tip,
 )
 
@@ -52,9 +52,6 @@ def health():
 
 @app.route("/manual/health-full")
 def health_full():
-    """
-    Returns internal system indicators — useful for debugging.
-    """
     return jsonify({
         "status": "ok",
         "fixtures_source": "API-FOOTBALL",
@@ -69,90 +66,76 @@ def health_full():
 
 @app.route("/manual/train")
 def manual_train():
-    """
-    Trigger full model training manually.
-    """
     run_full_training()
     return jsonify({"status": "training started"})
 
 
 @app.route("/manual/scan")
 def manual_scan():
-    """
-    Trigger a one-off scan manually.
-    """
     live_prediction_cycle()
     return jsonify({"status": "scan completed"})
 
 
 # ============================================================
-# LIVE ODDS PARSER (SAFE)
+# ODDS PARSER (UNIVERSAL)
 # ============================================================
 
-def extract_core_odds(odds_live):
+def extract_core_odds(odds_list):
     """
-    Accepts raw live odds feed from /odds/live and extracts:
-
-    • Fulltime 1X2
-    • Fulltime Both Teams To Score
-    • Fulltime Over/Under 2.5
-
-    Works safely even if odds feed contains exotic markets only.
+    Extracts FT 1X2, BTTS, O/U 2.5 from the absurd API-Football live odds feed.
+    Handles exotic-only leagues safely.
     """
 
     out_1x2 = {"home": None, "draw": None, "away": None}
     out_btts = {"yes": None, "no": None}
     out_ou25 = {"over": None, "under": None}
 
-    if not odds_live:
+    if not odds_list:
         return out_1x2, out_ou25, out_btts
 
-    for m in odds_live:
+    for m in odds_list:
         name = m.get("name", "").lower()
         values = m.get("values", [])
 
-        # -------- FULLTIME 1X2 --------
-        if "fulltime result" in name or name == "match winner" or name == "1x2":
+        # ---------------- FULLTIME 1X2 ----------------
+        if name in ["fulltime result", "match winner", "1x2"]:
             for v in values:
-                val = v.get("value", "").lower()
+                side = v.get("value", "").lower()
                 odd = v.get("odd")
                 if odd is None:
                     continue
-
-                if val == "home":
+                if side == "home":
                     out_1x2["home"] = float(odd)
-                elif val == "draw":
+                elif side == "draw":
                     out_1x2["draw"] = float(odd)
-                elif val == "away":
+                elif side == "away":
                     out_1x2["away"] = float(odd)
 
-        # -------- BTTS FT --------
+        # ---------------- BTTS FULLTIME ----------------
         if "both teams to score" in name and "half" not in name:
             for v in values:
-                val = v.get("value", "").lower()
+                side = v.get("value", "").lower()
                 odd = v.get("odd")
                 if odd is None:
                     continue
-
-                if val == "yes":
+                if side == "yes":
                     out_btts["yes"] = float(odd)
-                elif val == "no":
+                elif side == "no":
                     out_btts["no"] = float(odd)
 
-        # -------- O/U 2.5 --------
+        # ---------------- OVER/UNDER (select 2.5 line only) ----------------
         if "over/under" in name or "line" in name:
             for v in values:
                 label = v.get("value", "").lower()
-                handicap = str(v.get("handicap", "")).strip()
+                hcap = str(v.get("handicap", "")).strip()
                 odd = v.get("odd")
-
                 if odd is None:
                     continue
 
-                if handicap == "2.5":
+                if hcap == "2.5":
                     if "over" in label:
                         out_ou25["over"] = float(odd)
-                    elif "under" in label:
+                    if "under" in label:
                         out_ou25["under"] = float(odd)
 
     return out_1x2, out_ou25, out_btts
@@ -163,18 +146,13 @@ def extract_core_odds(odds_live):
 # ============================================================
 
 def process_fixture(f_raw):
-    """
-    Takes raw fixture from API-Football and returns predictions.
-    Also logs fixture + stats + odds to Supabase.
-    """
-
     fixture = normalize_fixture(f_raw)
     fid = fixture["fixture_id"]
 
-    # ---- FIXTURE SNAPSHOT ----
+    # Save fixture
     upsert_fixture(fixture)
 
-    # ---- STATS SNAPSHOT ----
+    # ---------------- STATS ----------------
     stats_raw = get_fixture_stats(fid)
     stats = {
         "minute": fixture.get("minute", 0),
@@ -183,43 +161,47 @@ def process_fixture(f_raw):
         "home_attacks": 0,
         "away_attacks": 0,
     }
+
+    # Parse shots + attacks safely
     if stats_raw:
         for team in stats_raw:
             tid = team.get("team", {}).get("id")
             for s in team.get("statistics", []):
-                t, v = s.get("type"), s.get("value") or 0
+                t = s.get("type")
+                v = s.get("value") or 0
+
                 if t == "Shots on Goal":
                     if tid == fixture["home_team_id"]:
                         stats["home_shots_on"] = v
                     else:
                         stats["away_shots_on"] = v
+
                 if t == "Attacks":
                     if tid == fixture["home_team_id"]:
                         stats["home_attacks"] = v
                     else:
                         stats["away_attacks"] = v
 
-    insert_stats_snapshot(fid, stats)
+    insert_stats(fid, stats)
 
-    # ---- ODDS SNAPSHOT ----
-    odds_live = api_get("odds/live", {"fixture": fid})
+    # ---------------- ODDS ----------------
+    odds_resp = api_get("odds/live", {"fixture": fid})
 
-    # odds structure is: { "response": [ { ... } ] }
-    odds_root = None
-    try:
-        odds_root = odds_live[0]["odds"]
-    except Exception:
-        odds_root = []
+    odds_data = odds_resp.get("response", [])
+    if odds_data:
+        odds_list = odds_data[0].get("odds", [])
+    else:
+        odds_list = []
 
-    odds_1x2, odds_ou25, odds_btts = extract_core_odds(odds_root)
+    odds_1x2, odds_ou25, odds_btts = extract_core_odds(odds_list)
 
-    insert_odds_snapshot(fid, {
+    insert_odds(fid, {
         "1x2": odds_1x2,
         "ou25": odds_ou25,
         "btts": odds_btts,
     })
 
-    # ---- ML FEATURES ----
+    # ---------------- ML PREDICTIONS ----------------
     prematch_strength = {"home": 0.0, "away": 0.0}
     prematch_goal_exp = 2.6
     prematch_btts_exp = 0.55
@@ -243,7 +225,7 @@ def live_prediction_cycle():
     all_preds = []
 
     for fr in fixtures_raw:
-        all_preds += process_fixture(fr)
+        all_preds.extend(process_fixture(fr))
 
     final_preds = filter_predictions(all_preds)
 
@@ -251,10 +233,8 @@ def live_prediction_cycle():
         print("[GOALSNIPER] No predictions passed filters.")
         return
 
-    # Send to Telegram
     send_predictions(final_preds)
 
-    # Save to Supabase
     for p in final_preds:
         insert_tip({
             "fixture_id": p.fixture_id,
@@ -266,7 +246,7 @@ def live_prediction_cycle():
             "minute": p.aux.get("minute"),
         })
 
-    print(f"[GOALSNIPER] Predictions sent & stored.")
+    print("[GOALSNIPER] Predictions sent & stored.")
 
 
 # ============================================================
@@ -289,7 +269,7 @@ start_async_scheduler()
 
 
 # ============================================================
-# FLASK ENTRY
+# FLASK ENTRYPOINT
 # ============================================================
 
 if __name__ == "__main__":
