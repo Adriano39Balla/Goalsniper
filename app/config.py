@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 
-# Load environment variables from .env (Railway will override these automatically)
+# Load environment variables
 load_dotenv()
 
 # -------------------------------------------------------
@@ -27,7 +27,7 @@ TABLE_RESULTS = "tip_results"
 # TELEGRAM SETTINGS
 # -------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # single-channel system
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # -------------------------------------------------------
 # MODEL PATHS
@@ -36,26 +36,27 @@ MODEL_DIR = "models/"
 MODEL_1X2 = os.path.join(MODEL_DIR, "logreg_1x2.pkl")
 MODEL_OU25 = os.path.join(MODEL_DIR, "logreg_ou25.pkl")
 MODEL_BTTS = os.path.join(MODEL_DIR, "logreg_btts.pkl")
-MODEL_CALIBRATION = os.path.join(MODEL_DIR, "bayesian_calibration.pkl")
 
 # -------------------------------------------------------
-# ADAPTIVE FILTER THRESHOLDS
+# FILTER SETTINGS (WITH SAFE MODE SUPPORT)
 # -------------------------------------------------------
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.65"))   # 65%
-MIN_EV = float(os.getenv("MIN_EV", "0.03"))                   # +3% EV
-MIN_ODDS = float(os.getenv("MIN_ODDS", "1.40"))               # Odds ≥ 1.40
+SAFE_MODE = os.getenv("SAFE_MODE", "false").lower() == "true"
 
-# Upper limit (system will adapt)
+# Default thresholds (adaptive logic will modify)
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.55"))  # LOWERED from 0.65 → 0.55
+MIN_EV = float(os.getenv("MIN_EV", "0.02"))                  # LOWERED from 0.03 → 0.02
+MIN_ODDS = float(os.getenv("MIN_ODDS", "1.40"))
+
 MAX_CONFIDENCE = 0.90
 
 # -------------------------------------------------------
-# INFERENCE & SCHEDULER SETTINGS
+# SCHEDULER
 # -------------------------------------------------------
-LIVE_PREDICTION_INTERVAL = int(os.getenv("LIVE_INTERVAL", "30"))  # seconds
+LIVE_PREDICTION_INTERVAL = int(os.getenv("LIVE_INTERVAL", "30"))
 PREMATCH_PREDICTION_INTERVAL = int(os.getenv("PREMATCH_INTERVAL", "600"))
 
 # -------------------------------------------------------
-# OTHER SETTINGS
+# OTHER
 # -------------------------------------------------------
 DEBUG_MODE = os.getenv("DEBUG", "0") == "1"
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
