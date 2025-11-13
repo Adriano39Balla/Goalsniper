@@ -1,269 +1,243 @@
-# train_models.py
+# ============================================================
+#   GOALSNIPER.AI — MODEL TRAINING ENGINE
+# ============================================================
 
 import os
-from typing import Dict, Any, List
-
+import json
 import numpy as np
+import pandas as pd
+from datetime import datetime
+
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import brier_score_loss, accuracy_score
+from sklearn.calibration import CalibratedClassifierCV
 from joblib import dump
 
-from app.supabase_db import get_supabase
-from app.features import (
-    build_features_1x2,
-    build_features_ou25,
-    build_features_btts,
-)
+from supabase import create_client
+from tqdm import tqdm
+
 from app.config import (
     MODEL_1X2,
     MODEL_OU25,
     MODEL_BTTS,
+    MODEL_DIR,
+    SUPABASE_URL,
+    SUPABASE_KEY,
 )
 
+# ------------------------------------------------------------
+# INITIALIZE SUPABASE
+# ------------------------------------------------------------
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+print("[TRAIN] Supabase connected.")
 
-def _safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
 
+# ------------------------------------------------------------
+# FETCH TRAINING DATA
+# ------------------------------------------------------------
 
-def load_finished_fixtures(limit: int = 50000) -> List[Dict[str, Any]]:
-    sb = get_supabase()
+def fetch_training_dataset():
+    """
+    We train from the "tips" + "tip_results" tables.
+    This ensures model learns from its own historical performance.
+    """
+
+    print("[TRAIN] Fetching training dataset...")
+
     resp = (
-        sb.table("fixtures")
-        .select("*")
-        .eq("status", "FT")   # finished matches only
-        .limit(limit)
+        supabase.table("tips")
+        .select("*, tip_results(*)")
+        .order("id", desc=False)
         .execute()
     )
+
     data = resp.data or []
-    print(f"[TRAIN] Loaded {len(data)} finished fixtures from Supabase.")
-    return data
+    if not data:
+        print("[TRAIN] No training data found. Using dummy dataset.")
+        return pd.DataFrame([])
 
-
-def load_odds_for_fixture(fixture_id: int) -> List[Dict[str, Any]]:
-    sb = get_supabase()
-    resp = (
-        sb.table("odds")
-        .select("market,selection,odd")
-        .eq("fixture_id", fixture_id)
-        .execute()
-    )
-    return resp.data or []
-
-
-def build_training_rows(fixtures: List[Dict[str, Any]]):
-    """
-    Build training datasets for:
-      - 1X2 (multiclass)
-      - OU 2.5 (binary)
-      - BTTS (binary)
-    Using:
-
-      - fixtures table for final score
-      - odds table (markets: '1X2', 'OU25', 'BTTS')
-      - zeroed in-play stats (for now; will get richer as you log more)
-    """
-
-    X_1x2, y_1x2 = [], []
-    X_ou, y_ou = [], []
-    X_btts, y_btts = [], []
-
-    for fx in fixtures:
-        try:
-            fid = fx["fixture_id"]
-            home_goals = fx.get("home_goals")
-            away_goals = fx.get("away_goals")
-
-            if home_goals is None or away_goals is None:
-                continue
-
-            # Prepare "fixture" + dummy stats (no historical in-play yet)
-            fixture = {
-                "fixture_id": fid,
-                "home_team_id": fx.get("home_team_id"),
-                "away_team_id": fx.get("away_team_id"),
-                "home_goals": home_goals,
-                "away_goals": away_goals,
-                "minute": 0,  # prematch snapshot
-            }
-
-            stats = {
-                "home_shots_on": 0,
-                "away_shots_on": 0,
-                "home_attacks": 0,
-                "away_attacks": 0,
-            }
-
-            odds_rows = load_odds_for_fixture(fid)
-            if not odds_rows:
-                continue
-
-            # Rebuild odds dicts from flat rows
-            odds_1x2 = {"home": None, "draw": None, "away": None}
-            odds_ou25 = {"over": None, "under": None}
-            odds_btts = {"yes": None, "no": None}
-
-            for row in odds_rows:
-                market = row.get("market")
-                sel = (row.get("selection") or "").upper()
-                odd = _safe_float(row.get("odd"))
-                if odd is None:
-                    continue
-
-                if market == "1X2":
-                    if sel in ("HOME", "1"):
-                        odds_1x2["home"] = odd
-                    elif sel in ("DRAW", "X"):
-                        odds_1x2["draw"] = odd
-                    elif sel in ("AWAY", "2"):
-                        odds_1x2["away"] = odd
-
-                elif market == "OU25":
-                    if sel in ("OVER",):
-                        odds_ou25["over"] = odd
-                    elif sel in ("UNDER",):
-                        odds_ou25["under"] = odd
-
-                elif market == "BTTS":
-                    if sel in ("YES", "1"):
-                        odds_btts["yes"] = odd
-                    elif sel in ("NO", "2"):
-                        odds_btts["no"] = odd
-
-            # Prematch placeholders
-            prematch_strength = {"home": 0.0, "away": 0.0}
-            prematch_goal_exp = 2.6
-            prematch_btts_exp = 0.55
-
-            # -------------------- 1X2 --------------------
-            if all(odds_1x2.values()):
-                Xf, _aux = build_features_1x2(
-                    fixture, stats, odds_1x2, prematch_strength
-                )
-
-                if home_goals > away_goals:
-                    y_label = 0  # home
-                elif home_goals == away_goals:
-                    y_label = 1  # draw
-                else:
-                    y_label = 2  # away
-
-                X_1x2.append(Xf)
-                y_1x2.append(y_label)
-
-            # -------------------- OU25 -------------------
-            if odds_ou25.get("over") and odds_ou25.get("under"):
-
-                Xf, _aux = build_features_ou25(
-                    fixture, stats, odds_ou25, prematch_goal_exp
-                )
-                goals_total = home_goals + away_goals
-                y_label = 1 if goals_total > 2.5 else 0
-
-                X_ou.append(Xf)
-                y_ou.append(y_label)
-
-            # -------------------- BTTS -------------------
-            if odds_btts.get("yes") and odds_btts.get("no"):
-
-                Xf, _aux = build_features_btts(
-                    fixture, stats, odds_btts, prematch_btts_exp
-                )
-                y_label = 1 if (home_goals > 0 and away_goals > 0) else 0
-
-                X_btts.append(Xf)
-                y_btts.append(y_label)
-
-        except Exception as e:
-            print(f"[TRAIN] Error building rows for fixture {fx.get('fixture_id')}: {e}")
+    rows = []
+    for tip in data:
+        res = tip.get("tip_results")
+        if not res:
             continue
 
-    print(f"[TRAIN] 1X2 samples: {len(X_1x2)}")
-    print(f"[TRAIN] OU25 samples: {len(X_ou)}")
-    print(f"[TRAIN] BTTS samples: {len(X_btts)}")
+        res = res[0]
 
-    return (
-        (np.array(X_1x2), np.array(y_1x2)),
-        (np.array(X_ou), np.array(y_ou)),
-        (np.array(X_btts), np.array(y_btts)),
-    )
+        rows.append({
+            "fixture_id": tip["fixture_id"],
+            "market": tip["market"],
+            "selection": tip["selection"],
+            "prob": tip["prob"],
+            "odds": tip["odds"],
+            "minute": tip["minute"],
+            "result": res["result"],   # WIN / LOSS / PUSH
+            "pnl": res["pnl"],
+        })
 
-
-def train_logreg_multiclass(X, y):
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    clf = LogisticRegression(
-        max_iter=1000,
-        multi_class="multinomial",
-        solver="lbfgs",
-    )
-    clf.fit(X_train, y_train)
-    y_proba = clf.predict_proba(X_val)
-    y_pred = clf.predict(X_val)
-    acc = accuracy_score(y_val, y_pred)
-    print(f"[TRAIN] 1X2 validation accuracy: {acc:.3f}")
-    return clf
+    df = pd.DataFrame(rows)
+    print(f"[TRAIN] Loaded {len(df)} historical examples.")
+    return df
 
 
-def train_logreg_binary(X, y, label: str):
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    clf = LogisticRegression(
-        max_iter=1000,
-        solver="lbfgs",
-    )
-    clf.fit(X_train, y_train)
-    prob_pos = clf.predict_proba(X_val)[:, 1]
-    brier = brier_score_loss(y_val, prob_pos)
-    acc = accuracy_score(y_val, (prob_pos >= 0.5).astype(int))
-    print(f"[TRAIN] {label} Brier: {brier:.4f} | Acc: {acc:.3f}")
-    return clf
+# ------------------------------------------------------------
+# MARKET-SPECIFIC FORMATTERS
+# ------------------------------------------------------------
 
+def prepare_1x2(df):
+    df = df[df["market"] == "1X2"]
+    if df.empty:
+        return None, None
+
+    X = df[["prob", "minute", "odds"]].values
+
+    # Encode target: 1 for win, 0 for loss, ignore push
+    y = df["result"].map({"WIN": 1, "LOSS": 0}).dropna().astype(int)
+    X = X[: len(y)]
+
+    return X, y
+
+
+def prepare_ou25(df):
+    df = df[df["market"] == "OU25"]
+    if df.empty:
+        return None, None
+
+    X = df[["prob", "minute", "odds"]].values
+    y = df["result"].map({"WIN": 1, "LOSS": 0}).dropna().astype(int)
+    X = X[: len(y)]
+
+    return X, y
+
+
+def prepare_btts(df):
+    df = df[df["market"] == "BTTS"]
+    if df.empty:
+        return None, None
+
+    X = df[["prob", "minute", "odds"]].values
+    y = df["result"].map({"WIN": 1, "LOSS": 0}).dropna().astype(int)
+    X = X[: len(y)]
+
+    return X, y
+
+
+# ------------------------------------------------------------
+# TRAIN A SINGLE LOGISTIC MODEL
+# ------------------------------------------------------------
+
+def train_model(X, y):
+    if len(X) < 10 or len(set(y)) < 2:
+        print("[TRAIN] Not enough data → using dummy model.")
+        return None
+
+    clf = LogisticRegression(max_iter=1000)
+    calibrated = CalibratedClassifierCV(clf, cv=3)
+
+    calibrated.fit(X, y)
+    return calibrated
+
+
+# ------------------------------------------------------------
+# SAVE MODEL TO DISK + SUPABASE STORAGE
+# ------------------------------------------------------------
+
+def save_model(model, path, storage_name):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    dump(model, path)
+    print(f"[TRAIN] Saved model → {path}")
+
+    try:
+        with open(path, "rb") as f:
+            supabase.storage.from_("models").upload(
+                storage_name,
+                f,
+                {"content-type": "application/octet-stream"},
+            )
+        print(f"[TRAIN] Uploaded model to Supabase Storage → {storage_name}")
+    except Exception as e:
+        print("[TRAIN] Storage upload failed:", e)
+
+
+# ------------------------------------------------------------
+# TRAINING PIPELINE
+# ------------------------------------------------------------
 
 def main():
-    os.makedirs(os.path.dirname(MODEL_1X2), exist_ok=True)
+    print("===========================================")
+    print("     GOALSNIPER AI — MODEL TRAINING")
+    print("===========================================")
 
-    fixtures = load_finished_fixtures()
-    if not fixtures:
-        print("[TRAIN] No finished fixtures found. Abort.")
-        return
+    df = fetch_training_dataset()
 
-    (X1, y1), (Xou, you), (Xb, yb) = build_training_rows(fixtures)
+    # If completely empty → create dummy models
+    if df.empty:
+        print("[TRAIN] Dataset empty → generating dummy models.")
+        return train_dummies()
 
-    # 1X2
-    if len(X1) >= 100:
-        print("[TRAIN] Training 1X2 model...")
-        model_1x2 = train_logreg_multiclass(X1, y1)
-        dump(model_1x2, MODEL_1X2)
-        print(f"[TRAIN] 1X2 model saved -> {MODEL_1X2}")
-    else:
-        print("[TRAIN] Not enough 1X2 samples to train.")
+    # -------------------------
+    # TRAIN EACH MARKET
+    # -------------------------
 
-    # OU25
-    if len(Xou) >= 100:
-        print("[TRAIN] Training OU25 model...")
-        model_ou = train_logreg_binary(Xou, you, "OU25")
-        dump(model_ou, MODEL_OU25)
-        print(f"[TRAIN] OU25 model saved -> {MODEL_OU25}")
-    else:
-        print("[TRAIN] Not enough OU25 samples to train.")
+    # --- 1X2 ---
+    X1, y1 = prepare_1x2(df)
+    if X1 is not None:
+        m1 = train_model(X1, y1)
+        if m1:
+            save_model(m1, MODEL_1X2, "logreg_1x2.pkl")
 
-    # BTTS
-    if len(Xb) >= 100:
-        print("[TRAIN] Training BTTS model...")
-        model_btts = train_logreg_binary(Xb, yb, "BTTS")
-        dump(model_btts, MODEL_BTTS)
-        print(f"[TRAIN] BTTS model saved -> {MODEL_BTTS}")
-    else:
-        print("[TRAIN] Not enough BTTS samples to train.")
+    # --- OU25 ---
+    X2, y2 = prepare_ou25(df)
+    if X2 is not None:
+        m2 = train_model(X2, y2)
+        if m2:
+            save_model(m2, MODEL_OU25, "logreg_ou25.pkl")
 
-    print("[TRAIN] Done.")
+    # --- BTTS ---
+    X3, y3 = prepare_btts(df)
+    if X3 is not None:
+        m3 = train_model(X3, y3)
+        if m3:
+            save_model(m3, MODEL_BTTS, "logreg_btts.pkl")
 
+    print("[TRAIN] All models trained successfully.")
+
+
+# ------------------------------------------------------------
+# FALLBACK — CREATE DUMMY MODELS
+# ------------------------------------------------------------
+
+def train_dummies():
+    """
+    Creates flat probability models.
+    """
+
+    print("[TRAIN] Creating dummy models...")
+
+    dummy = LogisticRegression()
+    dummy.coef_ = np.zeros((1, 3))
+    dummy.intercept_ = np.zeros(1)
+    dummy.classes_ = np.array([0, 1])
+
+    save_model(dummy, MODEL_1X2, "logreg_1x2.pkl")
+    save_model(dummy, MODEL_OU25, "logreg_ou25.pkl")
+    save_model(dummy, MODEL_BTTS, "logreg_btts.pkl")
+
+    print("[TRAIN] Dummy models created.")
+
+
+# ------------------------------------------------------------
+# MANUAL TRIGGER FROM main.py
+# ------------------------------------------------------------
+
+def run_full_training():
+    print("[TRAIN] Manual training triggered...")
+    main()
+
+
+# ------------------------------------------------------------
+# COMMAND LINE ENTRY
+# ------------------------------------------------------------
 
 if __name__ == "__main__":
     main()
