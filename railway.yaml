@@ -78,3 +78,14 @@ services:
       resources:
         cpu: 0.5
         memory: 512
+
+  daily-digest:
+    build:
+      dockerfile: Dockerfile
+    start: "python daily_digest.py"
+    schedule:
+      cron: "0 22 * * *"   # 22:00 UTC → 00:00 Berlin / customizable
+    deploy:
+      resources:
+        cpu: 0.5
+        memory: 256
