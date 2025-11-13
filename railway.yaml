@@ -1,9 +1,14 @@
 services:
+  # ------------------------------------------------------
+  # MAIN LIVE PREDICTION SERVICE
+  # ------------------------------------------------------
   goalsniper:
     build:
       dockerfile: Dockerfile
     env:
       PORT: 8000
+      ENVIRONMENT: "production"
+      SAFE_MODE: "true"        # set TRUE until real models train
     healthcheck:
       path: /health
       interval: 10
@@ -14,16 +19,22 @@ services:
       resources:
         cpu: 1
         memory: 1024
-    start: "python train_models.py"
+    start: "python main.py"
 
+  # ------------------------------------------------------
+  # TRAINING SERVICE (CRON JOB)
+  # ------------------------------------------------------
   train-models:
     build:
       dockerfile: Dockerfile
     env:
       ENVIRONMENT: "production"
     start: "python train_models.py"
+
+    # Daily at 02:00 UTC (04:00 winter Berlin, 05:00 summer)
     schedule:
       cron: "0 2 * * *"
+
     deploy:
       resources:
         cpu: 1
