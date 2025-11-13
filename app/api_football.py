@@ -68,13 +68,25 @@ def get_fixture_stats(fixture_id: int) -> Dict[str, Any]:
 # -------------------------------------------------------------
 # LIVE ODDS (1X2, O/U, BTTS from all bookies)
 # -------------------------------------------------------------
-def get_live_odds(fixture_id: int) -> List[Dict[str, Any]]:
-    """
-    Returns odds for the fixture across all markets and bookmakers.
-    Used for EV calculations and market eligibility.
-    """
-    odds = api_get("odds", {"fixture": fixture_id})
-    return odds
+def get_live_odds(fixture_id: int):
+    """Fetch real live odds with fallback."""
+    
+    # Primary live endpoint
+    odds = api_get("odds/live", {"fixture": fixture_id})
+    if odds:
+        return odds
+
+    # Fallback: all odds but filtered
+    odds = api_get("odds", {"fixture": fixture_id, "live": "all"})
+    if odds:
+        return odds
+
+    # Final fallback (rare)
+    odds = api_get("fixtures", {"id": fixture_id})
+    if odds and odds[0].get("odds"):
+        return odds[0]["odds"]
+
+    return []
 
 
 # -------------------------------------------------------------
