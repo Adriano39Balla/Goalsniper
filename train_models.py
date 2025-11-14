@@ -1,5 +1,5 @@
 # ============================================================
-#   GOALSNIPER.AI — MODEL TRAINING (USING DIRECT POSTGRES)
+#   GOALSNIPER.AI — MODEL TRAINING (SAFE AGAINST LOW DATA)
 # ============================================================
 
 import os
@@ -13,7 +13,6 @@ from sklearn.calibration import CalibratedClassifierCV
 from joblib import dump
 
 from supabase import create_client
-
 from app.db_pg import fetch_all
 from app.config import (
     MODEL_1X2,
@@ -25,156 +24,130 @@ from app.config import (
 )
 
 # ------------------------------------------------------------
-# SUPABASE CLIENT JUST FOR STORAGE (models bucket)
+# SUPABASE STORAGE CLIENT
 # ------------------------------------------------------------
-try:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("[TRAIN] Supabase client initialized.")
-except Exception as e:
-    print("[TRAIN] Supabase client init FAILED:", e)
-    supabase = None
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ------------------------------------------------------------
-# FETCH TRAINING DATA VIA SQL
+# FETCH TRAINING DATA
 # ------------------------------------------------------------
 
 def fetch_training_dataset():
-    """
-    Pull labeled examples directly via SQL.
-
-    We join:
-      tips.id           -> tip_results.tip_id
-    Only keep rows with result in ('WIN', 'LOSS').
-    """
-
-    print("[TRAIN] Loading training data with direct SQL...")
-
     sql = """
         SELECT
-            t.id           AS tip_id,
-            t.fixture_id   AS fixture_id,
-            t.market       AS market,
-            t.selection    AS selection,
-            t.prob         AS prob,
-            t.odds         AS odds,
-            t.minute       AS minute,
-            r.result       AS result,
-            r.pnl          AS pnl
+            t.fixture_id,
+            t.market,
+            t.selection,
+            t.minute,
+            t.prob,
+            t.odds,
+            r.result,
+            r.pnl,
+            t.id AS tip_id
         FROM tips t
         JOIN tip_results r ON r.tip_id = t.id
-        WHERE r.result IN ('WIN', 'LOSS')
+        WHERE r.result IN ('WIN','LOSS')
     """
-
     rows = fetch_all(sql)
-    if not rows:
-        print("[TRAIN] No labeled rows in tips + tip_results.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    print(f"[TRAIN] Loaded {len(df)} labeled examples from SQL.")
-    return df
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 # ------------------------------------------------------------
-# MARKET PREPROCESSORS
+# SAFE MARKET PREPARATION
 # ------------------------------------------------------------
 
-def prep_market(df: pd.DataFrame, market: str):
-    sub = df[df["market"] == market].copy()
-    if sub.empty:
-        print(f"[TRAIN] No rows for market={market}")
+MIN_SAMPLES = 10  # absolute minimum
+MIN_CLASS = 2     # minimum samples per class
+
+def prep_market(df, market):
+    df = df[df["market"] == market].dropna(subset=["prob", "odds"])
+    if df.empty:
+        print(f"[TRAIN] No rows for {market}")
         return None, None
 
-    # Basic feature set
-    sub = sub.dropna(subset=["prob", "odds"])
-    if sub.empty:
-        print(f"[TRAIN] No non-null rows for market={market}")
+    df["minute"] = df["minute"].fillna(0)
+
+    X = df[["prob", "minute", "odds"]].astype(float).values
+    y = df["result"].map({"WIN": 1, "LOSS": 0}).astype(int).values
+
+    # Check class counts
+    n0 = (y == 0).sum()
+    n1 = (y == 1).sum()
+    total = len(y)
+
+    print(f"[TRAIN] {market}: total={total}, WIN={n1}, LOSS={n0}")
+
+    if total < MIN_SAMPLES or min(n0, n1) < MIN_CLASS:
+        print(f"[TRAIN] Not enough balanced data for {market} → using SAFE FALLBACK")
         return None, None
 
-    sub["minute"] = sub["minute"].fillna(0)
-
-    X = sub[["prob", "minute", "odds"]].astype(float).values
-    y = sub["result"].map({"WIN": 1, "LOSS": 0}).astype(int).values
-
-    if len(X) < 20 or len(set(y)) < 2:
-        print(f"[TRAIN] Not enough usable data for {market} → {len(X)} rows")
-        return None, None
-
-    print(f"[TRAIN] Prepared {len(X)} rows for market={market}")
     return X, y
 
 
 # ------------------------------------------------------------
-# TRAIN A MODEL
+# SAFE TRAINING LOGIC
 # ------------------------------------------------------------
 
-def train_model(X, y, market_name: str):
-    if X is None or y is None:
-        print(f"[TRAIN] Skipping {market_name} — no data.")
-        return None
+def train_safe_model(X, y, market):
+    """
+    1. Try calibrated model
+    2. If class count too small → fallback to plain LogisticRegression
+    3. If even that fails → dummy model
+    """
 
-    base = LogisticRegression(max_iter=1000)
-    model = CalibratedClassifierCV(base, cv=3)
+    # ===== Attempt full calibrated model =====
+    try:
+        base = LogisticRegression(max_iter=1000)
+        model = CalibratedClassifierCV(base, cv=3)
 
-    model.fit(X, y)
-    print(f"[TRAIN] {market_name} model trained on {len(X)} samples.")
+        model.fit(X, y)
+        print(f"[TRAIN] {market}: Calibrated model trained")
+        return model
+
+    except Exception as e:
+        print(f"[TRAIN] {market}: calibration failed → {e}")
+
+    # ===== Fallback to uncalibrated LogisticRegression =====
+    try:
+        model = LogisticRegression(max_iter=1000)
+        model.fit(X, y)
+        print(f"[TRAIN] {market}: Uncalibrated model trained")
+        return model
+
+    except Exception as e:
+        print(f"[TRAIN] {market}: uncalibrated fallback failed → {e}")
+
+    # ===== Final fallback → SAFE dummy =====
+    print(f"[TRAIN] {market}: using dummy fallback model")
+
+    dummy_X = np.array([[0.1, 1, 1], [0.9, 89, 10]])
+    dummy_y = np.array([0, 1])
+
+    model = LogisticRegression(max_iter=200)
+    model.fit(dummy_X, dummy_y)
     return model
 
 
 # ------------------------------------------------------------
-# SAVE MODEL LOCALLY + TO SUPABASE STORAGE
+# SAVE MODEL
 # ------------------------------------------------------------
 
-def save_model(model, path: str, storage_name: str):
+def save_model(model, path, name):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-
     dump(model, path)
-    print(f"[TRAIN] Saved model to {path}")
-
-    if not supabase:
-        print("[TRAIN] Skipping upload — Supabase client not available.")
-        return
 
     try:
         with open(path, "rb") as f:
             supabase.storage.from_("models").upload(
-                storage_name,
+                name,
                 f,
                 file_options={"content-type": "application/octet-stream"},
                 upsert=True,
             )
-        print(f"[TRAIN] Uploaded {storage_name} → Supabase Storage (bucket=models)")
+        print(f"[TRAIN] Uploaded {name} to Supabase")
     except Exception as e:
-        print("[TRAIN] Upload to storage failed:", e)
-
-
-# ------------------------------------------------------------
-# SAFE DUMMY MODELS (FALLBACK)
-# ------------------------------------------------------------
-
-def make_safe_dummy():
-    """
-    Create a small but real fitted model so predict_proba works.
-    """
-    X = np.array([[0.1, 5, 2.0], [0.9, 85, 10.0]])
-    y = np.array([0, 1])
-
-    base = LogisticRegression(max_iter=200)
-    model = CalibratedClassifierCV(base, cv=2)
-    model.fit(X, y)
-    return model
-
-
-def train_dummies():
-    print("[TRAIN] Creating safe dummy models...")
-
-    dummy = make_safe_dummy()
-    save_model(dummy, MODEL_1X2, "logreg_1x2.pkl")
-    save_model(dummy, MODEL_OU25, "logreg_ou25.pkl")
-    save_model(dummy, MODEL_BTTS, "logreg_btts.pkl")
-
-    print("[TRAIN] Safe dummy models created & saved.")
+        print(f"[TRAIN] Upload error for {name}:", e)
 
 
 # ------------------------------------------------------------
@@ -185,41 +158,47 @@ def main():
     print("============================================")
     print("      GOALSNIPER AI — TRAINING START")
     print("============================================")
-    print(f"[TRAIN] Timestamp UTC: {datetime.utcnow().isoformat()}")
 
     df = fetch_training_dataset()
 
     if df.empty:
-        print("[TRAIN] No training data found → using dummy models.")
+        print("[TRAIN] No training data → using dummy models")
         return train_dummies()
 
-    # 1X2
-    X1, y1 = prep_market(df, "1X2")
-    m1 = train_model(X1, y1, "1X2")
-    if m1:
-        save_model(m1, MODEL_1X2, "logreg_1x2.pkl")
+    # -------------- Train markets --------------
 
-    # OU25
-    X2, y2 = prep_market(df, "OU25")
-    m2 = train_model(X2, y2, "OU25")
-    if m2:
-        save_model(m2, MODEL_OU25, "logreg_ou25.pkl")
+    for market, path, storage in [
+        ("1X2", MODEL_1X2, "logreg_1x2.pkl"),
+        ("OU25", MODEL_OU25, "logreg_ou25.pkl"),
+        ("BTTS", MODEL_BTTS, "logreg_btts.pkl"),
+    ]:
+        X, y = prep_market(df, market)
+        if X is None:
+            print(f"[TRAIN] {market}: no usable data → dummy fallback")
+            model = train_safe_model(None, None, market)
+        else:
+            model = train_safe_model(X, y, market)
 
-    # BTTS
-    X3, y3 = prep_market(df, "BTTS")
-    m3 = train_model(X3, y3, "BTTS")
-    if m3:
-        save_model(m3, MODEL_BTTS, "logreg_btts.pkl")
+        save_model(model, path, storage)
 
-    print("[TRAIN] Training complete.")
+    print("[TRAIN] Training complete")
 
 
 # ------------------------------------------------------------
-# PUBLIC ENTRYPOINT FOR main.py
-# ------------------------------------------------------------
+def train_dummies():
+    for market, path, name in [
+        ("1X2", MODEL_1X2, "logreg_1x2.pkl"),
+        ("OU25", MODEL_OU25, "logreg_ou25.pkl"),
+        ("BTTS", MODEL_BTTS, "logreg_btts.pkl"),
+    ]:
+        model = train_safe_model(None, None, market)
+        save_model(model, path, name)
 
+    print("[TRAIN] Dummy fallback models saved.")
+
+
+# Entry for main.py
 def run_full_training():
-    print("[TRAIN] Manual run triggered.")
     main()
 
 
