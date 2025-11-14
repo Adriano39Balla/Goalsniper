@@ -1,5 +1,5 @@
 # ============================================================
-#   GOALSNIPER.AI — MODEL TRAINING ENGINE (ROBUST VERSION)
+#   GOALSNIPER.AI — MODEL TRAINING ENGINE (UNIVERSAL VERSION)
 # ============================================================
 
 import os
@@ -29,135 +29,246 @@ print("[TRAIN] Supabase connected.")
 
 
 # ------------------------------------------------------------
-# DATABASE SCHEMA VALIDATION
+# UNIVERSAL DATA LOADING - WORKS WITH ANY SCHEMA
 # ------------------------------------------------------------
 
-def validate_database_schema():
-    """Check if required tables and columns exist"""
+def discover_table_schema(table_name):
+    """Discover the actual schema of a table by sampling data"""
     try:
-        # Test if tips table exists and has basic structure
-        test_resp = supabase.table("tips").select("id").limit(1).execute()
-        print("[TRAIN] Tips table exists and is accessible")
-        return True
-    except Exception as e:
-        error_str = str(e)
-        if "column tips.id does not exist" in error_str:
-            print("[TRAIN] WARNING: Tips table has different structure than expected")
-            return False
-        elif "relation" in error_str and "tips" in error_str:
-            print("[TRAIN] WARNING: Tips table doesn't exist")
-            return False
-        else:
-            print("[TRAIN] WARNING: Unknown database error:", e)
-            return False
-
-
-# ------------------------------------------------------------
-# FALLBACK DATA LOADING WITH SCHEMA DETECTION
-# ------------------------------------------------------------
-
-def fetch_training_dataset_robust():
-    """
-    Robust data loading that handles various schema issues
-    """
-    print("[TRAIN] Fetching training dataset with robust loader...")
-
-    # First, validate schema
-    if not validate_database_schema():
-        print("[TRAIN] Schema validation failed - no training data available")
-        return pd.DataFrame([])
-
-    try:
-        # Try different column names for ID
-        possible_id_columns = ['id', 'tip_id', 'fixture_id']
+        response = supabase.table(table_name).select("*").limit(5).execute()
+        if not response.data:
+            return {}
         
-        for id_col in possible_id_columns:
-            try:
-                # Try to get tips with this ID column
-                tips_resp = supabase.table("tips").select("*").order(id_col, desc=False).limit(100).execute()
-                if tips_resp.data:
-                    print(f"[TRAIN] Successfully loaded tips using '{id_col}' as key")
-                    tips_data = tips_resp.data
-                    break
-            except:
-                continue
+        # Analyze the first record to understand schema
+        sample_record = response.data[0]
+        schema_info = {
+            'columns': list(sample_record.keys()),
+            'sample': sample_record,
+            'has_data': True
+        }
+        print(f"[TRAIN] Discovered {table_name} columns: {schema_info['columns']}")
+        return schema_info
+    except Exception as e:
+        print(f"[TRAIN] Error discovering {table_name} schema: {e}")
+        return {'has_data': False, 'columns': []}
+
+
+def find_column_mapping(tips_schema, results_schema):
+    """Find how to map between tips and results tables"""
+    mapping = {
+        'tip_id': None,
+        'fixture_id': None, 
+        'market': None,
+        'selection': None,
+        'prob': None,
+        'odds': None,
+        'minute': None,
+        'result': None
+    }
+    
+    tip_cols = tips_schema.get('columns', [])
+    result_cols = results_schema.get('columns', [])
+    
+    # Find common columns
+    for key in mapping.keys():
+        if key in tip_cols:
+            mapping[key] = key
         else:
-            print("[TRAIN] Could not find valid ID column in tips table")
-            return pd.DataFrame([])
+            # Try to find similar columns
+            for col in tip_cols:
+                if key in col.lower():
+                    mapping[key] = col
+                    break
+    
+    print(f"[TRAIN] Column mapping: {mapping}")
+    return mapping
 
-    except Exception as e:
-        print("[TRAIN] ERROR loading tips:", e)
+
+def load_training_data_universal():
+    """
+    Universal data loader that adapts to any database schema
+    """
+    print("[TRAIN] Loading training data with universal adapter...")
+    
+    # Discover actual schema
+    tips_schema = discover_table_schema("tips")
+    results_schema = discover_table_schema("tip_results")
+    
+    if not tips_schema.get('has_data'):
+        print("[TRAIN] No tips data found")
         return pd.DataFrame([])
-
-    # Try to load results
+    
+    # Get column mapping
+    mapping = find_column_mapping(tips_schema, results_schema)
+    
+    # Load all tips
     try:
-        results_resp = supabase.table("tip_results").select("*").limit(100).execute()
-        results_data = results_resp.data or []
-        print(f"[TRAIN] Loaded {len(results_data)} results")
+        tips_response = supabase.table("tips").select("*").execute()
+        tips_data = tips_response.data or []
+        print(f"[TRAIN] Loaded {len(tips_data)} tips")
     except Exception as e:
-        print("[TRAIN] WARNING: Could not load tip_results:", e)
-        results_data = []
-
-    # Manual joining with flexible column mapping
+        print(f"[TRAIN] Error loading tips: {e}")
+        return pd.DataFrame([])
+    
+    # Load results if available
+    results_data = []
+    if results_schema.get('has_data'):
+        try:
+            results_response = supabase.table("tip_results").select("*").execute()
+            results_data = results_response.data or []
+            print(f"[TRAIN] Loaded {len(results_data)} results")
+        except Exception as e:
+            print(f"[TRAIN] Error loading results: {e}")
+    
+    # Process data with discovered mapping
     rows = []
     for tip in tips_data:
-        # Find matching result - try different join strategies
+        row = {}
+        
+        # Map known fields
+        for field, source_col in mapping.items():
+            if source_col and source_col in tip:
+                row[field] = tip[source_col]
+            else:
+                row[field] = None
+        
+        # Try to find matching result
         matching_result = None
-        
-        # Strategy 1: Try tip_id in results
-        tip_id = tip.get('id')
-        if tip_id and results_data:
-            matching_result = next((r for r in results_data if r.get('tip_id') == tip_id), None)
-        
-        # Strategy 2: Try fixture_id matching
-        if not matching_result:
-            fixture_id = tip.get('fixture_id')
-            if fixture_id and results_data:
-                market = tip.get('market')
-                selection = tip.get('selection')
+        if results_data:
+            # Strategy 1: Match by tip_id if available
+            if row['tip_id'] and results_data:
                 matching_result = next(
                     (r for r in results_data 
-                     if r.get('fixture_id') == fixture_id 
-                     and r.get('market') == market
-                     and r.get('selection') == selection), 
+                     if r.get(mapping['tip_id'] or 'tip_id') == row['tip_id']), 
                     None
                 )
-
-        if not matching_result:
-            continue
-
+            
+            # Strategy 2: Match by fixture_id + market + selection
+            if not matching_result and row['fixture_id']:
+                fixture_key = mapping['fixture_id'] or 'fixture_id'
+                market_key = mapping['market'] or 'market' 
+                selection_key = mapping['selection'] or 'selection'
+                
+                matching_result = next(
+                    (r for r in results_data
+                     if r.get(fixture_key) == row['fixture_id']
+                     and r.get(market_key) == row.get('market')
+                     and r.get(selection_key) == row.get('selection')),
+                    None
+                )
+        
+        # Add result data if found
+        if matching_result:
+            result_value = matching_result.get(mapping['result'] or 'result')
+            if result_value in ('WIN', 'LOSS'):
+                row['result'] = result_value
+                row['pnl'] = matching_result.get('pnl', 0)
+            else:
+                continue  # Skip non-WIN/LOSS results
+        else:
+            continue  # Skip tips without results
+        
         # Validate required fields
-        prob = tip.get("prob")
-        odds = tip.get("odds")
-        result = matching_result.get("result")
-
-        if prob is None or odds is None:
+        if row.get('prob') is None or row.get('odds') is None:
             continue
-        if result not in ("WIN", "LOSS"):
-            continue
-
+            
         try:
-            rows.append({
-                "fixture_id": tip.get("fixture_id"),
-                "market": tip.get("market"),
-                "selection": tip.get("selection"),
-                "prob": float(prob),
-                "odds": float(odds),
-                "minute": tip.get("minute") or 0,
-                "result": result,
-                "pnl": matching_result.get("pnl", 0),
-            })
+            # Ensure numeric fields
+            final_row = {
+                "fixture_id": row.get('fixture_id', 0),
+                "market": row.get('market', ''),
+                "selection": row.get('selection', ''),
+                "prob": float(row['prob']),
+                "odds": float(row['odds']),
+                "minute": row.get('minute', 0) or 0,
+                "result": row['result'],
+                "pnl": row.get('pnl', 0)
+            }
+            rows.append(final_row)
         except (ValueError, TypeError) as e:
-            print(f"[TRAIN] Skipping invalid tip data: {e}")
+            print(f"[TRAIN] Skipping invalid row: {e}")
             continue
-
+    
     df = pd.DataFrame(rows)
-    print(f"[TRAIN] Successfully loaded {len(df)} valid training examples.")
+    print(f"[TRAIN] Processed {len(df)} valid training examples")
     return df
 
 
 # ------------------------------------------------------------
-# MARKET PREPROCESSOR
+# FALLBACK: CREATE SYNTHETIC TRAINING DATA
+# ------------------------------------------------------------
+
+def create_synthetic_training_data():
+    """
+    Create synthetic training data when no real data exists
+    This helps bootstrap the system
+    """
+    print("[TRAIN] Creating synthetic training data for bootstrapping...")
+    
+    synthetic_data = []
+    
+    # Synthetic 1X2 data
+    for i in range(50):
+        prob = np.random.uniform(0.4, 0.8)
+        odds = np.random.uniform(1.5, 3.0)
+        minute = np.random.randint(0, 90)
+        # Higher prob → more likely to win
+        result = "WIN" if prob > 0.55 and np.random.random() > 0.3 else "LOSS"
+        
+        synthetic_data.append({
+            "fixture_id": 1000 + i,
+            "market": "1X2",
+            "selection": ["home", "draw", "away"][i % 3],
+            "prob": prob,
+            "odds": odds,
+            "minute": minute,
+            "result": result,
+            "pnl": 1.0 if result == "WIN" else -1.0
+        })
+    
+    # Synthetic OU25 data
+    for i in range(50):
+        prob = np.random.uniform(0.4, 0.8)
+        odds = np.random.uniform(1.5, 2.5)
+        minute = np.random.randint(0, 90)
+        result = "WIN" if prob > 0.5 and np.random.random() > 0.4 else "LOSS"
+        
+        synthetic_data.append({
+            "fixture_id": 2000 + i,
+            "market": "OU25",
+            "selection": ["over", "under"][i % 2],
+            "prob": prob,
+            "odds": odds,
+            "minute": minute,
+            "result": result,
+            "pnl": 1.0 if result == "WIN" else -1.0
+        })
+    
+    # Synthetic BTTS data
+    for i in range(50):
+        prob = np.random.uniform(0.3, 0.7)
+        odds = np.random.uniform(1.6, 2.2)
+        minute = np.random.randint(0, 90)
+        result = "WIN" if prob > 0.45 and np.random.random() > 0.5 else "LOSS"
+        
+        synthetic_data.append({
+            "fixture_id": 3000 + i,
+            "market": "BTTS",
+            "selection": ["yes", "no"][i % 2],
+            "prob": prob,
+            "odds": odds,
+            "minute": minute,
+            "result": result,
+            "pnl": 1.0 if result == "WIN" else -1.0
+        })
+    
+    df = pd.DataFrame(synthetic_data)
+    print(f"[TRAIN] Created {len(df)} synthetic training examples")
+    return df
+
+
+# ------------------------------------------------------------
+# MODEL TRAINING FUNCTIONS (SAME AS BEFORE)
 # ------------------------------------------------------------
 
 def prep(df, market):
@@ -174,13 +285,8 @@ def prep(df, market):
     return X, y
 
 
-# ------------------------------------------------------------
-# ROBUST MODEL TRAINING
-# ------------------------------------------------------------
-
 def train_model_safe(X, y, market_name):
-    """Train model with comprehensive error handling"""
-    if len(X) < 10:  # Lowered minimum for early stages
+    if len(X) < 5:  # Very low minimum for bootstrapping
         print(f"[TRAIN] Insufficient data for {market_name} ({len(X)} examples)")
         return None
 
@@ -189,33 +295,28 @@ def train_model_safe(X, y, market_name):
         return None
 
     try:
-        # Use simpler approach for small datasets
-        if len(X) < 50:
-            base = LogisticRegression(max_iter=1000)
-            model = CalibratedClassifierCV(base, cv=min(2, len(X) // 5))
-        else:
-            base = LogisticRegression(max_iter=1000)
-            model = CalibratedClassifierCV(base, cv=min(3, len(X) // 10))
-            
+        base = LogisticRegression(max_iter=1000)
+        # Use simpler approach for very small datasets
+        cv_folds = max(2, min(3, len(X) // 5))
+        model = CalibratedClassifierCV(base, cv=cv_folds)
         model.fit(X, y)
         print(f"[TRAIN] {market_name} model trained on {len(X)} examples")
         return model
-
     except Exception as e:
         print(f"[TRAIN] {market_name} model training failed:", e)
         return None
 
 
-# ------------------------------------------------------------
-# DUMMY MODEL CREATION
-# ------------------------------------------------------------
-
 def make_dummy_model_safe():
-    """Create a safe dummy model without cross-validation issues"""
+    """Create a basic model that won't fail"""
     try:
-        # Simple model without calibration to avoid CV issues
-        X = np.array([[0.5, 0, 2.0], [0.6, 90, 1.8]])
-        y = np.array([0, 1])
+        X = np.array([
+            [0.5, 0, 2.0],
+            [0.6, 45, 1.8], 
+            [0.4, 90, 2.2],
+            [0.7, 30, 1.5]
+        ])
+        y = np.array([0, 1, 0, 1])
         
         model = LogisticRegression(max_iter=1000)
         model.fit(X, y)
@@ -223,25 +324,6 @@ def make_dummy_model_safe():
     except Exception as e:
         print("[TRAIN] Dummy model creation failed:", e)
         return None
-
-
-def train_dummies_safe():
-    """Create dummy models safely"""
-    print("[TRAIN] Creating safe dummy models...")
-
-    dummy = make_dummy_model_safe()
-    if dummy is None:
-        print("[TRAIN] Failed to create dummy models")
-        return
-
-    try:
-        os.makedirs(os.path.dirname(MODEL_1X2), exist_ok=True)
-        dump(dummy, MODEL_1X2)
-        dump(dummy, MODEL_OU25)
-        dump(dummy, MODEL_BTTS)
-        print("[TRAIN] Safe dummy models created and saved locally")
-    except Exception as e:
-        print("[TRAIN] Failed to save dummy models:", e)
 
 
 # ------------------------------------------------------------
@@ -253,18 +335,17 @@ def main():
     print("        GOALSNIPER AI — TRAINING START")
     print("============================================")
 
-    # Load training data
-    df = fetch_training_dataset_robust()
-
+    # Try to load real data first
+    df = load_training_data_universal()
+    
+    # If no real data, use synthetic data for bootstrapping
     if df.empty:
-        print("[TRAIN] No training data available → creating safe dummy models")
-        train_dummies_safe()
-        print("[TRAIN] Training pipeline completed with dummy models")
-        return
-
+        print("[TRAIN] No real training data found → using synthetic data")
+        df = create_synthetic_training_data()
+    
     models_trained = 0
-
-    # Train each market model
+    
+    # Train models for each market
     markets = [
         ("1X2", MODEL_1X2),
         ("OU25", MODEL_OU25), 
@@ -277,23 +358,24 @@ def main():
             model = train_model_safe(X, y, market_name)
             if model:
                 try:
+                    os.makedirs(os.path.dirname(model_path), exist_ok=True)
                     dump(model, model_path)
-                    print(f"[TRAIN] Saved {market_name} model to {model_path}")
+                    print(f"[TRAIN] ✓ Saved {market_name} model")
                     models_trained += 1
                 except Exception as e:
-                    print(f"[TRAIN] Failed to save {market_name} model:", e)
+                    print(f"[TRAIN] ✗ Failed to save {market_name} model:", e)
+                    # Create dummy as fallback
+                    dummy = make_dummy_model_safe()
+                    if dummy:
+                        dump(dummy, model_path)
             else:
-                print(f"[TRAIN] Using dummy model for {market_name}")
+                print(f"[TRAIN] Using fallback model for {market_name}")
                 dummy = make_dummy_model_safe()
                 if dummy:
                     dump(dummy, model_path)
 
-    print(f"[TRAIN] Training complete. {models_trained} models trained successfully.")
+    print(f"[TRAIN] Training complete. {models_trained}/3 models trained successfully.")
 
-
-# ------------------------------------------------------------
-# MANUAL TRIGGER
-# ------------------------------------------------------------
 
 def run_full_training():
     print("[TRAIN] Manual run triggered.")
