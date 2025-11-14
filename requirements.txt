@@ -5,7 +5,8 @@ pytz==2024.1
 fastapi==0.104.1
 APScheduler==3.10.4
 uvicorn==0.24.0
-aiohttp
+aiohttp==3.8.6
+pgmpy==0.1.21
 pydantic==2.4.2
 pydantic-settings>=2.0
 redis==5.0.8
