@@ -1,0 +1,13 @@
+# Railway deployment manifest
+# Single service running Flask + APScheduler; use gunicorn in production
+# Expects env vars in Railway dashboard (see .env example)
+services:
+  goalsniper:
+    startCommand: gunicorn -w 1 -k gevent -b 0.0.0.0:$PORT main:app
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: RUN_SCHEDULER
+        value: "1"
+    healthcheckPath: /health
+    restartPolicyType: ON_FAILURE
