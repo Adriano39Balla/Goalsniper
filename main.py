@@ -112,7 +112,7 @@ def manual_train():
 
 
 # ============================================================
-# MANUAL SCAN
+# MANUAL SCAN -DEBUGGING
 # ============================================================
 
 @app.route("/manual/scan")
@@ -125,6 +125,32 @@ def manual_scan():
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/debug/database")
+def debug_database():
+    """Debug endpoint to check database structure"""
+    try:
+        # Check tips table structure
+        tips_resp = supabase.table("tips").select("*").limit(1).execute()
+        tips_sample = tips_resp.data[0] if tips_resp.data else {}
+        
+        # Check tip_results table structure  
+        results_resp = supabase.table("tip_results").select("*").limit(1).execute()
+        results_sample = results_resp.data[0] if results_resp.data else {}
+        
+        # Check table existence
+        tables_resp = supabase.table("tips").select("count", count="exact").limit(1).execute()
+        tips_count = tables_resp.count if hasattr(tables_resp, 'count') else len(tips_resp.data)
+        
+        return jsonify({
+            "tips_columns": list(tips_sample.keys()) if tips_sample else "No tips data",
+            "tip_results_columns": list(results_sample.keys()) if results_sample else "No results data", 
+            "tips_count": tips_count,
+            "tips_sample": tips_sample,
+            "results_sample": results_sample
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ============================================================
