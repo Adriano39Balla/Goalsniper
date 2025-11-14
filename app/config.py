@@ -56,7 +56,45 @@ LIVE_PREDICTION_INTERVAL = int(os.getenv("LIVE_INTERVAL", "30"))
 PREMATCH_PREDICTION_INTERVAL = int(os.getenv("PREMATCH_INTERVAL", "600"))
 
 # -------------------------------------------------------
+# RAILWAY-SPECIFIC SETTINGS
+# -------------------------------------------------------
+# Railway uses PORT environment variable automatically
+PORT = int(os.getenv("PORT", 8000))
+
+# -------------------------------------------------------
 # OTHER
 # -------------------------------------------------------
 DEBUG_MODE = os.getenv("DEBUG", "0") == "1"
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+
+# -------------------------------------------------------
+# VALIDATION (Helpful for debugging)
+# -------------------------------------------------------
+def validate_config():
+    """Validate critical configuration settings"""
+    errors = []
+    
+    if not API_FOOTBALL_KEY:
+        errors.append("API_FOOTBALL_KEY is missing")
+    
+    if not SUPABASE_URL:
+        errors.append("SUPABASE_URL is missing")
+    
+    if not SUPABASE_KEY:
+        errors.append("SUPABASE_KEY is missing")
+    
+    if not TELEGRAM_BOT_TOKEN:
+        errors.append("TELEGRAM_BOT_TOKEN is missing")
+    
+    if not TELEGRAM_CHAT_ID:
+        errors.append("TELEGRAM_CHAT_ID is missing")
+    
+    return errors
+
+# Optional: Auto-validate on import if in debug mode
+if DEBUG_MODE:
+    config_errors = validate_config()
+    if config_errors:
+        print("⚠️  Configuration warnings:")
+        for error in config_errors:
+            print(f"   - {error}")
