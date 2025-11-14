@@ -187,7 +187,16 @@ def process_fixture(f_raw):
 
     # ------------------- ODDS SNAPSHOT ----------------------
     odds_api = api_get("odds/live", {"fixture": fid})
-    odds_resp = odds_api.get("response", [])
+
+    # API sometimes returns dict, sometimes list → normalize
+    if isinstance(odds_api, dict):
+        odds_resp = odds_api.get("response", [])
+    elif isinstance(odds_api, list):
+        # The FIRST element is the actual API wrapper
+        odds_resp = odds_api[0].get("response", []) if odds_api and isinstance(odds_api[0], dict) else []
+    else:
+        odds_resp = []
+
     odds_list = odds_resp[0].get("odds", []) if odds_resp else []
 
     odds_1x2, odds_ou25, odds_btts = extract_core_odds(odds_list)
