@@ -1,0 +1,6 @@
+services:
+  api:
+    build:
+      builder: python:3.11
+      buildCommand: pip install -r requirements.txt
+      startCommand: python main.py
