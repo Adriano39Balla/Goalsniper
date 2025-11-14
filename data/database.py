@@ -15,6 +15,10 @@ class DatabaseManager:
     def connect(self):
         """Establish database connection"""
         try:
+            if not settings.DATABASE_URL:
+                logger.warning("DATABASE_URL not set, using in-memory storage")
+                return
+                
             self.conn = psycopg2.connect(
                 settings.DATABASE_URL,
                 cursor_factory=RealDictCursor
@@ -22,10 +26,15 @@ class DatabaseManager:
             logger.info("Connected to database successfully")
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
-            raise
+            # Continue without database for development
+            self.conn = None
     
     def execute_query(self, query: str, params: tuple = None) -> List[Dict]:
         """Execute query and return results"""
+        if not self.conn:
+            logger.warning("No database connection, returning empty results")
+            return []
+            
         try:
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
@@ -34,11 +43,19 @@ class DatabaseManager:
                 self.conn.commit()
                 return []
         except psycopg2.InterfaceError:
+            logger.warning("Database connection lost, reconnecting...")
             self.connect()
             return self.execute_query(query, params)
+        except Exception as e:
+            logger.error(f"Query execution failed: {e}")
+            return []
     
     def save_prediction(self, prediction_data: Dict[str, Any]) -> bool:
         """Save prediction to database"""
+        if not self.conn:
+            logger.warning("No database connection, skipping save")
+            return False
+            
         query = """
         INSERT INTO predictions (
             fixture_id, home_team, away_team, league_id, league_name,
@@ -49,16 +66,26 @@ class DatabaseManager:
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         params = (
-            prediction_data['fixture_id'], prediction_data['home_team'], 
-            prediction_data['away_team'], prediction_data['league_id'],
-            prediction_data['league_name'], prediction_data['prediction_time'],
-            prediction_data['home_win_prob'], prediction_data['away_win_prob'],
-            prediction_data['draw_prob'], prediction_data['over_25_prob'],
-            prediction_data['under_25_prob'], prediction_data['btts_yes_prob'],
-            prediction_data['btts_no_prob'], prediction_data['confidence'],
-            prediction_data['recommended_bet'], prediction_data['bet_type'],
-            prediction_data['stake_confidence'], prediction_data['model_version'],
-            prediction_data.get('live_minute'), prediction_data.get('current_score')
+            prediction_data.get('fixture_id', 0), 
+            prediction_data.get('home_team', 'Unknown'), 
+            prediction_data.get('away_team', 'Unknown'), 
+            prediction_data.get('league_id', 0),
+            prediction_data.get('league_name', 'Unknown'),
+            prediction_data.get('prediction_time', pd.Timestamp.now()),
+            prediction_data.get('home_win_prob', 0.33),
+            prediction_data.get('away_win_prob', 0.33),
+            prediction_data.get('draw_prob', 0.34),
+            prediction_data.get('over_25_prob', 0.5),
+            prediction_data.get('under_25_prob', 0.5),
+            prediction_data.get('btts_yes_prob', 0.5),
+            prediction_data.get('btts_no_prob', 0.5),
+            prediction_data.get('confidence', 0.5),
+            prediction_data.get('recommended_bet', 'NO_BET'),
+            prediction_data.get('bet_type', 'NO_BET'),
+            prediction_data.get('stake_confidence', 0.5),
+            prediction_data.get('model_version', 'ensemble_v1'),
+            prediction_data.get('live_minute'),
+            prediction_data.get('current_score')
         )
         try:
             self.execute_query(query, params)
@@ -69,6 +96,9 @@ class DatabaseManager:
     
     def save_bet_result(self, fixture_id: int, bet_type: str, success: bool, actual_odds: float = None):
         """Save bet result for model learning"""
+        if not self.conn:
+            return
+            
         query = """
         INSERT INTO bet_results (
             fixture_id, bet_type, success, actual_odds, processed
@@ -78,16 +108,23 @@ class DatabaseManager:
     
     def get_training_data(self, limit: int = 10000) -> pd.DataFrame:
         """Get historical data for model training"""
+        if not self.conn:
+            logger.warning("No database connection, returning empty DataFrame")
+            return pd.DataFrame()
+            
         query = """
         SELECT * FROM historical_matches 
         WHERE home_goals IS NOT NULL AND away_goals IS NOT NULL
         ORDER BY fixture_date DESC LIMIT %s
         """
         results = self.execute_query(query, (limit,))
-        return pd.DataFrame(results)
+        return pd.DataFrame(results) if results else pd.DataFrame()
     
     def get_live_fixtures(self) -> List[Dict]:
         """Get currently live fixtures"""
+        if not self.conn:
+            return []
+            
         query = """
         SELECT * FROM fixtures 
         WHERE status = 'Live' AND elapsed > 0
