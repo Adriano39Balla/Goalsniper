@@ -1,20 +1,21 @@
 import os
 from typing import Optional
-from pydantic import BaseSettings
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # API Football
-    API_FOOTBALL_KEY: str = os.getenv("API_FOOTBALL_KEY", "")
+    API_FOOTBALL_KEY: str = Field(default="", env="API_FOOTBALL_KEY")
     API_FOOTBALL_URL: str = "https://v3.football.api-sports.io"
     
     # Database
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
-    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-    SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+    DATABASE_URL: str = Field(default="", env="DATABASE_URL")
+    SUPABASE_URL: str = Field(default="", env="SUPABASE_URL")
+    SUPABASE_KEY: str = Field(default="", env="SUPABASE_KEY")
     
     # Telegram
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_BOT_TOKEN: str = Field(default="", env="TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID: str = Field(default="", env="TELEGRAM_CHAT_ID")
     
     # Model Settings
     MODEL_UPDATE_HOURS: int = 6
@@ -27,5 +28,6 @@ class Settings(BaseSettings):
     
     class Config:
         env_file = ".env"
+        case_sensitive = False
 
 settings = Settings()
