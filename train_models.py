@@ -1,5 +1,5 @@
 # ============================================================
-#   GOALSNIPER.AI — MODEL TRAINING ENGINE (FINAL SAFE VERSION)
+#   GOALSNIPER.AI — MODEL TRAINING ENGINE (ROBUST VERSION)
 # ============================================================
 
 import os
@@ -29,118 +29,130 @@ print("[TRAIN] Supabase connected.")
 
 
 # ------------------------------------------------------------
-# FETCH TRAINING DATA WITH FALLBACK SUPPORT
+# DATABASE SCHEMA VALIDATION
 # ------------------------------------------------------------
 
-def fetch_training_dataset_fallback():
-    """
-    Fallback method when foreign key relationship doesn't exist
-    """
-    print("[TRAIN] Using fallback data loading method...")
-    
+def validate_database_schema():
+    """Check if required tables and columns exist"""
     try:
-        # Load tips and results separately
-        tips_resp = supabase.table("tips").select("*").order("id", desc=False).execute()
-        results_resp = supabase.table("tip_results").select("*").execute()
-        
-        tips_data = tips_resp.data or []
-        results_data = results_resp.data or []
-        
-        print(f"[TRAIN] Loaded {len(tips_data)} tips and {len(results_data)} results")
-        
-        # Create a mapping of tip_id to result for quick lookup
-        results_map = {}
-        for result in results_data:
-            tip_id = result.get('tip_id')
-            if tip_id:
-                results_map[tip_id] = result
-        
-        rows = []
-        for tip in tips_data:
-            tip_id = tip.get('id')
-            result = results_map.get(tip_id)
-            
-            if not result:
-                continue
-                
-            if tip["prob"] is None or tip["odds"] is None:
-                continue
-            if result.get("result") not in ("WIN", "LOSS"):
-                continue
-
-            rows.append({
-                "fixture_id": tip["fixture_id"],
-                "market": tip["market"],
-                "selection": tip["selection"],
-                "prob": float(tip["prob"]),
-                "odds": float(tip["odds"]),
-                "minute": tip.get("minute") or 0,
-                "result": result["result"],
-                "pnl": result.get("pnl", 0),
-            })
-
-        df = pd.DataFrame(rows)
-        print(f"[TRAIN] Fallback loaded {len(df)} labeled examples.")
-        return df
-        
-    except Exception as e:
-        print("[TRAIN] ERROR in fallback loading:", e)
-        return pd.DataFrame([])
-
-
-def fetch_training_dataset():
-    """
-    Loads historical tips + results with automatic fallback
-    """
-    print("[TRAIN] Fetching training dataset...")
-
-    try:
-        # Try the joined query first
-        resp = (
-            supabase.table("tips")
-            .select("*, tip_results!tip_id(*)")
-            .order("id", desc=False)
-            .execute()
-        )
-        
-        data = resp.data or []
-        print(f"[TRAIN] Joined query successful, found {len(data)} tips")
-
+        # Test if tips table exists and has basic structure
+        test_resp = supabase.table("tips").select("id").limit(1).execute()
+        print("[TRAIN] Tips table exists and is accessible")
+        return True
     except Exception as e:
         error_str = str(e)
-        if "relationship" in error_str and "tip_results" in error_str:
-            print("[TRAIN] Foreign key relationship missing, using fallback...")
-            return fetch_training_dataset_fallback()
+        if "column tips.id does not exist" in error_str:
+            print("[TRAIN] WARNING: Tips table has different structure than expected")
+            return False
+        elif "relation" in error_str and "tips" in error_str:
+            print("[TRAIN] WARNING: Tips table doesn't exist")
+            return False
         else:
-            print("[TRAIN] ERROR loading data:", e)
+            print("[TRAIN] WARNING: Unknown database error:", e)
+            return False
+
+
+# ------------------------------------------------------------
+# FALLBACK DATA LOADING WITH SCHEMA DETECTION
+# ------------------------------------------------------------
+
+def fetch_training_dataset_robust():
+    """
+    Robust data loading that handles various schema issues
+    """
+    print("[TRAIN] Fetching training dataset with robust loader...")
+
+    # First, validate schema
+    if not validate_database_schema():
+        print("[TRAIN] Schema validation failed - no training data available")
+        return pd.DataFrame([])
+
+    try:
+        # Try different column names for ID
+        possible_id_columns = ['id', 'tip_id', 'fixture_id']
+        
+        for id_col in possible_id_columns:
+            try:
+                # Try to get tips with this ID column
+                tips_resp = supabase.table("tips").select("*").order(id_col, desc=False).limit(100).execute()
+                if tips_resp.data:
+                    print(f"[TRAIN] Successfully loaded tips using '{id_col}' as key")
+                    tips_data = tips_resp.data
+                    break
+            except:
+                continue
+        else:
+            print("[TRAIN] Could not find valid ID column in tips table")
             return pd.DataFrame([])
 
+    except Exception as e:
+        print("[TRAIN] ERROR loading tips:", e)
+        return pd.DataFrame([])
+
+    # Try to load results
+    try:
+        results_resp = supabase.table("tip_results").select("*").limit(100).execute()
+        results_data = results_resp.data or []
+        print(f"[TRAIN] Loaded {len(results_data)} results")
+    except Exception as e:
+        print("[TRAIN] WARNING: Could not load tip_results:", e)
+        results_data = []
+
+    # Manual joining with flexible column mapping
     rows = []
-    for tip in data:
-        results = tip.get("tip_results") or []
-        if not results:
+    for tip in tips_data:
+        # Find matching result - try different join strategies
+        matching_result = None
+        
+        # Strategy 1: Try tip_id in results
+        tip_id = tip.get('id')
+        if tip_id and results_data:
+            matching_result = next((r for r in results_data if r.get('tip_id') == tip_id), None)
+        
+        # Strategy 2: Try fixture_id matching
+        if not matching_result:
+            fixture_id = tip.get('fixture_id')
+            if fixture_id and results_data:
+                market = tip.get('market')
+                selection = tip.get('selection')
+                matching_result = next(
+                    (r for r in results_data 
+                     if r.get('fixture_id') == fixture_id 
+                     and r.get('market') == market
+                     and r.get('selection') == selection), 
+                    None
+                )
+
+        if not matching_result:
             continue
 
-        res = results[0]
+        # Validate required fields
+        prob = tip.get("prob")
+        odds = tip.get("odds")
+        result = matching_result.get("result")
 
-        if tip["prob"] is None or tip["odds"] is None:
+        if prob is None or odds is None:
             continue
-        if res.get("result") not in ("WIN", "LOSS"):
+        if result not in ("WIN", "LOSS"):
             continue
 
-        rows.append({
-            "fixture_id": tip["fixture_id"],
-            "market": tip["market"],
-            "selection": tip["selection"],
-            "prob": float(tip["prob"]),
-            "odds": float(tip["odds"]),
-            "minute": tip.get("minute") or 0,
-            "result": res["result"],
-            "pnl": res.get("pnl", 0),
-        })
+        try:
+            rows.append({
+                "fixture_id": tip.get("fixture_id"),
+                "market": tip.get("market"),
+                "selection": tip.get("selection"),
+                "prob": float(prob),
+                "odds": float(odds),
+                "minute": tip.get("minute") or 0,
+                "result": result,
+                "pnl": matching_result.get("pnl", 0),
+            })
+        except (ValueError, TypeError) as e:
+            print(f"[TRAIN] Skipping invalid tip data: {e}")
+            continue
 
     df = pd.DataFrame(rows)
-    print(f"[TRAIN] Loaded {len(df)} labeled examples.")
+    print(f"[TRAIN] Successfully loaded {len(df)} valid training examples.")
     return df
 
 
@@ -149,93 +161,87 @@ def fetch_training_dataset():
 # ------------------------------------------------------------
 
 def prep(df, market):
-    df = df[df["market"] == market]
     if df.empty:
         return None, None
+        
+    market_data = df[df["market"] == market]
+    if market_data.empty:
+        return None, None
 
-    X = df[["prob", "minute", "odds"]].fillna(0).astype(float).values
-    y = df["result"].map({"WIN": 1, "LOSS": 0}).astype(int).values
+    X = market_data[["prob", "minute", "odds"]].fillna(0).astype(float).values
+    y = market_data["result"].map({"WIN": 1, "LOSS": 0}).astype(int).values
 
     return X, y
 
 
 # ------------------------------------------------------------
-# TRAIN A MODEL
+# ROBUST MODEL TRAINING
 # ------------------------------------------------------------
 
-def train_model(X, y):
-    if len(X) < 40:
-        print(f"[TRAIN] Too little data ({len(X)} examples) → skipping real training.")
+def train_model_safe(X, y, market_name):
+    """Train model with comprehensive error handling"""
+    if len(X) < 10:  # Lowered minimum for early stages
+        print(f"[TRAIN] Insufficient data for {market_name} ({len(X)} examples)")
         return None
 
     if len(set(y)) < 2:
-        print("[TRAIN] Only one class present → skipping.")
+        print(f"[TRAIN] Only one class in {market_name} data")
         return None
 
     try:
-        base = LogisticRegression(max_iter=1000)
-        model = CalibratedClassifierCV(base, cv=min(3, len(X) // 10))  # Adaptive CV
+        # Use simpler approach for small datasets
+        if len(X) < 50:
+            base = LogisticRegression(max_iter=1000)
+            model = CalibratedClassifierCV(base, cv=min(2, len(X) // 5))
+        else:
+            base = LogisticRegression(max_iter=1000)
+            model = CalibratedClassifierCV(base, cv=min(3, len(X) // 10))
+            
         model.fit(X, y)
-        print(f"[TRAIN] Model trained successfully on {len(X)} examples")
+        print(f"[TRAIN] {market_name} model trained on {len(X)} examples")
         return model
 
     except Exception as e:
-        print("[TRAIN] Model training failed:", e)
+        print(f"[TRAIN] {market_name} model training failed:", e)
         return None
 
 
 # ------------------------------------------------------------
-# SAVE MODEL
+# DUMMY MODEL CREATION
 # ------------------------------------------------------------
 
-def save_model(model, path, storage_name):
+def make_dummy_model_safe():
+    """Create a safe dummy model without cross-validation issues"""
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        dump(model, path)
-        print(f"[TRAIN] Saved model → {path}")
-
-        # Try to upload to Supabase Storage
-        try:
-            with open(path, "rb") as f:
-                supabase.storage.from_("models").upload(
-                    path=storage_name,
-                    file=f,
-                    file_options={"content-type": "application/octet-stream"},
-                    upsert=True
-                )
-            print(f"[TRAIN] Uploaded → Supabase Storage/{storage_name}")
-
-        except Exception as e:
-            print("[TRAIN] Upload to Supabase Storage failed:", e)
-
+        # Simple model without calibration to avoid CV issues
+        X = np.array([[0.5, 0, 2.0], [0.6, 90, 1.8]])
+        y = np.array([0, 1])
+        
+        model = LogisticRegression(max_iter=1000)
+        model.fit(X, y)
+        return model
     except Exception as e:
-        print(f"[TRAIN] Failed to save model {path}:", e)
+        print("[TRAIN] Dummy model creation failed:", e)
+        return None
 
 
-# ------------------------------------------------------------
-# SAFE DUMMY MODEL
-# ------------------------------------------------------------
+def train_dummies_safe():
+    """Create dummy models safely"""
+    print("[TRAIN] Creating safe dummy models...")
 
-def make_dummy():
-    X = np.array([[0, 0, 1], [1, 90, 10]])
-    y = np.array([0, 1])
+    dummy = make_dummy_model_safe()
+    if dummy is None:
+        print("[TRAIN] Failed to create dummy models")
+        return
 
-    base = LogisticRegression(max_iter=200)
-    model = CalibratedClassifierCV(base, cv=2)
-    model.fit(X, y)
-    return model
-
-
-def train_dummies():
-    print("[TRAIN] Creating dummy models...")
-
-    dummy = make_dummy()
-
-    save_model(dummy, MODEL_1X2, "logreg_1x2.pkl")
-    save_model(dummy, MODEL_OU25, "logreg_ou25.pkl")
-    save_model(dummy, MODEL_BTTS, "logreg_btts.pkl")
-
-    print("[TRAIN] Dummy models created.")
+    try:
+        os.makedirs(os.path.dirname(MODEL_1X2), exist_ok=True)
+        dump(dummy, MODEL_1X2)
+        dump(dummy, MODEL_OU25)
+        dump(dummy, MODEL_BTTS)
+        print("[TRAIN] Safe dummy models created and saved locally")
+    except Exception as e:
+        print("[TRAIN] Failed to save dummy models:", e)
 
 
 # ------------------------------------------------------------
@@ -247,47 +253,40 @@ def main():
     print("        GOALSNIPER AI — TRAINING START")
     print("============================================")
 
-    df = fetch_training_dataset()
+    # Load training data
+    df = fetch_training_dataset_robust()
+
+    if df.empty:
+        print("[TRAIN] No training data available → creating safe dummy models")
+        train_dummies_safe()
+        print("[TRAIN] Training pipeline completed with dummy models")
+        return
 
     models_trained = 0
 
-    if df.empty:
-        print("[TRAIN] No training data → dummy models only.")
-        train_dummies()
-        return
+    # Train each market model
+    markets = [
+        ("1X2", MODEL_1X2),
+        ("OU25", MODEL_OU25), 
+        ("BTTS", MODEL_BTTS)
+    ]
 
-    # ---- 1X2 ----
-    X1, y1 = prep(df, "1X2")
-    if X1 is not None:
-        m1 = train_model(X1, y1)
-        if m1:
-            save_model(m1, MODEL_1X2, "logreg_1x2.pkl")
-            models_trained += 1
-        else:
-            print("[TRAIN] 1X2 model training failed, using dummy")
-            save_model(make_dummy(), MODEL_1X2, "logreg_1x2.pkl")
-
-    # ---- OU25 ----
-    X2, y2 = prep(df, "OU25")
-    if X2 is not None:
-        m2 = train_model(X2, y2)
-        if m2:
-            save_model(m2, MODEL_OU25, "logreg_ou25.pkl")
-            models_trained += 1
-        else:
-            print("[TRAIN] OU25 model training failed, using dummy")
-            save_model(make_dummy(), MODEL_OU25, "logreg_ou25.pkl")
-
-    # ---- BTTS ----
-    X3, y3 = prep(df, "BTTS")
-    if X3 is not None:
-        m3 = train_model(X3, y3)
-        if m3:
-            save_model(m3, MODEL_BTTS, "logreg_btts.pkl")
-            models_trained += 1
-        else:
-            print("[TRAIN] BTTS model training failed, using dummy")
-            save_model(make_dummy(), MODEL_BTTS, "logreg_btts.pkl")
+    for market_name, model_path in markets:
+        X, y = prep(df, market_name)
+        if X is not None:
+            model = train_model_safe(X, y, market_name)
+            if model:
+                try:
+                    dump(model, model_path)
+                    print(f"[TRAIN] Saved {market_name} model to {model_path}")
+                    models_trained += 1
+                except Exception as e:
+                    print(f"[TRAIN] Failed to save {market_name} model:", e)
+            else:
+                print(f"[TRAIN] Using dummy model for {market_name}")
+                dummy = make_dummy_model_safe()
+                if dummy:
+                    dump(dummy, model_path)
 
     print(f"[TRAIN] Training complete. {models_trained} models trained successfully.")
 
