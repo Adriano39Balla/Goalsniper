@@ -1,5 +1,6 @@
 from supabase import create_client
 from app.config import SUPABASE_URL, SUPABASE_KEY
+import datetime
 
 # ------------------------------------------------------------
 # INIT CLIENT
@@ -12,6 +13,30 @@ except Exception as e:
     supabase = None
 
 
+# ------------------------------------------------------------
+# Helper: convert UNIX timestamp → ISO UTC
+# ------------------------------------------------------------
+def convert_timestamp(ts):
+    """
+    Converts UNIX timestamp to ISO-8601 format.
+    If already a string or invalid → return as-is.
+    """
+    if ts is None:
+        return None
+
+    # Already iso format?
+    if isinstance(ts, str) and "T" in ts:
+        return ts
+
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
+    except Exception:
+        pass
+
+    return ts  # fallback
+
+
 # ============================================================
 # FIXTURE SNAPSHOT
 # ============================================================
@@ -22,22 +47,29 @@ def upsert_fixture(fix):
         fixture_id, league_id, home_team_id, away_team_id,
         home_goals, away_goals, status, minute, timestamp
     """
+
     if not supabase:
         print("[DB] upsert_fixture skipped — client not initialized")
         return
 
     try:
+        # FIX UNIX TIMESTAMP
+        if "timestamp" in fix:
+            fix["timestamp"] = convert_timestamp(fix["timestamp"])
+
         res = (
             supabase.table("fixtures_live")
             .upsert(fix, on_conflict="fixture_id")
             .execute()
         )
-        # Debug print
-        # print(f"[DB] Upsert fixture {fix.get('fixture_id')}")
+
+        # Debug
+        # print(f"[DB] Upserted fixture {fix.get('fixture_id')}")
         return res
 
     except Exception as e:
         print("[DB] upsert_fixture error:", e)
+        print("[DB] Payload was:", fix)
         return None
 
 
@@ -46,25 +78,14 @@ def upsert_fixture(fix):
 # ============================================================
 
 def insert_stats(fid, stats):
-    """
-    stats MUST contain:
-        minute, home_shots_on, away_shots_on,
-        home_attacks, away_attacks
-    """
+    payload = {"fixture_id": fid, **stats}
 
     if not supabase:
         print("[DB] insert_stats skipped — client not initialized")
-        return None
-
-    payload = {
-        "fixture_id": fid,
-        **stats
-    }
+        return
 
     try:
-        res = supabase.table("fixture_stats").insert(payload).execute()
-        # print(f"[DB] Stats inserted for {fid}")
-        return res
+        return supabase.table("fixture_stats").insert(payload).execute()
 
     except Exception as e:
         print("[DB] insert_stats error:", e)
@@ -77,28 +98,17 @@ def insert_stats(fid, stats):
 # ============================================================
 
 def insert_odds(fid, odds):
-    """
-    odds MUST be structured like:
-    {
-        "1x2": {"home": X, "draw": Y, "away": Z},
-        "ou25": {"over": X, "under": Y},
-        "btts": {"yes": X, "no": Y}
-    }
-    """
-
-    if not supabase:
-        print("[DB] insert_odds skipped — client not initialized")
-        return None
-
     payload = {
         "fixture_id": fid,
         "odds": odds
     }
 
+    if not supabase:
+        print("[DB] insert_odds skipped — client not initialized")
+        return
+
     try:
-        res = supabase.table("fixture_odds").insert(payload).execute()
-        # print(f"[DB] Odds inserted for {fid}")
-        return res
+        return supabase.table("fixture_odds").insert(payload).execute()
 
     except Exception as e:
         print("[DB] insert_odds error:", e)
@@ -111,19 +121,12 @@ def insert_odds(fid, odds):
 # ============================================================
 
 def insert_tip(tip):
-    """
-    tip MUST contain:
-        fixture_id, market, selection, prob, odds, ev, minute
-    """
-
     if not supabase:
         print("[DB] insert_tip skipped — client not initialized")
-        return None
+        return
 
     try:
-        res = supabase.table("tips").insert(tip).execute()
-        # print(f"[DB] Tip stored for {tip.get('fixture_id')}")
-        return res
+        return supabase.table("tips").insert(tip).execute()
 
     except Exception as e:
         print("[DB] insert_tip error:", e)
