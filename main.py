@@ -1216,7 +1216,10 @@ def http_train():
         log.exception("train_models failed: %s", e); return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/admin/digest", methods=["POST","GET"])
-def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg))}
+def http_digest():
+    _require_admin()
+    msg = daily_accuracy_digest()
+    return jsonify({"ok": True, "sent": bool(msg)})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
 def http_auto_tune():
