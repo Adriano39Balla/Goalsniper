@@ -2,6 +2,7 @@ flask==3.0.3
 gevent==23.9.1
 python-dotenv==1.0.1
 pytz==2024.1
+fastapi==0.104.1
 APScheduler==3.10.4
 redis==5.0.8
 sentry-sdk==2.13.0
