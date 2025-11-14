@@ -48,8 +48,11 @@ class BettingAISystem:
             # Load AI models
             self.ensemble_predictor.load_models()
             
-            # Initialize Telegram bot
-            await telegram_bot.initialize()
+            # Initialize Telegram bot (if token provided)
+            if settings.TELEGRAM_BOT_TOKEN:
+                await telegram_bot.initialize()
+            else:
+                logger.warning("Telegram bot token not provided, skipping initialization")
             
             # Health check
             health_status = await self.health_monitor.get_health_status()
@@ -59,7 +62,7 @@ class BettingAISystem:
             
         except Exception as e:
             logger.error(f"System initialization failed: {e}")
-            raise
+            # Continue with limited functionality
     
     async def start(self):
         """Start the system"""
