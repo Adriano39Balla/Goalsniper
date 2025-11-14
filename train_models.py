@@ -1,185 +1,276 @@
-# ============================================================
-#   GOALSNIPER.AI — TRAINING ENGINE (FINAL SAFE VERSION)
-# ============================================================
-
-import os
-import numpy as np
 import pandas as pd
-from datetime import datetime
-
+import numpy as np
+import joblib
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from joblib import dump
-
+from sklearn.model_selection import TimeSeriesSplit
 from supabase import create_client
-from app.db_pg import fetch_all   # direct SQL fetcher
-from app.config import (
-    MODEL_1X2, MODEL_OU25, MODEL_BTTS, MODEL_DIR,
-    SUPABASE_URL, SUPABASE_KEY
-)
+import requests
+import asyncio
+import aiohttp
+from datetime import datetime, timedelta
+import os
 
-# ------------------------------------------------------------
-# SUPABASE STORAGE
-# ------------------------------------------------------------
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-BUCKET = "models"
+# Configuration
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+API_FOOTBALL_KEY = os.getenv('API_FOOTBALL_KEY')
 
+class BayesianNetwork:
+    def __init__(self):
+        self.prior_probabilities = {}
+        self.conditional_probabilities = {}
+        
+    def update_priors(self, historical_data):
+        """Update prior probabilities based on historical data"""
+        # Calculate base rates for different leagues and conditions
+        for league in historical_data['league_id'].unique():
+            league_data = historical_data[historical_data['league_id'] == league]
+            
+            # Prior for Over/Under
+            total_goals = league_data['home_team_goals'] + league_data['away_team_goals']
+            self.prior_probabilities[f'{league}_over_2.5'] = (total_goals > 2.5).mean()
+            self.prior_probabilities[f'{league}_over_1.5'] = (total_goals > 1.5).mean()
+            
+            # Prior for BTTS
+            self.prior_probabilities[f'{league}_btts'] = (
+                (league_data['home_team_goals'] > 0) & 
+                (league_data['away_team_goals'] > 0)
+            ).mean()
+            
+            # Prior for Home Win
+            self.prior_probabilities[f'{league}_home_win'] = (
+                league_data['home_team_goals'] > league_data['away_team_goals']
+            ).mean()
 
-def upload_file_safe(local_path, storage_name):
-    """Safe upload using sync API — NO upsert parameter."""
+class AdvancedBettingPredictor:
+    def __init__(self):
+        self.bayesian_net = BayesianNetwork()
+        self.models = {}
+        self.feature_columns = []
+        self.calibration_data = []
+        
+    def create_features(self, match_data):
+        """Create sophisticated features for ML models"""
+        features = {}
+        
+        # Team strength features
+        features['home_attack_strength'] = match_data.get('home_team_goals_avg', 1.5)
+        features['away_attack_strength'] = match_data.get('away_team_goals_avg', 1.5)
+        features['home_defense_strength'] = match_data.get('home_team_conceded_avg', 1.2)
+        features['away_defense_strength'] = match_data.get('away_team_conceded_avg', 1.2)
+        
+        # Form features (last 5 games)
+        features['home_form'] = match_data.get('home_team_form', 0.5)
+        features['away_form'] = match_data.get('away_team_form', 0.5)
+        
+        # Momentum features
+        features['home_momentum'] = match_data.get('home_team_momentum', 0)
+        features['away_momentum'] = match_data.get('away_team_momentum', 0)
+        
+        # Contextual features
+        features['league_avg_goals'] = match_data.get('league_avg_goals', 2.5)
+        features['importance'] = match_data.get('match_importance', 0.5)
+        features['rivalry'] = match_data.get('is_rivalry', 0)
+        
+        # Live match features
+        if match_data.get('is_live', False):
+            features['minutes_played'] = match_data.get('minutes_played', 0)
+            features['current_score_home'] = match_data.get('current_home_goals', 0)
+            features['current_score_away'] = match_data.get('current_away_goals', 0)
+            features['momentum_indicator'] = match_data.get('momentum_indicator', 0.5)
+            features['recent_attacks'] = match_data.get('recent_attacks', 0)
+        
+        return features
+    
+    def train_models(self, training_data):
+        """Train multiple models for different bet types"""
+        print("Training advanced betting models...")
+        
+        # Prepare features and targets
+        X = []
+        y_over_25 = []
+        y_btts = []
+        y_home_win = []
+        
+        for match in training_data:
+            features = self.create_features(match)
+            X.append(list(features.values()))
+            
+            # Targets
+            total_goals = match['home_team_goals'] + match['away_team_goals']
+            y_over_25.append(1 if total_goals > 2.5 else 0)
+            y_btts.append(1 if match['home_team_goals'] > 0 and match['away_team_goals'] > 0 else 0)
+            y_home_win.append(1 if match['home_team_goals'] > match['away_team_goals'] else 0)
+        
+        X = np.array(X)
+        self.feature_columns = list(features.keys())
+        
+        # Train models with calibration
+        bet_types = {
+            'over_25': y_over_25,
+            'btts': y_btts, 
+            'home_win': y_home_win
+        }
+        
+        for bet_type, y in bet_types.items():
+            # Base model
+            base_model = GradientBoostingClassifier(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42
+            )
+            
+            # Calibrated model for better probability estimates
+            calibrated_model = CalibratedClassifierCV(
+                base_model, 
+                method='isotonic', 
+                cv=3
+            )
+            
+            calibrated_model.fit(X, y)
+            self.models[bet_type] = calibrated_model
+            
+            print(f"Trained and calibrated model for {bet_type}")
+    
+    def predict_with_confidence(self, match_data):
+        """Generate predictions with calibrated probabilities and confidence scores"""
+        features = self.create_features(match_data)
+        X = np.array([list(features.values())])
+        
+        predictions = {}
+        
+        for bet_type, model in self.models.items():
+            # Get calibrated probabilities
+            proba = model.predict_proba(X)[0]
+            
+            # Bayesian adjustment using prior knowledge
+            league = match_data.get('league_id', 'default')
+            prior_key = f"{league}_{bet_type}"
+            prior_prob = self.bayesian_net.prior_probabilities.get(prior_key, 0.5)
+            
+            # Blend prior with model prediction (Bayesian update)
+            alpha = 0.1  # Strength of prior
+            adjusted_prob = (1 - alpha) * proba[1] + alpha * prior_prob
+            
+            # Calculate confidence based on feature strength and model certainty
+            feature_strength = np.std(list(features.values()))
+            model_confidence = np.max(proba)
+            confidence_score = 0.7 * model_confidence + 0.3 * feature_strength
+            
+            predictions[bet_type] = {
+                'probability': float(adjusted_prob),
+                'confidence': float(confidence_score),
+                'prediction': adjusted_prob > 0.5,
+                'edge': float(adjusted_prob - 0.5)  # Positive edge over bookmaker implied probability
+            }
+        
+        return predictions
+    
+    def learn_from_mistakes(self, bet_outcomes):
+        """Self-learning from incorrect predictions"""
+        for outcome in bet_outcomes:
+            match_data = outcome['match_data']
+            actual_result = outcome['actual_result']
+            predicted_result = outcome['predicted_result']
+            
+            if predicted_result != actual_result:
+                # Add to calibration data for model retraining
+                self.calibration_data.append({
+                    'match_data': match_data,
+                    'correct_prediction': actual_result
+                })
+                
+                # Update Bayesian priors
+                self._update_bayesian_network(match_data, actual_result)
+    
+    def _update_bayesian_network(self, match_data, actual_result):
+        """Update Bayesian network based on new evidence"""
+        league = match_data.get('league_id', 'default')
+        
+        # Update priors based on actual outcomes
+        for bet_type in ['over_25', 'btts', 'home_win']:
+            prior_key = f"{league}_{bet_type}"
+            current_prior = self.bayesian_net.prior_probabilities.get(prior_key, 0.5)
+            
+            # Simple exponential moving average update
+            learning_rate = 0.01
+            new_prior = (1 - learning_rate) * current_prior + learning_rate * actual_result[bet_type]
+            
+            self.bayesian_net.prior_probabilities[prior_key] = new_prior
+
+class DataFetcher:
+    def __init__(self):
+        self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        self.api_headers = {
+            'x-rapidapi-key': API_FOOTBALL_KEY,
+            'x-rapidapi-host': 'api-football-v1.p.rapidapi.com'
+        }
+    
+    async def fetch_historical_data(self, days=365):
+        """Fetch historical match data for training"""
+        print(f"Fetching historical data for last {days} days...")
+        
+        # In production, implement actual API calls
+        # This is a simplified version
+        historical_data = []
+        
+        # Fetch from Supabase first
+        response = self.supabase.table('historical_matches')\
+            .select('*')\
+            .gte('date', f'{(datetime.now() - timedelta(days=days)).date()}')\
+            .execute()
+        
+        return response.data
+    
+    async def fetch_live_matches(self):
+        """Fetch current live matches for prediction"""
+        print("Fetching live matches...")
+        
+        async with aiohttp.ClientSession() as session:
+            url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
+            params = {'live': 'all'}
+            
+            async with session.get(url, headers=self.api_headers, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('response', [])
+                else:
+                    print(f"API Error: {response.status}")
+                    return []
+
+async def main_training():
+    """Main training function"""
+    print("Starting model training pipeline...")
+    
+    # Initialize components
+    predictor = AdvancedBettingPredictor()
+    data_fetcher = DataFetcher()
+    
     try:
-        with open(local_path, "rb") as f:
-            supabase.storage \
-                .from_(BUCKET) \
-                .upload(storage_name, f)
-        print(f"[TRAIN] Uploaded to storage → {storage_name}")
+        # Fetch training data
+        historical_data = await data_fetcher.fetch_historical_data(180)  # Last 6 months
+        
+        if historical_data:
+            # Train models
+            predictor.train_models(historical_data)
+            
+            # Save trained models
+            joblib.dump(predictor, 'models/trained_predictor.joblib')
+            joblib.dump(predictor.feature_columns, 'models/feature_columns.joblib')
+            
+            print("Model training completed successfully!")
+        else:
+            print("No historical data found for training")
+            
     except Exception as e:
-        print(f"[TRAIN] Upload error for {storage_name}: {e}")
-
-
-# ------------------------------------------------------------
-# FETCH TRAINING DATA FROM SQL
-# ------------------------------------------------------------
-
-def fetch_training_dataset():
-    sql = """
-        SELECT
-            t.fixture_id,
-            t.market,
-            t.selection,
-            t.minute,
-            t.prob,
-            t.odds,
-            r.result,
-            r.pnl
-        FROM tips t
-        JOIN tip_results r ON r.tip_id = t.id
-        WHERE r.result IN ('WIN','LOSS')
-    """
-    rows = fetch_all(sql)
-    df = pd.DataFrame(rows) if rows else pd.DataFrame()
-    print(f"[TRAIN] Loaded {len(df)} rows")
-    return df
-
-
-# ------------------------------------------------------------
-# MARKET PREP
-# ------------------------------------------------------------
-
-MIN_SAMPLES = 10
-MIN_CLASS = 2
-
-def prep_market(df, market):
-    df = df[df["market"] == market]
-    if df.empty:
-        return None, None
-
-    df = df.dropna(subset=["prob", "odds"])
-    df["minute"] = df["minute"].fillna(0)
-
-    X = df[["prob", "minute", "odds"]].astype(float).values
-    y = df["result"].map({"WIN": 1, "LOSS": 0}).astype(int).values
-
-    n0 = (y == 0).sum()
-    n1 = (y == 1).sum()
-    total = len(y)
-
-    print(f"[TRAIN] {market}: total={total}, WIN={n1}, LOSS={n0}")
-
-    if total < MIN_SAMPLES or min(n0, n1) < MIN_CLASS:
-        print(f"[TRAIN] {market}: insufficient data → fallback")
-        return None, None
-
-    return X, y
-
-
-# ------------------------------------------------------------
-# SAFE TRAINING LOGIC
-# ------------------------------------------------------------
-
-def train_safe_model(X, y, market):
-    """
-    1. If real data is present → try calibrated CV
-    2. If data too small → build dummy X,y
-    """
-
-    # If data missing → use dummy set
-    if X is None or y is None:
-        X = np.array([[0.2, 10, 2.5], [0.7, 80, 1.8]])
-        y = np.array([0, 1])
-        print(f"[TRAIN] {market}: using dummy synthetic dataset")
-
-    # Try calibrated model
-    try:
-        base = LogisticRegression(max_iter=1000)
-        model = CalibratedClassifierCV(base, cv=2)
-        model.fit(X, y)
-        print(f"[TRAIN] {market}: calibrated model trained")
-        return model
-    except Exception as e:
-        print(f"[TRAIN] {market}: calibration failed → {e}")
-
-    # Try simple logistic regression
-    try:
-        model = LogisticRegression(max_iter=1000)
-        model.fit(X, y)
-        print(f"[TRAIN] {market}: uncalibrated model trained")
-        return model
-    except Exception as e:
-        print(f"[TRAIN] {market}: uncalibrated failed → {e}")
-
-    # FINAL fallback: guaranteed trainable dummy
-    print(f"[TRAIN] {market}: using final dummy fallback")
-    X = np.array([[0, 0, 1], [1, 90, 10]])
-    y = np.array([0, 1])
-
-    model = LogisticRegression(max_iter=200)
-    model.fit(X, y)
-    return model
-
-
-# ------------------------------------------------------------
-# SAVE MODEL
-# ------------------------------------------------------------
-
-def save_model(model, path, storage_name):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    dump(model, path)
-    print(f"[TRAIN] Saved model → {path}")
-
-    upload_file_safe(path, storage_name)
-
-
-# ------------------------------------------------------------
-# MAIN PIPELINE
-# ------------------------------------------------------------
-
-def main():
-    print("============================================")
-    print("      GOALSNIPER AI — TRAINING START")
-    print("============================================")
-
-    df = fetch_training_dataset()
-
-    # Market list
-    markets = [
-        ("1X2", MODEL_1X2, "logreg_1x2.pkl"),
-        ("OU25", MODEL_OU25, "logreg_ou25.pkl"),
-        ("BTTS", MODEL_BTTS, "logreg_btts.pkl"),
-    ]
-
-    for market, model_path, storage_name in markets:
-        X, y = prep_market(df, market)
-        model = train_safe_model(X, y, market)
-        save_model(model, model_path, storage_name)
-
-    print("[TRAIN] Training complete")
-
-
-# Callback for main app
-def run_full_training():
-    main()
-
+        print(f"Training error: {e}")
 
 if __name__ == "__main__":
-    main()
+    # Create models directory
+    os.makedirs('models', exist_ok=True)
+    
+    # Run training
+    asyncio.run(main_training())
