@@ -1,33 +1,34 @@
-import os
-from typing import Optional
-from pydantic import Field
-from pydantic_settings import BaseSettings
+# config/settings.py
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
+    # v2-style settings config
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
+
     # API Football
-    API_FOOTBALL_KEY: str = Field(default="", env="API_FOOTBALL_KEY")
+    API_FOOTBALL_KEY: str = ""
     API_FOOTBALL_URL: str = "https://v3.football.api-sports.io"
-    
+
     # Database
-    DATABASE_URL: str = Field(default="", env="DATABASE_URL")
-    SUPABASE_URL: str = Field(default="", env="SUPABASE_URL")
-    SUPABASE_KEY: str = Field(default="", env="SUPABASE_KEY")
-    
+    DATABASE_URL: str = ""
+    SUPABASE_URL: str = ""
+    SUPABASE_KEY: str = ""
+
     # Telegram
-    TELEGRAM_BOT_TOKEN: str = Field(default="", env="TELEGRAM_BOT_TOKEN")
-    TELEGRAM_CHAT_ID: str = Field(default="", env="TELEGRAM_CHAT_ID")
-    
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+
     # Model Settings
     MODEL_UPDATE_HOURS: int = 6
     MIN_CONFIDENCE_THRESHOLD: float = 0.65
     LIVE_UPDATE_INTERVAL: int = 30  # seconds
-    
+
     # Feature Engineering
     ROLLING_WINDOW: int = 10
     FEATURE_LOOKBACK: int = 15
-    
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
 
 settings = Settings()
