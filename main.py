@@ -1,4 +1,8 @@
 import threading
+import traceback
+import sys
+import os
+from datetime import datetime
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -48,17 +52,35 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "goalsniper-ai"})
+    return jsonify({
+        "status": "ok", 
+        "service": "goalsniper-ai",
+        "timestamp": datetime.utcnow().isoformat()
+    })
 
 
 @app.route("/manual/health-full")
 def health_full():
-    return jsonify({
-        "status": "ok",
-        "scheduler_running": scheduler.running,
-        "models_loaded": True,
-        "api": "api-football",
-    })
+    try:
+        # Test basic functionality
+        from app.config import DEBUG_MODE, LIVE_PREDICTION_INTERVAL
+        
+        health_status = {
+            "status": "ok",
+            "timestamp": datetime.utcnow().isoformat(),
+            "scheduler_running": scheduler.running if scheduler else False,
+            "debug_mode": DEBUG_MODE,
+            "interval": LIVE_PREDICTION_INTERVAL,
+            "python_version": sys.version
+        }
+        
+        return jsonify(health_status)
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }), 500
 
 
 # ============================================================
@@ -67,16 +89,26 @@ def health_full():
 
 def _async_train():
     """Run full model training in a background thread."""
-    print("[TRAIN] Async training started...")
-    run_full_training()
-    print("[TRAIN] Async training finished.")
+    try:
+        print(f"[TRAIN] Async training started at {datetime.utcnow().isoformat()}...")
+        run_full_training()
+        print(f"[TRAIN] Async training finished at {datetime.utcnow().isoformat()}.")
+    except Exception as e:
+        print(f"[TRAIN ERROR] {str(e)}")
+        traceback.print_exc()
 
 
 @app.route("/manual/train")
 def manual_train():
     """Triggers full training without blocking the web request."""
-    threading.Thread(target=_async_train).start()
-    return jsonify({"status": "training started (async)"})
+    try:
+        threading.Thread(target=_async_train, daemon=True).start()
+        return jsonify({
+            "status": "training started (async)",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 # ============================================================
@@ -85,8 +117,14 @@ def manual_train():
 
 @app.route("/manual/scan")
 def manual_scan():
-    threading.Thread(target=live_prediction_cycle).start()
-    return jsonify({"status": "manual scan triggered"})
+    try:
+        threading.Thread(target=live_prediction_cycle, daemon=True).start()
+        return jsonify({
+            "status": "manual scan triggered",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 # ============================================================
@@ -217,32 +255,52 @@ def process_fixture(f_raw):
 # ============================================================
 
 def live_prediction_cycle():
-    print("[GOALSNIPER] Live scan running...")
+    print(f"[GOALSNIPER] Live scan started at {datetime.utcnow().isoformat()}")
+    
+    try:
+        fixtures = get_live_fixtures()
+        all_preds = []
+        
+        if not fixtures:
+            print("[GOALSNIPER] No live fixtures found.")
+            return
 
-    fixtures = get_live_fixtures()
-    all_preds = []
+        for fr in fixtures:
+            try:
+                preds = process_fixture(fr)
+                all_preds.extend(preds)
+            except Exception as e:
+                print(f"[ERROR] Failed to process fixture: {e}")
+                continue
 
-    for fr in fixtures:
-        all_preds.extend(process_fixture(fr))
+        final_preds = filter_predictions(all_preds)
 
-    final_preds = filter_predictions(all_preds)
+        if not final_preds:
+            print("[GOALSNIPER] No predictions passed filters.")
+            return
 
-    if not final_preds:
-        print("[GOALSNIPER] No predictions passed filters.")
-        return
+        send_predictions(final_preds)
 
-    send_predictions(final_preds)
-
-    for p in final_preds:
-        insert_tip({
-            "fixture_id": p.fixture_id,
-            "market": p.market,
-            "selection": p.selection,
-            "prob": p.prob,
-            "odds": p.odds,
-            "ev": p.ev,
-            "minute": p.aux.get("minute"),
-        })
+        for p in final_preds:
+            try:
+                insert_tip({
+                    "fixture_id": p.fixture_id,
+                    "market": p.market,
+                    "selection": p.selection,
+                    "prob": p.prob,
+                    "odds": p.odds,
+                    "ev": p.ev,
+                    "minute": p.aux.get("minute"),
+                })
+            except Exception as e:
+                print(f"[ERROR] Failed to insert tip: {e}")
+                continue
+                
+        print(f"[GOALSNIPER] Live scan completed at {datetime.utcnow().isoformat()}")
+        
+    except Exception as e:
+        print(f"[GOALSNIPER ERROR] {str(e)}")
+        traceback.print_exc()
 
 
 # ============================================================
@@ -264,4 +322,10 @@ threading.Thread(target=start_scheduler_once).start()
 # ============================================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=DEBUG_MODE)
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Starting Goalsniper AI on port {port}")
+    
+    # Start scheduler in main thread context
+    start_scheduler_once()
+    
+    app.run(host="0.0.0.0", port=port, debug=DEBUG_MODE)
