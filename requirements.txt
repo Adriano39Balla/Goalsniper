@@ -4,6 +4,7 @@ python-dotenv==1.0.1
 pytz==2024.1
 fastapi==0.104.1
 APScheduler==3.10.4
+uvicorn==0.24.0
 redis==5.0.8
 sentry-sdk==2.13.0
 numpy==1.26.4
