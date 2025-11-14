@@ -31,7 +31,7 @@ from app.supabase_db import (
     insert_tip,
 )
 
-# Manual training (train_models.py)
+# Training engine  (IMPORTANT: must match file location)
 from train_models import run_full_training
 
 # Config
@@ -55,49 +55,38 @@ def health():
 def health_full():
     return jsonify({
         "status": "ok",
-        "models_ready": True,
         "scheduler_running": scheduler.running,
-        "api_source": "api-football",
+        "models_loaded": True,
+        "api": "api-football",
     })
 
 
 # ============================================================
-# MANUAL ENDPOINTS (SAFE)
+# MANUAL TRAINING — NON BLOCKING
 # ============================================================
 
-def _background_train():
-    """Run full training in a background thread."""
-    try:
-        print("[TRAIN] Background training started...")
-        run_full_training()
-        print("[TRAIN] Background training finished.")
-    except Exception as e:
-        print("[TRAIN] Background training ERROR:", e)
+def _async_train():
+    """Run full model training in a background thread."""
+    print("[TRAIN] Async training started...")
+    run_full_training()
+    print("[TRAIN] Async training finished.")
 
 
 @app.route("/manual/train")
 def manual_train():
-    """
-    Manually trigger full model training.
-    Runs in background to avoid HTTP timeout on Railway.
-    """
-    t = threading.Thread(target=_background_train, daemon=True)
-    t.start()
-    return jsonify({"status": "training started (background)"})
+    """Triggers full training without blocking the web request."""
+    threading.Thread(target=_async_train).start()
+    return jsonify({"status": "training started (async)"})
 
+
+# ============================================================
+# MANUAL SCAN
+# ============================================================
 
 @app.route("/manual/scan")
 def manual_scan():
-    """
-    Manually trigger a single live prediction scan.
-    Wrapped in try/except so the HTTP request always returns.
-    """
-    try:
-        live_prediction_cycle()
-        return jsonify({"status": "scan completed"})
-    except Exception as e:
-        print("[SCAN] Manual scan ERROR:", e)
-        return jsonify({"status": "error", "detail": str(e)}), 500
+    threading.Thread(target=live_prediction_cycle).start()
+    return jsonify({"status": "manual scan triggered"})
 
 
 # ============================================================
@@ -105,24 +94,6 @@ def manual_scan():
 # ============================================================
 
 def extract_core_odds(odds_list):
-    """
-    Extract only the markets we need from API-Football live odds:
-
-      - Fulltime 1X2
-      - Fulltime BTTS
-      - Fulltime Over/Under 2.5
-
-    `odds_list` is a list like:
-      [
-        {
-          "id": ...,
-          "name": "Fulltime Result",
-          "values": [...]
-        },
-        ...
-      ]
-    """
-
     out_1x2 = {"home": None, "draw": None, "away": None}
     out_btts = {"yes": None, "no": None}
     out_ou25 = {"over": None, "under": None}
@@ -134,131 +105,111 @@ def extract_core_odds(odds_list):
         name = (m.get("name") or "").lower()
         values = m.get("values") or []
 
-        # -------------- FULLTIME 1X2 --------------
+        # Fulltime 1X2
         if name in ["fulltime result", "match winner", "1x2"]:
             for v in values:
                 val = (v.get("value") or "").lower()
                 odd = v.get("odd")
                 if odd is None:
                     continue
-                if val == "home":
-                    out_1x2["home"] = float(odd)
-                elif val == "draw":
-                    out_1x2["draw"] = float(odd)
-                elif val == "away":
-                    out_1x2["away"] = float(odd)
+                if val == "home": out_1x2["home"] = float(odd)
+                if val == "draw": out_1x2["draw"] = float(odd)
+                if val == "away": out_1x2["away"] = float(odd)
 
-        # -------------- BTTS FULLTIME --------------
+        # BTTS
         if "both teams to score" in name and "half" not in name:
             for v in values:
                 val = (v.get("value") or "").lower()
                 odd = v.get("odd")
                 if odd is None:
                     continue
-                if val == "yes":
-                    out_btts["yes"] = float(odd)
-                elif val == "no":
-                    out_btts["no"] = float(odd)
+                if val == "yes": out_btts["yes"] = float(odd)
+                if val == "no": out_btts["no"] = float(odd)
 
-        # -------------- O/U 2.5 --------------
+        # Over/Under Line
         if "over/under" in name or "line" in name:
             for v in values:
-                label = (v.get("value") or "").lower()
                 handicap = str(v.get("handicap") or "").strip()
+                label = (v.get("value") or "").lower()
                 odd = v.get("odd")
                 if odd is None:
                     continue
-
                 if handicap == "2.5":
-                    if "over" in label:
-                        out_ou25["over"] = float(odd)
-                    if "under" in label:
-                        out_ou25["under"] = float(odd)
+                    if "over" in label: out_ou25["over"] = float(odd)
+                    if "under" in label: out_ou25["under"] = float(odd)
 
     return out_1x2, out_ou25, out_btts
 
 
 # ============================================================
-# PROCESS A SINGLE FIXTURE
+# PROCESS FIXTURE
 # ============================================================
 
 def process_fixture(f_raw):
-    """
-    Take raw fixture from API-Football, log it, fetch stats+odds,
-    build features, run predictions, and return a list[Prediction].
-    """
+    fixture = normalize_fixture(f_raw)
+    fid = fixture["fixture_id"]
 
-    try:
-        fixture = normalize_fixture(f_raw)
-        fid = fixture["fixture_id"]
+    upsert_fixture(fixture)
 
-        # ------------------- FIXTURE SNAPSHOT -------------------
-        upsert_fixture(fixture)
+    # --- Stats ---
+    stats = {
+        "minute": fixture.get("minute") or 0,
+        "home_shots_on": 0,
+        "away_shots_on": 0,
+        "home_attacks": 0,
+        "away_attacks": 0,
+    }
 
-        # ------------------- STATS SNAPSHOT ---------------------
-        stats_row = {
-            "minute": fixture.get("minute", 0),
-            "home_shots_on": 0,
-            "away_shots_on": 0,
-            "home_attacks": 0,
-            "away_attacks": 0,
-        }
+    stats_raw = get_fixture_stats(fid) or []
+    for team in stats_raw:
+        tid = team.get("team", {}).get("id")
+        for s in team.get("statistics", []):
+            t = s.get("type")
+            v = s.get("value") or 0
 
-        stats_raw = get_fixture_stats(fid)
-        if stats_raw:
-            for team in stats_raw:
-                tid = team.get("team", {}).get("id")
-                for s in team.get("statistics", []):
-                    t = s.get("type")
-                    v = s.get("value") or 0
+            if t == "Shots on Goal":
+                if tid == fixture["home_team_id"]:
+                    stats["home_shots_on"] = v
+                else:
+                    stats["away_shots_on"] = v
 
-                    if t == "Shots on Goal":
-                        if tid == fixture["home_team_id"]:
-                            stats_row["home_shots_on"] = v
-                        else:
-                            stats_row["away_shots_on"] = v
+            if t == "Attacks":
+                if tid == fixture["home_team_id"]:
+                    stats["home_attacks"] = v
+                else:
+                    stats["away_attacks"] = v
 
-                    if t == "Attacks":
-                        if tid == fixture["home_team_id"]:
-                            stats_row["home_attacks"] = v
-                        else:
-                            stats_row["away_attacks"] = v
+    insert_stats(fid, stats)
 
-        insert_stats(fid, stats_row)
+    # --- Odds ---
+    odds_api = api_get("odds/live", {"fixture": fid})
 
-        # ------------------- ODDS SNAPSHOT ----------------------
-        # api_get returns the "response" array directly → list
-        odds_rows = api_get("odds/live", {"fixture": fid})
+    # Normalize dict/list response
+    if isinstance(odds_api, dict):
+        odds_resp = odds_api.get("response") or []
+    elif isinstance(odds_api, list):
+        odds_resp = odds_api[0].get("response") if odds_api and isinstance(odds_api[0], dict) else []
+    else:
+        odds_resp = []
 
-        if odds_rows and isinstance(odds_rows, list):
-            first = odds_rows[0]
-            odds_list = first.get("odds", []) if isinstance(first, dict) else []
-        else:
-            odds_list = []
+    odds_list = odds_resp[0].get("odds") if odds_resp else []
+    odds_1x2, odds_ou25, odds_btts = extract_core_odds(odds_list)
 
-        odds_1x2, odds_ou25, odds_btts = extract_core_odds(odds_list)
+    insert_odds(fid, {
+        "1x2": odds_1x2,
+        "ou25": odds_ou25,
+        "btts": odds_btts,
+    })
 
-        insert_odds(fid, {
-            "1x2": odds_1x2,
-            "ou25": odds_ou25,
-            "btts": odds_btts,
-        })
+    # --- Predictions ---
+    prematch_strength = {"home": 0.0, "away": 0.0}
 
-        # ------------------- ML PREDICTIONS ---------------------
-        prematch_strength = {"home": 0.0, "away": 0.0}
-        prematch_goal_exp = 2.6
-        prematch_btts_exp = 0.55
+    preds = []
+    preds += predict_fixture_1x2(fixture, stats, odds_1x2, prematch_strength)
+    preds += predict_fixture_ou25(fixture, stats, odds_ou25, 2.6)
+    preds += predict_fixture_btts(fixture, stats, odds_btts, 0.55)
 
-        preds = []
-        preds += predict_fixture_1x2(fixture, stats_row, odds_1x2, prematch_strength)
-        preds += predict_fixture_ou25(fixture, stats_row, odds_ou25, prematch_goal_exp)
-        preds += predict_fixture_btts(fixture, stats_row, odds_btts, prematch_btts_exp)
-
-        return preds
-
-    except Exception as e:
-        print(f"[PROCESS] Error processing fixture: {e}")
-        return []
+    return preds
 
 
 # ============================================================
@@ -266,20 +217,13 @@ def process_fixture(f_raw):
 # ============================================================
 
 def live_prediction_cycle():
-    print("[GOALSNIPER] Live scan triggered...")
+    print("[GOALSNIPER] Live scan running...")
 
-    try:
-        fixtures_raw = get_live_fixtures()
-    except Exception as e:
-        print("[GOALSNIPER] Error fetching live fixtures:", e)
-        return
-
+    fixtures = get_live_fixtures()
     all_preds = []
 
-    for fr in fixtures_raw:
-        preds = process_fixture(fr)
-        if preds:
-            all_preds.extend(preds)
+    for fr in fixtures:
+        all_preds.extend(process_fixture(fr))
 
     final_preds = filter_predictions(all_preds)
 
@@ -287,10 +231,8 @@ def live_prediction_cycle():
         print("[GOALSNIPER] No predictions passed filters.")
         return
 
-    # Send to Telegram
     send_predictions(final_preds)
 
-    # Store predictions in Supabase
     for p in final_preds:
         insert_tip({
             "fixture_id": p.fixture_id,
@@ -302,8 +244,6 @@ def live_prediction_cycle():
             "minute": p.aux.get("minute"),
         })
 
-    print(f"[GOALSNIPER] Predictions sent & saved ({len(final_preds)} bets).")
-
 
 # ============================================================
 # SCHEDULER
@@ -314,19 +254,13 @@ def start_scheduler_once():
         return
     scheduler.add_job(live_prediction_cycle, "interval", seconds=LIVE_PREDICTION_INTERVAL)
     scheduler.start()
-    print(f"[GOALSNIPER] Scheduler started ({LIVE_PREDICTION_INTERVAL}s)")
 
 
-def start_async_scheduler():
-    t = threading.Thread(target=start_scheduler_once, daemon=True)
-    t.start()
-
-
-start_async_scheduler()
+threading.Thread(target=start_scheduler_once).start()
 
 
 # ============================================================
-# FLASK ENTRYPOINT
+# Flask entry
 # ============================================================
 
 if __name__ == "__main__":
