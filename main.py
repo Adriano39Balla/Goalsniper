@@ -347,11 +347,13 @@ def init_db():
 
         # Ensure ALL expected columns exist (covers very old schemas)
         _add("match_id BIGINT", "match_id")
+        _add("fixture_id BIGINT", "fixture_id")          # NEW
         _add("league_id BIGINT", "league_id")
         _add("league TEXT", "league")
         _add("home TEXT", "home")
         _add("away TEXT", "away")
         _add("market TEXT", "market")
+        _add("selection TEXT", "selection")              # NEW
         _add("suggestion TEXT", "suggestion")
         _add("confidence DOUBLE PRECISION", "confidence")
         _add("confidence_raw DOUBLE PRECISION", "confidence_raw")
@@ -370,6 +372,8 @@ def init_db():
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_tips_match_created ON tips (match_id, created_ts)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
+        if _has("fixture_id"):
+            c.execute("CREATE INDEX IF NOT EXISTS idx_tips_fixture ON tips (fixture_id)")
         if _has("sent_ok", "created_ts"):
             c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
 
@@ -588,6 +592,21 @@ def extract_features(m: dict) -> Dict[str,float]:
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# selection helper (NEW)
+# ──────────────────────────────────────────────────────────────────────────────
+def _selection_from(market_text: str, suggestion: str) -> str:
+    m = (market_text or "").upper()
+    s = (suggestion or "").upper()
+    if m.startswith("OVER/UNDER"):
+        return "Over" if s.startswith("OVER") else "Under"
+    if m == "BTTS":
+        return "Yes" if s.endswith("YES") else "No"
+    if m == "1X2":
+        if s.startswith("HOME"): return "Home"
+        if s.startswith("AWAY"): return "Away"
+    return "Unknown"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Model loading (weights stored as JSON in settings table)
 # ──────────────────────────────────────────────────────────────────────────────
 EPS=1e-12
@@ -710,7 +729,6 @@ def _load_training_rows_from_snapshots(days: int = 365, per_match: str = "latest
             got = c.execute(f"SELECT match_id, final_goals_h, final_goals_a, btts_yes FROM match_results WHERE match_id IN ({fmt})", tuple(mids)).fetchall()
             for (mid, gh, ga, btts) in got:
                 have.add(int(mid))
-            # optional: silently skip those without results yet
 
     out: List[Tuple[dict, str, int, Optional[float]]] = []
     for (mid, cts, payload) in rows:
@@ -719,22 +737,15 @@ def _load_training_rows_from_snapshots(days: int = 365, per_match: str = "latest
         try:
             snap = json.loads(payload or "{}")
             feat = snap.get("stat") or snap  # support both {stat:{...}} and flat payloads
-            # pull results (a second query per row here is fine; you can cache if needed)
             with db_conn() as c2:
                 gh, ga, btts = c2.execute(
                     "SELECT final_goals_h, final_goals_a, btts_yes FROM match_results WHERE match_id=%s",
                     (int(mid),)
                 ).fetchone()
             total = int(gh or 0) + int(ga or 0)
-
-            # OU labels
             out.append((feat, "Over 2.5 Goals", 1 if total > 2.5 else 0, None))
             out.append((feat, "Over 3.5 Goals", 1 if total > 3.5 else 0, None))
-
-            # BTTS
             out.append((feat, "BTTS: Yes", 1 if int(btts or 0) == 1 else 0, None))
-
-            # 1X2 (draw suppressed) — provide both streams so home/away models each learn
             out.append((feat, "Home Win", 1 if int(gh or 0) > int(ga or 0) else 0, None))
             out.append((feat, "Away Win", 1 if int(ga or 0) > int(gh or 0) else 0, None))
         except Exception:
@@ -1134,15 +1145,15 @@ def production_scan() -> Tuple[int, int]:
                         continue
                     created_ts = base_now + idx
                     prob_pct = round(float(prob) * 100.0, 1)
+                    sel = _selection_from(market_txt, suggestion)  # NEW
                     with db_conn() as c2:
                         c2.execute(
-                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,"
-                            "confidence,confidence_raw,score_at_tip,minute,created_ts,"
-                            "odds,book,ev_pct,sent_ok) "
-                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                            "INSERT INTO tips(fixture_id,match_id,league_id,league,home,away,market,selection,suggestion,"
+                            "confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
                             (
-                                fid, league_id, league, home, away,
-                                market_txt, suggestion,
+                                fid, fid, league_id, league, home, away,
+                                market_txt, sel, suggestion,
                                 float(prob_pct), float(prob), score, minute, created_ts,
                                 (float(odds) if odds is not None else None),
                                 (book or None),
