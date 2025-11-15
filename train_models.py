@@ -756,3 +756,4 @@ def _cli_main() -> None:
     print(json.dumps(res, indent=2))
 
 if __name__ == "__main__":
+    _cli_main()
