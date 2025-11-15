@@ -1443,6 +1443,20 @@ def http_training_readiness():
         "tips_with_odds": int(tips_with_odds)
     })
 
+@app.route("/admin/odds-debug", methods=["GET"])
+def http_odds_debug():
+    _require_admin()
+    fid = int(request.args.get("fixture_id") or request.args.get("fid") or 0)
+    if not fid:
+        return jsonify({"ok": False, "error": "fixture_id (or fid) required"}), 400
+    od = fetch_odds(fid)
+    return jsonify({
+        "ok": True,
+        "fixture_id": fid,
+        "odds": {k: v for k, v in od.items() if k != "_debug"},
+        "debug": od.get("_debug", {})
+    })
+
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest():
     _require_admin()
