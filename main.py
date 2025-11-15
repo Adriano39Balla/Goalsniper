@@ -270,7 +270,7 @@ REQ_TIMEOUT_SEC = float(os.getenv("REQ_TIMEOUT_SEC", "8.0"))
 # ──────────────────────────────────────────────────────────────────────────────
 def init_db():
     with db_conn() as c:
-        # --- Create tables if missing (won't alter existing tables) ---
+        # 1) Create tables if missing (no PK assumptions here)
         c.execute("""CREATE TABLE IF NOT EXISTS tips (
             match_id BIGINT,
             league_id BIGINT,
@@ -323,34 +323,47 @@ def init_db():
             payload TEXT
         )""")
 
-        # --- Evolutive column adds (safe even if already present) ---
-        def _add(coldef: str):
-            c.execute(f"ALTER TABLE tips ADD COLUMN IF NOT EXISTS {coldef}")
+        # 2) Column introspection for 'tips'
+        cols = set(
+            x[0] for x in c.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='tips'"
+            ).fetchall()
+        )
 
-        _add("league_id BIGINT")
-        _add("league TEXT")
-        _add("home TEXT")
-        _add("away TEXT")
-        _add("market TEXT")
-        _add("suggestion TEXT")
-        _add("confidence DOUBLE PRECISION")
-        _add("confidence_raw DOUBLE PRECISION")
-        _add("score_at_tip TEXT")
-        _add("minute INTEGER")
-        _add("created_ts BIGINT")
-        _add("odds DOUBLE PRECISION")
-        _add("book TEXT")
-        _add("ev_pct DOUBLE PRECISION")
-        _add("sent_ok INTEGER")
+        def _add(coldef: str, colname: str):
+            if colname not in cols:
+                c.execute(f"ALTER TABLE tips ADD COLUMN IF NOT EXISTS {coldef}")
+                cols.add(colname)
 
-        # --- Indexes/constraints (created after columns exist) ---
-        # Unique surrogate for intended PK(match_id, created_ts) without altering existing PK
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_tips_match_created ON tips (match_id, created_ts)")
+        # Ensure ALL expected columns exist (covers very old schemas)
+        _add("match_id BIGINT", "match_id")
+        _add("league_id BIGINT", "league_id")
+        _add("league TEXT", "league")
+        _add("home TEXT", "home")
+        _add("away TEXT", "away")
+        _add("market TEXT", "market")
+        _add("suggestion TEXT", "suggestion")
+        _add("confidence DOUBLE PRECISION", "confidence")
+        _add("confidence_raw DOUBLE PRECISION", "confidence_raw")
+        _add("score_at_tip TEXT", "score_at_tip")
+        _add("minute INTEGER", "minute")
+        _add("created_ts BIGINT", "created_ts")
+        _add("odds DOUBLE PRECISION", "odds")
+        _add("book TEXT", "book")
+        _add("ev_pct DOUBLE PRECISION", "ev_pct")
+        _add("sent_ok INTEGER", "sent_ok")
 
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
+        # 3) Indexes/constraints — only if the required columns exist
+        def _has(*need): return all(n in cols for n in need)
 
+        if _has("match_id", "created_ts"):
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_tips_match_created ON tips (match_id, created_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
+        if _has("sent_ok", "created_ts"):
+            c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
+
+        # Other table indexes (these don't depend on old columns)
         c.execute("CREATE INDEX IF NOT EXISTS idx_snap_by_match ON tip_snapshots (match_id, created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_updated ON match_results (updated_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_match ON odds_history (match_id, captured_ts DESC)")
