@@ -1419,6 +1419,30 @@ def http_train():
     except Exception as e:
         log.exception("train_models failed: %s", e); return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/admin/training-readiness", methods=["GET"])
+def http_training_readiness():
+    _require_admin()
+    with db_conn() as c:
+        total_snaps = c.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
+        matches_snaps = c.execute("SELECT COUNT(DISTINCT match_id) FROM tip_snapshots").fetchone()[0]
+        matches_ready = c.execute("""
+            SELECT COUNT(DISTINCT s.match_id)
+            FROM tip_snapshots s
+            JOIN match_results r ON r.match_id = s.match_id
+        """).fetchone()[0]
+        tips_with_odds = c.execute("""
+            SELECT COUNT(*) FROM tips
+            WHERE odds IS NOT NULL AND suggestion <> 'HARVEST'
+        """).fetchone()[0]
+    return jsonify({
+        "ok": True,
+        "snapshots_total": int(total_snaps),
+        "snapshot_matches": int(matches_snaps),
+        "matches_with_results": int(matches_ready),
+        "est_rows_from_snapshots": int(matches_ready) * 5,
+        "tips_with_odds": int(tips_with_odds)
+    })
+
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest():
     _require_admin()
