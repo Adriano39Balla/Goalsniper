@@ -17,7 +17,7 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
 import numpy as np
-import pandas as pd
+
 from flask import Flask, jsonify, request, abort
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
