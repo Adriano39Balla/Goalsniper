@@ -270,33 +270,87 @@ REQ_TIMEOUT_SEC = float(os.getenv("REQ_TIMEOUT_SEC", "8.0"))
 # ──────────────────────────────────────────────────────────────────────────────
 def init_db():
     with db_conn() as c:
+        # --- Create tables if missing (won't alter existing tables) ---
         c.execute("""CREATE TABLE IF NOT EXISTS tips (
-            match_id BIGINT, league_id BIGINT, league TEXT,
-            home TEXT, away TEXT, market TEXT, suggestion TEXT,
-            confidence DOUBLE PRECISION, confidence_raw DOUBLE PRECISION,
-            score_at_tip TEXT, minute INTEGER, created_ts BIGINT,
+            match_id BIGINT,
+            league_id BIGINT,
+            league TEXT,
+            home TEXT, away TEXT,
+            market TEXT, suggestion TEXT,
+            confidence DOUBLE PRECISION,
+            confidence_raw DOUBLE PRECISION,
+            score_at_tip TEXT,
+            minute INTEGER,
+            created_ts BIGINT,
             odds DOUBLE PRECISION, book TEXT, ev_pct DOUBLE PRECISION,
-            sent_ok INTEGER DEFAULT 1,
-            PRIMARY KEY (match_id, created_ts))""")
+            sent_ok INTEGER DEFAULT 1
+        )""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS tip_snapshots (
             match_id BIGINT, created_ts BIGINT, payload TEXT,
-            PRIMARY KEY (match_id, created_ts))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS feedback (
-            id SERIAL PRIMARY KEY, match_id BIGINT UNIQUE, verdict INTEGER, created_ts BIGINT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
+            PRIMARY KEY (match_id, created_ts)
+        )""")
+
+        c.execute("""CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY, value TEXT
+        )""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS match_results (
-            match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
+            match_id BIGINT PRIMARY KEY,
+            final_goals_h INTEGER, final_goals_a INTEGER,
+            btts_yes INTEGER, updated_ts BIGINT
+        )""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS odds_history (
-            match_id BIGINT, captured_ts BIGINT, market TEXT, selection TEXT,
-            odds DOUBLE PRECISION, book TEXT,
-            PRIMARY KEY (match_id, market, selection, captured_ts))""")
+            match_id BIGINT,
+            captured_ts BIGINT,
+            market TEXT,
+            selection TEXT,
+            odds DOUBLE PRECISION,
+            book TEXT,
+            PRIMARY KEY (match_id, market, selection, captured_ts)
+        )""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS lineups (
-            match_id BIGINT PRIMARY KEY, created_ts BIGINT, payload TEXT)""")
+            match_id BIGINT PRIMARY KEY,
+            created_ts BIGINT,
+            payload TEXT
+        )""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
-            match_id BIGINT PRIMARY KEY, created_ts BIGINT, payload TEXT)""")
+            match_id BIGINT PRIMARY KEY,
+            created_ts BIGINT,
+            payload TEXT
+        )""")
+
+        # --- Evolutive column adds (safe even if already present) ---
+        def _add(coldef: str):
+            c.execute(f"ALTER TABLE tips ADD COLUMN IF NOT EXISTS {coldef}")
+
+        _add("league_id BIGINT")
+        _add("league TEXT")
+        _add("home TEXT")
+        _add("away TEXT")
+        _add("market TEXT")
+        _add("suggestion TEXT")
+        _add("confidence DOUBLE PRECISION")
+        _add("confidence_raw DOUBLE PRECISION")
+        _add("score_at_tip TEXT")
+        _add("minute INTEGER")
+        _add("created_ts BIGINT")
+        _add("odds DOUBLE PRECISION")
+        _add("book TEXT")
+        _add("ev_pct DOUBLE PRECISION")
+        _add("sent_ok INTEGER")
+
+        # --- Indexes/constraints (created after columns exist) ---
+        # Unique surrogate for intended PK(match_id, created_ts) without altering existing PK
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_tips_match_created ON tips (match_id, created_ts)")
+
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
+
         c.execute("CREATE INDEX IF NOT EXISTS idx_snap_by_match ON tip_snapshots (match_id, created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_updated ON match_results (updated_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_match ON odds_history (match_id, captured_ts DESC)")
