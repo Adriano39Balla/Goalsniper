@@ -1,759 +1,434 @@
-# file: train_models.py
-
-
-import argparse, json, os, logging, math
-from typing import Any, Dict, List, Optional, Tuple
+#!/usr/bin/env python3
+import os, json, time, math, logging
+from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
-import pandas as pd
 import psycopg2
+from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+
 from sklearn.linear_model import LogisticRegression
-from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import (
-    brier_score_loss, accuracy_score, log_loss, precision_score,
-    roc_auc_score, precision_recall_curve
-)
+from sklearn.model_selection import train_test_split
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
+load_dotenv()
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
-logger = logging.getLogger("trainer")
+log = logging.getLogger("trainer")
 
-# ───────────────────────── Feature sets (match main.py) ───────────────────────── #
+# ── ENV ───────────────────────────────────────────────────────────────────────
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if "sslmode=" not in DATABASE_URL:
+    DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
 
-FEATURES: List[str] = [
-    "minute",
-    "goals_h","goals_a","goals_sum","goals_diff",
+MIN_SAMPLES_PER_MODEL = int(os.getenv("MIN_SAMPLES_PER_MODEL", "50"))  # start easy
+TIP_MIN_MINUTE = int(os.getenv("TIP_MIN_MINUTE", "12"))
+SNAP_MAX_MINUTE = int(os.getenv("SNAP_MAX_MINUTE", "85"))
+
+TARGET_PRECISION = float(os.getenv("TARGET_PRECISION", "0.60"))
+THRESH_MIN_PREDICTIONS = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
+MIN_THRESH = float(os.getenv("MIN_THRESH", "55"))
+MAX_THRESH = float(os.getenv("MAX_THRESH", "85"))
+APPLY_TUNE_PREC_TOL = float(os.getenv("APPLY_TUNE_PREC_TOL", "0.03"))
+MAX_ODDS_ALL = float(os.getenv("MAX_ODDS_ALL", "20.0"))
+
+# common feature whitelist (if we need to pick from messy payloads)
+WHITELIST = {
+    "minute","goals_h","goals_a","goals_sum","goals_diff",
     "xg_h","xg_a","xg_sum","xg_diff",
     "sot_h","sot_a","sot_sum",
     "sh_total_h","sh_total_a",
     "cor_h","cor_a","cor_sum",
     "pos_h","pos_a","pos_diff",
     "red_h","red_a","red_sum",
-    "yellow_h","yellow_a",
-]
+    "yellow_h","yellow_a"
+}
 
-# Prematch snapshots (as saved by main.save_prematch_snapshot via extract_prematch_features)
-PRE_FEATURES: List[str] = [
-    "pm_ov25_h","pm_ov35_h","pm_btts_h",
-    "pm_ov25_a","pm_ov35_a","pm_btts_a",
-    "pm_ov25_h2h","pm_ov35_h2h","pm_btts_h2h",
-    # live placeholders for shape-compat
-    "minute","goals_h","goals_a","goals_sum","goals_diff",
-    "xg_h","xg_a","xg_sum","xg_diff","sot_h","sot_a","sot_sum",
-    "sh_total_h","sh_total_a","cor_h","cor_a","cor_sum",
-    "pos_h","pos_a","pos_diff","red_h","red_a","red_sum",
-    "yellow_h","yellow_a",
-]
+# ── DB helpers ────────────────────────────────────────────────────────────────
+def _conn():
+    return psycopg2.connect(DATABASE_URL)
 
-EPS = 1e-6
+def get_rows(sql: str, params: tuple = ()):
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, params); return cur.fetchall()
 
-# ─────────────────────── Env knobs ─────────────────────── #
+def exec_sql(sql: str, params: tuple = ()):
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
 
-RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "120"))  # 0 disables
-RECENCY_MONTHS         = int(os.getenv("RECENCY_MONTHS", "36"))             # training window cap
-MARKET_CUTOFFS_RAW     = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
-TIP_MAX_MINUTE_ENV     = os.getenv("TIP_MAX_MINUTE", "")
-OU_TRAIN_LINES_RAW     = os.getenv("OU_TRAIN_LINES", os.getenv("OU_LINES", "2.5,3.5"))
+def set_setting(key: str, value: str) -> None:
+    exec_sql("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (key, value))
 
-def _parse_market_cutoffs(s: str) -> Dict[str,int]:
-    out: Dict[str,int] = {}
-    for tok in (s or "").split(","):
-        tok = tok.strip()
-        if not tok or "=" not in tok: continue
-        k,v = tok.split("=",1)
-        try: out[k.strip().upper()] = int(float(v.strip()))
-        except: pass
-    return out
+# ── math utils ────────────────────────────────────────────────────────────────
+def _sigmoid(x: float) -> float:
+    if x < -50: return 1e-22
+    if x >  50: return 1-1e-22
+    return 1.0/(1.0+math.exp(-x))
 
-MARKET_CUTOFFS = _parse_market_cutoffs(MARKET_CUTOFFS_RAW)
-try:
-    TIP_MAX_MINUTE: Optional[int] = int(float(TIP_MAX_MINUTE_ENV)) if TIP_MAX_MINUTE_ENV.strip() else None
-except Exception:
-    TIP_MAX_MINUTE = None
+def _logit(p: float) -> float:
+    p = max(1e-12, min(1-1e-12, float(p)))
+    return math.log(p/(1.0-p))
 
-def _parse_ou_lines(raw: str) -> List[float]:
-    vals: List[float] = []
-    for t in (raw or "").split(","):
-        t = t.strip()
-        if not t: continue
-        try: vals.append(float(t))
-        except: pass
-    return vals or [2.5, 3.5]
+def _fit_platt(probs: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    z = np.array([_logit(p) for p in probs]).reshape(-1, 1)
+    lr = LogisticRegression(solver="liblinear", max_iter=200)
+    lr.fit(z, y.astype(int))
+    return float(lr.coef_[0][0]), float(lr.intercept_[0])
 
-# ─────────────────────── DB utils ─────────────────────── #
-
-def _connect(db_url: str):
-    if not db_url: raise SystemExit("DATABASE_URL must be set.")
-    if "sslmode=" not in db_url:
-        db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
-    conn = psycopg2.connect(db_url); conn.autocommit = True
-    return conn
-
-def _read_sql(conn, sql: str, params: Tuple = ()) -> pd.DataFrame:
-    return pd.read_sql_query(sql, conn, params=params)
-
-def _exec(conn, sql: str, params: Tuple = ()) -> None:
-    with conn.cursor() as cur: cur.execute(sql, params)
-
-def _set_setting(conn, key: str, value: str) -> None:
-    _exec(conn,
-          "INSERT INTO settings(key,value) VALUES(%s,%s) "
-          "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-          (key, value))
-
-def _ensure_training_tables(conn) -> None:
-    _exec(conn, "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-    _exec(conn, """
-        CREATE TABLE IF NOT EXISTS prematch_snapshots (
-            match_id   BIGINT PRIMARY KEY,
-            created_ts BIGINT,
-            payload    TEXT
-        )
-    """)
-    _exec(conn, "CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
-
-def _get_setting_json(conn, key: str) -> Optional[dict]:
+# ── payload parsing (robust) ──────────────────────────────────────────────────
+def _to_float(v) -> Optional[float]:
     try:
-        df = _read_sql(conn, "SELECT value FROM settings WHERE key=%s", (key,))
-        if df.empty: return None
-        return json.loads(df.iloc[0]["value"])
+        if isinstance(v, str):
+            s = v.strip()
+            if s.endswith("%"):
+                return float(s[:-1])
+            return float(s)
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
     except Exception:
         return None
 
-# ─────────────────────── Data loaders ─────────────────────── #
+def _flatten_numeric(obj: Any, out: Dict[str, float], prefix: str = "") -> None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}{k}" if prefix == "" else f"{prefix}.{k}"
+            if isinstance(v, (dict, list)):
+                _flatten_numeric(v, out, key)
+            else:
+                fv = _to_float(v)
+                if fv is not None:
+                    leaf = key.split(".")[-1]
+                    # keep either whitelisted names or anything that looks numeric
+                    if leaf in WHITELIST or prefix.endswith("stat"):
+                        out[leaf] = fv
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _flatten_numeric(v, out, f"{prefix}[{i}]")
+    else:
+        fv = _to_float(obj)
+        if fv is not None and (prefix or "value") in WHITELIST:
+            out[prefix or "value"] = fv
 
-def _ensure_columns(df: "pd.DataFrame", cols: List[str]) -> "pd.DataFrame":
-    for c in cols:
-        if c not in df.columns: df[c] = 0.0
-    df[cols] = df[cols].replace([np.inf,-np.inf], np.nan).fillna(0.0)
-    return df[cols]
+def _maybe_json(s: str) -> Any:
+    try:
+        js = json.loads(s)
+        # double-encoded?
+        if isinstance(js, str) and js.strip().startswith("{"):
+            return json.loads(js)
+        return js
+    except Exception:
+        return {}
 
-def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
-    q = """
-    WITH latest AS (
-      SELECT match_id, MAX(created_ts) AS ts
-      FROM tip_snapshots
-      GROUP BY match_id
+def _features_from_payload(raw: str) -> Dict[str, float]:
+    """
+    Accepts many shapes:
+    - {"stat": {...}}  ← preferred
+    - flat numeric dict
+    - nested dicts (we flatten numerical leaves)
+    - double-encoded JSON
+    """
+    try:
+        js = _maybe_json(raw or "{}")
+        if not isinstance(js, dict):
+            return {}
+        # prefer stat if present
+        source = js.get("stat") if isinstance(js.get("stat"), (dict, list)) else js
+        out: Dict[str, float] = {}
+        _flatten_numeric(source, out)
+        # soft prune: only keep whitelisted + minute if present
+        if out:
+            out2 = {}
+            for k, v in out.items():
+                if k in WHITELIST or k == "minute":
+                    out2[k] = float(v)
+            if not out2:  # if pruning killed everything, keep the original numeric set
+                out2 = {k: float(v) for k, v in out.items()}
+            return out2
+        return {}
+    except Exception:
+        return {}
+
+# ── Loaders ───────────────────────────────────────────────────────────────────
+def _load_training_rows_from_tips(days: int = 90) -> List[Tuple[dict, str, int]]:
+    cutoff = int(time.time()) - days * 24 * 3600
+    sql = """
+      SELECT t.match_id, t.suggestion, r.final_goals_h, r.final_goals_a, r.btts_yes,
+             (
+                SELECT s.payload FROM tip_snapshots s
+                WHERE s.match_id = t.match_id AND s.created_ts <= t.created_ts
+                ORDER BY s.created_ts DESC LIMIT 1
+             ) AS payload
+      FROM tips t
+      JOIN match_results r ON r.match_id = t.match_id
+      WHERE t.created_ts >= %s
+        AND t.suggestion <> 'HARVEST'
+        AND t.odds BETWEEN 1.01 AND %s
+    """
+    rows = get_rows(sql, (cutoff, MAX_ODDS_ALL))
+    out: List[Tuple[dict, str, int]] = []
+    for (mid, sugg, gh, ga, btts, payload) in rows:
+        feat = _features_from_payload(payload or "{}")
+        if not feat: continue
+        minute = int(float(feat.get("minute", 0)))
+        if minute and minute < TIP_MIN_MINUTE:  # if we know minute, respect it
+            continue
+        total = int(gh or 0) + int(ga or 0)
+        if sugg.startswith("Over"):
+            line = None
+            for tok in sugg.split():
+                try: line = float(tok); break
+                except: pass
+            if line is None: continue
+            y = 1 if total > line else (0 if total < line else None)
+            if y is None: continue
+            out.append((feat, f"Over {line} Goals", y))
+        elif sugg == "BTTS: Yes":
+            out.append((feat, "BTTS: Yes", 1 if int(btts or 0) == 1 else 0))
+        elif sugg == "BTTS: No":
+            out.append((feat, "BTTS: Yes", 0 if int(btts or 0) == 1 else 1))  # train YES model
+        elif sugg == "Home Win":
+            out.append((feat, "Home Win", 1 if int(gh or 0) > int(ga or 0) else 0))
+        elif sugg == "Away Win":
+            out.append((feat, "Away Win", 1 if int(ga or 0) > int(gh or 0) else 0))
+    log.info("[TRAIN] rows from tips+odds: %d", len(out))
+    return out
+
+def _load_training_rows_from_snapshots(days: int = 730, per_match: str = "first_viable") -> List[Tuple[dict, str, int]]:
+    cutoff = int(time.time()) - days * 24 * 3600
+    # only matches with results
+    mids = get_rows("""
+        SELECT DISTINCT s.match_id
+        FROM tip_snapshots s
+        JOIN match_results r ON r.match_id = s.match_id
+        WHERE s.created_ts >= %s
+    """, (cutoff,))
+    mids = [int(x[0]) for x in mids]
+    if not mids:
+        log.info("[TRAIN] no snapshot matches with results in window")
+        return []
+    # stream snapshots and pick one per match
+    rows = get_rows(
+        "SELECT match_id, created_ts, payload FROM tip_snapshots WHERE match_id = ANY(%s) ORDER BY match_id, created_ts ASC",
+        (mids,)
     )
-    SELECT l.match_id, s.created_ts, s.payload,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
-    FROM latest l
-    JOIN tip_snapshots s ON s.match_id = l.match_id AND s.created_ts = l.ts
-    JOIN match_results r ON r.match_id = l.match_id
-    """
-    rows = _read_sql(conn, q)
-    if rows.empty: return pd.DataFrame()
+    by_mid: Dict[int, List[Tuple[int, str]]] = {}
+    for (mid, cts, payload) in rows:
+        by_mid.setdefault(int(mid), []).append((int(cts), payload))
 
-    feats: List[Dict[str,Any]] = []
-    for _, row in rows.iterrows():
-        try:
-            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else (row["payload"] or {})
-            stat = payload.get("stat") or {}
-            gh = float(payload.get("gh", 0)); ga = float(payload.get("ga", 0))
-            f = {
-                "_mid": int(row["match_id"]), "_ts": float(row["created_ts"]),
-                "minute": float(payload.get("minute", 0)),
-                "goals_h": gh, "goals_a": ga, "goals_sum": gh+ga, "goals_diff": gh-ga,
-                "xg_h": float(stat.get("xg_h",0)), "xg_a": float(stat.get("xg_a",0)),
-                "xg_sum": float(stat.get("xg_sum", stat.get("xg_h",0)+stat.get("xg_a",0))),
-                "xg_diff": float(stat.get("xg_diff", stat.get("xg_h",0)-stat.get("xg_a",0))),
-                "sot_h": float(stat.get("sot_h",0)), "sot_a": float(stat.get("sot_a",0)),
-                "sot_sum": float(stat.get("sot_sum", stat.get("sot_h",0)+stat.get("sot_a",0))),
-                "cor_h": float(stat.get("cor_h",0)), "cor_a": float(stat.get("cor_a",0)),
-                "cor_sum": float(stat.get("cor_sum", stat.get("cor_h",0)+stat.get("cor_a",0))),
-                "pos_h": float(stat.get("pos_h",0)), "pos_a": float(stat.get("pos_a",0)),
-                "pos_diff": float(stat.get("pos_diff", stat.get("pos_h",0)-stat.get("pos_a",0))),
-                "red_h": float(stat.get("red_h",0)), "red_a": float(stat.get("red_a",0)),
-                "red_sum": float(stat.get("red_sum", stat.get("red_h",0)+stat.get("red_a",0))),
-                "sh_total_h": float(stat.get("sh_total_h",0)), "sh_total_a": float(stat.get("sh_total_a",0)),
-                "yellow_h": float(stat.get("yellow_h",0)), "yellow_a": float(stat.get("yellow_a",0)),
-                "final_goals_h": int(row["final_goals_h"] or 0),
-                "final_goals_a": int(row["final_goals_a"] or 0),
-                "btts_yes": int(row["btts_yes"] or 0),
-                "final_goals_sum": int(row["final_goals_h"] or 0) + int(row["final_goals_a"] or 0),
-                "final_goals_diff": int(row["final_goals_h"] or 0) - int(row["final_goals_a"] or 0),
-            }
-            feats.append(f)
-        except Exception:
+    # results map
+    res_map = {}
+    res_rows = get_rows("SELECT match_id, final_goals_h, final_goals_a, btts_yes FROM match_results WHERE match_id = ANY(%s)", (mids,))
+    for (mid, gh, ga, btts) in res_rows:
+        res_map[int(mid)] = (int(gh or 0), int(ga or 0), int(btts or 0))
+
+    out: List[Tuple[dict, str, int]] = []
+    used = 0
+    usable = 0
+
+    for mid, arr in by_mid.items():
+        pick_feat = None
+        if per_match == "latest":
+            _, payload = arr[-1]
+            feat = _features_from_payload(payload)
+            if feat: pick_feat = feat
+        else:  # earliest viable
+            for _, payload in arr:
+                feat = _features_from_payload(payload)
+                if not feat: continue
+                minute = int(float(feat.get("minute", 0)))
+                if minute == 0:  # old payloads: accept; else enforce min
+                    pick_feat = feat; break
+                if TIP_MIN_MINUTE <= minute <= SNAP_MAX_MINUTE:
+                    pick_feat = feat; break
+        if not pick_feat: 
             continue
-    if not feats: return pd.DataFrame()
+        usable += 1
+        gh, ga, btts = res_map.get(mid, (None, None, None))
+        if gh is None: continue
+        total = gh + ga
+        out.append((pick_feat, "Over 2.5 Goals", 1 if total > 2.5 else 0))
+        out.append((pick_feat, "Over 3.5 Goals", 1 if total > 3.5 else 0))
+        out.append((pick_feat, "BTTS: Yes",      1 if btts == 1 else 0))
+        out.append((pick_feat, "Home Win",       1 if gh > ga else 0))
+        out.append((pick_feat, "Away Win",       1 if ga > gh else 0))
+        used += 1
 
-    df = pd.DataFrame(feats)
-    num = [c for c in df.columns if c not in ("_mid","_ts")]
-    df[num] = df[num].replace([np.inf,-np.inf], np.nan).fillna(0.0)
-    df["minute"] = df["minute"].clip(0, 120)
-    df = df[df["minute"] >= float(min_minute)].copy()
+    log.info("[TRAIN] snapshots: matches=%d usable=%d rows=%d", len(by_mid), usable, len(out))
+    return out
 
-    if RECENCY_MONTHS > 0:
-        cutoff = pd.Timestamp.utcnow().timestamp() - RECENCY_MONTHS*30*24*3600
-        df = df[df["_ts"] >= cutoff].copy()
-    return df
+# ── model training ────────────────────────────────────────────────────────────
+def _train_one(rows: List[Tuple[dict, str, int]], label_key: str) -> Optional[Dict[str, Any]]:
+    X: List[List[float]] = []
+    y: List[int] = []
 
-def load_prematch_data(conn) -> pd.DataFrame:
-    q = """
-    SELECT p.match_id, p.created_ts, p.payload,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
-    FROM prematch_snapshots p
-    JOIN match_results r ON r.match_id = p.match_id
-    """
-    rows = _read_sql(conn, q)
-    if rows.empty: return pd.DataFrame()
+    # union feature set
+    keys_set = set()
+    for feat, lab, yy in rows:
+        if lab == label_key and feat:
+            keys_set.update(feat.keys())
+    feature_names = sorted(list(keys_set))
+    if not feature_names:
+        log.info("[TRAIN] %s skipped — no usable features", label_key); return None
 
-    feats: List[Dict[str,Any]] = []
-    for _, row in rows.iterrows():
-        try:
-            payload = json.loads(row["payload"]) or {}
-            feat = (payload.get("feat") or {})
-            f = {k: float(feat.get(k, 0.0) or 0.0) for k in PRE_FEATURES}
-            gh_f = int(row["final_goals_h"] or 0); ga_f = int(row["final_goals_a"] or 0)
-            f["_ts"] = int(row["created_ts"] or 0)
-            f["final_goals_sum"]  = gh_f + ga_f
-            f["final_goals_diff"] = gh_f - ga_f
-            f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
-            feats.append(f)
-        except Exception:
-            continue
-    if not feats: return pd.DataFrame()
-    return pd.DataFrame(feats).replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    for feat, lab, yy in rows:
+        if lab != label_key: continue
+        X.append([float(feat.get(k, 0.0) or 0.0) for k in feature_names])
+        y.append(int(yy))
 
-# ─────────────────────── Modeling helpers ─────────────────────── #
+    if len(y) < MIN_SAMPLES_PER_MODEL:
+        log.info("[TRAIN] %s skipped — %d < %d samples", label_key, len(y), MIN_SAMPLES_PER_MODEL); return None
 
-def fit_lr_safe(X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray]=None) -> Optional[LogisticRegression]:
-    if len(np.unique(y)) < 2:
-        return None
-    C = float(os.getenv("LR_C", "1.0"))  # tunable
-    return LogisticRegression(
-        max_iter=5000,
-        solver="saga",
-        penalty="l2",
-        class_weight="balanced",
-        n_jobs=-1,
-        C=C,
-        random_state=42,
-    ).fit(X, y, sample_weight=sample_weight)
+    Xn = np.asarray(X, dtype=float)
+    yn = np.asarray(y, dtype=int)
 
-def _logit_vec(p: np.ndarray) -> np.ndarray:
-    p = np.clip(p.astype(float), 1e-6, 1-1e-6)
-    return np.log(p/(1.0-p))
-
-def _fit_calibration(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[str, Any]:
-    """Return ('platt',(a,b)) or ('isotonic', IsotonicRegression)."""
-    y = y_true.astype(int)
-    z = _logit_vec(p_raw).reshape(-1,1)
-
-    # Platt on logits
-    lr = LogisticRegression(max_iter=1000, solver="lbfgs").fit(z, y)
-    a = float(lr.coef_.ravel()[0]); b = float(lr.intercept_.ravel()[0])
-    p_platt = 1.0/(1.0+np.exp(-(a*z.ravel()+b)))
-    brier_platt = brier_score_loss(y, p_platt)
-
-    best_kind, best_obj, best_brier = "platt", (a,b), brier_platt
-
-    # Isotonic if enough mass and both classes present
-    if len(y) >= 300 and 0 < y.mean() < 1:
-        iso = IsotonicRegression(out_of_bounds="clip")
-        iso.fit(p_raw, y)
-        p_iso = iso.predict(p_raw)
-        brier_iso = brier_score_loss(y, p_iso)
-        if brier_iso + 1e-6 < best_brier:
-            best_kind, best_obj, best_brier = "isotonic", iso, brier_iso
-
-    return best_kind, best_obj
-
-def _apply_calibration(p_raw: np.ndarray, cal_kind: str, cal_obj) -> np.ndarray:
-    if cal_kind == "platt":
-        a,b = cal_obj
-        z = _logit_vec(p_raw)
-        return 1.0/(1.0+np.exp(-(a*z + b)))
-    return np.asarray(cal_obj.predict(p_raw), dtype=float)
-
-def _weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[str,float]:
-    return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
-
-def build_model_blob(model: LogisticRegression, features: List[str], cal_kind: str, cal_obj,
-                     mean: Optional[np.ndarray]=None, scale: Optional[np.ndarray]=None) -> Dict[str,Any]:
-    # If mean/scale provided (we trained on standardized X), fold them into raw-space weights.
-    if mean is not None and scale is not None:
-        intercept, weights = _fold_std_into_weights(model, mean, scale, features)
-    else:
-        intercept = float(model.intercept_.ravel()[0])
-        weights = _weights_dict(model, features)
-
-    blob = {
-        "intercept": float(intercept),
-        "weights": weights,
-        "calibration": {"method":"sigmoid","a":1.0,"b":0.0},
-    }
-    if cal_kind == "platt":
-        a,b = cal_obj
-        blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
-    else:
-        # keep serving simple: approximate isotonic in logit space
-        x = np.concatenate([
-            np.linspace(0.01, 0.10, 30),
-            np.linspace(0.10, 0.90, 120),
-            np.linspace(0.90, 0.99, 30),
-        ])
-        y = np.asarray(cal_obj.predict(x), dtype=float)
-        zx = _logit_vec(x); zy = _logit_vec(np.clip(y, 1e-4, 1-1e-4))
-        a,b = np.polyfit(zx, zy, 1)
-        blob["calibration"] = {"method":"platt","a":float(a),"b":float(b)}
-    return blob
-
-def _standardize_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (X_std, mean, scale). Any zero-variance column is left unscaled."""
-    mean = X.mean(axis=0)
-    scale = X.std(axis=0, ddof=0)
-    scale = np.where(scale <= 1e-12, 1.0, scale)
-    Xs = (X - mean) / scale
-    return Xs, mean, scale
-
-def _fold_std_into_weights(model: LogisticRegression, mean: np.ndarray, scale: np.ndarray, features: List[str]) -> Tuple[float, Dict[str, float]]:
-    """Convert weights learned on standardized X back to raw feature space."""
-    # model.coef_ is for standardized features => w_std
-    w_std = model.coef_.ravel().astype(float)
-    b_std = float(model.intercept_.ravel()[0])
-    # raw weights
-    w_raw = (w_std / scale).astype(float)
-    # intercept shift: b_raw = b_std - sum_j (w_std_j * mean_j / scale_j)
-    b_raw = float(b_std - np.sum(w_std * (mean / scale)))
-    weights = {name: float(w) for name, w in zip(features, w_raw.tolist())}
-    return b_raw, weights
-
-# ─────────────────────── Thresholding ─────────────────────── #
-
-def _percent(x: float) -> float: return float(x)*100.0
-
-def _pick_threshold_for_target_precision(
-    y_true: np.ndarray, p_cal: np.ndarray, target_precision: float,
-    min_preds: int = 25, default_threshold: float = 0.65
-) -> float:
-    y = y_true.astype(int); p = np.asarray(p_cal, dtype=float)
-    best_t: Optional[float] = None
-    candidates = np.arange(0.50, 0.951, 0.005)
-
-    feasible: List[Tuple[float,float,int]] = []
-    for t in candidates:
-        pred = (p>=t).astype(int); n_pred = int(pred.sum())
-        if n_pred < min_preds: continue
-        prec = precision_score(y, pred, zero_division=0)
-        if prec >= target_precision: feasible.append((float(t), float(prec), n_pred))
-
-    if feasible:
-        feasible.sort(key=lambda z: (z[0], -z[1]))
-        best_t = feasible[0][0]
-    else:
-        prec, rec, thr = precision_recall_curve(y, p)
-        if len(thr) > 0:
-            f1 = 2*(prec*rec)/(prec+rec+1e-9)
-            idx = int(np.argmax(f1[:-1])) if len(f1) > 1 else 0
-            best_t = float(thr[max(0, min(idx, len(thr)-1))])
-
-    if best_t is None:
-        best_acc = -1.0
-        for t in candidates:
-            acc = accuracy_score(y, (p>=t).astype(int))
-            if acc > best_acc: best_t, best_acc = float(t), acc
-
-    return float(best_t if best_t is not None else default_threshold)
-
-# ─────────────────────── Split & weights ─────────────────────── #
-
-def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray,np.ndarray]:
-    if "_ts" not in df.columns:
-        n = len(df); idx = np.arange(n)
-        rng = np.random.default_rng(42); rng.shuffle(idx)
-        cut = int((1-test_size)*n)
-        tr = np.zeros(n,dtype=bool); te = np.zeros(n,dtype=bool)
-        tr[idx[:cut]] = True; te[idx[cut:]] = True
-        return tr, te
-
-    df_sorted = df.sort_values("_ts").reset_index(drop=True)
-    n = len(df_sorted); cut = int(max(1,(1-test_size)*n))
-    train_idx = df_sorted.index[:cut].to_numpy(); test_idx = df_sorted.index[cut:].to_numpy()
-    tr = np.zeros(n,dtype=bool); te = np.zeros(n,dtype=bool)
-    tr[train_idx] = True; te[test_idx] = True
-    return tr, te
-
-def recency_weights(ts: np.ndarray) -> Optional[np.ndarray]:
-    if RECENCY_HALF_LIFE_DAYS <= 0: return None
-    now = float(pd.Timestamp.utcnow().timestamp())
-    dt_days = (now - ts.astype(float)) / (24*3600.0)
-    lam = np.log(2) / max(1e-9, RECENCY_HALF_LIFE_DAYS)
-    w = np.exp(-lam * np.maximum(0.0, dt_days))
-    s = float(np.sum(w))
-    return (w/s) if s>0 else None
-
-# ─────────────────────── Core training ─────────────────────── #
-
-def _minute_cutoff_for_market(market: str) -> Optional[int]:
-    m = (market or "").upper()
-    if m.startswith("PRE "): return None
-    if m.startswith("OVER/UNDER"): return MARKET_CUTOFFS.get("OU", TIP_MAX_MINUTE)
-    if m == "BTTS": return MARKET_CUTOFFS.get("BTTS", TIP_MAX_MINUTE)
-    if m == "1X2":  return MARKET_CUTOFFS.get("1X2", TIP_MAX_MINUTE)
-    return TIP_MAX_MINUTE
-
-def _ece(y_true: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
-    y = y_true.astype(int); p = np.clip(p.astype(float), 0, 1)
-    edges = np.linspace(0.0, 1.0, bins+1); ece = 0.0
-    for i in range(bins):
-        lo,hi = edges[i], edges[i+1]
-        mask = (p>=lo)&(p<hi) if i<bins-1 else (p>=lo)&(p<=hi)
-        if not np.any(mask): continue
-        conf = float(np.mean(p[mask])); acc = float(np.mean(y[mask]))
-        ece += (np.sum(mask)/len(p)) * abs(conf-acc)
-    return float(ece)
-
-def _mask_undecided(market_key: str, X_all: np.ndarray, y_all: np.ndarray, features: List[str]) -> np.ndarray:
-    """
-    Keep rows where the outcome isn't trivially decided at snapshot.
-    - OU_L: drop rows where goals_sum > line (Over guaranteed)
-    - BTTS: drop rows where goals_h>0 and goals_a>0 (Yes guaranteed)
-    - 1X2: keep all (never fully decided until FT)
-    """
-    fidx = {f:i for i,f in enumerate(features)}
-    keep = np.ones(len(y_all), dtype=bool)
-
-    # helpers
-    def col(name): return X_all[:, fidx[name]] if name in fidx else np.zeros(len(X_all))
-
-    goals_sum = col("goals_sum")
-    gh = col("goals_h"); ga = col("goals_a")
-
-    if market_key.startswith("OU_"):
-        try:
-            ln = float(market_key.split("_", 1)[1].replace(",", "."))
-        except Exception:
-            ln = 2.5
-        # if goals_sum > line, Over is already guaranteed; drop that snapshot
-        keep &= ~(goals_sum > ln)
-    elif market_key == "BTTS_YES":
-        # both already scored -> BTTS is locked as True; drop
-        keep &= ~((gh > 0) & (ga > 0))
-    # 1X2_* : no drop
-
-    return keep
-
-def _train_binary_head(
-    conn,
-    X_all: np.ndarray,
-    y_all: np.ndarray,
-    ts_all: np.ndarray,
-    mask_tr: np.ndarray,
-    mask_te: np.ndarray,
-    feature_names: List[str],
-    model_key: str,
-    threshold_label: Optional[str],
-    target_precision: float,
-    min_preds: int,
-    min_thresh_pct: float,
-    max_thresh_pct: float,
-    default_thr_prob: float,
-    metrics_name: Optional[str] = None,
-    train_minute_cutoff: Optional[int] = None,
-) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
-    """
-    Train one binary head (e.g., BTTS_YES, OU_2.5, WLD_HOME).
-
-    Changes vs. original:
-      - Standardize X on train fold (mean/std), then fold scaler back into weights
-        so serving code in main.py remains unchanged.
-      - Drop trivial/decided in-play snapshots for this head (focus on uncertain states).
-      - Deterministic LogisticRegression (random_state) + tunable C via LR_C.
-    """
-    # sanity
-    if len(np.unique(y_all)) < 2:
-        return False, {}, None
-
-    # Apply minute cutoff on training rows (col 0 is 'minute'), if provided
-    if train_minute_cutoff is not None:
-        try:
-            mt = (X_all[:, 0] <= float(train_minute_cutoff))
-            mask_tr = mask_tr & mt
-        except Exception:
-            pass
-
-    # Drop trivial/decided snapshots for this specific head (train only)
-    try:
-        undecided = _mask_undecided(model_key, X_all, y_all, feature_names)
-        new_mask_tr = mask_tr & undecided
-        if np.any(new_mask_tr):
-            mask_tr = new_mask_tr
-        else:
-            logger.info("[TRAIN] %s: undecided filter removed all train rows; proceeding without it.", model_key)
-    except Exception as _:
-        # be permissive; training should still proceed
-        pass
-
-    # Split to folds
-    X_tr, X_te = X_all[mask_tr], X_all[mask_te]
-    y_tr, y_te = y_all[mask_tr], y_all[mask_te]
-    ts_tr      = ts_all[mask_tr]
-
-    # Standardize on train, apply to test
-    X_tr_std, mu, sd = _standardize_fit(X_tr)
-    X_te_std = (X_te - mu) / sd
-
-    # Fit LR with recency weights
-    sw = recency_weights(ts_tr)
-    model = fit_lr_safe(X_tr_std, y_tr, sample_weight=sw)
-    if model is None:
-        return False, {}, None
-
-    # Validate (calibration on validation fold)
-    p_raw_te = model.predict_proba(X_te_std)[:, 1]
-    cal_kind, cal_obj = _fit_calibration(y_te, p_raw_te)
-    p_cal = _apply_calibration(p_raw_te, cal_kind, cal_obj)
-
-    # Metrics
-    mets = {
-        "brier": float(brier_score_loss(y_te, p_cal)),
-        "auc": float(roc_auc_score(y_te, p_cal)) if len(np.unique(y_te)) > 1 else float("nan"),
-        "ece": float(_ece(y_te, p_cal)),
-        "acc@0.5": float(accuracy_score(y_te, (p_cal >= 0.5).astype(int))),
-        "logloss": float(log_loss(y_te, p_cal, labels=[0, 1])),
-        "n_test": int(len(y_te)),
-        "prevalence": float(y_all.mean()),
-        "calibration": cal_kind,
-    }
-    if metrics_name:
-        logger.info("[METRICS] %s: %s", metrics_name, mets)
-
-    # Serialize model: fold scaler into raw-space weights so serving stays unchanged
-    blob = build_model_blob(model, feature_names, cal_kind, cal_obj, mean=mu, scale=sd)
-    for k in (f"model_latest:{model_key}", f"model:{model_key}"):
-        _set_setting(conn, k, json.dumps(blob))
-
-    # Optional: derive/update per-market threshold from validation fold
-    if threshold_label:
-        thr_prob = _pick_threshold_for_target_precision(
-            y_true=y_te,
-            p_cal=p_cal,
-            target_precision=target_precision,
-            min_preds=min_preds,
-            default_threshold=default_thr_prob,
-        )
-        thr_pct = float(np.clip(_percent(thr_prob), min_thresh_pct, max_thresh_pct))
-        _set_setting(conn, f"conf_threshold:{threshold_label}", f"{thr_pct:.2f}")
-
-    return True, mets, p_cal
-
-# ─────────────────────── Entry point ─────────────────────── #
-
-def _fmt_line(line: float) -> str: return f"{line}".rstrip("0").rstrip(".")
-
-def train_models(
-    db_url: Optional[str] = None,
-    min_minute: Optional[int] = None,
-    test_size: Optional[float] = None,
-    min_rows: Optional[int] = None,
-) -> Dict[str,Any]:
-    conn = _connect(db_url or os.getenv("DATABASE_URL"))
-    _ensure_training_tables(conn)
-
-    min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
-    test_size  = float(test_size  if test_size  is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
-    min_rows   = int(min_rows   if min_rows   is not None else os.getenv("MIN_ROWS", 150))
-
-    ou_lines = _parse_ou_lines(OU_TRAIN_LINES_RAW)
-
-    target_precision = float(os.getenv("TARGET_PRECISION","0.60"))
-    min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS","25"))
-    min_thresh = float(os.getenv("MIN_THRESH","55"))
-    max_thresh = float(os.getenv("MAX_THRESH","85"))
-
-    summary: Dict[str,Any] = {"ok": True, "trained": {}, "metrics": {}, "thresholds": {}}
+    lr = LogisticRegression(solver="liblinear", max_iter=1000)
+    lr.fit(Xn, yn)
+    raw_scores = lr.decision_function(Xn)
+    raw_probs = 1 / (1 + np.exp(-raw_scores))
 
     try:
-        # ===== In-Play =====
-        df_ip = load_inplay_data(conn, min_minute=min_minute)
-        if not df_ip.empty and len(df_ip) >= min_rows:
-            tr_mask, te_mask = time_order_split(df_ip, test_size=test_size)
-            df_ip = df_ip.reset_index(drop=True)
-            X_all  = _ensure_columns(df_ip, FEATURES).values
-            ts_all = df_ip["_ts"].values
+        _, X_te, _, y_te, p_te = train_test_split(Xn, yn, raw_probs, test_size=0.2, random_state=42, stratify=yn)
+        a, b = _fit_platt(p_te, y_te)
+    except Exception:
+        a, b = 1.0, 0.0
 
-            # BTTS
-            ok, mets, _ = _train_binary_head(
-                conn, X_all, df_ip["btts_yes"].values.astype(int), ts_all,
-                tr_mask, te_mask, FEATURES, "BTTS_YES", "BTTS",
-                target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                "BTTS_YES", _minute_cutoff_for_market("BTTS")
-            )
-            summary["trained"]["BTTS_YES"] = ok
-            if ok: summary["metrics"]["BTTS_YES"] = mets
+    weights = {feature_names[i]: float(lr.coef_[0][i]) for i in range(len(feature_names))}
+    intercept = float(lr.intercept_[0])
 
-            # OU lines
-            totals = df_ip["final_goals_sum"].values.astype(int)
-            for line in ou_lines:
-                name = f"OU_{_fmt_line(line)}"
-                ok, mets, _ = _train_binary_head(
-                    conn, X_all, (totals > line).astype(int), ts_all,
-                    tr_mask, te_mask, FEATURES, name, f"Over/Under {_fmt_line(line)}",
-                    target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                    name, _minute_cutoff_for_market("Over/Under")
-                )
-                summary["trained"][name] = ok
-                if ok:
-                    summary["metrics"][name] = mets
-                    if abs(line-2.5) < 1e-6:
-                        blob = _get_setting_json(conn, f"model_latest:{name}")
-                        if blob is not None:
-                            for k in ("model_latest:O25","model:O25"):
-                                _set_setting(conn, k, json.dumps(blob))
-
-            # 1X2
-            gd = df_ip["final_goals_diff"].values.astype(int)
-            y_home = (gd > 0).astype(int); y_draw = (gd == 0).astype(int); y_away = (gd < 0).astype(int)
-
-            ok_h, mets_h, p_h = _train_binary_head(conn, X_all, y_home, ts_all, tr_mask, te_mask, FEATURES,
-                                                   "WLD_HOME", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_HOME",
-                                                   _minute_cutoff_for_market("1X2"))
-            ok_d, mets_d, p_d = _train_binary_head(conn, X_all, y_draw, ts_all, tr_mask, te_mask, FEATURES,
-                                                   "WLD_DRAW", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_DRAW",
-                                                   _minute_cutoff_for_market("1X2"))
-            ok_a, mets_a, p_a = _train_binary_head(conn, X_all, y_away, ts_all, tr_mask, te_mask, FEATURES,
-                                                   "WLD_AWAY", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_AWAY",
-                                                   _minute_cutoff_for_market("1X2"))
-
-            summary["trained"]["WLD_HOME"] = ok_h; summary["trained"]["WLD_DRAW"] = ok_d; summary["trained"]["WLD_AWAY"] = ok_a
-            if ok_h: summary["metrics"]["WLD_HOME"] = mets_h
-            if ok_d: summary["metrics"]["WLD_DRAW"] = mets_d
-            if ok_a: summary["metrics"]["WLD_AWAY"] = mets_a
-
-            if ok_h and ok_d and ok_a and (p_h is not None) and (p_d is not None) and (p_a is not None):
-                ps = np.clip(p_h,EPS,1-EPS)+np.clip(p_d,EPS,1-EPS)+np.clip(p_a,EPS,1-EPS)
-                phn, pdn, pan = p_h/ps, p_d/ps, p_a/ps
-                p_max = np.maximum.reduce([phn, pdn, pan])
-
-                gd_te = gd[te_mask]
-                y_class = np.zeros_like(gd_te, dtype=int)
-                y_class[gd_te==0] = 1; y_class[gd_te<0] = 2
-                correct = (np.argmax(np.stack([phn,pdn,pan],axis=1), axis=1) == y_class).astype(int)
-
-                thr_prob = _pick_threshold_for_target_precision(
-                    y_true=correct, p_cal=p_max,
-                    target_precision=target_precision, min_preds=min_preds, default_threshold=0.45
-                )
-                thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
-                _set_setting(conn, "conf_threshold:1X2", f"{thr_pct:.2f}")
-                summary["thresholds"]["1X2"] = thr_pct
-        else:
-            logger.info("In-Play: not enough labeled data (have %d, need >= %d).", len(df_ip), min_rows)
-            summary["trained"]["BTTS_YES"] = False
-
-        # ===== Prematch =====
-        df_pre = load_prematch_data(conn)
-        if not df_pre.empty and len(df_pre) >= min_rows:
-            tr_mask, te_mask = time_order_split(df_pre, test_size=test_size)
-            df_pre = df_pre.reset_index(drop=True)
-            Xp_all = _ensure_columns(df_pre, PRE_FEATURES).values
-            ts_pre = df_pre["_ts"].values
-
-            # PRE BTTS
-            ok, mets, _ = _train_binary_head(
-                conn, Xp_all, df_pre["label_btts"].values.astype(int), ts_pre,
-                tr_mask, te_mask, PRE_FEATURES, "PRE_BTTS_YES", "PRE BTTS",
-                target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                "PRE_BTTS_YES", None
-            )
-            summary["trained"]["PRE_BTTS_YES"] = ok
-            if ok: summary["metrics"]["PRE_BTTS_YES"] = mets
-
-            # PRE OU
-            totals = df_pre["final_goals_sum"].values.astype(int)
-            for line in ou_lines:
-                name = f"PRE_OU_{_fmt_line(line)}"
-                ok, mets, _ = _train_binary_head(
-                    conn, Xp_all, (totals > line).astype(int), ts_pre,
-                    tr_mask, te_mask, PRE_FEATURES, name, f"PRE Over/Under {_fmt_line(line)}",
-                    target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                    name, None
-                )
-                summary["trained"][name] = ok
-                if ok: summary["metrics"][name] = mets
-
-            # PRE 1X2 (draw suppressed)
-            gd = df_pre["final_goals_diff"].values.astype(int)
-            y_home = (gd > 0).astype(int); y_away = (gd < 0).astype(int)
-
-            ok_h, mets_h, p_h = _train_binary_head(conn, Xp_all, y_home, ts_pre, tr_mask, te_mask, PRE_FEATURES,
-                                                   "PRE_WLD_HOME", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_HOME", None)
-            ok_a, mets_a, p_a = _train_binary_head(conn, Xp_all, y_away, ts_pre, tr_mask, te_mask, PRE_FEATURES,
-                                                   "PRE_WLD_AWAY", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_AWAY", None)
-            summary["trained"]["PRE_WLD_HOME"] = ok_h; summary["trained"]["PRE_WLD_AWAY"] = ok_a
-            if ok_h: summary["metrics"]["PRE_WLD_HOME"] = mets_h
-            if ok_a: summary["metrics"]["PRE_WLD_AWAY"] = mets_a
-
-            if ok_h and ok_a and (p_h is not None) and (p_a is not None):
-                ps = np.clip(p_h,EPS,1-EPS) + np.clip(p_a,EPS,1-EPS)
-                phn, pan = p_h/ps, p_a/ps
-                p_max = np.maximum(phn, pan)
-                gd_te = gd[te_mask]
-                y_class = np.where(gd_te>0, 0, np.where(gd_te<0, 1, -1))
-                mask = (y_class != -1)
-                if mask.any():
-                    correct = (np.argmax(np.stack([phn,pan],axis=1), axis=1)[mask] == y_class[mask]).astype(int)
-                    thr_prob = _pick_threshold_for_target_precision(
-                        y_true=correct, p_cal=p_max[mask],
-                        target_precision=target_precision, min_preds=min_preds, default_threshold=0.45
-                    )
-                    thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
-                    _set_setting(conn, "conf_threshold:PRE 1X2", f"{thr_pct:.2f}")
-                    summary["thresholds"]["PRE 1X2"] = thr_pct
-        else:
-            logger.info("Prematch: not enough labeled data (have %d, need >= %d).", len(df_pre), min_rows)
-            summary["trained"]["PRE_BTTS_YES"] = False
-
-        metrics_bundle = {
-            "trained_at_utc": pd.Timestamp.utcnow().isoformat(timespec="seconds")+"Z",
-            **summary["metrics"],
-            "features_inplay": FEATURES,
-            "features_prematch": PRE_FEATURES,
-            "thresholds": summary.get("thresholds", {}),
-            "target_precision": target_precision,
-            "ou_lines": [float(x) for x in ou_lines],
-            "min_rows": int(min_rows),
-            "test_size": float(test_size),
-            "recency_half_life_days": float(RECENCY_HALF_LIFE_DAYS),
-            "market_cutoffs": MARKET_CUTOFFS,
-            "tip_max_minute": TIP_MAX_MINUTE,
+    bayes = {  # simple NB overlay; harmless if features missing
+        "features": {
+            "sot_sum": {"bins": [0, 2, 5, 10, 99], "lr": [0.8, 1.0, 1.2, 1.4]},
+            "xg_sum":  {"bins": [0, .5, 1.0, 2.0, 99], "lr": [0.8, 1.0, 1.2, 1.4]},
+            "cor_sum": {"bins": [0, 2, 5,  9, 99], "lr": [0.9, 1.0, 1.1, 1.2]}
         }
-        _set_setting(conn, "model_metrics_latest", json.dumps(metrics_bundle))
-        return summary
+    }
+    return {"intercept": intercept, "weights": weights,
+            "calibration": {"method": "sigmoid", "a": float(a), "b": float(b)},
+            "bayes": bayes}
 
-    except Exception as e:
-        logger.exception("Training failed: %s", e)
-        return {"ok": False, "error": str(e)}
-    finally:
-        try: conn.close()
-        except Exception: pass
+def _save_model(key: str, mdl: Dict[str, Any]) -> None:
+    set_setting(key, json.dumps(mdl, separators=(",", ":"), ensure_ascii=False))
 
-# ─────────────────────── CLI ─────────────────────── #
+def train_models(days: int = 365) -> Dict[str, Any]:
+    # prefer tips+odds
+    rows = _load_training_rows_from_tips(days=90)
+    if sum(1 for r in rows if r[1] in ("Over 2.5 Goals","Over 3.5 Goals","BTTS: Yes","Home Win","Away Win")) < MIN_SAMPLES_PER_MODEL:
+        rows = _load_training_rows_from_snapshots(days=730, per_match="first_viable")
 
-def _cli_main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--db-url", help="Postgres DSN (or use env DATABASE_URL)")
-    ap.add_argument("--min-minute", dest="min_minute", type=int, default=int(os.getenv("TRAIN_MIN_MINUTE", 15)))
-    ap.add_argument("--test-size", type=float, default=float(os.getenv("TRAIN_TEST_SIZE", 0.25)))
-    ap.add_argument("--min-rows", type=int, default=int(os.getenv("MIN_ROWS", 150)))
-    args = ap.parse_args()
-    res = train_models(
-        db_url=args.db_url or os.getenv("DATABASE_URL"),
-        min_minute=args.min_minute, test_size=args.test_size, min_rows=args.min_rows
+    # visibility
+    counts = {}
+    for key in ("Over 2.5 Goals","Over 3.5 Goals","BTTS: Yes","Home Win","Away Win"):
+        counts[key] = sum(1 for r in rows if r[1] == key)
+    log.info("[TRAIN] label counts: %s", counts)
+
+    results: Dict[str, Any] = {"ok": True, "trained": {}}
+
+    mdl = _train_one(rows, "Over 2.5 Goals")
+    results["trained"]["OU_2.5"] = bool(mdl)
+    if mdl: _save_model("OU_2.5", mdl)
+
+    mdl = _train_one(rows, "Over 3.5 Goals")
+    results["trained"]["OU_3.5"] = bool(mdl)
+    if mdl: _save_model("OU_3.5", mdl)
+
+    mdl = _train_one(rows, "BTTS: Yes")
+    results["trained"]["BTTS_YES"] = bool(mdl)
+    if mdl: _save_model("BTTS_YES", mdl)
+
+    mdl = _train_one(rows, "Home Win")
+    results["trained"]["WLD_HOME"] = bool(mdl)
+    if mdl: _save_model("WLD_HOME", mdl)
+
+    mdl = _train_one(rows, "Away Win")
+    results["trained"]["WLD_AWAY"] = bool(mdl)
+    if mdl: _save_model("WLD_AWAY", mdl)
+
+    # keep a non-zero draw model for normalization
+    draw_mdl = {"intercept": 0.0, "weights": {}, "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0}}
+    _save_model("WLD_DRAW", draw_mdl); results["trained"]["WLD_DRAW"] = True
+
+    if not any(v for k, v in results["trained"].items() if k != "WLD_DRAW"):
+        results["ok"] = False
+        results["reason"] = f"Not enough usable samples per label (counts={counts}, min={MIN_SAMPLES_PER_MODEL})"
+    return results
+
+# ── ROI-aware auto tune (unchanged) ───────────────────────────────────────────
+def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
+    cutoff = int(time.time()) - days * 24 * 3600
+    rows = get_rows(
+        """
+        SELECT t.market, t.suggestion, COALESCE(t.confidence_raw, t.confidence/100.0) AS prob, t.odds,
+               r.final_goals_h, r.final_goals_a, r.btts_yes
+        FROM tips t
+        JOIN match_results r ON r.match_id = t.match_id
+        WHERE t.created_ts >= %s
+          AND t.suggestion <> 'HARVEST'
+          AND t.sent_ok = 1
+          AND t.odds IS NOT NULL
+        """, (cutoff,)
     )
-    print(json.dumps(res, indent=2))
+    if not rows:
+        set_setting("last_auto_tune", "no data"); return {}
+
+    by: Dict[str, List[Tuple[float, int, float]]] = {}
+    for (mk, sugg, prob, odds, gh, ga, btts) in rows:
+        try: prob=float(prob or 0.0); odds=float(odds or 0.0)
+        except: continue
+        if not (1.01 <= odds <= MAX_ODDS_ALL): continue
+
+        def _lbl(s: str) -> Optional[int]:
+            total = int(gh or 0) + int(ga or 0)
+            if s.startswith("Over"):
+                line=None
+                for tok in s.split():
+                    try: line=float(tok); break
+                    except: pass
+                if line is None: return None
+                return 1 if total>line else (0 if total<line else None)
+            if s=="BTTS: Yes": return 1 if int(btts or 0)==1 else 0
+            if s=="BTTS: No":  return 1 if int(btts or 0)==0 else 0
+            if s=="Home Win":  return 1 if int(gh or 0)>int(ga or 0) else 0
+            if s=="Away Win":  return 1 if int(ga or 0)>int(gh or 0) else 0
+            return None
+
+        y=_lbl(sugg)
+        if y is None: continue
+        mk_key = mk.replace("PRE ", "")
+        by.setdefault(mk_key, []).append((prob, int(y), odds))
+
+    tuned: Dict[str, float] = {}
+    def _eval(items: List[Tuple[float,int,float]], thr_prob: float) -> Tuple[int,float,float]:
+        sel=[(p,y,o) for (p,y,o) in items if p>=thr_prob]
+        n=len(sel)
+        if n==0: return 0,0.0,0.0
+        wins=sum(y for (_,y,_) in sel); prec=wins/n
+        roi=sum((y*(od-1.0)-(1-y)) for (_,y,od) in sel)/n
+        return n,float(prec),float(roi)
+
+    for mk, items in by.items():
+        if len(items) < THRESH_MIN_PREDICTIONS: continue
+        best=None; feasible=False
+        for thr_pct in np.arange(MIN_THRESH, MAX_THRESH+1e-9, 1.0):
+            n,prec,roi=_eval(items, thr_pct/100.0)
+            if n<THRESH_MIN_PREDICTIONS: continue
+            if prec>=TARGET_PRECISION:
+                feasible=True
+                score=(roi,prec,n)
+                if (best is None) or (score>(best[0],best[1],best[2])):
+                    best=(roi,prec,n,thr_pct)
+        if not feasible:
+            for thr_pct in np.arange(MIN_THRESH, MAX_THRESH+1e-9, 1.0):
+                n,prec,roi=_eval(items, thr_pct/100.0)
+                if n<THRESH_MIN_PREDICTIONS: continue
+                if (prec>=max(0.0,TARGET_PRECISION-APPLY_TUNE_PREC_TOL)) and (roi>0.0):
+                    score=(roi,prec,n)
+                    if (best is None) or (score>(best[0],best[1],best[2])):
+                        best=(roi,prec,n,thr_pct)
+        if best is not None:
+            tuned[mk]=float(best[3])
+
+    for k,pct in tuned.items():
+        set_setting(f"conf_threshold:{k}", f"{pct:.2f}")
+    return tuned
 
 if __name__ == "__main__":
-    _cli_main()
+    print(json.dumps(train_models(), indent=2))
