@@ -158,6 +158,16 @@ def _metric_obs_duration(job: str, t0: float) -> None:
     except Exception:
         pass
 
+# ───────── Optional import: trainer ─────────
+try:
+    import train_models as _tm        
+    train_models = _tm.train_models   
+except Exception as e:
+    _IMPORT_ERR = repr(e)
+    def train_models(*args, **kwargs):  # type: ignore
+        log.warning("train_models not available: %s", _IMPORT_ERR)
+        return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional add-ons
 # ──────────────────────────────────────────────────────────────────────────────
@@ -445,6 +455,19 @@ def _api_get(url: str, params: dict, timeout: int = 15):
             log.warning("[CB] API-Football opened due to exceptions")
         return None
 
+# ───────── League filter ─────────
+_BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
+def _blocked_league(league_obj: dict) -> bool:
+    name=str((league_obj or {}).get("name","")).lower()
+    country=str((league_obj or {}).get("country","")).lower()
+    typ=str((league_obj or {}).get("type","")).lower()
+    txt=f"{country} {name} {typ}"
+    if any(p in txt for p in _BLOCK_PATTERNS): return True
+    deny=[x.strip() for x in os.getenv("LEAGUE_DENY_IDS","").split(",") if x.strip()]
+    lid=str((league_obj or {}).get("id") or "")
+    if lid in deny: return True
+    return False
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Feature extraction helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -654,6 +677,69 @@ def _load_wld_models():
     return (load_model_from_settings("WLD_HOME"),
             load_model_from_settings("WLD_DRAW"),
             load_model_from_settings("WLD_AWAY"))
+
+def _load_training_rows_from_snapshots(days: int = 365, per_match: str = "latest") -> List[Tuple[dict, str, int, Optional[float]]]:
+    """
+    Build training rows directly from tip_snapshots + match_results (no tips/odds needed).
+    Returns tuples shaped like the tips loader: (feat_dict, 'Suggestion', label(0/1), None)
+    We generate:
+      - 'Over 2.5'  (label = 1 if final goals > 2.5)
+      - 'Over 3.5'  (same logic)
+      - 'BTTS: Yes' (label = 1 if btts_yes == 1)
+      - 'Home Win'  (label = 1 if home final > away final)
+      - 'Away Win'  (label = 1 if away final > home final)
+    """
+    cutoff = int(time.time()) - days * 24 * 3600
+    with db_conn() as c:
+        if per_match == "latest":
+            q = """
+                SELECT s.match_id, MAX(s.created_ts) AS created_ts, MIN(s.payload) AS payload
+                FROM tip_snapshots s
+                WHERE s.created_ts >= %s
+                GROUP BY s.match_id
+            """
+        else:  # "all" (can be huge)
+            q = "SELECT s.match_id, s.created_ts, s.payload FROM tip_snapshots s WHERE s.created_ts >= %s"
+        rows = c.execute(q, (cutoff,)).fetchall()
+
+        # join in bulk to reduce API calls
+        mids = [int(r[0]) for r in rows]
+        have = set()
+        if mids:
+            fmt = ",".join(["%s"] * len(mids))
+            got = c.execute(f"SELECT match_id, final_goals_h, final_goals_a, btts_yes FROM match_results WHERE match_id IN ({fmt})", tuple(mids)).fetchall()
+            for (mid, gh, ga, btts) in got:
+                have.add(int(mid))
+            # optional: silently skip those without results yet
+
+    out: List[Tuple[dict, str, int, Optional[float]]] = []
+    for (mid, cts, payload) in rows:
+        if int(mid) not in have:
+            continue
+        try:
+            snap = json.loads(payload or "{}")
+            feat = snap.get("stat") or snap  # support both {stat:{...}} and flat payloads
+            # pull results (a second query per row here is fine; you can cache if needed)
+            with db_conn() as c2:
+                gh, ga, btts = c2.execute(
+                    "SELECT final_goals_h, final_goals_a, btts_yes FROM match_results WHERE match_id=%s",
+                    (int(mid),)
+                ).fetchone()
+            total = int(gh or 0) + int(ga or 0)
+
+            # OU labels
+            out.append((feat, "Over 2.5 Goals", 1 if total > 2.5 else 0, None))
+            out.append((feat, "Over 3.5 Goals", 1 if total > 3.5 else 0, None))
+
+            # BTTS
+            out.append((feat, "BTTS: Yes", 1 if int(btts or 0) == 1 else 0, None))
+
+            # 1X2 (draw suppressed) — provide both streams so home/away models each learn
+            out.append((feat, "Home Win", 1 if int(gh or 0) > int(ga or 0) else 0, None))
+            out.append((feat, "Away Win", 1 if int(ga or 0) > int(gh or 0) else 0, None))
+        except Exception:
+            continue
+    return out
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Odds aggregation (+ detailed reasons)
@@ -894,7 +980,7 @@ def _odds_debug_reason(odds_map: dict, mk: str, sug: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 # Core scan
 # ──────────────────────────────────────────────────────────────────────────────
-ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
+ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win", "Over", "Under"}
 
 def _allowed_with_ou_lines():
     out=set(ALLOWED_SUGGESTIONS)
@@ -1114,6 +1200,51 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     if updated: log.info("[RESULTS] backfilled %d", updated)
     return updated
 
+def backfill_results_from_snapshots(max_rows: int = 200, days: int = 365) -> int:
+    """
+    Use tip_snapshots to discover match_ids (even if no tips were sent),
+    fetch final results from API-Football, and write into match_results.
+    """
+    cutoff = int(time.time()) - days * 24 * 3600
+    updated = 0
+    with db_conn() as c:
+        rows = c.execute(
+            """
+            SELECT DISTINCT s.match_id
+            FROM tip_snapshots s
+            LEFT JOIN match_results r ON r.match_id = s.match_id
+            WHERE s.created_ts >= %s AND r.match_id IS NULL
+            ORDER BY s.created_ts DESC
+            LIMIT %s
+            """,
+            (cutoff, max_rows),
+        ).fetchall()
+
+    for (mid,) in rows:
+        fx = _fixture_by_id(int(mid))
+        if not fx:
+            continue
+        st = (((fx.get("fixture") or {}).get("status") or {}).get("short") or "")
+        if not _is_final(st):
+            continue
+        g = fx.get("goals") or {}
+        gh = int(g.get("home") or 0)
+        ga = int(g.get("away") or 0)
+        btts = 1 if (gh > 0 and ga > 0) else 0
+        with db_conn() as c2:
+            c2.execute(
+                "INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
+                "VALUES(%s,%s,%s,%s,%s) "
+                "ON CONFLICT(match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
+                "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
+                (int(mid), gh, ga, btts, int(time.time())),
+            )
+        updated += 1
+
+    if updated:
+        log.info("[RESULTS] backfilled from snapshots: %d", updated)
+    return updated
+
 def _tip_outcome_for_result(suggestion: str, res: Dict[str,Any]) -> Optional[int]:
     gh=int(res.get("final_goals_h") or 0); ga=int(res.get("final_goals_a") or 0)
     total=gh+ga; btts=int(res.get("btts_yes") or 0); s=(suggestion or "").strip()
@@ -1271,6 +1402,12 @@ def http_scan(): _require_admin(); s,l=production_scan(); return jsonify({"ok": 
 
 @app.route("/admin/backfill-results", methods=["POST","GET"])
 def http_backfill(): _require_admin(); n=backfill_results_for_open_matches(400); return jsonify({"ok": True, "updated": n})
+
+@app.route("/admin/backfill-results-snapshots", methods=["POST","GET"])
+def http_backfill_snapshots():
+    _require_admin()
+    n = backfill_results_from_snapshots(1000, 365)  # scan a lot on demand
+    return jsonify({"ok": True, "updated": int(n)})
 
 @app.route("/admin/train", methods=["POST","GET"])
 def http_train():
