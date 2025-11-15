@@ -3,7 +3,7 @@
 # Expects env vars in Railway dashboard (see .env example)
 services:
   goalsniper:
-    startCommand: gunicorn -w 1 -k gevent -b 0.0.0.0:$PORT main:app
+    startCommand: python main.py
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
