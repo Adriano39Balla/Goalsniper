@@ -104,6 +104,15 @@ DUP_COOLDOWN_MIN   = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 TIP_MIN_MINUTE     = int(os.getenv("TIP_MIN_MINUTE", "12"))   # was 8
 SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
 
+# ---- Ping budget controls
+API_BUDGET_DAILY     = int(os.getenv("API_BUDGET_DAILY", "150000"))
+MAX_FIXTURES_PER_SCAN= int(os.getenv("MAX_FIXTURES_PER_SCAN", "160"))
+USE_EVENTS_IN_FEATURES = os.getenv("USE_EVENTS_IN_FEATURES", "0") not in ("0","false","False","no","NO")
+try:
+    LEAGUE_ALLOW_IDS = {int(x) for x in os.getenv("LEAGUE_ALLOW_IDS","").split(",") if x.strip().isdigit()}
+except Exception:
+    LEAGUE_ALLOW_IDS = set()
+
 HARVEST_MODE       = os.getenv("HARVEST_MODE", "1") not in ("0","false","False","no","NO")
 TRAIN_ENABLE       = os.getenv("TRAIN_ENABLE", "1") not in ("0","false","False","no","NO")
 TRAIN_HOUR_UTC     = int(os.getenv("TRAIN_HOUR_UTC", "2"))
@@ -456,6 +465,57 @@ def fetch_match_stats(fid: int) -> list:
     if not out: NEG_CACHE[k]=(now, True)
     return out
 
+def fetch_live_fixtures_only() -> List[dict]:
+    """
+    Light call: fetch 'live=all' fixtures ONLY, without fanning out to /statistics or /events.
+    We will ration fan-out by quota later.
+    """
+    js = _api_get(FOOTBALL_API_URL, {"live": "all"}) or {}
+    matches = [m for m in (js.get("response", []) if isinstance(js, dict) else [])
+               if not _blocked_league(m.get("league") or {})]
+    out = []
+    for m in matches:
+        st = ((m.get("fixture", {}) or {}).get("status", {}) or {})
+        elapsed = st.get("elapsed")
+        short = (st.get("short") or "").upper()
+        if elapsed is None or elapsed > 120 or short not in INPLAY_STATUSES:
+            continue
+        out.append(m)
+    return out
+
+def _quota_per_scan() -> int:
+    """
+    Compute how many fixtures we can safely fan-out to per scan, given daily budget.
+    We count fan-out calls only: /statistics (+ /events if enabled).
+    The single /fixtures?live=all call per scan is negligible overhead.
+    """
+    scans_per_day = max(1, int(86400 / max(1, SCAN_INTERVAL_SEC)))
+    ppf = 1 + (1 if USE_EVENTS_IN_FEATURES else 0)   # per-fixture fan-out: stats + optional events
+    safe = int(API_BUDGET_DAILY / max(1, (scans_per_day * ppf))) - 10  # tiny safety margin
+    return max(1, min(MAX_FIXTURES_PER_SCAN, safe))
+
+def _priority_key(m: dict) -> Tuple[int, int, int, int, int]:
+    """
+    Sort fixtures to spend calls where we get most signal:
+    1) allow-listed leagues first
+    2) mid-game minutes (20..80)
+    3) 'interesting' scores (1–3 goals)
+    4) minutes close to 60
+    5) higher total goals
+    """
+    minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
+    gh = int((m.get("goals") or {}).get("home") or 0)
+    ga = int((m.get("goals") or {}).get("away") or 0)
+    total = gh + ga
+    lid = int(((m.get("league") or {}) or {}).get("id") or 0)
+    return (
+        3 if (LEAGUE_ALLOW_IDS and lid in LEAGUE_ALLOW_IDS) else 0,
+        2 if 20 <= minute <= 80 else 0,
+        1 if total in (1, 2, 3) else 0,
+        -abs(60 - minute),
+        -total,
+    )
+
 def fetch_match_events(fid: int) -> list:
     now=time.time()
     k=("events", fid)
@@ -469,16 +529,31 @@ def fetch_match_events(fid: int) -> list:
     return out
 
 def fetch_live_matches() -> List[dict]:
-    js=_api_get(FOOTBALL_API_URL, {"live":"all"}) or {}
-    matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
-    out=[]
-    for m in matches:
-        st=((m.get("fixture",{}) or {}).get("status",{}) or {})
-        elapsed=st.get("elapsed"); short=(st.get("short") or "").upper()
-        if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES: continue
-        fid=(m.get("fixture",{}) or {}).get("id")
-        m["statistics"]=fetch_match_stats(fid); m["events"]=fetch_match_events(fid)
+    """
+    Budget-aware fetch:
+      1) pull live fixtures once (cheap)
+      2) sort by value (priority)
+      3) fan-out /statistics (+ optional /events) only for a quota of fixtures
+    """
+    fixtures = fetch_live_fixtures_only()
+    if not fixtures:
+        return []
+
+    # prioritize and keep only the top quota fixtures
+    fixtures.sort(key=_priority_key, reverse=True)
+    quota = _quota_per_scan()
+    chosen = fixtures[:quota]
+
+    out = []
+    for m in chosen:
+        fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+        m["statistics"] = fetch_match_stats(fid)
+        m["events"] = fetch_match_events(fid) if USE_EVENTS_IN_FEATURES else []
         out.append(m)
+
+    # ppf = stats (1) + optional events (1)
+    ppf = 1 + (1 if USE_EVENTS_IN_FEATURES else 0)
+    log.info("[SCAN/BUDGET] fixtures=%d selected=%d quota=%d ppf=%d", len(fixtures), len(out), quota, ppf)
     return out
 
 # ───────── Prematch helpers (short) ─────────
@@ -503,6 +578,35 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
                 fixtures.append(r)
     fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
     return fixtures
+
+def _budget_snapshot() -> Dict[str, Any]:
+    scans_per_day = max(1, int(86400 / max(1, SCAN_INTERVAL_SEC)))
+    quota = _quota_per_scan()
+    ppf = 1 + (1 if USE_EVENTS_IN_FEATURES else 0)  # stats + optional events
+    # daily calls ≈ scans_per_day * (1 fixtures call + quota * ppf)
+    estimated_daily_calls = scans_per_day * (1 + quota * ppf)
+
+    return {
+        "scan_interval_sec": SCAN_INTERVAL_SEC,
+        "scans_per_day": scans_per_day,
+        "api_budget_daily": API_BUDGET_DAILY,
+        "use_events_in_features": bool(USE_EVENTS_IN_FEATURES),
+        "quota_per_scan": quota,
+        "ppf": ppf,
+        "estimated_daily_calls": int(estimated_daily_calls),
+        "max_fixtures_per_scan_cap": MAX_FIXTURES_PER_SCAN,
+        "allow_list_size": len(LEAGUE_ALLOW_IDS or []),
+    }
+
+def _format_budget_telegram(snap: Dict[str, Any]) -> str:
+    return (
+        "📉 <b>API Budget</b>\n"
+        f"• Scan interval: {snap['scan_interval_sec']}s  (≈ {snap['scans_per_day']} scans/day)\n"
+        f"• Quota per scan: {snap['quota_per_scan']} fixtures  (ppf={snap['ppf']})\n"
+        f"• Est. daily calls: {snap['estimated_daily_calls']:,} / {snap['api_budget_daily']:,}\n"
+        f"• Events in features: {'ON' if snap['use_events_in_features'] else 'OFF'}\n"
+        f"• Cap per scan: {snap['max_fixtures_per_scan_cap']}  • Allow-list leagues: {snap['allow_list_size']}"
+    )
 
 # ───────── Feature extraction (live) ─────────
 def _num(v) -> float:
@@ -2110,6 +2214,17 @@ def metrics():
         return jsonify({"ok": True, "metrics": METRICS})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/budget", methods=["POST","GET"])
+def http_budget():
+    _require_admin()
+    snap = _budget_snapshot()
+    # Always send to Telegram for visibility
+    try:
+        send_telegram(_format_budget_telegram(snap))
+    except Exception:
+        pass
+    return jsonify({"ok": True, "budget": snap})
 
 @app.route("/init-db", methods=["POST"])
 def http_init_db(): _require_admin(); init_db(); return jsonify({"ok": True})
