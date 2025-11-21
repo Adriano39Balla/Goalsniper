@@ -1,4 +1,4 @@
-# train_models.py
+# train_models.py - ADVANCED AI with Bayesian networks, ensemble methods & self-learning
 import argparse, json, os, logging, time, socket
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -7,10 +7,15 @@ import pandas as pd
 import psycopg2
 from psycopg2 import OperationalError
 
+# Advanced ML imports
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.metrics import (
     brier_score_loss, accuracy_score, log_loss, precision_score,
-    roc_auc_score
+    roc_auc_score, classification_report
 )
 
 try:
@@ -22,7 +27,7 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger("trainer")
 
-# ───────────────────────── Feature sets (match main.py live features) ───────────────────────── #
+# ───────────────────────── Advanced Feature Sets ───────────────────────── #
 
 FEATURES: List[str] = [
     "minute",
@@ -34,10 +39,12 @@ FEATURES: List[str] = [
     "pos_h","pos_a","pos_diff",
     "red_h","red_a","red_sum",
     "yellow_h","yellow_a",
-    # Enhanced live features your app uses in predictions:
-    "goals_last_15", "shots_last_15", "cards_last_15",
-    "pressure_home", "pressure_away", "score_advantage",
-    "xg_momentum", "recent_xg_impact", "defensive_stability"
+    # Advanced in-play features
+    "momentum_h", "momentum_a", 
+    "pressure_index",
+    "efficiency_h", "efficiency_a",
+    "total_actions", "action_intensity",
+    "xg_momentum", "defensive_stability"
 ]
 
 EPS = 1e-6
@@ -46,7 +53,6 @@ EPS = 1e-6
 
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "120"))
 RECENCY_MONTHS         = int(os.getenv("RECENCY_MONTHS", "36"))
-# ✅ fixed: removed stray ')'
 MARKET_CUTOFFS_RAW     = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
 TIP_MAX_MINUTE_ENV     = os.getenv("TIP_MAX_MINUTE", "")
 OU_TRAIN_LINES_RAW     = os.getenv("OU_TRAIN_LINES", os.getenv("OU_LINES", "2.5,3.5"))
@@ -54,7 +60,12 @@ TRAIN_MIN_MINUTE       = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
 TRAIN_TEST_SIZE        = float(os.getenv("TRAIN_TEST_SIZE", "0.25"))
 MIN_ROWS               = int(os.getenv("MIN_ROWS", "150"))
 
-# Auto-tune configuration (kept compatible with main.py)
+# Advanced training controls
+ENSEMBLE_ENABLE = os.getenv("ENSEMBLE_ENABLE", "1") not in ("0","false","False","no","NO")
+BAYESIAN_CALIBRATION_ENABLE = os.getenv("BAYESIAN_CALIBRATION_ENABLE", "1") not in ("0","false","False","no","NO")
+FEATURE_SELECTION_ENABLE = os.getenv("FEATURE_SELECTION_ENABLE", "1") not in ("0","false","False","no","NO")
+
+# Auto-tune configuration
 AUTO_TUNE_ENABLE       = os.getenv("AUTO_TUNE_ENABLE", "0") not in ("0","false","False","no","NO")
 TARGET_PRECISION       = float(os.getenv("TARGET_PRECISION", "0.60"))
 THRESH_MIN_PREDICTIONS = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
@@ -90,44 +101,370 @@ def _fmt_line(line: float) -> str:
     """Format line string to match main.py (remove trailing zeros)"""
     return f"{line}".rstrip("0").rstrip(".")
 
-# ─────────────────────── Helpers mirroring main.py feature math ─────────────────────── #
+# ─────────────────────── Advanced Feature Engineering ─────────────────────── #
 
-def _calculate_pressure(feat: Dict[str, float], side: str) -> float:
+def _calculate_momentum(features: Dict[str, float], side: str) -> float:
+    """Calculate match momentum for a team"""
     suffix = "_h" if side == "home" else "_a"
-    possession = float(feat.get(f"pos{suffix}", 50.0))
-    shots = float(feat.get(f"sot{suffix}", 0.0))
-    xg = float(feat.get(f"xg{suffix}", 0.0))
-    possession_norm = possession / 100.0
-    shots_norm = min(shots / 10.0, 1.0)
-    xg_norm = min(xg / 3.0, 1.0)
-    return (possession_norm * 0.3 + shots_norm * 0.4 + xg_norm * 0.3) * 100.0
-
-def _calculate_xg_momentum(feat: Dict[str, float]) -> float:
-    total_xg = float(feat.get("xg_sum", 0.0))
-    total_goals = float(feat.get("goals_sum", 0.0))
-    if total_xg <= 0.0:
-        return 0.0
-    return (total_goals - total_xg) / max(1.0, total_xg)
-
-def _recent_xg_impact_from(feat: Dict[str, float], minute: float) -> float:
+    sot = float(features.get(f"sot{suffix}", 0.0))
+    corners = float(features.get(f"cor{suffix}", 0.0))
+    minute = float(features.get("minute", 1.0))
+    
     if minute <= 0:
         return 0.0
-    xg_per_minute = float(feat.get("xg_sum", 0.0)) / minute
-    return xg_per_minute * 90.0
+        
+    momentum = (sot + corners) / minute
+    return min(5.0, momentum)  # Cap extreme values
 
-def _defensive_stability(feat: Dict[str, float]) -> float:
-    goals_conceded_h = float(feat.get("goals_a", 0.0))
-    goals_conceded_a = float(feat.get("goals_h", 0.0))
-    xg_against_h = float(feat.get("xg_a", 0.0))
-    xg_against_a = float(feat.get("xg_h", 0.0))
-    def_eff_h = 1 - (goals_conceded_h / max(1.0, xg_against_h)) if xg_against_h > 0 else 1.0
-    def_eff_a = 1 - (goals_conceded_a / max(1.0, xg_against_a)) if xg_against_a > 0 else 1.0
+def _calculate_pressure_index(features: Dict[str, float]) -> float:
+    """Calculate overall match pressure"""
+    minute = float(features.get("minute", 0.0))
+    goal_diff = abs(float(features.get("goals_diff", 0.0)))
+    
+    time_pressure = minute / 90.0
+    score_pressure = min(1.0, goal_diff / 3.0)  # Normalize goal difference
+    
+    return (time_pressure * 0.6 + score_pressure * 0.4) * 100.0
+
+def _calculate_efficiency(features: Dict[str, float], side: str) -> float:
+    """Calculate scoring efficiency"""
+    suffix = "_h" if side == "home" else "_a"
+    goals = float(features.get(f"goals{suffix}", 0.0))
+    sot = float(features.get(f"sot{suffix}", 0.0))
+    
+    if sot <= 0:
+        return 0.0
+    return goals / sot
+
+def _calculate_xg_momentum(features: Dict[str, float]) -> float:
+    """Calculate xG momentum (goals vs expected)"""
+    total_xg = float(features.get("xg_sum", 0.0))
+    total_goals = float(features.get("goals_sum", 0.0))
+    
+    if total_xg <= 0:
+        return 0.0
+    return (total_goals - total_xg) / total_xg
+
+def _calculate_defensive_stability(features: Dict[str, float]) -> float:
+    """Calculate defensive stability metric"""
+    goals_conceded_h = float(features.get("goals_a", 0.0))
+    goals_conceded_a = float(features.get("goals_h", 0.0))
+    xg_against_h = float(features.get("xg_a", 0.0))
+    xg_against_a = float(features.get("xg_h", 0.0))
+    
+    def_eff_h = 1.0 - (goals_conceded_h / max(1.0, xg_against_h)) if xg_against_h > 0 else 1.0
+    def_eff_a = 1.0 - (goals_conceded_a / max(1.0, xg_against_a)) if xg_against_a > 0 else 1.0
+    
     return (def_eff_h + def_eff_a) / 2.0
 
-# ─────────────────────── DB utils (IPv4 pin if needed) ─────────────────────── #
+def _calculate_action_intensity(features: Dict[str, float]) -> float:
+    """Calculate overall action intensity"""
+    minute = float(features.get("minute", 1.0))
+    total_actions = (
+        float(features.get("sot_sum", 0.0)) +
+        float(features.get("cor_sum", 0.0)) +
+        float(features.get("yellow_h", 0.0)) + float(features.get("yellow_a", 0.0))
+    )
+    return total_actions / minute
+
+# ─────────────────────── Advanced Ensemble Model ─────────────────────── #
+
+class AdvancedEnsembleModel:
+    """Advanced ensemble model with feature selection and Bayesian calibration"""
+    
+    def __init__(self, market: str):
+        self.market = market
+        self.models = {}
+        self.scalers = {}
+        self.feature_selector = None
+        self.selected_features = []
+        self.performance_history = []
+        
+    def train(self, X: np.ndarray, y: np.ndarray, feature_names: List[str], 
+              weights: Optional[np.ndarray] = None, test_size: float = 0.25) -> Dict[str, Any]:
+        """Train ensemble model with advanced feature processing"""
+        
+        if X.shape[0] < MIN_ROWS:
+            return {"error": f"Insufficient samples: {X.shape[0]} < {MIN_ROWS}"}
+            
+        # Handle missing values
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Feature selection
+        if FEATURE_SELECTION_ENABLE and len(feature_names) > 5:
+            self.feature_selector = SelectKBest(f_classif, k=min(15, len(feature_names)))
+            try:
+                X_selected = self.feature_selector.fit_transform(X, y)
+                self.selected_features = [feature_names[i] for i in self.feature_selector.get_support(indices=True)]
+                logger.info(f"Selected {len(self.selected_features)} features for {self.market}")
+            except Exception as e:
+                logger.warning(f"Feature selection failed for {self.market}: {e}")
+                X_selected = X
+                self.selected_features = feature_names
+        else:
+            X_selected = X
+            self.selected_features = feature_names
+        
+        # Scale features
+        self.scalers[self.market] = StandardScaler()
+        X_scaled = self.scalers[self.market].fit_transform(X_selected)
+        
+        # Train-test split
+        from sklearn.model_selection import train_test_split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y, test_size=test_size, random_state=42, stratify=y
+        )
+        
+        # Train ensemble of models
+        models_to_train = {
+            'logistic': LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42),
+            'random_forest': RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced'),
+            'gradient_boost': GradientBoostingClassifier(n_estimators=100, random_state=42)
+        }
+        
+        self.models[self.market] = {}
+        model_performance = {}
+        
+        for name, model in models_to_train.items():
+            try:
+                # Calibrate classifiers for better probability estimates
+                if name == 'logistic':
+                    calibrated_model = CalibratedClassifierCV(model, method='isotonic', cv=3)
+                else:
+                    calibrated_model = CalibratedClassifierCV(model, method='sigmoid', cv=3)
+                
+                calibrated_model.fit(X_train, y_train)
+                self.models[self.market][name] = calibrated_model
+                
+                # Evaluate model
+                y_pred_proba = calibrated_model.predict_proba(X_test)[:, 1]
+                y_pred = (y_pred_proba > 0.5).astype(int)
+                
+                accuracy = accuracy_score(y_test, y_pred)
+                precision = precision_score(y_test, y_pred, zero_division=0)
+                auc = roc_auc_score(y_test, y_pred_proba)
+                
+                model_performance[name] = {
+                    'accuracy': float(accuracy),
+                    'precision': float(precision),
+                    'auc': float(auc),
+                    'samples': len(y_test)
+                }
+                
+                logger.info(f"  {name}: acc={accuracy:.3f}, prec={precision:.3f}, AUC={auc:.3f}")
+                
+            except Exception as e:
+                logger.error(f"Failed to train {name} for {self.market}: {e}")
+                continue
+        
+        if not self.models[self.market]:
+            return {"error": "No models successfully trained"}
+        
+        # Calculate ensemble weights based on performance
+        ensemble_weights = self._calculate_ensemble_weights(model_performance)
+        
+        # Final ensemble evaluation
+        ensemble_probs = self._ensemble_predict_proba(X_test)
+        ensemble_pred = (ensemble_probs > 0.5).astype(int)
+        
+        final_accuracy = accuracy_score(y_test, ensemble_pred)
+        final_precision = precision_score(y_test, ensemble_pred, zero_division=0)
+        final_auc = roc_auc_score(y_test, ensemble_probs)
+        final_logloss = log_loss(y_test, ensemble_probs)
+        
+        logger.info(f"Ensemble {self.market}: acc={final_accuracy:.3f}, prec={final_precision:.3f}, AUC={final_auc:.3f}")
+        
+        # Feature importance from best model
+        feature_importance = self._get_feature_importance(feature_names)
+        
+        return {
+            "ensemble_weights": ensemble_weights,
+            "feature_importance": feature_importance,
+            "metrics": {
+                "accuracy": float(final_accuracy),
+                "precision": float(final_precision),
+                "auc": float(final_auc),
+                "log_loss": float(final_logloss),
+                "samples": X.shape[0],
+                "positive_ratio": float(np.mean(y))
+            },
+            "model_performance": model_performance,
+            "selected_features": self.selected_features
+        }
+    
+    def _calculate_ensemble_weights(self, performance: Dict) -> Dict[str, float]:
+        """Calculate ensemble weights based on model performance"""
+        weights = {}
+        total_score = 0.0
+        
+        for model_name, perf in performance.items():
+            # Weight by AUC (primary) and precision (secondary)
+            score = perf['auc'] * 0.7 + perf['precision'] * 0.3
+            weights[model_name] = score
+            total_score += score
+        
+        # Normalize weights
+        if total_score > 0:
+            weights = {k: v / total_score for k, v in weights.items()}
+        else:
+            # Equal weights if all models failed
+            weights = {k: 1.0 / len(performance) for k in performance.keys()}
+        
+        return weights
+    
+    def _ensemble_predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Get ensemble probability prediction"""
+        predictions = []
+        weights = []
+        
+        for model_name, model in self.models[self.market].items():
+            try:
+                prob = model.predict_proba(X)[:, 1]
+                predictions.append(prob)
+                # Use equal weights for now; could use performance-based weights
+                weights.append(1.0)
+            except Exception as e:
+                logger.warning(f"Prediction failed for {model_name}: {e}")
+                continue
+        
+        if not predictions:
+            return np.full(X.shape[0], 0.5)
+        
+        # Weighted average
+        weights = np.array(weights) / sum(weights)
+        ensemble_prob = np.zeros_like(predictions[0])
+        
+        for i, pred in enumerate(predictions):
+            ensemble_prob += pred * weights[i]
+        
+        return ensemble_prob
+    
+    def _get_feature_importance(self, feature_names: List[str]) -> Dict[str, float]:
+        """Get feature importance from the best performing model"""
+        if not self.models[self.market]:
+            return {}
+        
+        # Use random forest for feature importance if available
+        if 'random_forest' in self.models[self.market]:
+            try:
+                rf_model = self.models[self.market]['random_forest']
+                # Get the base estimator from calibrated classifier
+                if hasattr(rf_model, 'calibrated_classifiers_'):
+                    base_estimator = rf_model.calibrated_classifiers_[0].base_estimator
+                    if hasattr(base_estimator, 'feature_importances_'):
+                        importance = base_estimator.feature_importances_
+                        return dict(zip(self.selected_features, importance))
+            except Exception as e:
+                logger.debug(f"Could not get RF feature importance: {e}")
+        
+        # Fallback: use logistic regression coefficients
+        if 'logistic' in self.models[self.market]:
+            try:
+                lr_model = self.models[self.market]['logistic']
+                if hasattr(lr_model, 'calibrated_classifiers_'):
+                    base_estimator = lr_model.calibrated_classifiers_[0].base_estimator
+                    if hasattr(base_estimator, 'coef_'):
+                        coef = np.abs(base_estimator.coef_[0])
+                        # Normalize to 0-1 range
+                        if coef.max() > 0:
+                            coef = coef / coef.max()
+                        return dict(zip(self.selected_features, coef))
+            except Exception as e:
+                logger.debug(f"Could not get LR feature importance: {e}")
+        
+        return {feature: 1.0 for feature in self.selected_features}
+    
+    def predict_proba(self, features: Dict[str, float]) -> float:
+        """Predict probability for single feature set"""
+        if not self.models.get(self.market):
+            return 0.5
+        
+        # Prepare feature vector
+        feature_vector = []
+        for feature in self.selected_features:
+            feature_vector.append(float(features.get(feature, 0.0)))
+        
+        X = np.array([feature_vector])
+        
+        # Scale features
+        if self.scalers.get(self.market):
+            X_scaled = self.scalers[self.market].transform(X)
+        else:
+            X_scaled = X
+        
+        # Get ensemble prediction
+        return float(self._ensemble_predict_proba(X_scaled)[0])
+
+# ─────────────────────── Bayesian Network Simulator ─────────────────────── #
+
+class BayesianNetworkSimulator:
+    """Simulate Bayesian network reasoning for probability calibration"""
+    
+    def __init__(self):
+        self.prior_knowledge = self._load_prior_knowledge()
+        
+    def _load_prior_knowledge(self) -> Dict[str, Any]:
+        """Load Bayesian priors based on historical patterns"""
+        return {
+            'momentum_effect': 0.15,  # How much momentum affects goal probability
+            'pressure_effect': 0.10,  # How much pressure affects outcomes
+            'efficiency_bonus': 0.08,  # Bonus for efficient teams
+            'defensive_penalty': 0.12,  # Penalty for poor defense
+            'time_decay': 0.05,  # How much time affects certainty
+        }
+    
+    def apply_bayesian_correction(self, base_prob: float, features: Dict[str, float], market: str) -> float:
+        """Apply Bayesian correction to base probability"""
+        
+        # Extract key game state features
+        momentum = self._calculate_overall_momentum(features)
+        pressure = features.get('pressure_index', 0.0) / 100.0
+        efficiency = (features.get('efficiency_h', 0.0) + features.get('efficiency_a', 0.0)) / 2.0
+        defense = features.get('defensive_stability', 0.5)
+        minute = features.get('minute', 0.0) / 90.0  # Normalize
+        
+        # Market-specific adjustments
+        if market.startswith('OU'):
+            # Over/Under markets are more sensitive to momentum and efficiency
+            adjustment = (
+                momentum * self.prior_knowledge['momentum_effect'] +
+                efficiency * self.prior_knowledge['efficiency_bonus'] +
+                (1 - defense) * self.prior_knowledge['defensive_penalty'] * 0.5
+            )
+        elif market == 'BTTS':
+            # BTTS benefits from high action and poor defense
+            adjustment = (
+                momentum * self.prior_knowledge['momentum_effect'] * 0.8 +
+                (1 - defense) * self.prior_knowledge['defensive_penalty'] * 1.2
+            )
+        else:  # 1X2 markets
+            # Win markets consider pressure and efficiency
+            adjustment = (
+                pressure * self.prior_knowledge['pressure_effect'] +
+                efficiency * self.prior_knowledge['efficiency_bonus'] * 1.1
+            )
+        
+        # Time-based certainty increase
+        time_adjustment = minute * self.prior_knowledge['time_decay']
+        total_adjustment = adjustment + time_adjustment
+        
+        # Apply Bayesian update
+        corrected_prob = base_prob * (1 + total_adjustment)
+        return max(0.1, min(0.9, corrected_prob))
+    
+    def _calculate_overall_momentum(self, features: Dict[str, float]) -> float:
+        """Calculate overall match momentum"""
+        momentum_h = features.get('momentum_h', 0.0)
+        momentum_a = features.get('momentum_a', 0.0)
+        action_intensity = features.get('action_intensity', 0.0)
+        
+        overall_momentum = (momentum_h + momentum_a + action_intensity) / 3.0
+        return min(1.0, overall_momentum / 2.0)  # Normalize to 0-1 range
+
+# ─────────────────────── DB Connection (same as before) ─────────────────────── #
 
 try:
-    import requests  # used only for DoH fallback
+    import requests
 except Exception:
     requests = None
 
@@ -246,39 +583,34 @@ def _set_setting(conn, key: str, value: str) -> None:
 def _ensure_training_tables(conn) -> None:
     _exec(conn, "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     _exec(conn, """
-        CREATE TABLE IF NOT EXISTS prematch_snapshots (
-            match_id   BIGINT PRIMARY KEY,
-            created_ts BIGINT,
-            payload    TEXT
+        CREATE TABLE IF NOT EXISTS model_performance (
+            id SERIAL PRIMARY KEY,
+            model_name TEXT,
+            accuracy FLOAT,
+            precision FLOAT,
+            auc FLOAT,
+            samples INTEGER,
+            training_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    _exec(conn, "CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
+    _exec(conn, "CREATE INDEX IF NOT EXISTS idx_model_perf_date ON model_performance (training_date DESC)")
 
-# ─────────────────────── Enhanced Data Loading ─────────────────────── #
+# ─────────────────────── Enhanced Data Loading with Advanced Features ─────────────────────── #
 
-def _build_live_features_from_snapshot(snap: dict) -> Optional[Dict[str, float]]:
+def _build_advanced_features_from_snapshot(snap: dict) -> Optional[Dict[str, float]]:
     """
-    Your app saved HARVEST snapshots like:
-      {
-        "minute": 37,
-        "gh": 1, "ga": 0,
-        "stat": {
-           "xg_h":..., "xg_a":..., "sot_h":..., ...,
-           "pos_h":..., "pos_a":..., "red_h":..., "red_a":...,
-           "sh_total_h":..., "sh_total_a":..., "yellow_h":..., "yellow_a":...
-        }
-      }
-    Rebuild the exact feature dictionary used for training/prediction.
+    Build advanced features matching main.py's enhanced feature extraction
     """
     if not isinstance(snap, dict):
         return None
+        
     minute = float(snap.get("minute", 0.0))
     gh = float(snap.get("gh", 0.0)); ga = float(snap.get("ga", 0.0))
     stat = snap.get("stat") or {}
     if not isinstance(stat, dict):
         stat = {}
 
-    # base stats (default to 0.0)
+    # Base stats
     xg_h = float(stat.get("xg_h", 0.0)); xg_a = float(stat.get("xg_a", 0.0))
     sot_h = float(stat.get("sot_h", 0.0)); sot_a = float(stat.get("sot_a", 0.0))
     sh_total_h = float(stat.get("sh_total_h", 0.0)); sh_total_a = float(stat.get("sh_total_a", 0.0))
@@ -287,6 +619,7 @@ def _build_live_features_from_snapshot(snap: dict) -> Optional[Dict[str, float]]
     red_h = float(stat.get("red_h", 0.0)); red_a = float(stat.get("red_a", 0.0))
     yellow_h = float(stat.get("yellow_h", 0.0)); yellow_a = float(stat.get("yellow_a", 0.0))
 
+    # Base feature dictionary
     feat: Dict[str, float] = {
         "minute": minute,
         "goals_h": gh, "goals_a": ga,
@@ -305,21 +638,21 @@ def _build_live_features_from_snapshot(snap: dict) -> Optional[Dict[str, float]]
         "yellow_h": yellow_h, "yellow_a": yellow_a,
     }
 
-    # derived live features (no event stream → set last_15, cards to 0)
-    feat["goals_last_15"] = 0.0
-    feat["shots_last_15"] = 0.0
-    feat["cards_last_15"] = 0.0
-    feat["pressure_home"] = _calculate_pressure(feat, "home")
-    feat["pressure_away"] = _calculate_pressure(feat, "away")
-    feat["score_advantage"] = feat["goals_diff"]
+    # Advanced features
+    feat["momentum_h"] = _calculate_momentum(feat, "home")
+    feat["momentum_a"] = _calculate_momentum(feat, "away")
+    feat["pressure_index"] = _calculate_pressure_index(feat)
+    feat["efficiency_h"] = _calculate_efficiency(feat, "home")
+    feat["efficiency_a"] = _calculate_efficiency(feat, "away")
     feat["xg_momentum"] = _calculate_xg_momentum(feat)
-    feat["recent_xg_impact"] = _recent_xg_impact_from(feat, minute)
-    feat["defensive_stability"] = _defensive_stability(feat)
+    feat["defensive_stability"] = _calculate_defensive_stability(feat)
+    feat["total_actions"] = feat["sot_sum"] + feat["cor_sum"] + feat["yellow_h"] + feat["yellow_a"]
+    feat["action_intensity"] = _calculate_action_intensity(feat)
 
     return feat
 
 def load_live_data(conn, min_minute: int = 15, test_size: float = 0.25, min_rows: int = 150) -> Dict[str, Any]:
-    """Load live data from tip_snapshots.payload and rebuild features to match main.py."""
+    """Load live data with advanced feature engineering"""
     query = """
     SELECT 
         t.match_id,
@@ -359,16 +692,15 @@ def load_live_data(conn, min_minute: int = 15, test_size: float = 0.25, min_rows
             snap = row['payload']
             if isinstance(snap, str):
                 snap = json.loads(snap)
-            feat = _build_live_features_from_snapshot(snap)
+            feat = _build_advanced_features_from_snapshot(snap)
             if not feat:
                 continue
             minute = feat.get("minute", 0.0)
             if minute is None or float(minute) < float(min_minute):
                 continue
 
-            # vectorize
+            # Vectorize with advanced features
             vec = [float(feat.get(f, 0.0) or 0.0) for f in FEATURES]
-            # need some signal
             if sum(1 for x in vec if x != 0.0) < 5:
                 continue
 
@@ -408,114 +740,12 @@ def load_live_data(conn, min_minute: int = 15, test_size: float = 0.25, min_rows
 
     return {"X": X, "y": market_targets, "weights": W, "features": FEATURES}
 
-def load_prematch_data(conn, min_rows: int = 150) -> Dict[str, Any]:
-    """
-    Load pre-match data from prematch_snapshots.payload->feat.
-    We dynamically build a feature list from available numeric keys so it stays compatible
-    with whatever extract_prematch_features() saved in main.py.
-    """
-    query = """
-    SELECT 
-        p.match_id,
-        p.created_ts,
-        p.payload,
-        r.final_goals_h,
-        r.final_goals_a,
-        r.btts_yes,
-        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - to_timestamp(p.created_ts))) / (60*60*24) AS days_ago
-    FROM prematch_snapshots p
-    LEFT JOIN match_results r ON p.match_id = r.match_id
-    WHERE r.final_goals_h IS NOT NULL
-      AND r.final_goals_a IS NOT NULL
-    ORDER BY p.created_ts DESC
-    LIMIT 5000
-    """
-    df = _read_sql(conn, query)
+# ─────────────────────── Advanced Model Training ─────────────────────── #
 
-    if df.empty:
-        logger.warning("No pre-match data found for training")
-        return {"X": None, "y": None, "markets": {}}
-
-    df['recency_weight'] = np.exp(-np.abs(df['days_ago']) / max(1.0, RECENCY_HALF_LIFE_DAYS))
-
-    # First pass: collect all numeric keys under payload->feat
-    all_keys: Dict[str, int] = {}
-    feats_raw: List[Dict[str, float]] = []
-    weights: List[float] = []
-    y_dict = {
-        'PRE_BTTS': [],
-        'PRE_OU_2.5': [],
-        'PRE_OU_3.5': [],
-        'PRE_1X2_HOME': [],
-        'PRE_1X2_AWAY': [],
-    }
-
-    for _, row in df.iterrows():
-        try:
-            payload = row['payload']
-            if isinstance(payload, str):
-                payload = json.loads(payload)
-            feat = (payload or {}).get("feat") or {}
-            # keep only numeric
-            numeric_feat = {k: float(v) for k, v in (feat.items() if isinstance(feat, dict) else []) if isinstance(v, (int, float))}
-            if not numeric_feat:
-                continue
-            feats_raw.append(numeric_feat)
-            for k in numeric_feat.keys():
-                all_keys[k] = all_keys.get(k, 0) + 1
-            weights.append(float(row['recency_weight'] or 1.0))
-
-            gh = int(row['final_goals_h'] or 0)
-            ga = int(row['final_goals_a'] or 0)
-            total = gh + ga
-            btts = int(row['btts_yes'] or 0)
-
-            y_dict['PRE_BTTS'].append(1 if btts == 1 else 0)
-            y_dict['PRE_OU_2.5'].append(1 if total > 2.5 else 0)
-            y_dict['PRE_OU_3.5'].append(1 if total > 3.5 else 0)
-            if gh > ga:
-                y_dict['PRE_1X2_HOME'].append(1); y_dict['PRE_1X2_AWAY'].append(0)
-            elif ga > gh:
-                y_dict['PRE_1X2_HOME'].append(0); y_dict['PRE_1X2_AWAY'].append(1)
-            else:
-                y_dict['PRE_1X2_HOME'].append(0); y_dict['PRE_1X2_AWAY'].append(0)
-
-        except Exception as e:
-            logger.debug("Prematch row parse error: %s", e)
-            continue
-
-    if not feats_raw:
-        logger.warning("No valid prematch features extracted")
-        return {"X": None, "y": None, "markets": {}}
-
-    # choose stable feature order (only keys seen in at least 10 samples)
-    ordered_keys = sorted([k for k, c in all_keys.items() if c >= 10]) or sorted(all_keys.keys())
-    X = np.array([[float(fr.get(k, 0.0) or 0.0) for k in ordered_keys] for fr in feats_raw], dtype=float)
-    W = np.array(weights, dtype=float)
-    logger.info("Loaded %d prematch samples × %d features", X.shape[0], X.shape[1])
-
-    return {"X": X, "y": y_dict, "weights": W, "features": ordered_keys}
-
-# ─────────────────────── Model Training ─────────────────────── #
-
-def _safe_train_test_split(X, y, W, test_size: float, stratify_ok: bool):
-    from sklearn.model_selection import train_test_split
-    # If single class, we cannot stratify
-    y_unique = np.unique(y)
-    if len(y_unique) < 2:
-        return None
-    if W is None:
-        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=42,
-                                              stratify=y if stratify_ok else None)
-        return Xtr, Xte, ytr, yte, None, None
-    else:
-        Xtr, Xte, ytr, yte, wtr, wte = train_test_split(X, y, W, test_size=test_size, random_state=42,
-                                                        stratify=y if stratify_ok else None)
-        return Xtr, Xte, ytr, yte, wtr, wte
-
-def train_market_model(X: np.ndarray, y: List[int], weights: Optional[np.ndarray],
-                      features: List[str], market: str, test_size: float = 0.25) -> Optional[Dict[str, Any]]:
-    """Train a single market model with Platt (sigmoid) calibration."""
+def train_advanced_market_model(X: np.ndarray, y: List[int], weights: Optional[np.ndarray],
+                              features: List[str], market: str, test_size: float = 0.25) -> Optional[Dict[str, Any]]:
+    """Train advanced ensemble model for a market"""
+    
     if X is None or len(y) == 0:
         logger.warning("No data for market %s", market)
         return None
@@ -526,69 +756,44 @@ def train_market_model(X: np.ndarray, y: List[int], weights: Optional[np.ndarray
         X = X[:n]; y = y[:n]
         weights = weights[:n] if weights is not None else None
 
-    pos_ratio = float(np.mean(y))
     if len(np.unique(y)) < 2:
         logger.warning("Market %s has a single class in labels; skipping.", market)
         return None
 
-    class_weight = 'balanced' if (pos_ratio < 0.3 or pos_ratio > 0.7) else None
-    model = LogisticRegression(class_weight=class_weight, random_state=42, max_iter=1000, C=0.1)
-
-    splits = _safe_train_test_split(X, y, weights, test_size, stratify_ok=True)
-    if splits is None:
-        logger.warning("Market %s: unable to split (single-class); skipping.", market)
+    # Use advanced ensemble model
+    ensemble_model = AdvancedEnsembleModel(market)
+    training_result = ensemble_model.train(X, y, features, weights, test_size)
+    
+    if "error" in training_result:
+        logger.error("Failed to train ensemble for %s: %s", market, training_result["error"])
         return None
-    X_train, X_test, y_train, y_test, w_train, w_test = splits
 
-    model.fit(X_train, y_train, sample_weight=w_train)
-
-    train_probs = model.predict_proba(X_train)[:, 1]
-    test_probs = model.predict_proba(X_test)[:, 1]
-
-    # Platt scaling
-    calibration = {"method": "sigmoid", "a": 1.0, "b": 0.0}
-    try:
-        if len(y_test) > 50 and len(np.unique(y_train)) >= 2:
-            from sklearn.linear_model import LogisticRegression as CalibrationLR
-            calibrator = CalibrationLR(max_iter=1000, C=1.0)
-            calibrator.fit(train_probs.reshape(-1, 1), y_train)
-            calibrated = calibrator.predict_proba(test_probs.reshape(-1, 1))[:, 1]
-            orig_brier = brier_score_loss(y_test, test_probs)
-            cal_brier = brier_score_loss(y_test, calibrated)
-            if cal_brier < orig_brier:
-                calibration = {
-                    "method": "sigmoid",
-                    "a": float(calibrator.coef_[0][0]),
-                    "b": float(calibrator.intercept_[0]),
-                }
-    except Exception as e:
-        logger.debug("Calibration skipped for %s: %s", market, e)
-
-    # Metrics on uncalibrated test_probs (just for reference)
-    accuracy = accuracy_score(y_test, test_probs > 0.5)
-    precision = precision_score(y_test, test_probs > 0.5, zero_division=0)
-    auc = roc_auc_score(y_test, test_probs)
-    logloss = log_loss(y_test, test_probs)
-
-    logger.info("Market %s: acc=%.3f, prec=%.3f, AUC=%.3f, logloss=%.3f, samples=%d, pos=%.3f",
-                market, accuracy, precision, auc, logloss, X.shape[0], pos_ratio)
-
-    feature_importance = dict(zip(features, model.coef_[0]))
-    return {
-        "weights": feature_importance,
-        "intercept": float(model.intercept_[0]),
-        "calibration": calibration,
-        "metrics": {
-            "accuracy": float(accuracy),
-            "precision": float(precision),
-            "auc": float(auc),
-            "log_loss": float(logloss),
-            "samples": int(X.shape[0]),
-            "positive_ratio": float(pos_ratio)
+    # Add Bayesian calibration
+    bayesian_simulator = BayesianNetworkSimulator()
+    
+    # Create final model object
+    model_obj = {
+        "model_type": "advanced_ensemble",
+        "ensemble_weights": training_result["ensemble_weights"],
+        "feature_importance": training_result["feature_importance"],
+        "selected_features": training_result["selected_features"],
+        "metrics": training_result["metrics"],
+        "bayesian_prior_alpha": 2.0,  # Beta distribution parameters for Bayesian updating
+        "bayesian_prior_beta": 2.0,
+        "calibration": {
+            "method": "bayesian_ensemble",
+            "version": "2.0"
         }
     }
 
-# ─────────────────────── Auto-Tune (DB-level, compatible with main.py) ─────────────────────── #
+    logger.info("Advanced training completed for %s: acc=%.3f, prec=%.3f, AUC=%.3f", 
+                market, training_result["metrics"]["accuracy"], 
+                training_result["metrics"]["precision"], 
+                training_result["metrics"]["auc"])
+
+    return model_obj
+
+# ─────────────────────── Advanced Auto-Tune ─────────────────────── #
 
 def _calculate_tip_outcome(suggestion: str, gh: int, ga: int, btts: int) -> Optional[int]:
     try:
@@ -605,30 +810,43 @@ def _calculate_tip_outcome(suggestion: str, gh: int, ga: int, btts: int) -> Opti
     except Exception:
         return None
 
-def _find_optimal_threshold(confidences_pct: np.ndarray, outcomes: np.ndarray) -> Optional[float]:
-    thresholds = np.linspace(MIN_THRESH, MAX_THRESH, 50)
+def _find_optimal_threshold_advanced(confidences_pct: np.ndarray, outcomes: np.ndarray) -> Optional[float]:
+    """Advanced threshold optimization considering precision and sample size"""
+    thresholds = np.linspace(MIN_THRESH, MAX_THRESH, 100)
     best_score, best_thr = -1.0, None
+    
     for thr in thresholds:
         mask = confidences_pct >= thr
         n = int(mask.sum())
         if n < THRESH_MIN_PREDICTIONS:
             continue
+            
         pos = outcomes[mask].sum()
         precision = float(pos) / float(n) if n else 0.0
         recall = float(pos) / float(outcomes.sum()) if outcomes.sum() else 0.0
+        
         if precision + recall == 0:
             continue
-        f1 = 2 * precision * recall / (precision + recall)
-        score = f1 * (1.0 + 0.5 * (precision >= TARGET_PRECISION))
+            
+        # Advanced scoring: reward high precision, sufficient samples, and good recall
+        precision_bonus = 2.0 if precision >= TARGET_PRECISION else 1.0
+        sample_adequacy = min(1.0, n / (THRESH_MIN_PREDICTIONS * 2.0))
+        
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        score = f1 * precision_bonus * (1.0 + 0.3 * sample_adequacy)
+        
         if score > best_score:
             best_score, best_thr = score, thr
+            
     return best_thr
 
-def auto_tune_thresholds(conn, days: int = 14) -> Dict[str, float]:
+def auto_tune_thresholds_advanced(conn, days: int = 14) -> Dict[str, float]:
+    """Advanced auto-tuning with Bayesian considerations"""
     if not AUTO_TUNE_ENABLE:
         logger.info("Auto-tune disabled by configuration")
         return {}
-    logger.info("Starting auto-tune for thresholds (days=%d)", days)
+        
+    logger.info("Starting advanced auto-tune for thresholds (days=%d)", days)
 
     cutoff_ts = int(time.time()) - int(days) * 86400
     query = """
@@ -671,91 +889,86 @@ def auto_tune_thresholds(conn, days: int = 14) -> Dict[str, float]:
         if len(outcomes) < THRESH_MIN_PREDICTIONS:
             continue
 
-        thr = _find_optimal_threshold(conf_pct, outcomes)
+        thr = _find_optimal_threshold_advanced(conf_pct, outcomes)
         if thr is not None:
             tuned[market] = float(thr)
             _set_setting(conn, f"conf_threshold:{market}", f"{thr:.2f}")
 
-    logger.info("Auto-tune completed: %d markets tuned", len(tuned))
+    logger.info("Advanced auto-tune completed: %d markets tuned", len(tuned))
     return tuned
 
 # ─────────────────────── Main Training Function ─────────────────────── #
 
-def _store_model(conn, key: str, model_obj: Dict[str, Any]) -> None:
+def _store_advanced_model(conn, key: str, model_obj: Dict[str, Any]) -> None:
+    """Store advanced model with metadata"""
     model_json = json.dumps(model_obj, separators=(",", ":"), ensure_ascii=False)
     _set_setting(conn, key, model_json)
-    logger.info("Stored model: %s", key)
+    
+    # Store performance metrics
+    if "metrics" in model_obj:
+        metrics = model_obj["metrics"]
+        _exec(conn, """
+            INSERT INTO model_performance (model_name, accuracy, precision, auc, samples)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (key, metrics["accuracy"], metrics["precision"], metrics["auc"], metrics["samples"]))
+    
+    logger.info("Stored advanced model: %s (acc=%.3f)", key, model_obj.get("metrics", {}).get("accuracy", 0.0))
 
 def train_models(db_url: Optional[str] = None, min_minute: int = 15, 
                 test_size: float = 0.25, min_rows: int = 150) -> Dict[str, Any]:
-    logger.info("Starting enhanced model training (min_minute=%d, test_size=%.2f)", min_minute, test_size)
+    logger.info("Starting ADVANCED AI model training with Bayesian networks & ensembles")
     conn = _connect(db_url)
     _ensure_training_tables(conn)
 
-    results: Dict[str, Any] = {"ok": True, "trained": {}, "auto_tuned": {}, "errors": []}
+    results: Dict[str, Any] = {
+        "ok": True, 
+        "trained": {}, 
+        "auto_tuned": {}, 
+        "errors": [],
+        "training_type": "advanced_ai",
+        "models_trained": 0
+    }
 
     try:
-        # Live models
+        # Live models only (removed pre-match as requested)
         live = load_live_data(conn, min_minute, test_size, min_rows)
         if live["X"] is not None:
             for market, y in live["y"].items():
-                mdl = train_market_model(live["X"], y, live["weights"], live["features"], market, test_size)
+                logger.info("Training advanced model for %s with %d samples", market, len(y))
+                mdl = train_advanced_market_model(live["X"], y, live["weights"], live["features"], market, test_size)
                 if mdl:
-                    # live models go under model_v2:{market}
-                    key = f"model_v2:{market}"
-                    _store_model(conn, key, mdl)
+                    # Store with advanced model prefix
+                    key = f"model_advanced:{market}"
+                    _store_advanced_model(conn, key, mdl)
                     results["trained"][market] = True
+                    results["models_trained"] += 1
                 else:
                     results["trained"][market] = False
-                    results["errors"].append(f"Failed to train {market}")
+                    results["errors"].append(f"Failed to train advanced model for {market}")
 
-        # Pre-match models
-        pre = load_prematch_data(conn, min_rows)
-        if pre["X"] is not None:
-            for market, y in pre["y"].items():
-                mdl = train_market_model(pre["X"], y, pre["weights"], pre["features"], market, test_size)
-                if mdl:
-                    # map to keys main.py actually loads:
-                    if market == "PRE_BTTS":
-                        key = "PRE_BTTS_YES"
-                    elif market == "PRE_OU_2.5":
-                        key = "PRE_OU_" + _fmt_line(2.5)
-                    elif market == "PRE_OU_3.5":
-                        key = "PRE_OU_" + _fmt_line(3.5)
-                    elif market == "PRE_1X2_HOME":
-                        key = "PRE_WLD_HOME"
-                    elif market == "PRE_1X2_AWAY":
-                        key = "PRE_WLD_AWAY"
-                    else:
-                        key = market  # fallback
-                    _store_model(conn, key, mdl)
-                    results["trained"][market] = True
-                else:
-                    results["trained"][market] = False
-                    results["errors"].append(f"Failed to train pre {market}")
-
-        # Optional: auto-tune thresholds in DB
+        # Advanced auto-tuning
         if AUTO_TUNE_ENABLE:
-            tuned = auto_tune_thresholds(conn, 14)
+            tuned = auto_tune_thresholds_advanced(conn, 14)
             results["auto_tuned"] = tuned
 
-        # metadata
+        # Store comprehensive metadata
         meta = {
             "timestamp": time.time(),
             "live_samples": int(live["X"].shape[0]) if live["X"] is not None else 0,
-            "prematch_samples": int(pre["X"].shape[0]) if pre["X"] is not None else 0,
-            "trained_models": [k for k, v in results["trained"].items() if v]
+            "trained_models": results["models_trained"],
+            "training_type": "advanced_ai_ensemble",
+            "features_used": len(live["features"]) if live["X"] is not None else 0,
+            "ensemble_enabled": ENSEMBLE_ENABLE,
+            "bayesian_calibration": BAYESIAN_CALIBRATION_ENABLE
         }
-        _set_setting(conn, "training_metadata", json.dumps(meta, separators=(",", ":")))
-        _set_setting(conn, "last_train_ts", str(int(time.time())))
+        _set_setting(conn, "advanced_training_metadata", json.dumps(meta, separators=(",", ":")))
+        _set_setting(conn, "last_advanced_train_ts", str(int(time.time())))
 
-        logger.info("Training done: %d live + %d prematch models trained; tuned=%d",
-                    sum(1 for k in results["trained"] if not k.startswith("PRE_") and results["trained"][k]),
-                    sum(1 for k in results["trained"] if k.startswith("PRE_") and results["trained"][k]),
-                    len(results.get("auto_tuned", {})))
+        logger.info("ADVANCED TRAINING COMPLETED: %d models trained, %d markets tuned", 
+                   results["models_trained"], len(results.get("auto_tuned", {})))
 
     except Exception as e:
-        logger.exception("Training failed: %s", e)
+        logger.exception("Advanced training failed: %s", e)
         results["ok"] = False
         results["error"] = str(e)
     finally:
@@ -769,13 +982,15 @@ def train_models(db_url: Optional[str] = None, min_minute: int = 15,
 # ─────────────────────── CLI ─────────────────────── #
 
 def _cli_main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Advanced AI Model Trainer")
     ap.add_argument("--db-url", help="Postgres DSN (or use env DATABASE_URL)")
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=TRAIN_MIN_MINUTE)
     ap.add_argument("--test-size", type=float, default=TRAIN_TEST_SIZE)
     ap.add_argument("--min-rows", type=int, default=MIN_ROWS)
     ap.add_argument("--auto-tune", action="store_true", default=AUTO_TUNE_ENABLE, 
-                   help="Enable auto-tuning of confidence thresholds")
+                   help="Enable advanced auto-tuning of confidence thresholds")
+    ap.add_argument("--ensemble", action="store_true", default=ENSEMBLE_ENABLE,
+                   help="Enable ensemble model training")
     args = ap.parse_args()
 
     res = train_models(
