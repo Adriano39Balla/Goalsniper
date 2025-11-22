@@ -12,14 +12,18 @@ import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
 
 from psycopg2.extras import RealDictCursor
-from sklearn.model_selection import train_test_split
 
-# Import the *same* predictor class used by main.py
+# ----------------------------------------------------------------------------
+# IMPORTANT: prevent main.py from starting the web app & scheduler when imported
+# ----------------------------------------------------------------------------
+os.environ.setdefault("GOALSNIPER_SKIP_BOOT_ON_IMPORT", "1")
+
+# Import the *same* predictor class and constants used by main.py
 from main import (
     AdvancedEnsemblePredictor,
     OU_LINES,
     _fmt_line,
-    extract_features,
+    extract_features,  # not used directly, kept for parity / potential feature transforms
 )
 
 log = logging.getLogger("train_models")
@@ -87,8 +91,8 @@ def load_training_data(conn) -> List[Dict[str, Any]]:
         try:
             snap = json.loads(row["payload"])
             features = snap.get("stat", {})
-            gh = int(row["final_goals_h"])
-            ga = int(row["final_goals_a"])
+            gh = int(row["final_goals_h"] or 0)
+            ga = int(row["final_goals_a"] or 0)
             total = gh + ga
             btts_yes = int(row["btts_yes"] or 0)
 
@@ -200,6 +204,7 @@ def train_single_market(
         log.info("[TRAIN] skipped %s/%s: too few samples (%d)", market, suggestion, len(rows))
         return None
 
+    # Build labels just to sanity-check class balance
     X, y, feat_names = build_feature_matrix(rows)
     y = np.array(y, dtype=int)
 
@@ -210,6 +215,7 @@ def train_single_market(
     model_key = f"{market}_{suggestion.replace(' ', '_')}"
     predictor = AdvancedEnsemblePredictor(model_key)
 
+    # Train using raw feature dicts to preserve selector/scaler inside predictor
     result = predictor.train([r["features"] for r in rows], y.tolist())
     if not result.get("ok"):
         log.error("[TRAIN] training failed for %s: %s", model_key, result)
@@ -232,6 +238,8 @@ def train_single_market(
         "model_key": model_key,
         "path": path,
         "sample_count": len(rows),
+        "trained_at": int(time.time()),
+        "features": feat_names,
     }
 
 
@@ -258,10 +266,12 @@ def train_all_markets(conn) -> Dict[str, Any]:
                 "sample_count": info["sample_count"],
                 "model_key": info["model_key"],
                 "saved_path": info["path"],
+                "trained_at": info["trained_at"],
             }
             _store_model_metadata(conn, info["model_key"], meta)
 
     return {"ok": True, "trained": trained_info}
+
 
 # ---------------------------------------------------------------------
 # Store model metadata in settings
@@ -472,7 +482,7 @@ if __name__ == "__main__":
         result = train_all_markets(conn)
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
 
-        if os.getenv("AUTO_TUNE_ON_TRAIN", "1") not in ("0", "false", "False", "no", "NO"):
+        if os.getenv("AUTO_TUNE_ON_TRAIN", "1").lower() not in ("0", "false", "no"):
             tuned = auto_tune_thresholds_advanced(
                 conn,
                 days=int(os.getenv("AUTO_TUNE_DAYS", "14")),
