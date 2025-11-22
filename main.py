@@ -117,8 +117,6 @@ SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
 API_BUDGET_DAILY      = int(os.getenv("API_BUDGET_DAILY", "150000"))
 MAX_FIXTURES_PER_SCAN = int(os.getenv("MAX_FIXTURES_PER_SCAN", "160"))
 USE_EVENTS_IN_FEATURES = os.getenv("USE_EVENTS_IN_FEATURES", "0") not in ("0","false","False","no","NO")
-ODDS_CALLS_PER_FIXTURE = int(os.getenv("ODDS_CALLS_PER_FIXTURE", "1"))
-_BUDGET_SAMPLE = {"seen": 0, "selected": 0, "ppf": 0, "quota": 0, "last": 0}
 try:
     LEAGUE_ALLOW_IDS = {int(x) for x in os.getenv("LEAGUE_ALLOW_IDS","").split(",") if x.strip().isdigit()}
 except Exception:
@@ -876,54 +874,6 @@ def _api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
             log.warning("[CB] API-Football opened due to exceptions")
         return None
 
-def _api_calls_used_since_boot() -> Dict[str, int]:
-    try:
-        counts = METRICS.get("api_calls_total", {})
-        # defaultdict(int) may include None key; normalize to strings
-        return {str(k): int(v) for k, v in counts.items()}
-    except Exception:
-        return {}
-
-def _estimate_daily_calls() -> Dict[str, Any]:
-    scans_per_day = max(1, int(86400 / max(1, SCAN_INTERVAL_SEC)))
-    ppf = _BUDGET_SAMPLE.get("ppf") or (1 + (1 if USE_EVENTS_IN_FEATURES else 0) + max(0, ODDS_CALLS_PER_FIXTURE))
-    # worst-case: pick up to current quota if we don't have a sample yet
-    sel = _BUDGET_SAMPLE.get("selected") or _quota_per_scan()
-    # per scan: 1 fixtures listing + sel * ppf per picked fixture
-    calls_per_scan = 1 + sel * ppf
-    calls_per_day  = scans_per_day * calls_per_scan
-    used_map = _api_calls_used_since_boot()
-    used_total = sum(used_map.values())
-    return {
-        "scans_per_day": scans_per_day,
-        "ppf": int(ppf),
-        "selected_per_scan_est": int(sel),
-        "calls_per_scan_est": int(calls_per_scan),
-        "calls_per_day_est": int(calls_per_day),
-        "api_budget_daily": int(API_BUDGET_DAILY),
-        "used_since_boot": int(used_total),
-        "used_breakdown": used_map,
-        "last_sample_ts": int(_BUDGET_SAMPLE.get("last", 0)),
-    }
-
-def _format_budget_report(est: Dict[str, Any]) -> str:
-    br = est.get("used_breakdown", {})
-    parts = [f"📉 <b>API Budget</b>",
-             f"Daily budget: {est.get('api_budget_daily'):,}",
-             f"Scan interval: {SCAN_INTERVAL_SEC}s  •  scans/day ≈ {est.get('scans_per_day')}",
-             f"Per fixture pings (ppf): {est.get('ppf')}  •  est picked/scan: {est.get('selected_per_scan_est')}",
-             f"Calls/scan ≈ {est.get('calls_per_scan_est')}  •  Calls/day ≈ {est.get('calls_per_day_est'):,}",
-             f"Since boot used ≈ {est.get('used_since_boot'):,} "
-             f"(fixtures={br.get('fixtures',0)}, stats={br.get('statistics',0)}, events={br.get('events',0)}, odds={br.get('odds',0)})"]
-    return "\n".join(parts)
-
-def send_budget_report() -> Dict[str, Any]:
-    est = _estimate_daily_calls()
-    msg = _format_budget_report(est)
-    send_telegram(msg)
-    est["text"] = msg
-    return est
-
 # ───────── League filter ─────────
 _BLOCK_PATTERNS = [
     "u17",
@@ -986,11 +936,8 @@ def fetch_live_fixtures_only() -> List[dict]:
     return out
 
 def _quota_per_scan() -> int:
-    # scans/day
     scans_per_day = max(1, int(86400 / max(1, SCAN_INTERVAL_SEC)))
-    # per-picked-fixture calls: stats (1) + optional events (1) + odds (ODDS_CALLS_PER_FIXTURE)
-    ppf = 1 + (1 if USE_EVENTS_IN_FEATURES else 0) + max(0, ODDS_CALLS_PER_FIXTURE)
-    # keep a small buffer; fixtures listing is ~1 call per scan (amortized)
+    ppf = 1 + (1 if USE_EVENTS_IN_FEATURES else 0)
     safe = int(API_BUDGET_DAILY / max(1, (scans_per_day * ppf))) - 10
     return max(1, min(MAX_FIXTURES_PER_SCAN, safe))
 
@@ -1036,16 +983,9 @@ def fetch_live_matches() -> List[dict]:
         m["statistics"] = fetch_match_stats(fid)
         m["events"]     = fetch_match_events(fid) if USE_EVENTS_IN_FEATURES else []
         out.append(m)
-        ppf = 1 + (1 if USE_EVENTS_IN_FEATURES else 0) + max(0, ODDS_CALLS_PER_FIXTURE)
-        _BUDGET_SAMPLE.update({
-            "seen": len(fixtures),
-            "selected": len(out),
-            "ppf": ppf,
-            "quota": quota,
-            "last": int(time.time())
-        })
-        log.info("[SCAN/BUDGET] fixtures_seen=%d selected=%d quota=%d ppf=%d", len(fixtures), len(out), quota, ppf)
-        return out
+    ppf = 1 + (1 if USE_EVENTS_IN_FEATURES else 0)
+    log.info("[SCAN/BUDGET] fixtures=%d selected=%d quota=%d ppf=%d", len(fixtures), len(out), quota, ppf)
+    return out
 
 # ───────── Advanced Feature Extraction ─────────
 def _num(v) -> float:
@@ -2296,15 +2236,6 @@ def metrics():
         return jsonify({"ok": True, "metrics": METRICS})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/admin/budget", methods=["GET", "POST"])
-def http_budget():
-    _require_admin()
-    notify = request.args.get("notify", "1").lower() not in ("0","false","no")
-    est = _estimate_daily_calls()
-    if notify:
-        send_telegram(_format_budget_report(est))
-    return jsonify({"ok": True, **est})
 
 @app.route("/admin/scan", methods=["POST", "GET"])
 def http_scan():
