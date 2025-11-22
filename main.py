@@ -2161,7 +2161,7 @@ def _start_scheduler_once():
 
         if DAILY_ACCURACY_DIGEST_ENABLE:
             sched.add_job(
-                lambda: _run_with_pg_lock(1004, daily_accuracy_digest),
+                lambda: _run_with_pg_lock(1004, daily_accuracy_digest, 1),
                 CronTrigger(
                     hour=int(os.getenv("DAILY_ACCURACY_HOUR", "3")),
                     minute=int(os.getenv("DAILY_ACCURACY_MINUTE", "6")),
