@@ -334,6 +334,67 @@ class AdvancedEnsemblePredictor:
         
         _metric_inc("ensemble_predictions_total", label=self.model_name)
         return bayesian_prob
+
+    def calculate_tip_reliability(match_id: int, suggestion: str, probability: float) -> Dict[str, Any]:
+    """Calculate reliability metrics for each tip"""
+    reliability_score = 0.0
+    flags = []
+    
+    # Score based on probability strength
+    if probability >= 0.7:
+        reliability_score += 0.3
+        flags.append("high_confidence")
+    elif probability >= 0.6:
+        reliability_score += 0.2
+        flags.append("medium_confidence")
+    else:
+        reliability_score += 0.1
+        flags.append("low_confidence")
+    
+    # Score based on data quality (minute of match)
+    with db_conn() as c:
+        minute_row = c.execute(
+            "SELECT minute FROM tips WHERE match_id=%s ORDER BY created_ts DESC LIMIT 1",
+            (match_id,)
+        ).fetchone()
+        
+    if minute_row and minute_row[0] >= 60:
+        reliability_score += 0.3
+        flags.append("late_match_data")
+    elif minute_row and minute_row[0] >= 30:
+        reliability_score += 0.2
+        flags.append("mid_match_data")
+    else:
+        reliability_score += 0.1
+        flags.append("early_match_data")
+    
+    # Score based on feature completeness
+    with db_conn() as c:
+        feature_row = c.execute(
+            "SELECT COUNT(*) FROM self_learning_data WHERE match_id=%s",
+            (match_id,)
+        ).fetchone()
+    
+    if feature_row and feature_row[0] > 5:
+        reliability_score += 0.2
+        flags.append("rich_features")
+    else:
+        reliability_score += 0.1
+        flags.append("basic_features")
+    
+    # Market-specific adjustments
+    if "Over" in suggestion or "Under" in suggestion:
+        reliability_score += 0.1
+        flags.append("ou_market")
+    elif "BTTS" in suggestion:
+        reliability_score += 0.05
+        flags.append("btts_market")
+    
+    return {
+        "reliability_score": min(1.0, reliability_score),
+        "flags": flags,
+        "grade": "A" if reliability_score >= 0.8 else "B" if reliability_score >= 0.6 else "C"
+    }
     
     def _prepare_features(self, features: Dict[str, float]) -> Optional[np.ndarray]:
         if self.model_name not in self.scalers:
@@ -581,6 +642,38 @@ class SelfLearningSystem:
             if stats["total"] > 0:
                 importance_scores[feature] = stats["predictive"] / stats["total"]
         return importance_scores
+
+def verify_learning_system() -> Dict[str, Any]:
+    """Check if the learning system is working properly"""
+    status = {}
+    
+    with db_conn() as c:
+        # Check if we have match results to learn from
+        results_count = c.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
+        status['match_results_available'] = results_count
+        
+        # Check self-learning data
+        learning_data = c.execute("SELECT COUNT(*) FROM self_learning_data").fetchone()[0]
+        status['learning_records'] = learning_data
+        
+        # Check if learning is happening
+        learned_outcomes = c.execute(
+            "SELECT COUNT(*) FROM self_learning_data WHERE actual_outcome IS NOT NULL"
+        ).fetchone()[0]
+        status['learned_outcomes'] = learned_outcomes
+        
+        # Check recent tip performance
+        recent_tips = c.execute("""
+            SELECT COUNT(*), 
+                   SUM(CASE WHEN t.suggestion <> 'HARVEST' THEN 1 ELSE 0 END) as real_tips,
+                   AVG(t.confidence) as avg_confidence
+            FROM tips t 
+            WHERE t.created_ts >= %s
+        """, (int(time.time()) - 24*3600,)).fetchone()
+        status['recent_tips_24h'] = recent_tips[1] if recent_tips else 0
+        status['avg_confidence'] = float(recent_tips[2]) if recent_tips and recent_tips[2] else 0
+    
+    return status
 
 # ───────── Initialize Advanced Systems ─────────
 bayesian_network    = BayesianBettingNetwork()
@@ -2557,6 +2650,12 @@ def http_train():
     except Exception as e:
         log.exception("train_models failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/system-status")
+def http_system_status():
+    _require_admin()
+    learning_status = verify_learning_system()
+    return jsonify({"ok": True, "system_status": learning_status})
 
 @app.route("/admin/auto-tune", methods=["POST", "GET"])
 def http_auto_tune():
