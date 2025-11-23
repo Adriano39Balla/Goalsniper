@@ -2308,7 +2308,7 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
         log.info("[RESULTS] backfilled %d", updated)
     return updated
 
-def daily_accuracy_digest(window_days: int = 7) -> Optional[str]:
+def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
     if not DAILY_ACCURACY_DIGEST_ENABLE:
         return None
     backfill_results_for_open_matches(400)
