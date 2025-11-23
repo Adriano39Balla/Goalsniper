@@ -2633,6 +2633,9 @@ def http_self_learn():
     process_self_learning_from_results()
     return jsonify({"ok": True})
 
+@app.route("/admin/digest", methods=["POST","GET"])
+def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
+
 @app.route("/admin/reset-thresholds", methods=["POST", "GET"])
 def http_reset_thresholds():
     _require_admin()
