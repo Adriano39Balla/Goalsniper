@@ -1173,7 +1173,8 @@ def advanced_predict_probability(
         log.debug("📋 Using data-poor weighting (40/60)")
     
     final_prob = float(max(0.01, min(0.99, final_prob)))
-    log.debug("🎯 Final probability: %.3f", final_prob)
+    log.info("🎯 FINAL probability for %s - %s: %.1f%% (bayesian: %.1f%%, ensemble: %.1f%%)", 
+             market, suggestion, final_prob*100, bayesian_prob*100, ensemble_prob*100)
     
     prediction_data = {
         "features": features,
@@ -1446,8 +1447,11 @@ def _pretty_score(m: dict) -> str:
 def _get_market_threshold(m: str) -> float:
     try:
         v = get_setting_cached(f"conf_threshold:{m}")
-        return float(v) if v is not None else float(CONF_THRESHOLD)
+        threshold = float(v) if v is not None else float(CONF_THRESHOLD)
+        log.debug("⚙️ Market threshold for %s: %.1f%%", m, threshold)
+        return threshold
     except Exception:
+        log.debug("⚙️ Using default threshold for %s: %.1f%%", m, float(CONF_THRESHOLD))
         return float(CONF_THRESHOLD)
 
 def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
@@ -1465,6 +1469,9 @@ def _candidate_is_sane(sug: str, feat: Dict[str, float]) -> bool:
     gh    = int(feat.get("goals_h", 0))
     ga    = int(feat.get("goals_a", 0))
     total = gh + ga
+    minute = int(feat.get("minute", 0))
+
+    log.debug("🔍 Sanity check for %s: score %s-%s (total: %s), minute: %s", sug, gh, ga, total, minute)
 
     if sug.startswith("Over"):
         ln = _parse_ou_line_from_suggestion(sug)
@@ -1474,6 +1481,8 @@ def _candidate_is_sane(sug: str, feat: Dict[str, float]) -> bool:
         sane = (ln is not None) and (total < ln)
         if not sane:
             log.debug("❌ Insane Over suggestion: %s (total: %s, line: %s)", sug, total, ln)
+        else:
+            log.debug("✅ Sane Over suggestion: %s (total: %s, line: %s)", sug, total, ln)
         return sane
 
     if sug.startswith("Under"):
@@ -1484,11 +1493,20 @@ def _candidate_is_sane(sug: str, feat: Dict[str, float]) -> bool:
         sane = (ln is not None) and (total < ln)
         if not sane:
             log.debug("❌ Insane Under suggestion: %s (total: %s, line: %s)", sug, total, ln)
+        else:
+            log.debug("✅ Sane Under suggestion: %s (total: %s, line: %s)", sug, total, ln)
         return sane
 
     if sug.startswith("BTTS") and (gh > 0 and ga > 0):
         log.debug("❌ Insane BTTS suggestion: %s (both already scored)", sug)
         return False
+
+    if sug == "BTTS: Yes" and (gh > 0 and ga > 0):
+        log.debug("✅ Sane BTTS Yes: both teams scored")
+        return True
+    if sug == "BTTS: No" and not (gh > 0 and ga > 0):
+        log.debug("✅ Sane BTTS No: both teams haven't scored")
+        return True
 
     log.debug("✅ Sane suggestion: %s", sug)
     return True
@@ -1692,81 +1710,114 @@ def _generate_advanced_predictions(
     log.info("🤖 Generating advanced predictions for fixture %s (minute: %s)", fid, minute)
     candidates: List[Tuple[str, str, float]] = []
 
+    # Log all features for debugging
+    log.info("📊 Feature summary - minute: %s, goals: %s-%s, xG: %.2f-%.2f, SOT: %s-%s", 
+             features.get('minute'), 
+             features.get('goals_h'), features.get('goals_a'),
+             features.get('xg_h', 0), features.get('xg_a', 0),
+             features.get('sot_h', 0), features.get('sot_a', 0))
+
     # OU markets
     for line in OU_LINES:
         sline  = _fmt_line(line)
         market = f"Over/Under {sline}"
+        threshold = _get_market_threshold(market)
+        
+        log.info("🎯 Testing OU market: %s (threshold: %.1f%%)", market, threshold)
 
         over_sug = f"Over {sline} Goals"
         over_prob = advanced_predict_probability(features, market, over_sug, match_id=fid)
-        threshold = _get_market_threshold(market)
-        if over_prob * 100.0 >= threshold and _candidate_is_sane(over_sug, features):
-            log.info("✅ Adding Over candidate: %s (prob: %.1f%%, threshold: %.1f%%)", 
-                    over_sug, over_prob*100, threshold)
-            candidates.append((market, over_sug, over_prob))
+        log.info("📈 Over %s probability: %.1f%%", sline, over_prob * 100)
+        
+        if over_prob * 100.0 >= threshold:
+            if _candidate_is_sane(over_sug, features):
+                log.info("✅ Adding Over candidate: %s (prob: %.1f%%)", over_sug, over_prob*100)
+                candidates.append((market, over_sug, over_prob))
+            else:
+                log.info("❌ Over candidate failed sanity check: %s", over_sug)
         else:
-            log.debug("❌ Skipping Over: %s (prob: %.1f%%, threshold: %.1f%%)", 
-                     over_sug, over_prob*100, threshold)
+            log.info("❌ Over probability below threshold: %.1f%% < %.1f%%", over_prob*100, threshold)
 
         under_sug  = f"Under {sline} Goals"
         under_prob = 1.0 - over_prob
-        if under_prob * 100.0 >= threshold and _candidate_is_sane(under_sug, features):
-            log.info("✅ Adding Under candidate: %s (prob: %.1f%%, threshold: %.1f%%)", 
-                    under_sug, under_prob*100, threshold)
-            candidates.append((market, under_sug, under_prob))
+        log.info("📈 Under %s probability: %.1f%%", sline, under_prob * 100)
+        
+        if under_prob * 100.0 >= threshold:
+            if _candidate_is_sane(under_sug, features):
+                log.info("✅ Adding Under candidate: %s (prob: %.1f%%)", under_sug, under_prob*100)
+                candidates.append((market, under_sug, under_prob))
+            else:
+                log.info("❌ Under candidate failed sanity check: %s", under_sug)
         else:
-            log.debug("❌ Skipping Under: %s (prob: %.1f%%, threshold: %.1f%%)", 
-                     under_sug, under_prob*100, threshold)
+            log.info("❌ Under probability below threshold: %.1f%% < %.1f%%", under_prob*100, threshold)
 
     # BTTS market
     market = "BTTS"
-    btts_yes_prob = advanced_predict_probability(features, market, "BTTS: Yes", match_id=fid)
     threshold = _get_market_threshold(market)
-    if btts_yes_prob * 100.0 >= threshold and _candidate_is_sane("BTTS: Yes", features):
-        log.info("✅ Adding BTTS Yes candidate (prob: %.1f%%, threshold: %.1f%%)", 
-                btts_yes_prob*100, threshold)
-        candidates.append((market, "BTTS: Yes", btts_yes_prob))
+    log.info("🎯 Testing BTTS market (threshold: %.1f%%)", threshold)
+    
+    btts_yes_prob = advanced_predict_probability(features, market, "BTTS: Yes", match_id=fid)
+    log.info("📈 BTTS Yes probability: %.1f%%", btts_yes_prob * 100)
+    
+    if btts_yes_prob * 100.0 >= threshold:
+        if _candidate_is_sane("BTTS: Yes", features):
+            log.info("✅ Adding BTTS Yes candidate (prob: %.1f%%)", btts_yes_prob*100)
+            candidates.append((market, "BTTS: Yes", btts_yes_prob))
+        else:
+            log.info("❌ BTTS Yes candidate failed sanity check")
     else:
-        log.debug("❌ Skipping BTTS Yes (prob: %.1f%%, threshold: %.1f%%)", 
-                 btts_yes_prob*100, threshold)
+        log.info("❌ BTTS Yes probability below threshold: %.1f%% < %.1f%%", btts_yes_prob*100, threshold)
 
     btts_no_prob = 1.0 - btts_yes_prob
-    if btts_no_prob * 100.0 >= threshold and _candidate_is_sane("BTTS: No", features):
-        log.info("✅ Adding BTTS No candidate (prob: %.1f%%, threshold: %.1f%%)", 
-                btts_no_prob*100, threshold)
-        candidates.append((market, "BTTS: No", btts_no_prob))
+    log.info("📈 BTTS No probability: %.1f%%", btts_no_prob * 100)
+    
+    if btts_no_prob * 100.0 >= threshold:
+        if _candidate_is_sane("BTTS: No", features):
+            log.info("✅ Adding BTTS No candidate (prob: %.1f%%)", btts_no_prob*100)
+            candidates.append((market, "BTTS: No", btts_no_prob))
+        else:
+            log.info("❌ BTTS No candidate failed sanity check")
     else:
-        log.debug("❌ Skipping BTTS No (prob: %.1f%%, threshold: %.1f%%)", 
-                 btts_no_prob*100, threshold)
+        log.info("❌ BTTS No probability below threshold: %.1f%% < %.1f%%", btts_no_prob*100, threshold)
 
     # 1X2 market
     market = "1X2"
+    threshold = _get_market_threshold(market)
+    log.info("🎯 Testing 1X2 market (threshold: %.1f%%)", threshold)
+    
     home_win_prob = advanced_predict_probability(features, market, "Home Win", match_id=fid)
     away_win_prob = advanced_predict_probability(features, market, "Away Win", match_id=fid)
-    threshold = _get_market_threshold(market)
+    
+    log.info("📈 Home Win probability: %.1f%%", home_win_prob * 100)
+    log.info("📈 Away Win probability: %.1f%%", away_win_prob * 100)
 
     total_win_prob = home_win_prob + away_win_prob
     if total_win_prob > 0:
         home_win_prob = home_win_prob / total_win_prob
         away_win_prob = away_win_prob / total_win_prob
+        
+        log.info("📊 Normalized probabilities - Home: %.1f%%, Away: %.1f%%", 
+                 home_win_prob*100, away_win_prob*100)
 
         if home_win_prob * 100.0 >= threshold:
-            log.info("✅ Adding Home Win candidate (prob: %.1f%%, threshold: %.1f%%)", 
-                    home_win_prob*100, threshold)
+            log.info("✅ Adding Home Win candidate (prob: %.1f%%)", home_win_prob*100)
             candidates.append((market, "Home Win", home_win_prob))
         else:
-            log.debug("❌ Skipping Home Win (prob: %.1f%%, threshold: %.1f%%)", 
-                     home_win_prob*100, threshold)
+            log.info("❌ Home Win probability below threshold: %.1f%% < %.1f%%", home_win_prob*100, threshold)
             
         if away_win_prob * 100.0 >= threshold:
-            log.info("✅ Adding Away Win candidate (prob: %.1f%%, threshold: %.1f%%)", 
-                    away_win_prob*100, threshold)
+            log.info("✅ Adding Away Win candidate (prob: %.1f%%)", away_win_prob*100)
             candidates.append((market, "Away Win", away_win_prob))
         else:
-            log.debug("❌ Skipping Away Win (prob: %.1f%%, threshold: %.1f%%)", 
-                     away_win_prob*100, threshold)
+            log.info("❌ Away Win probability below threshold: %.1f%% < %.1f%%", away_win_prob*100, threshold)
+    else:
+        log.info("❌ No valid 1X2 probabilities (total: %.3f)", total_win_prob)
 
     log.info("🎯 Generated %s total prediction candidates", len(candidates))
+    
+    # Log what the confidence threshold actually is
+    log.info("⚙️ Current CONF_THRESHOLD setting: %s", CONF_THRESHOLD)
+    
     return candidates
 
 def production_scan() -> Tuple[int, int]:
@@ -1809,14 +1860,14 @@ def production_scan() -> Tuple[int, int]:
 
                 feat   = extract_features(m)
                 minute = int(feat.get("minute", 0))
-                log.debug("⏱️ Match minute: %s", minute)
+                log.info("⏱️ Match minute: %s, TIP_MIN_MINUTE: %s", minute, TIP_MIN_MINUTE)
                 
                 if minute < TIP_MIN_MINUTE:
-                    log.debug("⏩ Skipping match %s - minute %s < TIP_MIN_MINUTE %s", fid, minute, TIP_MIN_MINUTE)
+                    log.info("⏩ Skipping match %s - minute %s < TIP_MIN_MINUTE %s", fid, minute, TIP_MIN_MINUTE)
                     continue
                     
                 if is_feed_stale(fid, m, minute):
-                    log.debug("⏩ Skipping match %s - stale feed", fid)
+                    log.info("⏩ Skipping match %s - stale feed", fid)
                     continue
 
                 if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
@@ -1834,12 +1885,12 @@ def production_scan() -> Tuple[int, int]:
 
                 candidates = _generate_advanced_predictions(feat, fid, minute)
                 if not candidates:
-                    log.debug("⏩ No prediction candidates for match %s", fid)
+                    log.info("⏩ No prediction candidates for match %s", fid)
                     continue
 
                 ranked = _process_and_rank_candidates(candidates, fid, feat)
                 if not ranked:
-                    log.debug("⏩ No ranked candidates for match %s", fid)
+                    log.info("⏩ No ranked candidates for match %s", fid)
                     continue
 
                 match_saved = _save_and_send_tips(
