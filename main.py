@@ -1447,12 +1447,40 @@ def _pretty_score(m: dict) -> str:
 def _get_market_threshold(m: str) -> float:
     try:
         v = get_setting_cached(f"conf_threshold:{m}")
-        threshold = float(v) if v is not None else float(CONF_THRESHOLD)
-        log.debug("⚙️ Market threshold for %s: %.1f%%", m, threshold)
-        return threshold
-    except Exception:
-        log.debug("⚙️ Using default threshold for %s: %.1f%%", m, float(CONF_THRESHOLD))
+        if v is not None:
+            threshold = float(v)
+            log.info("⚙️ Using CUSTOM threshold for %s: %.1f%%", m, threshold)
+            return threshold
+        else:
+            # Use the global CONF_THRESHOLD as default for all markets
+            threshold = float(CONF_THRESHOLD)
+            log.info("⚙️ Using GLOBAL threshold for %s: %.1f%%", m, threshold)
+            return threshold
+    except Exception as e:
+        log.error("❌ Error getting threshold for %s: %s, using default: %.1f%%", m, e, float(CONF_THRESHOLD))
         return float(CONF_THRESHOLD)
+
+def reset_market_thresholds_to_global() -> Dict[str, float]:
+    """Reset all market thresholds to use the global CONF_THRESHOLD"""
+    log.info("🔄 Resetting all market thresholds to global CONF_THRESHOLD: %.1f%%", CONF_THRESHOLD)
+    
+    markets = ["BTTS", "1X2"]
+    for line in OU_LINES:
+        markets.append(f"Over/Under {_fmt_line(line)}")
+    
+    reset_results = {}
+    for market in markets:
+        try:
+            # Delete any custom threshold settings to fall back to global
+            with db_conn() as c:
+                c.execute("DELETE FROM settings WHERE key = %s", (f"conf_threshold:{market}",))
+            reset_results[market] = CONF_THRESHOLD
+            log.info("✅ Reset %s threshold to global: %.1f%%", market, CONF_THRESHOLD)
+        except Exception as e:
+            log.error("❌ Failed to reset %s threshold: %s", market, e)
+            reset_results[market] = None
+    
+    return reset_results
 
 def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     try:
@@ -1823,6 +1851,20 @@ def _generate_advanced_predictions(
 def production_scan() -> Tuple[int, int]:
     """Main in-play scanning with advanced AI systems"""
     log.info("🚀 STARTING PRODUCTION SCAN")
+    
+    # Log threshold configuration at the start
+    log.info("⚙️ GLOBAL CONF_THRESHOLD: %.1f%%", CONF_THRESHOLD)
+    log.info("⚙️ Checking market thresholds...")
+    
+    # Test what thresholds are being used for each market
+    test_markets = ["BTTS", "1X2"]
+    for line in OU_LINES:
+        test_markets.append(f"Over/Under {_fmt_line(line)}")
+    
+    for market in test_markets:
+        threshold = _get_market_threshold(market)
+        log.info("⚙️ Market %s will use threshold: %.1f%%", market, threshold)
+    
     if not _db_ping():
         log.error("❌ Database ping failed")
         return 0, 0
@@ -2497,6 +2539,12 @@ def http_self_learn():
     _require_admin()
     process_self_learning_from_results()
     return jsonify({"ok": True})
+
+@app.route("/admin/reset-thresholds", methods=["POST", "GET"])
+def http_reset_thresholds():
+    _require_admin()
+    results = reset_market_thresholds_to_global()
+    return jsonify({"ok": True, "reset_thresholds": results})
 
 @app.route("/admin/train", methods=["POST", "GET"])
 def http_train():
