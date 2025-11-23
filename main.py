@@ -336,65 +336,65 @@ class AdvancedEnsemblePredictor:
         return bayesian_prob
 
     def calculate_tip_reliability(match_id: int, suggestion: str, probability: float) -> Dict[str, Any]:
-    """Calculate reliability metrics for each tip"""
-    reliability_score = 0.0
-    flags = []
+        """Calculate reliability metrics for each tip"""
+        reliability_score = 0.0
+        flags = []
     
-    # Score based on probability strength
-    if probability >= 0.7:
-        reliability_score += 0.3
-        flags.append("high_confidence")
-    elif probability >= 0.6:
-        reliability_score += 0.2
-        flags.append("medium_confidence")
-    else:
-        reliability_score += 0.1
-        flags.append("low_confidence")
+        # Score based on probability strength
+        if probability >= 0.7:
+            reliability_score += 0.3
+            flags.append("high_confidence")
+        elif probability >= 0.6:
+            reliability_score += 0.2
+            flags.append("medium_confidence")
+        else:
+            reliability_score += 0.1
+            flags.append("low_confidence")
     
-    # Score based on data quality (minute of match)
-    with db_conn() as c:
-        minute_row = c.execute(
-            "SELECT minute FROM tips WHERE match_id=%s ORDER BY created_ts DESC LIMIT 1",
-            (match_id,)
-        ).fetchone()
+        # Score based on data quality (minute of match)
+        with db_conn() as c:
+            minute_row = c.execute(
+                "SELECT minute FROM tips WHERE match_id=%s ORDER BY created_ts DESC LIMIT 1",
+                (match_id,)
+            ).fetchone()
         
-    if minute_row and minute_row[0] >= 60:
-        reliability_score += 0.3
-        flags.append("late_match_data")
-    elif minute_row and minute_row[0] >= 30:
-        reliability_score += 0.2
-        flags.append("mid_match_data")
-    else:
-        reliability_score += 0.1
-        flags.append("early_match_data")
+        if minute_row and minute_row[0] >= 60:
+            reliability_score += 0.3
+            flags.append("late_match_data")
+        elif minute_row and minute_row[0] >= 30:
+            reliability_score += 0.2
+            flags.append("mid_match_data")
+        else:
+            reliability_score += 0.1
+            flags.append("early_match_data")
     
-    # Score based on feature completeness
-    with db_conn() as c:
-        feature_row = c.execute(
-            "SELECT COUNT(*) FROM self_learning_data WHERE match_id=%s",
-            (match_id,)
-        ).fetchone()
+        # Score based on feature completeness
+        with db_conn() as c:
+            feature_row = c.execute(
+                "SELECT COUNT(*) FROM self_learning_data WHERE match_id=%s",
+                (match_id,)
+            ).fetchone()
     
-    if feature_row and feature_row[0] > 5:
-        reliability_score += 0.2
-        flags.append("rich_features")
-    else:
-        reliability_score += 0.1
-        flags.append("basic_features")
+        if feature_row and feature_row[0] > 5:
+            reliability_score += 0.2
+            flags.append("rich_features")
+        else:
+            reliability_score += 0.1
+            flags.append("basic_features")
     
-    # Market-specific adjustments
-    if "Over" in suggestion or "Under" in suggestion:
-        reliability_score += 0.1
-        flags.append("ou_market")
-    elif "BTTS" in suggestion:
-        reliability_score += 0.05
-        flags.append("btts_market")
+        # Market-specific adjustments
+        if "Over" in suggestion or "Under" in suggestion:
+            reliability_score += 0.1
+            flags.append("ou_market")
+        elif "BTTS" in suggestion:
+            reliability_score += 0.05
+            flags.append("btts_market")
     
-    return {
-        "reliability_score": min(1.0, reliability_score),
-        "flags": flags,
-        "grade": "A" if reliability_score >= 0.8 else "B" if reliability_score >= 0.6 else "C"
-    }
+        return {
+            "reliability_score": min(1.0, reliability_score),
+            "flags": flags,
+            "grade": "A" if reliability_score >= 0.8 else "B" if reliability_score >= 0.6 else "C"
+        }
     
     def _prepare_features(self, features: Dict[str, float]) -> Optional[np.ndarray]:
         if self.model_name not in self.scalers:
