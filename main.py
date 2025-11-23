@@ -811,8 +811,12 @@ def init_db() -> None:
 # ───────── Telegram ─────────
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("❌ Telegram credentials missing - BOT_TOKEN: %s, CHAT_ID: %s", 
+                 "SET" if TELEGRAM_BOT_TOKEN else "MISSING", 
+                 "SET" if TELEGRAM_CHAT_ID else "MISSING")
         return False
     try:
+        log.info("📤 Attempting to send Telegram message...")
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             data={
@@ -824,18 +828,24 @@ def send_telegram(text: str) -> bool:
             timeout=REQ_TIMEOUT_SEC,
         )
         ok = bool(r.ok)
-        if ok:
+        if not ok:
+            log.error("❌ Telegram API error: %s - %s", r.status_code, r.text)
+        else:
+            log.info("✅ Telegram message sent successfully")
             _metric_inc("tips_sent_total", n=1)
         return ok
-    except Exception:
+    except Exception as e:
+        log.error("❌ Telegram send exception: %s", e)
         return False
 
 # ───────── API helpers ─────────
 def _api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
     if not API_KEY:
+        log.error("❌ API_KEY missing for API call to %s", url)
         return None
     now = time.time()
     if API_CB["opened_until"] > now:
+        log.warning("🚫 API Circuit Breaker open until %s", API_CB["opened_until"])
         return None
     
     lbl = "unknown"
@@ -852,12 +862,15 @@ def _api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
         lbl = "unknown"
 
     try:
+        log.debug("🌐 API call to %s with params %s", url, params)
         r = session.get(url, headers=HEADERS, params=params, timeout=min(timeout, REQ_TIMEOUT_SEC))
         _metric_inc("api_calls_total", label=lbl, n=1)
         if r.status_code == 429:
+            log.warning("🚫 API Rate Limited - status 429")
             METRICS["api_rate_limited_total"] += 1
             API_CB["failures"] += 1
         elif r.status_code >= 500:
+            log.error("❌ API Server Error - status %s", r.status_code)
             API_CB["failures"] += 1
         else:
             API_CB["failures"] = 0
@@ -866,8 +879,14 @@ def _api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
             API_CB["opened_until"] = now + API_CB_COOLDOWN_SEC
             log.warning("[CB] API-Football opened for %ss", API_CB_COOLDOWN_SEC)
 
+        if r.ok:
+            log.debug("✅ API call successful")
+        else:
+            log.error("❌ API call failed: %s - %s", r.status_code, r.text)
+            
         return r.json() if r.ok else None
-    except Exception:
+    except Exception as e:
+        log.error("❌ API call exception: %s", e)
         API_CB["failures"] += 1
         if API_CB["failures"] >= API_CB_THRESHOLD:
             API_CB["opened_until"] = time.time() + API_CB_COOLDOWN_SEC
@@ -895,51 +914,69 @@ def _blocked_league(league_obj: dict) -> bool:
     typ     = str((league_obj or {}).get("type", "")).lower()
     txt     = f"{country} {name} {typ}"
     if any(p in txt for p in _BLOCK_PATTERNS):
+        log.debug("🚫 Blocked league: %s", txt)
         return True
     deny = [x.strip() for x in os.getenv("LEAGUE_DENY_IDS", "").split(",") if x.strip()]
     lid  = str((league_obj or {}).get("id") or "")
     if lid in deny:
+        log.debug("🚫 Denied league ID: %s", lid)
         return True
     return False
 
 # ───────── Live fetches ─────────
 def fetch_match_stats(fid: int) -> list:
+    log.debug("📊 Fetching stats for fixture %s", fid)
     now = time.time()
     k   = ("stats", fid)
     ts_empty = NEG_CACHE.get(k, (0.0, False))
     if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC):
+        log.debug("📊 Using negative cache for stats %s", fid)
         return []
     if fid in STATS_CACHE and now - STATS_CACHE[fid][0] < 90:
+        log.debug("📊 Using cache for stats %s", fid)
         return STATS_CACHE[fid][1]
     js  = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
     out = js.get("response", []) if isinstance(js, dict) else []
     STATS_CACHE[fid] = (now, out)
     if not out:
+        log.debug("📊 No stats found for %s, caching negative", fid)
         NEG_CACHE[k] = (now, True)
+    else:
+        log.debug("📊 Found %s stats records for %s", len(out), fid)
     return out
 
 def fetch_live_fixtures_only() -> List[dict]:
+    log.info("🌐 Fetching live fixtures...")
     js = _api_get(FOOTBALL_API_URL, {"live": "all"}) or {}
     matches = [
         m
         for m in (js.get("response", []) if isinstance(js, dict) else [])
         if not _blocked_league(m.get("league") or {})
     ]
+    log.info("📋 Found %s total live matches before filtering", len(matches))
+    
     out = []
     for m in matches:
         st      = ((m.get("fixture", {}) or {}).get("status", {}) or {})
         elapsed = st.get("elapsed")
         short   = (st.get("short") or "").upper()
         if elapsed is None or elapsed > 120 or short not in INPLAY_STATUSES:
+            log.debug("⏩ Skipping match %s - elapsed: %s, status: %s", 
+                     m.get('fixture', {}).get('id'), elapsed, short)
             continue
         out.append(m)
+    
+    log.info("🎯 Filtered to %s in-play matches", len(out))
     return out
 
 def _quota_per_scan() -> int:
     scans_per_day = max(1, int(86400 / max(1, SCAN_INTERVAL_SEC)))
     ppf = 1 + (1 if USE_EVENTS_IN_FEATURES else 0)
     safe = int(API_BUDGET_DAILY / max(1, (scans_per_day * ppf))) - 10
-    return max(1, min(MAX_FIXTURES_PER_SCAN, safe))
+    quota = max(1, min(MAX_FIXTURES_PER_SCAN, safe))
+    log.debug("💰 Quota calculation: scans_per_day=%s, ppf=%s, safe=%s, quota=%s", 
+             scans_per_day, ppf, safe, quota)
+    return quota
 
 def _priority_key(m: dict) -> Tuple[int,int,int,int,int]:
     minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
@@ -956,35 +993,49 @@ def _priority_key(m: dict) -> Tuple[int,int,int,int,int]:
     )
 
 def fetch_match_events(fid: int) -> list:
+    log.debug("📅 Fetching events for fixture %s", fid)
     now = time.time()
     k   = ("events", fid)
     ts_empty = NEG_CACHE.get(k, (0.0, False))
     if ts_empty[1] and (now - ts_empty[0] < NEG_TTL_SEC):
+        log.debug("📅 Using negative cache for events %s", fid)
         return []
     if fid in EVENTS_CACHE and now - EVENTS_CACHE[fid][0] < 90:
+        log.debug("📅 Using cache for events %s", fid)
         return EVENTS_CACHE[fid][1]
     js  = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
     out = js.get("response", []) if isinstance(js, dict) else []
     EVENTS_CACHE[fid] = (now, out)
     if not out:
+        log.debug("📅 No events found for %s, caching negative", fid)
         NEG_CACHE[k] = (now, True)
+    else:
+        log.debug("📅 Found %s events for %s", len(out), fid)
     return out
 
 def fetch_live_matches() -> List[dict]:
+    log.info("🚀 Starting live matches fetch...")
     fixtures = fetch_live_fixtures_only()
     if not fixtures:
+        log.info("❌ No live fixtures found")
         return []
+        
+    log.info("📊 Sorting %s fixtures by priority...", len(fixtures))
     fixtures.sort(key=_priority_key, reverse=True)
     quota  = _quota_per_scan()
     chosen = fixtures[:quota]
+    log.info("🎯 Selected %s fixtures from %s total (quota: %s)", len(chosen), len(fixtures), quota)
+    
     out    = []
-    for m in chosen:
+    for i, m in enumerate(chosen):
         fid           = int((m.get("fixture", {}) or {}).get("id") or 0)
+        log.debug("🔍 Processing fixture %s (%s/%s)", fid, i+1, len(chosen))
         m["statistics"] = fetch_match_stats(fid)
         m["events"]     = fetch_match_events(fid) if USE_EVENTS_IN_FEATURES else []
         out.append(m)
+        
     ppf = 1 + (1 if USE_EVENTS_IN_FEATURES else 0)
-    log.info("[SCAN/BUDGET] fixtures=%d selected=%d quota=%d ppf=%d", len(fixtures), len(out), quota, ppf)
+    log.info("✅ Completed live matches fetch: %s fixtures, ppf=%s", len(out), ppf)
     return out
 
 # ───────── Advanced Feature Extraction ─────────
@@ -1003,6 +1054,7 @@ def _pos_pct(v) -> float:
         return 0.0
 
 def extract_features(m: dict) -> Dict[str, float]:
+    log.debug("🔧 Extracting features for match...")
     home   = m["teams"]["home"]["name"]
     away   = m["teams"]["away"]["name"]
     gh     = m["goals"]["home"] or 0
@@ -1053,7 +1105,7 @@ def extract_features(m: dict) -> Dict[str, float]:
     total_actions   = sot_h + sot_a + cor_h + cor_a
     action_intensity= total_actions / max(1, minute)
 
-    return {
+    features = {
         "minute": float(minute),
         "goals_h": float(gh),
         "goals_a": float(ga),
@@ -1088,6 +1140,9 @@ def extract_features(m: dict) -> Dict[str, float]:
         "total_actions": float(total_actions),
         "action_intensity": float(action_intensity),
     }
+    
+    log.debug("✅ Extracted %s features for %s vs %s (minute: %s)", len(features), home, away, minute)
+    return features
 
 # ───────── Advanced Prediction System ─────────
 def advanced_predict_probability(
@@ -1097,21 +1152,28 @@ def advanced_predict_probability(
     match_id: Optional[int] = None,
 ) -> float:
     """Advanced prediction using ensemble + Bayesian methods"""
+    log.debug("🤖 Predicting probability for %s - %s (match: %s)", market, suggestion, match_id)
+    
     # Bayesian network: treat `suggestion` as the 'market phrase'
     bayesian_prob = bayesian_network.infer_probability(features, suggestion)
+    log.debug("📊 Bayesian probability: %.3f", bayesian_prob)
     
     # Ensemble predictor
     model_key = f"{market}_{suggestion.replace(' ', '_')}"
     ensemble_predictor = get_advanced_predictor(model_key)
     ensemble_prob = ensemble_predictor.predict_probability(features)
+    log.debug("📈 Ensemble probability: %.3f", ensemble_prob)
     
     data_richness = min(1.0, float(features.get("minute", 0)) / 60.0)
     if data_richness > 0.7:
         final_prob = 0.7 * ensemble_prob + 0.3 * bayesian_prob
+        log.debug("📋 Using data-rich weighting (70/30)")
     else:
         final_prob = 0.4 * ensemble_prob + 0.6 * bayesian_prob
+        log.debug("📋 Using data-poor weighting (40/60)")
     
     final_prob = float(max(0.01, min(0.99, final_prob)))
+    log.debug("🎯 Final probability: %.3f", final_prob)
     
     prediction_data = {
         "features": features,
@@ -1140,6 +1202,7 @@ def advanced_predict_probability(
                     int(time.time()),
                 ),
             )
+        log.debug("💾 Saved prediction data for self-learning")
     except Exception as e:
         log.debug("[SELF-LEARNING] store failed: %s", e)
     
@@ -1149,6 +1212,7 @@ def advanced_predict_probability(
 def process_self_learning_from_results() -> None:
     """Process completed games to learn from prediction outcomes"""
     if not SELF_LEARNING_ENABLE:
+        log.info("🤖 Self-learning disabled")
         return
         
     cutoff_ts = int(time.time()) - 24 * 3600
@@ -1166,6 +1230,7 @@ def process_self_learning_from_results() -> None:
             (cutoff_ts, SELF_LEARN_BATCH_SIZE),
         ).fetchall()
     
+    log.info("🤖 Processing %s self-learning records", len(rows))
     processed = 0
     for sl_id, match_id, market, features_json, pred_prob, gh, ga, btts in rows:
         try:
@@ -1243,9 +1308,11 @@ def _aggregate_price(vals: List[Tuple[float, str]], prob_hint: Optional[float]) 
     return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
 
 def fetch_odds(fid: int) -> dict:
+    log.debug("💰 Fetching odds for fixture %s", fid)
     now    = time.time()
     cached = ODDS_CACHE.get(fid)
     if cached and now - cached[0] < 120:
+        log.debug("💰 Using cached odds for %s", fid)
         return cached[1]
 
     def _fetch(path: str) -> dict:
@@ -1291,8 +1358,8 @@ def fetch_odds(fid: int) -> dict:
                                     by_market.setdefault(key, {}).setdefault(side, []).append((float(v.get("odd") or 0), book_name))
                                 except Exception:
                                     pass
-    except Exception:
-        pass
+    except Exception as e:
+        log.error("❌ Error parsing odds: %s", e)
 
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for mkey, side_map in by_market.items():
@@ -1302,6 +1369,7 @@ def fetch_odds(fid: int) -> dict:
                 ok = False
                 break
         if not ok:
+            log.debug("💰 Insufficient books for market %s", mkey)
             continue
 
         out[mkey] = {}
@@ -1309,8 +1377,10 @@ def fetch_odds(fid: int) -> dict:
             ag, label = _aggregate_price(lst, None)
             if ag is not None:
                 out[mkey][side] = {"odds": float(ag), "book": label}
+                log.debug("💰 Market %s %s: odds=%.2f, book=%s", mkey, side, ag, label)
 
     ODDS_CACHE[fid] = (now, out)
+    log.debug("💰 Found odds for %s markets for fixture %s", len(out), fid)
     return out
 
 def _min_odds_for_market(market: str) -> float:
@@ -1323,22 +1393,37 @@ def _min_odds_for_market(market: str) -> float:
     return 1.01
 
 def _get_odds_for_market(odds_map: dict, market: str, suggestion: str) -> Tuple[Optional[float], Optional[str]]:
+    log.debug("🔍 Getting odds for %s - %s", market, suggestion)
     if market == "BTTS":
         d   = odds_map.get("BTTS", {})
         tgt = "Yes" if suggestion.endswith("Yes") else "No"
         if tgt in d:
-            return d[tgt]["odds"], d[tgt]["book"]
+            odds, book = d[tgt]["odds"], d[tgt]["book"]
+            log.debug("✅ Found BTTS odds: %.2f from %s", odds, book)
+            return odds, book
+        else:
+            log.debug("❌ No BTTS odds found for %s", tgt)
     elif market == "1X2":
         d   = odds_map.get("1X2", {})
         tgt = "Home" if suggestion == "Home Win" else ("Away" if suggestion == "Away Win" else None)
         if tgt and tgt in d:
-            return d[tgt]["odds"], d[tgt]["book"]
+            odds, book = d[tgt]["odds"], d[tgt]["book"]
+            log.debug("✅ Found 1X2 odds: %.2f from %s", odds, book)
+            return odds, book
+        else:
+            log.debug("❌ No 1X2 odds found for %s", tgt)
     elif market.startswith("Over/Under"):
         ln_val = _parse_ou_line_from_suggestion(suggestion)
         d      = odds_map.get(f"OU_{_fmt_line(ln_val)}", {}) if ln_val is not None else {}
         tgt    = "Over" if suggestion.startswith("Over") else "Under"
         if tgt in d:
-            return d[tgt]["odds"], d[tgt]["book"]
+            odds, book = d[tgt]["odds"], d[tgt]["book"]
+            log.debug("✅ Found OU odds: %.2f from %s", odds, book)
+            return odds, book
+        else:
+            log.debug("❌ No OU odds found for %s %s", tgt, ln_val)
+    else:
+        log.debug("❌ Unknown market type: %s", market)
     return None, None
 
 # ───────── Core prediction logic with advanced systems ─────────
@@ -1383,15 +1468,29 @@ def _candidate_is_sane(sug: str, feat: Dict[str, float]) -> bool:
 
     if sug.startswith("Over"):
         ln = _parse_ou_line_from_suggestion(sug)
-        return (ln is not None) and (total < ln)
+        if ln is None:
+            log.debug("❌ Invalid Over line in suggestion: %s", sug)
+            return False
+        sane = (ln is not None) and (total < ln)
+        if not sane:
+            log.debug("❌ Insane Over suggestion: %s (total: %s, line: %s)", sug, total, ln)
+        return sane
 
     if sug.startswith("Under"):
         ln = _parse_ou_line_from_suggestion(sug)
-        return (ln is not None) and (total < ln)
+        if ln is None:
+            log.debug("❌ Invalid Under line in suggestion: %s", sug)
+            return False
+        sane = (ln is not None) and (total < ln)
+        if not sane:
+            log.debug("❌ Insane Under suggestion: %s (total: %s, line: %s)", sug, total, ln)
+        return sane
 
     if sug.startswith("BTTS") and (gh > 0 and ga > 0):
+        log.debug("❌ Insane BTTS suggestion: %s (both already scored)", sug)
         return False
 
+    log.debug("✅ Sane suggestion: %s", sug)
     return True
 
 def _format_tip_message(
@@ -1459,17 +1558,26 @@ def _save_and_send_tips(
     per_league_counter: Dict[int, int],
     c: PooledConn,
 ) -> int:
+    log.info("💾 Starting to save and send tips for %s vs %s (%s tips ranked)", home, away, len(ranked))
     saved   = 0
     base_now= int(time.time())
 
     for idx, (market, suggestion, prob, odds, book, ev_pct, _) in enumerate(ranked):
+        log.debug("💾 Processing tip %s/%s: %s - %s (prob: %.3f)", 
+                 idx+1, len(ranked), market, suggestion, prob)
+                 
         if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
+            log.debug("⏩ League cap reached for league %s (%s tips)", league_id, per_league_counter.get(league_id, 0))
             continue
 
         created_ts = base_now + idx
         prob_pct   = round(prob * 100.0, 1)
+        log.debug("📊 Tip details: prob=%.1f%%, odds=%s, ev=%s", prob_pct, odds, ev_pct)
 
         try:
+            log.info("💾 INSERTING tip into database: %s vs %s - %s (%.1f%%)", 
+                    home, away, suggestion, prob_pct)
+                    
             c.execute(
                 "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,"
                 "confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
@@ -1490,30 +1598,41 @@ def _save_and_send_tips(
                     (float(odds) if odds is not None else None),
                     (book or None),
                     (float(ev_pct) if ev_pct is not None else None),
-                    0,
+                    0,  # sent_ok=0 initially
                 ),
             )
+            log.info("✅ SUCCESSFULLY inserted tip into database")
+
+            # Count this as saved regardless of Telegram success
+            saved += 1
+            log.info("📈 Incremented saved counter to %s", saved)
+            per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
+            log.debug("🏆 League %s counter: %s", league_id, per_league_counter[league_id])
 
             message = _format_tip_message(
                 home, away, league, minute, score, suggestion, float(prob_pct), feat, odds, book, ev_pct
             )
+            log.info("📤 Attempting to send Telegram message...")
             sent = send_telegram(message)
             if sent:
+                log.info("✅ Telegram sent successfully, updating sent_ok to 1")
                 c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (fid, created_ts))
                 _metric_inc("tips_sent_total", n=1)
-
-            saved += 1
-            per_league_counter[league_id] = per_league_counter.get(league_id, 0) + 1
+            else:
+                log.error("❌ Failed to send Telegram message, but tip was saved to DB")
 
             if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                log.info("🎯 Reached MAX_TIPS_PER_SCAN limit (%s)", MAX_TIPS_PER_SCAN)
                 break
             if saved >= max(1, PREDICTIONS_PER_MATCH):
+                log.info("🎯 Reached PREDICTIONS_PER_MATCH limit (%s)", PREDICTIONS_PER_MATCH)
                 break
 
         except Exception as e:
-            log.exception("[PROD] insert/send failed: %s", e)
+            log.exception("❌ [PROD] insert/send failed: %s", e)
             continue
 
+    log.info("🎉 Finished saving tips: %s tips saved for %s vs %s", saved, home, away)
     return saved
 
 def _process_and_rank_candidates(
@@ -1521,33 +1640,48 @@ def _process_and_rank_candidates(
     fid: int,
     features: Dict[str, float],
 ) -> List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]]:
+    log.info("🏆 Processing and ranking %s candidates for fixture %s", len(candidates), fid)
     ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
     odds_map = fetch_odds(fid) if API_KEY else {}
+    log.debug("💰 Odds map has %s markets", len(odds_map))
 
     for market, suggestion, prob in candidates:
+        log.debug("🔍 Processing candidate: %s - %s (prob: %.3f)", market, suggestion, prob)
+        
         if suggestion not in ALLOWED_SUGGESTIONS:
+            log.debug("❌ Suggestion not in allowed list: %s", suggestion)
             continue
 
         odds, book = _get_odds_for_market(odds_map, market, suggestion)
         if odds is None and not ALLOW_TIPS_WITHOUT_ODDS:
+            log.debug("❌ No odds found and ALLOW_TIPS_WITHOUT_ODDS=False")
             continue
 
         if odds is not None:
             min_odds = _min_odds_for_market(market)
             if not (min_odds <= odds <= MAX_ODDS_ALL):
+                log.debug("❌ Odds outside range: %.2f (min: %.2f, max: %.2f)", odds, min_odds, MAX_ODDS_ALL)
                 continue
 
             edge   = _ev(prob, odds)
             ev_pct = round(edge * 100.0, 1)
             if int(round(edge * 10000)) < EDGE_MIN_BPS:
+                log.debug("❌ EV too low: %.1f%% < %s bps", ev_pct, EDGE_MIN_BPS)
                 continue
+            log.debug("✅ Good EV: %.1f%%", ev_pct)
         else:
             ev_pct = None
+            log.debug("ℹ️ No odds available, skipping EV check")
 
         rank_score = (prob ** 1.2) * (1.0 + (ev_pct or 0.0) / 100.0)
+        log.debug("📊 Rank score: %.3f", rank_score)
         ranked.append((market, suggestion, prob, odds, book, ev_pct, rank_score))
 
     ranked.sort(key=lambda x: x[6], reverse=True)
+    log.info("🎯 Ranked %s candidates out of %s", len(ranked), len(candidates))
+    for i, (mkt, sug, prob, odds, _, ev, score) in enumerate(ranked[:3]):  # Log top 3
+        log.debug("🏅 Rank %s: %s - %s (prob: %.3f, odds: %s, ev: %s, score: %.3f)", 
+                 i+1, mkt, sug, prob, odds, ev, score)
     return ranked
 
 def _generate_advanced_predictions(
@@ -1555,6 +1689,7 @@ def _generate_advanced_predictions(
     fid: int,
     minute: int,
 ) -> List[Tuple[str, str, float]]:
+    log.info("🤖 Generating advanced predictions for fixture %s (minute: %s)", fid, minute)
     candidates: List[Tuple[str, str, float]] = []
 
     # OU markets
@@ -1564,44 +1699,81 @@ def _generate_advanced_predictions(
 
         over_sug = f"Over {sline} Goals"
         over_prob = advanced_predict_probability(features, market, over_sug, match_id=fid)
-        if over_prob * 100.0 >= _get_market_threshold(market) and _candidate_is_sane(over_sug, features):
+        threshold = _get_market_threshold(market)
+        if over_prob * 100.0 >= threshold and _candidate_is_sane(over_sug, features):
+            log.info("✅ Adding Over candidate: %s (prob: %.1f%%, threshold: %.1f%%)", 
+                    over_sug, over_prob*100, threshold)
             candidates.append((market, over_sug, over_prob))
+        else:
+            log.debug("❌ Skipping Over: %s (prob: %.1f%%, threshold: %.1f%%)", 
+                     over_sug, over_prob*100, threshold)
 
         under_sug  = f"Under {sline} Goals"
         under_prob = 1.0 - over_prob
-        if under_prob * 100.0 >= _get_market_threshold(market) and _candidate_is_sane(under_sug, features):
+        if under_prob * 100.0 >= threshold and _candidate_is_sane(under_sug, features):
+            log.info("✅ Adding Under candidate: %s (prob: %.1f%%, threshold: %.1f%%)", 
+                    under_sug, under_prob*100, threshold)
             candidates.append((market, under_sug, under_prob))
+        else:
+            log.debug("❌ Skipping Under: %s (prob: %.1f%%, threshold: %.1f%%)", 
+                     under_sug, under_prob*100, threshold)
 
     # BTTS market
     market = "BTTS"
     btts_yes_prob = advanced_predict_probability(features, market, "BTTS: Yes", match_id=fid)
-    if btts_yes_prob * 100.0 >= _get_market_threshold(market) and _candidate_is_sane("BTTS: Yes", features):
+    threshold = _get_market_threshold(market)
+    if btts_yes_prob * 100.0 >= threshold and _candidate_is_sane("BTTS: Yes", features):
+        log.info("✅ Adding BTTS Yes candidate (prob: %.1f%%, threshold: %.1f%%)", 
+                btts_yes_prob*100, threshold)
         candidates.append((market, "BTTS: Yes", btts_yes_prob))
+    else:
+        log.debug("❌ Skipping BTTS Yes (prob: %.1f%%, threshold: %.1f%%)", 
+                 btts_yes_prob*100, threshold)
 
     btts_no_prob = 1.0 - btts_yes_prob
-    if btts_no_prob * 100.0 >= _get_market_threshold(market) and _candidate_is_sane("BTTS: No", features):
+    if btts_no_prob * 100.0 >= threshold and _candidate_is_sane("BTTS: No", features):
+        log.info("✅ Adding BTTS No candidate (prob: %.1f%%, threshold: %.1f%%)", 
+                btts_no_prob*100, threshold)
         candidates.append((market, "BTTS: No", btts_no_prob))
+    else:
+        log.debug("❌ Skipping BTTS No (prob: %.1f%%, threshold: %.1f%%)", 
+                 btts_no_prob*100, threshold)
 
     # 1X2 market
     market = "1X2"
     home_win_prob = advanced_predict_probability(features, market, "Home Win", match_id=fid)
     away_win_prob = advanced_predict_probability(features, market, "Away Win", match_id=fid)
+    threshold = _get_market_threshold(market)
 
     total_win_prob = home_win_prob + away_win_prob
     if total_win_prob > 0:
         home_win_prob = home_win_prob / total_win_prob
         away_win_prob = away_win_prob / total_win_prob
 
-        if home_win_prob * 100.0 >= _get_market_threshold(market):
+        if home_win_prob * 100.0 >= threshold:
+            log.info("✅ Adding Home Win candidate (prob: %.1f%%, threshold: %.1f%%)", 
+                    home_win_prob*100, threshold)
             candidates.append((market, "Home Win", home_win_prob))
-        if away_win_prob * 100.0 >= _get_market_threshold(market):
+        else:
+            log.debug("❌ Skipping Home Win (prob: %.1f%%, threshold: %.1f%%)", 
+                     home_win_prob*100, threshold)
+            
+        if away_win_prob * 100.0 >= threshold:
+            log.info("✅ Adding Away Win candidate (prob: %.1f%%, threshold: %.1f%%)", 
+                    away_win_prob*100, threshold)
             candidates.append((market, "Away Win", away_win_prob))
+        else:
+            log.debug("❌ Skipping Away Win (prob: %.1f%%, threshold: %.1f%%)", 
+                     away_win_prob*100, threshold)
 
+    log.info("🎯 Generated %s total prediction candidates", len(candidates))
     return candidates
 
 def production_scan() -> Tuple[int, int]:
     """Main in-play scanning with advanced AI systems"""
+    log.info("🚀 STARTING PRODUCTION SCAN")
     if not _db_ping():
+        log.error("❌ Database ping failed")
         return 0, 0
         
     matches   = fetch_live_matches()
@@ -1610,51 +1782,67 @@ def production_scan() -> Tuple[int, int]:
         log.info("[PROD] no live matches")
         return 0, 0
 
+    log.info("🔍 Processing %s live matches", live_seen)
     saved = 0
     now_ts = int(time.time())
     per_league_counter: Dict[int, int] = {}
 
     with db_conn() as c:
-        for m in matches:
+        for i, m in enumerate(matches):
             try:
                 fid = int((m.get("fixture", {}) or {}).get("id") or 0)
                 if not fid:
+                    log.debug("⏩ Skipping match without fixture ID")
                     continue
 
+                log.info("🎯 Processing match %s/%s: fixture %s", i+1, len(matches), fid)
+                
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - DUP_COOLDOWN_MIN * 60
-                    if c.execute(
+                    dup_check = c.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
                         (fid, cutoff),
-                    ).fetchone():
+                    ).fetchone()
+                    if dup_check:
+                        log.debug("⏩ Skipping match %s due to duplicate cooldown", fid)
                         continue
 
                 feat   = extract_features(m)
                 minute = int(feat.get("minute", 0))
+                log.debug("⏱️ Match minute: %s", minute)
+                
                 if minute < TIP_MIN_MINUTE:
+                    log.debug("⏩ Skipping match %s - minute %s < TIP_MIN_MINUTE %s", fid, minute, TIP_MIN_MINUTE)
                     continue
+                    
                 if is_feed_stale(fid, m, minute):
+                    log.debug("⏩ Skipping match %s - stale feed", fid)
                     continue
 
                 if HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % 3 == 0:
                     try:
+                        log.debug("🌱 Saving snapshot for training")
                         save_snapshot_from_match(m, feat)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("❌ Snapshot save failed: %s", e)
 
                 league_id, league = _league_name(m)
                 home, away        = _teams(m)
                 score             = _pretty_score(m)
+                
+                log.info("🏠 %s vs %s (%s) - %s minute %s", home, away, league, score, minute)
 
                 candidates = _generate_advanced_predictions(feat, fid, minute)
                 if not candidates:
+                    log.debug("⏩ No prediction candidates for match %s", fid)
                     continue
 
                 ranked = _process_and_rank_candidates(candidates, fid, feat)
                 if not ranked:
+                    log.debug("⏩ No ranked candidates for match %s", fid)
                     continue
 
-                saved += _save_and_send_tips(
+                match_saved = _save_and_send_tips(
                     ranked,
                     fid,
                     league_id,
@@ -1667,12 +1855,15 @@ def production_scan() -> Tuple[int, int]:
                     per_league_counter,
                     c,
                 )
+                saved += match_saved
+                log.info("💾 Match %s: saved %s tips (total saved: %s)", fid, match_saved, saved)
 
                 if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
+                    log.info("🎯 Reached MAX_TIPS_PER_SCAN limit (%s)", MAX_TIPS_PER_SCAN)
                     break
 
             except Exception as e:
-                log.exception("[PROD] match loop failed: %s", e)
+                log.exception("❌ [PROD] match loop failed for match %s: %s", fid, e)
                 continue
 
     log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
@@ -1902,6 +2093,7 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
             (cutoff, max_rows),
         ).fetchall()
         
+    log.info("🔍 Backfilling results for %s matches", len(rows))
     for (mid,) in rows:
         fx = _fixture_by_id(int(mid))
         if not fx:
