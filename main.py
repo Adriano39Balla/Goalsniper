@@ -439,10 +439,10 @@ class AdvancedEnsemblePredictor:
         _metric_inc("bayesian_updates_total", label=self.model_name)
 
     def update_models_incremental(self, new_data: List[Dict]):
-    """Update models without full retraining"""
-    for model in self.models.values():
-        if hasattr(model, 'partial_fit'):
-            model.partial_fit(new_features, new_targets)
+        """Update models without full retraining"""
+        for model in self.models.values():
+            if hasattr(model, 'partial_fit'):
+                model.partial_fit(new_features, new_targets)
 
 # ───────── Bayesian Network Implementation ─────────
 class BayesianBettingNetwork:
