@@ -438,6 +438,12 @@ class AdvancedEnsemblePredictor:
             self.performance_history = self.performance_history[-100:]
         _metric_inc("bayesian_updates_total", label=self.model_name)
 
+    def update_models_incremental(self, new_data: List[Dict]):
+    """Update models without full retraining"""
+    for model in self.models.values():
+        if hasattr(model, 'partial_fit'):
+            model.partial_fit(new_features, new_targets)
+
 # ───────── Bayesian Network Implementation ─────────
 class BayesianBettingNetwork:
     """Bayesian network for in-play betting predictions"""
@@ -674,6 +680,12 @@ def verify_learning_system() -> Dict[str, Any]:
         status['avg_confidence'] = float(recent_tips[2]) if recent_tips and recent_tips[2] else 0
     
     return status
+
+def predict_next_10min_goals(self, features: Dict) -> float:
+    """Predict probability of goals in next 10 minutes"""
+    goal_rate = features.get('goals_sum', 0) / max(1, features.get('minute', 1))
+    pressure = self._calculate_pressure_index(features)
+    return self.time_series_model.predict([[goal_rate, pressure, features['momentum_h']]])
 
 # ───────── Initialize Advanced Systems ─────────
 bayesian_network    = BayesianBettingNetwork()
@@ -930,6 +942,14 @@ def send_telegram(text: str) -> bool:
     except Exception as e:
         log.error("❌ Telegram send exception: %s", e)
         return False
+
+def should_send_tip_now(self, features: Dict, market: str, base_prob: float) -> bool:
+    """Enhanced timing logic for elite tips"""
+    if market.startswith("Over"):
+        next_10min_goal_prob = self.predict_next_10min_goals(features)
+        # Only send Over tips when goals are imminent
+        return next_10min_goal_prob > 0.35 and base_prob >= 0.75
+    return base_prob >= 0.75
 
 # ───────── API helpers ─────────
 def _api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
