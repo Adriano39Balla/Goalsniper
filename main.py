@@ -3133,6 +3133,17 @@ def http_self_learn():
     process_self_learning_from_results()
     return jsonify({"ok": True})
 
+@app.route("/admin/training-progress")
+def http_training_progress():
+    _require_admin()
+    try:
+        from train_models import analyze_training_progress
+        with db_conn() as c:
+            progress = analyze_training_progress(c.conn)
+        return jsonify({"ok": True, "progress": progress})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
 
