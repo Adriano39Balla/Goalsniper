@@ -1,4 +1,5 @@
 # train_models.py – advanced in-play trainer matching main.py
+# Enhanced: Feature cleaning, advanced feature engineering, robust training pipeline
 
 import argparse
 import json
@@ -6,6 +7,7 @@ import logging
 import os
 import socket
 import time
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -17,13 +19,15 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.feature_selection import SelectKBest, f_classif, VarianceThreshold
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
     roc_auc_score,
     log_loss,
 )
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.exceptions import ConvergenceWarning
 
 try:
     from dotenv import load_dotenv
@@ -31,15 +35,20 @@ try:
 except Exception:
     pass
 
+# Configure warnings
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s - %(message)s",
 )
 log = logging.getLogger("trainer")
 
-# ---------- Feature set (must match main.py.extract_features) ----------
+# ---------- Enhanced Feature Set (must match main.py.extract_features) ----------
 
-FEATURES: List[str] = [
+BASE_FEATURES: List[str] = [
     "minute",
     "goals_h", "goals_a", "goals_sum", "goals_diff",
     "xg_h", "xg_a", "xg_sum", "xg_diff",
@@ -55,6 +64,22 @@ FEATURES: List[str] = [
     "total_actions",
     "action_intensity",
 ]
+
+ADVANCED_FEATURES: List[str] = [
+    "momentum_ratio",
+    "pressure_per_minute", 
+    "goal_efficiency_h",
+    "goal_efficiency_a",
+    "late_game",
+    "middle_game",
+    "early_game",
+    "xg_dominance",
+    "shot_dominance",
+    "close_game",
+    "high_scoring"
+]
+
+FEATURES = BASE_FEATURES + ADVANCED_FEATURES
 
 EPS = 1e-6
 
@@ -122,6 +147,187 @@ def _fmt_line(line: float) -> str:
 
 
 OU_TRAIN_LINES: List[float] = _parse_ou_lines(OU_TRAIN_LINES_RAW)
+
+# ---------- Enhanced Feature Engineering ----------
+
+def remove_constant_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove constant and near-constant features with comprehensive logging"""
+    original_count = len(df.columns)
+    log.info(f"🔧 Cleaning features: {original_count} original features")
+    
+    # Remove constant features (zero variance)
+    constant_features = []
+    for col in df.columns:
+        if df[col].nunique() <= 1:
+            constant_features.append(col)
+    
+    if constant_features:
+        log.warning(f"🗑️ Removing {len(constant_features)} constant features: {constant_features}")
+        df = df.drop(columns=constant_features)
+    
+    # Remove near-constant features (< 1% variance)
+    near_constant_features = []
+    for col in df.columns:
+        unique_ratio = df[col].nunique() / len(df)
+        if unique_ratio < 0.01:  # Less than 1% unique values
+            near_constant_features.append(col)
+    
+    if near_constant_features:
+        log.warning(f"🗑️ Removing {len(near_constant_features)} near-constant features: {near_constant_features}")
+        df = df.drop(columns=near_constant_features)
+    
+    final_count = len(df.columns)
+    log.info(f"✅ Feature cleaning complete: {final_count} features remaining ({original_count - final_count} removed)")
+    
+    return df
+
+def robust_feature_selection(X, y, feature_names, k_features=15):
+    """Robust feature selection that handles constant features gracefully"""
+    try:
+        log.info(f"🎯 Starting feature selection: {len(feature_names)} features, target {k_features}")
+        
+        # Remove constant features first using VarianceThreshold
+        selector = VarianceThreshold(threshold=0.01)  # Remove features with <1% variance
+        X_clean = selector.fit_transform(X)
+        
+        kept_features = [feature_names[i] for i in range(len(feature_names)) 
+                        if selector.get_support()[i]]
+        log.info(f"📊 After variance threshold: {len(kept_features)} features")
+        
+        if len(kept_features) <= k_features:
+            log.info("📊 Using all remaining features (not enough for selection)")
+            return X_clean, kept_features
+        
+        # Now apply SelectKBest with warning suppression
+        kbest = SelectKBest(f_classif, k=min(k_features, len(kept_features)))
+        X_selected = kbest.fit_transform(X_clean, y)
+        
+        selected_features = [kept_features[i] for i in range(len(kept_features)) 
+                           if kbest.get_support()[i]]
+        log.info(f"🎯 Selected {len(selected_features)} best features from {len(kept_features)} candidates")
+        
+        return X_selected, selected_features
+        
+    except Exception as e:
+        log.warning(f"⚠️ Feature selection failed: {e}, using all features")
+        return X, feature_names
+
+def create_advanced_features(df):
+    """Create more predictive features from existing ones with comprehensive error handling"""
+    log.info("🚀 Creating advanced features...")
+    
+    # Make a copy to avoid modifying original
+    df_enhanced = df.copy()
+    original_columns = set(df_enhanced.columns)
+    
+    try:
+        # Momentum ratios - measure team dominance
+        df_enhanced['momentum_ratio'] = np.where(
+            df_enhanced['momentum_a'] > 0,
+            df_enhanced['momentum_h'] / (df_enhanced['momentum_a'] + 0.001),
+            np.where(df_enhanced['momentum_h'] > 0, 2.0, 1.0)  # Home dominance or neutral
+        )
+        
+        # Pressure metrics - game intensity over time
+        df_enhanced['pressure_per_minute'] = np.where(
+            df_enhanced['minute'] > 0,
+            df_enhanced['pressure_index'] / (df_enhanced['minute'] + 1),
+            0.0
+        )
+        
+        # Efficiency metrics - conversion rates
+        df_enhanced['goal_efficiency_h'] = np.where(
+            df_enhanced['sot_h'] > 0,
+            df_enhanced['goals_h'] / (df_enhanced['sot_h'] + 1),
+            0.0
+        )
+        df_enhanced['goal_efficiency_a'] = np.where(
+            df_enhanced['sot_a'] > 0,
+            df_enhanced['goals_a'] / (df_enhanced['sot_a'] + 1),
+            0.0
+        )
+        
+        # Time-based features - game phase indicators
+        df_enhanced['late_game'] = (df_enhanced['minute'] > 70).astype(int)
+        df_enhanced['middle_game'] = ((df_enhanced['minute'] >= 30) & 
+                                    (df_enhanced['minute'] <= 70)).astype(int)
+        df_enhanced['early_game'] = (df_enhanced['minute'] < 30).astype(int)
+        
+        # Dominance indicators - relative team strength
+        df_enhanced['xg_dominance'] = np.where(
+            df_enhanced['xg_sum'] > 0,
+            df_enhanced['xg_diff'] / (df_enhanced['xg_sum'] + 0.001),
+            0.0
+        )
+        df_enhanced['shot_dominance'] = np.where(
+            df_enhanced['sot_sum'] > 0,
+            (df_enhanced['sot_h'] - df_enhanced['sot_a']) / (df_enhanced['sot_sum'] + 0.001),
+            0.0
+        )
+        
+        # Game state features - match context
+        df_enhanced['close_game'] = (np.abs(df_enhanced['goals_diff']) <= 1).astype(int)
+        df_enhanced['high_scoring'] = (df_enhanced['goals_sum'] >= 2).astype(int)
+        df_enhanced['goal_rich'] = (df_enhanced['goals_sum'] >= 3).astype(int)
+        
+        # Action intensity normalized by time
+        df_enhanced['normalized_actions'] = np.where(
+            df_enhanced['minute'] > 0,
+            df_enhanced['total_actions'] / df_enhanced['minute'],
+            df_enhanced['total_actions']
+        )
+        
+        new_columns = set(df_enhanced.columns) - original_columns
+        log.info(f"✅ Created {len(new_columns)} advanced features: {list(new_columns)}")
+        
+    except Exception as e:
+        log.error(f"❌ Advanced feature creation failed: {e}")
+        return df  # Return original if enhancement fails
+    
+    return df_enhanced
+
+def enhanced_data_preparation(X, y, feature_names, test_size=0.25):
+    """Enhanced data preparation pipeline with comprehensive feature engineering"""
+    log.info("🔄 Starting enhanced data preparation pipeline")
+    
+    try:
+        # Convert to DataFrame for easier manipulation
+        df = pd.DataFrame(X, columns=feature_names)
+        log.info(f"📥 Loaded data: {df.shape[0]} samples, {df.shape[1]} features")
+        
+        # Step 1: Remove constant features
+        df_clean = remove_constant_features(df)
+        
+        # Step 2: Create advanced features
+        df_enhanced = create_advanced_features(df_clean)
+        
+        # Step 3: Handle infinite and NaN values
+        df_enhanced = df_enhanced.replace([np.inf, -np.inf], 0)
+        df_enhanced = df_enhanced.fillna(0)
+        
+        # Step 4: Robust feature selection
+        X_clean = df_enhanced.values
+        X_selected, selected_features = robust_feature_selection(
+            X_clean, y, list(df_enhanced.columns), k_features=12
+        )
+        
+        # Step 5: Train-test split with stratification
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_selected, y, test_size=test_size, random_state=42, stratify=y
+        )
+        
+        log.info(f"✅ Data preparation complete: {X_train.shape[0]} train, {X_test.shape[0]} test, {len(selected_features)} features")
+        
+        return X_train, X_test, y_train, y_test, selected_features
+        
+    except Exception as e:
+        log.error(f"❌ Enhanced data preparation failed: {e}")
+        # Fallback to basic preparation
+        log.info("🔄 Falling back to basic data preparation")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42, stratify=y
+        )
+        return X_train, X_test, y_train, y_test, feature_names
 
 # ---------- Advanced feature engineering (aligned with main.py) ----------
 
@@ -263,13 +469,13 @@ def _build_advanced_features_from_snapshot(snap: dict) -> Optional[Dict[str, flo
     return feat
 
 
-# ---------- Ensemble model (trainer-side) ----------
+# ---------- Enhanced Ensemble Model ----------
 
 
 class AdvancedEnsembleModel:
     """
-    Trainer-side ensemble that mirrors the idea in main.py:
-    Logistic + RandomForest + GradientBoost with calibration and feature selection.
+    Enhanced trainer-side ensemble with robust feature engineering and comprehensive metrics.
+    Mirrors the advanced architecture in main.py with professional-grade error handling.
     """
 
     def __init__(self, market: str):
@@ -278,6 +484,7 @@ class AdvancedEnsembleModel:
         self.scaler: Optional[StandardScaler] = None
         self.selector: Optional[SelectKBest] = None
         self.selected_features: List[str] = []
+        log.info(f"🎯 Initializing AdvancedEnsembleModel for {market}")
 
     def train(
         self,
@@ -287,47 +494,32 @@ class AdvancedEnsembleModel:
         test_size: float = 0.25,
     ) -> Dict[str, Any]:
         if X.shape[0] < MIN_ROWS:
+            log.warning(f"❌ Insufficient samples for {self.market}: {X.shape[0]} < {MIN_ROWS}")
             return {"error": f"insufficient samples: {X.shape[0]} < {MIN_ROWS}"}
 
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        log.info(f"🔧 Training {self.market} with {X.shape[0]} samples, {len(feature_names)} features")
 
-        # Feature selection
-        if len(feature_names) > 5:
-            self.selector = SelectKBest(f_classif, k=min(15, len(feature_names)))
-            try:
-                X_sel = self.selector.fit_transform(X, y)
-                self.selected_features = [
-                    feature_names[i]
-                    for i in self.selector.get_support(indices=True)
-                ]
-            except Exception as e:
-                log.warning("Feature selection failed for %s: %s", self.market, e)
-                self.selector = None
-                X_sel = X
-                self.selected_features = list(feature_names)
-        else:
-            X_sel = X
-            self.selected_features = list(feature_names)
-
-        # Scale
-        self.scaler = StandardScaler()
-        X_scaled = self.scaler.fit_transform(X_sel)
-
-        from sklearn.model_selection import train_test_split
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_scaled, y, test_size=test_size, random_state=42, stratify=y
+        # Use enhanced data preparation pipeline
+        X_train, X_test, y_train, y_test, self.selected_features = enhanced_data_preparation(
+            X, y, feature_names, test_size
         )
 
+        # Scale features professionally
+        self.scaler = StandardScaler()
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+
+        # Define base models with optimized parameters
         base_models = {
             "logistic": LogisticRegression(
-                max_iter=1000, class_weight="balanced", random_state=42
+                max_iter=2000, class_weight="balanced", random_state=42, C=0.8
             ),
             "random_forest": RandomForestClassifier(
-                n_estimators=120, random_state=42, class_weight="balanced"
+                n_estimators=150, random_state=42, class_weight="balanced",
+                max_depth=12, min_samples_split=8
             ),
             "gradient_boost": GradientBoostingClassifier(
-                n_estimators=150, random_state=42
+                n_estimators=200, random_state=42, learning_rate=0.08, max_depth=6
             ),
         }
 
@@ -336,11 +528,14 @@ class AdvancedEnsembleModel:
         for name, base in base_models.items():
             try:
                 method = "isotonic" if name == "logistic" else "sigmoid"
-                clf = CalibratedClassifierCV(base, method=method, cv=3)
-                clf.fit(X_train, y_train)
+                
+                # Professional training with comprehensive error handling
+                clf = CalibratedClassifierCV(base, method=method, cv=5, n_jobs=-1)
+                clf.fit(X_train_scaled, y_train)
                 self.models[name] = clf
 
-                proba = clf.predict_proba(X_test)[:, 1]
+                # Comprehensive model evaluation
+                proba = clf.predict_proba(X_test_scaled)[:, 1]
                 pred = (proba >= 0.5).astype(int)
 
                 acc = accuracy_score(y_test, pred)
@@ -362,13 +557,14 @@ class AdvancedEnsembleModel:
                     auc,
                 )
             except Exception as e:
-                log.error("Failed to train %s for %s: %s", name, self.market, e)
+                log.error("❌ Failed to train %s for %s: %s", name, self.market, e)
 
         if not self.models:
+            log.error("❌ No models successfully trained for %s", self.market)
             return {"error": "no models trained"}
 
-        # Ensemble evaluation
-        ens_proba = self._ensemble_predict_proba(X_test)
+        # Ensemble evaluation with cross-validation
+        ens_proba = self._ensemble_predict_proba(X_test_scaled)
         ens_pred = (ens_proba >= 0.5).astype(int)
 
         acc = accuracy_score(y_test, ens_pred)
@@ -376,13 +572,21 @@ class AdvancedEnsembleModel:
         auc = roc_auc_score(y_test, ens_proba)
         ll = log_loss(y_test, ens_proba)
 
+        # Cross-validation for model stability assessment
+        cv_scores = cross_val_score(
+            self.models["random_forest"],  # Use RF for CV as it's most stable
+            X_train_scaled, y_train, cv=5, scoring='accuracy', n_jobs=-1
+        )
+
         log.info(
-            "[%s] ensemble acc=%.3f prec=%.3f auc=%.3f logloss=%.3f",
+            "[%s] ENSEMBLE acc=%.3f prec=%.3f auc=%.3f logloss=%.3f cv=%.3f±%.3f",
             self.market,
             acc,
             prec,
             auc,
             ll,
+            cv_scores.mean(),
+            cv_scores.std(),
         )
 
         feat_imp = self._feature_importance()
@@ -393,12 +597,21 @@ class AdvancedEnsembleModel:
                 "precision": float(prec),
                 "auc": float(auc),
                 "log_loss": float(ll),
+                "cv_accuracy_mean": float(cv_scores.mean()),
+                "cv_accuracy_std": float(cv_scores.std()),
                 "samples": int(len(y)),
                 "positive_ratio": float(np.mean(y)),
+                "feature_count": len(self.selected_features),
             },
             "per_model": metrics_by_model,
             "selected_features": list(self.selected_features),
             "feature_importance": feat_imp,
+            "training_summary": {
+                "market": self.market,
+                "total_samples": len(y),
+                "training_time": time.time(),
+                "model_versions": list(self.models.keys())
+            }
         }
 
     def _ensemble_predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -408,23 +621,29 @@ class AdvancedEnsembleModel:
                 p = clf.predict_proba(X)[:, 1]
                 preds.append(p)
             except Exception as e:
-                log.warning("Prediction failed for %s / %s: %s", self.market, name, e)
+                log.warning("⚠️ Prediction failed for %s / %s: %s", self.market, name, e)
         if not preds:
+            log.warning("⚠️ No successful predictions, returning default probabilities")
             return np.full(X.shape[0], 0.5)
         preds_arr = np.vstack(preds)
         return preds_arr.mean(axis=0)
 
     def _feature_importance(self) -> Dict[str, float]:
-        # Prefer RF if available
+        """Comprehensive feature importance analysis"""
+        importance_scores = {}
+        
+        # Prefer RF if available (most reliable)
         if "random_forest" in self.models:
             clf = self.models["random_forest"]
             try:
                 base = clf.calibrated_classifiers_[0].base_estimator
                 if hasattr(base, "feature_importances_"):
                     imp = base.feature_importances_
-                    return dict(zip(self.selected_features, map(float, imp)))
-            except Exception:
-                pass
+                    importance_scores = dict(zip(self.selected_features, map(float, imp)))
+                    log.info(f"📊 RF feature importance computed for {self.market}")
+                    return importance_scores
+            except Exception as e:
+                log.warning(f"⚠️ RF feature importance failed: {e}")
 
         # Fallback: logistic coefficients
         if "logistic" in self.models:
@@ -435,10 +654,14 @@ class AdvancedEnsembleModel:
                     coef = np.abs(base.coef_[0])
                     if coef.max() > 0:
                         coef = coef / coef.max()
-                    return dict(zip(self.selected_features, map(float, coef)))
-            except Exception:
-                pass
+                    importance_scores = dict(zip(self.selected_features, map(float, coef)))
+                    log.info(f"📊 Logistic feature importance computed for {self.market}")
+                    return importance_scores
+            except Exception as e:
+                log.warning(f"⚠️ Logistic feature importance failed: {e}")
 
+        # Final fallback: equal importance
+        log.info(f"📊 Using uniform feature importance for {self.market}")
         return {f: 1.0 for f in self.selected_features}
 
 
@@ -776,8 +999,9 @@ def train_advanced_market_model(
         "feature_importance": res["feature_importance"],
         "metrics": res["metrics"],
         "per_model": res["per_model"],
+        "training_summary": res.get("training_summary", {}),
         # Note: we do not persist sklearn weights here; main.py uses its own live ensemble.
-        "version": "1.0",
+        "version": "2.0",  # Updated version for enhanced features
     }
 
 
@@ -936,6 +1160,89 @@ def _store_advanced_model(conn, key: str, model_obj: Dict[str, Any]) -> None:
     )
 
 
+# ---------- Training Progress Analysis ----------
+
+def analyze_training_progress(conn):
+    """Analyze training progress and model performance trends with comprehensive metrics"""
+    try:
+        # Get recent model performances
+        sql = """
+        SELECT 
+            model_name,
+            accuracy,
+            precision,
+            auc,
+            samples,
+            training_date
+        FROM model_performance 
+        WHERE training_date >= CURRENT_DATE - INTERVAL '30 days'
+        ORDER BY training_date DESC, model_name
+        """
+        df = _read_sql(conn, sql)
+        
+        if df.empty:
+            log.info("No training data available for analysis")
+            return {"status": "no_training_data"}
+        
+        # Analyze trends
+        trends = {}
+        market_health = {}
+        
+        for model in df['model_name'].unique():
+            model_data = df[df['model_name'] == model].sort_values('training_date')
+            if len(model_data) > 1:
+                latest = model_data.iloc[0]
+                previous = model_data.iloc[1]
+                
+                acc_change = latest['accuracy'] - previous['accuracy']
+                prec_change = latest['precision'] - previous['precision']
+                
+                # Health assessment
+                health_score = 0
+                if latest['accuracy'] > 0.7: health_score += 1
+                if latest['precision'] > 0.65: health_score += 1
+                if latest['auc'] > 0.75: health_score += 1
+                if acc_change > 0: health_score += 1
+                
+                health_status = "EXCELLENT" if health_score >= 4 else "GOOD" if health_score >= 3 else "NEEDS_ATTENTION"
+                
+                trends[model] = {
+                    'latest_accuracy': float(latest['accuracy']),
+                    'accuracy_trend': '📈' if acc_change > 0.01 else '📉' if acc_change < -0.01 else '➡️',
+                    'latest_precision': float(latest['precision']),
+                    'precision_trend': '📈' if prec_change > 0.01 else '📉' if prec_change < -0.01 else '➡️',
+                    'latest_auc': float(latest['auc']),
+                    'samples': int(latest['samples']),
+                    'health_status': health_status,
+                    'health_score': health_score
+                }
+        
+        # Overall assessment
+        avg_accuracy = df['accuracy'].mean()
+        avg_precision = df['precision'].mean()
+        total_samples = df['samples'].sum()
+        
+        overall_health = "EXCELLENT" if avg_accuracy > 0.75 else "GOOD" if avg_accuracy > 0.65 else "NEEDS_ATTENTION"
+        
+        return {
+            "status": "success",
+            "total_models_tracked": len(df['model_name'].unique()),
+            "analysis_period": "30 days",
+            "trends": trends,
+            "overall_health": overall_health,
+            "summary": {
+                "avg_accuracy": float(avg_accuracy),
+                "avg_precision": float(avg_precision),
+                "total_samples_used": int(total_samples),
+                "models_with_improvement": sum(1 for t in trends.values() if t['accuracy_trend'] == '📈')
+            }
+        }
+        
+    except Exception as e:
+        log.error(f"Training progress analysis failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+
 # ---------- Main training entrypoint used by main.py ----------
 
 
@@ -945,7 +1252,8 @@ def train_models(
     test_size: float = TRAIN_TEST_SIZE,
     min_rows: int = MIN_ROWS,
 ) -> Dict[str, Any]:
-    log.info("Starting advanced in-play training (min_minute=%d)", min_minute)
+    log.info("🚀 Starting advanced in-play training (min_minute=%d)", min_minute)
+    start_time = time.time()
     conn = _connect(db_url)
     _ensure_training_tables(conn)
 
@@ -956,16 +1264,30 @@ def train_models(
         "errors": [],
         "training_type": "advanced_inplay",
         "models_trained": 0,
+        "training_analysis": {},
+        "feature_engineering": {
+            "base_features": len(BASE_FEATURES),
+            "advanced_features": len(ADVANCED_FEATURES),
+            "total_features": len(FEATURES)
+        }
     }
 
     try:
+        # First analyze previous training progress
+        log.info("📊 Analyzing previous training progress...")
+        results["training_analysis"] = analyze_training_progress(conn)
+        
+        # Load and prepare data
+        log.info("📥 Loading training data...")
         live = load_live_data(conn, min_minute=min_minute)
         X = live["X"]
+        
         if X is not None:
+            log.info(f"🎯 Training models for {len(live['y'])} markets...")
             for market, y in live["y"].items():
                 if len(y) < min_rows:
                     log.info(
-                        "Skipping %s: only %d rows (<%d)",
+                        "⏭️ Skipping %s: only %d rows (<%d)",
                         market,
                         len(y),
                         min_rows,
@@ -974,7 +1296,7 @@ def train_models(
                     continue
 
                 log.info(
-                    "Training model for %s with %d samples", market, len(y)
+                    "🔧 Training model for %s with %d samples", market, len(y)
                 )
                 mdl = train_advanced_market_model(
                     X,
@@ -988,22 +1310,33 @@ def train_models(
                     _store_advanced_model(conn, key, mdl)
                     results["trained"][market] = True
                     results["models_trained"] += 1
+                    log.info(f"✅ Successfully trained {market}")
                 else:
                     results["trained"][market] = False
                     results["errors"].append(
                         f"Failed to train model for {market}"
                     )
+                    log.error(f"❌ Failed to train {market}")
 
+        # Auto-tuning if enabled
         if AUTO_TUNE_ENABLE:
+            log.info("🎛️  Starting auto-tuning...")
             tuned = auto_tune_thresholds_advanced(conn, 14)
             results["auto_tuned"] = tuned
+            log.info(f"✅ Auto-tuned {len(tuned)} markets")
 
+        # Store comprehensive training metadata
+        training_duration = time.time() - start_time
         meta = {
             "timestamp": time.time(),
+            "training_duration_seconds": float(training_duration),
             "live_samples": int(X.shape[0]) if X is not None else 0,
             "trained_models": results["models_trained"],
             "training_type": "advanced_inplay",
             "features_used": len(live["features"]) if X is not None else 0,
+            "feature_engineering_applied": True,
+            "feature_cleaning_applied": True,
+            "model_architecture": "AdvancedEnsembleModel_v2"
         }
         _set_setting(
             conn,
@@ -1013,13 +1346,14 @@ def train_models(
         _set_setting(conn, "last_advanced_train_ts", str(int(time.time())))
 
         log.info(
-            "Advanced training completed: %d models, %d markets tuned",
+            "🎉 Advanced training completed: %d models, %d markets tuned, %.1f seconds",
             results["models_trained"],
             len(results.get("auto_tuned", {})),
+            training_duration
         )
 
     except Exception as e:
-        log.exception("Training failed: %s", e)
+        log.exception("❌ Training failed: %s", e)
         results["ok"] = False
         results["error"] = str(e)
     finally:
