@@ -657,20 +657,14 @@ class AdvancedEnsemblePredictor:
     def _calculate_pressure_index(self, features: Dict) -> float:
         """Calculate pressure index for goal prediction"""
         try:
+            # TEMPORARY FIX - Get minute from features or use default
+            if 'minute' not in features:
+                log.warning("⚠️  'minute' key missing from features, using default")
+                return 0.5  # Default neutral pressure
+            
             minute = features.get('minute', 1)
             goal_diff = abs(features.get('goals_diff', 0))
             total_goals = features.get('goals_sum', 0)
-            
-            # Pressure increases with close scorelines and late minutes
-            time_pressure = min(1.0, minute / 90.0)
-            score_pressure = 1.0 - min(1.0, goal_diff / 3.0)  # Closer games = more pressure
-            
-            pressure = (time_pressure * 0.6) + (score_pressure * 0.4)
-            return max(0.0, min(1.0, pressure))
-            
-        except Exception as e:
-            log.error("❌ Pressure index calculation failed: %s", e)
-            return 0.5
 
     def update_models_incremental(self, new_data: List[Dict]):
         """Update models without full retraining"""
@@ -1594,7 +1588,10 @@ def extract_features(m: dict) -> Dict[str, float]:
     away   = m["teams"]["away"]["name"]
     gh     = m["goals"]["home"] or 0
     ga     = m["goals"]["away"] or 0
-    minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
+    minute_data = ((m.get("fixture") or {}).get("status") or {})
+    minute = int(minute_data.get("elapsed") or 0)
+    # Ensure minute is available in features for all functions
+    features["minute"] = float(minute)  # This ensures it's always there
 
     stats: Dict[str, Dict[str, Any]] = {}
     for s in (m.get("statistics") or []):
