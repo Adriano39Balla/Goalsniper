@@ -671,15 +671,14 @@ class AdvancedEnsemblePredictor:
         if not ENABLE_INCREMENTAL_LEARNING:
             log.info("⏩ Incremental learning disabled")
             return
-            
-        log.info("🔄 STARTING incremental model update with %s new records", len(new_data))
         
+        log.info("🔄 STARTING incremental model update with %s new records", len(new_data))
+    
         if not new_data:
             log.warning("📭 No new data provided for incremental update")
             return
-        
+    
         try:
-            # Prepare features and targets
             new_features = []
             new_targets = []
             
