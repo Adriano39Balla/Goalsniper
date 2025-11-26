@@ -657,14 +657,26 @@ class AdvancedEnsemblePredictor:
     def _calculate_pressure_index(self, features: Dict) -> float:
         """Calculate pressure index for goal prediction"""
         try:
-            # TEMPORARY FIX - Get minute from features or use default
-            if 'minute' not in features:
-                log.warning("⚠️  'minute' key missing from features, using default")
-                return 0.5  # Default neutral pressure
-            
+            # Get minute from features with proper fallback
             minute = features.get('minute', 1)
             goal_diff = abs(features.get('goals_diff', 0))
             total_goals = features.get('goals_sum', 0)
+            
+            # Calculate pressure based on game state
+            time_pressure = minute / 90.0
+            score_pressure = min(1.0, goal_diff * 0.3)  # Close games have more pressure
+            goal_pressure = min(1.0, total_goals * 0.2)  # High-scoring games
+            
+            pressure = (time_pressure * 0.4 + score_pressure * 0.4 + goal_pressure * 0.2)
+            
+            log.info("📊 Pressure calculation - Minute: %s, Goal diff: %s, Total goals: %s, Pressure: %.3f", 
+                    minute, goal_diff, total_goals, pressure)
+            
+            return max(0.0, min(1.0, pressure))
+            
+        except Exception as e:
+            log.error("❌ Pressure calculation failed: %s", e, exc_info=True)
+            return 0.5  # Default neutral pressure
 
     def update_models_incremental(self, new_data: List[Dict]):
         """Update models without full retraining"""
