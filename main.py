@@ -1,6 +1,7 @@
 # goalsniper — PURE IN-PLAY AI mode with Bayesian networks & self-learning
 # Upgraded: Bayesian networks, self-learning from wrong bets, advanced ensemble models
 # Enhanced: Context analysis, performance monitoring, multi-book odds, timing optimization
+# SUPERCHARGED: Enhanced API-Football integration with player stats, historical data, and predictions endpoint
 
 import os, json, time, logging, requests, psycopg2
 import numpy as np
@@ -75,6 +76,9 @@ METRICS = {
     "multi_book_odds_searches": 0,
     "timing_analysis_decisions": 0,
     "volume_reductions_triggered": 0,
+    "enhanced_features_processed": 0,
+    "historical_context_applied": 0,
+    "api_predictions_blended": 0,
 }
 
 def _metric_inc(name: str, label: Optional[str] = None, n: int = 1) -> None:
@@ -165,6 +169,12 @@ ENABLE_MULTI_BOOK_ODDS = os.getenv("ENABLE_MULTI_BOOK_ODDS", "1") not in ("0","f
 ENABLE_TIMING_OPTIMIZATION = os.getenv("ENABLE_TIMING_OPTIMIZATION", "1") not in ("0","false","False","no","NO")
 ENABLE_INCREMENTAL_LEARNING = os.getenv("ENABLE_INCREMENTAL_LEARNING", "1") not in ("0","false","False","no","NO")
 
+# Enhanced API-Football features
+ENABLE_ENHANCED_FEATURES = os.getenv("ENABLE_ENHANCED_FEATURES", "1") not in ("0","false","False","no","NO")
+ENABLE_HISTORICAL_CONTEXT = os.getenv("ENABLE_HISTORICAL_CONTEXT", "1") not in ("0","false","False","no","NO")
+ENABLE_API_PREDICTIONS = os.getenv("ENABLE_API_PREDICTIONS", "1") not in ("0","false","False","no","NO")
+ENABLE_PLAYER_IMPACT = os.getenv("ENABLE_PLAYER_IMPACT", "1") not in ("0","false","False","no","NO")
+
 # Optional warnings
 if not ADMIN_API_KEY:
     log.warning("ADMIN_API_KEY is not set — /admin/* endpoints are less protected.")
@@ -242,6 +252,8 @@ session.mount(
 STATS_CACHE:  Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 ODDS_CACHE:   Dict[int, Tuple[float, dict]] = {}
+HISTORICAL_CACHE: Dict[str, Tuple[float, Dict]] = {}
+PREDICTIONS_CACHE: Dict[int, Tuple[float, Dict]] = {}
 SETTINGS_TTL  = int(os.getenv("SETTINGS_TTL_SEC", "60"))
 MODELS_TTL    = int(os.getenv("MODELS_CACHE_TTL_SEC", "120"))
 TZ_UTC        = ZoneInfo("UTC")
@@ -256,6 +268,305 @@ API_CB = {"failures": 0, "opened_until": 0.0}
 API_CB_THRESHOLD    = int(os.getenv("API_CB_THRESHOLD", "8"))
 API_CB_COOLDOWN_SEC = int(os.getenv("API_CB_COOLDOWN_SEC", "90"))
 REQ_TIMEOUT_SEC     = float(os.getenv("REQ_TIMEOUT_SEC", "8.0"))
+
+# ───────── Enhanced Feature Extraction System ─────────
+def extract_enhanced_features(m: dict) -> Dict[str, float]:
+    """Enhanced feature extraction with player impact and advanced metrics"""
+    log.info("🔧 EXTRACTING ENHANCED FEATURES")
+    
+    # Get basic features first
+    basic_features = extract_features(m)
+    
+    if not ENABLE_ENHANCED_FEATURES:
+        log.info("⏩ Enhanced features disabled, returning basic features")
+        return basic_features
+    
+    try:
+        home   = m["teams"]["home"]["name"]
+        away   = m["teams"]["away"]["name"]
+        events = m.get("events", [])
+        
+        # Enhanced player impact metrics
+        player_metrics = extract_player_impact_metrics(events, home, away)
+        log.info("🎯 Player impact metrics extracted: %s", player_metrics)
+        
+        # Enhanced historical context
+        historical_context = add_historical_context(m.get("fixture", {}).get("id"), home, away)
+        log.info("📊 Historical context applied: %s", historical_context)
+        
+        # Enhanced team strength metrics
+        team_strength = calculate_team_strength_metrics(basic_features, home, away)
+        log.info("💪 Team strength metrics calculated: %s", team_strength)
+        
+        # Enhanced lineup changes detection
+        lineup_changes = detect_lineup_changes(events)
+        log.info("🔄 Lineup changes detected: %s", lineup_changes)
+        
+        # Combine all enhanced features
+        enhanced_features = {
+            **basic_features,
+            **player_metrics,
+            **historical_context,
+            **team_strength,
+            **lineup_changes
+        }
+        
+        log.info("✅ ENHANCED FEATURES EXTRACTED: %s total features", len(enhanced_features))
+        _metric_inc("enhanced_features_processed")
+        
+        return enhanced_features
+        
+    except Exception as e:
+        log.error("❌ Enhanced feature extraction failed: %s", e, exc_info=True)
+        log.warning("⚠️  Falling back to basic features")
+        return basic_features
+
+def extract_player_impact_metrics(events: List[Dict], home_team: str, away_team: str) -> Dict[str, float]:
+    """Extract player-level impact metrics from events"""
+    log.info("👤 Extracting player impact metrics")
+    
+    try:
+        key_players_home = 0
+        key_players_away = 0
+        key_events_home = 0
+        key_events_away = 0
+        
+        for event in events:
+            team = event.get("team", {}).get("name", "")
+            event_type = event.get("type", "").lower()
+            detail = event.get("detail", "").lower()
+            
+            # Count key players based on significant events
+            if event_type in ["goal", "assist", "penalty"]:
+                if team == home_team:
+                    key_events_home += 1
+                    key_players_home = max(key_players_home, 1)
+                elif team == away_team:
+                    key_events_away += 1
+                    key_players_away = max(key_players_away, 1)
+            
+            # Count key players based on cards (negative impact)
+            elif event_type == "card" and "red" in detail:
+                if team == home_team:
+                    key_players_home -= 1
+                elif team == away_team:
+                    key_players_away -= 1
+        
+        player_impact = {
+            "key_players_active_h": float(max(0, key_players_home)),
+            "key_players_active_a": float(max(0, key_players_away)),
+            "key_player_imbalance": float(key_players_home - key_players_away),
+            "key_events_home": float(key_events_home),
+            "key_events_away": float(key_events_away),
+            "total_key_events": float(key_events_home + key_events_away)
+        }
+        
+        log.info("📈 Player impact metrics: %s", player_impact)
+        return player_impact
+        
+    except Exception as e:
+        log.error("❌ Player impact extraction failed: %s", e)
+        return {
+            "key_players_active_h": 0.0,
+            "key_players_active_a": 0.0,
+            "key_player_imbalance": 0.0,
+            "key_events_home": 0.0,
+            "key_events_away": 0.0,
+            "total_key_events": 0.0
+        }
+
+def add_historical_context(match_id: Optional[int], home_team: str, away_team: str) -> Dict[str, float]:
+    """Add head-to-head and recent form data"""
+    if not ENABLE_HISTORICAL_CONTEXT:
+        return {}
+        
+    log.info("📚 Adding historical context for %s vs %s", home_team, away_team)
+    
+    try:
+        with db_conn() as c:
+            # Get last 5 meetings between these teams
+            h2h_results = c.execute("""
+                SELECT mr.final_goals_h, mr.final_goals_a, mr.btts_yes
+                FROM match_results mr
+                JOIN tips t ON mr.match_id = t.match_id
+                WHERE t.home = %s AND t.away = %s
+                ORDER BY t.created_ts DESC 
+                LIMIT 5
+            """, (home_team, away_team)).fetchall()
+            
+        if h2h_results:
+            home_wins = sum(1 for gh, ga, _ in h2h_results if gh > ga)
+            away_wins = sum(1 for gh, ga, _ in h2h_results if ga > gh)
+            draws = len(h2h_results) - home_wins - away_wins
+            total_goals = sum(gh + ga for gh, ga, _ in h2h_results)
+            btts_count = sum(btts for _, _, btts in h2h_results)
+            
+            historical_context = {
+                "h2h_home_win_rate": home_wins / len(h2h_results),
+                "h2h_away_win_rate": away_wins / len(h2h_results),
+                "h2h_draw_rate": draws / len(h2h_results),
+                "h2h_avg_goals": total_goals / len(h2h_results),
+                "h2h_btts_rate": btts_count / len(h2h_results),
+                "h2h_sample_size": len(h2h_results)
+            }
+            
+            log.info("📊 Historical context: %s meetings, Home wins: %.1f%%, Avg goals: %.2f", 
+                    len(h2h_results), historical_context["h2h_home_win_rate"] * 100, 
+                    historical_context["h2h_avg_goals"])
+                    
+            _metric_inc("historical_context_applied")
+            return historical_context
+        else:
+            log.info("📭 No historical data available for %s vs %s", home_team, away_team)
+            return {}
+            
+    except Exception as e:
+        log.error("❌ Historical context extraction failed: %s", e)
+        return {}
+
+def calculate_team_strength_metrics(features: Dict[str, float], home_team: str, away_team: str) -> Dict[str, float]:
+    """Calculate comprehensive team strength metrics"""
+    log.info("💪 Calculating team strength metrics")
+    
+    try:
+        strength_metrics = {
+            "xg_dominance": features.get("xg_h", 0.0) - features.get("xg_a", 0.0),
+            "sot_dominance": features.get("sot_h", 0.0) - features.get("sot_a", 0.0),
+            "possession_dominance": features.get("pos_diff", 0.0),
+            "momentum_advantage": features.get("momentum_h", 0.0) - features.get("momentum_a", 0.0),
+            "efficiency_advantage": features.get("efficiency_h", 0.0) - features.get("efficiency_a", 0.0),
+            "pressure_advantage": features.get("pressure_index", 0.0),
+            "action_intensity_ratio": features.get("action_intensity", 0.0) / max(1.0, features.get("minute", 1.0))
+        }
+        
+        # Normalize metrics
+        for key in strength_metrics:
+            strength_metrics[key] = float(max(-1.0, min(1.0, strength_metrics[key])))
+        
+        log.info("📈 Team strength metrics calculated: %s", strength_metrics)
+        return strength_metrics
+        
+    except Exception as e:
+        log.error("❌ Team strength calculation failed: %s", e)
+        return {}
+
+def detect_lineup_changes(events: List[Dict]) -> Dict[str, float]:
+    """Detect significant lineup changes during the match"""
+    log.info("🔄 Detecting lineup changes")
+    
+    try:
+        red_cards = 0
+        key_substitutions = 0
+        injuries = 0
+        
+        for event in events:
+            event_type = event.get("type", "").lower()
+            detail = event.get("detail", "").lower()
+            
+            if event_type == "card" and "red" in detail:
+                red_cards += 1
+            elif event_type == "subst":
+                key_substitutions += 1
+            elif "injury" in detail or "var" in detail:
+                injuries += 1
+        
+        lineup_metrics = {
+            "red_cards_total": float(red_cards),
+            "key_substitutions": float(key_substitutions),
+            "injury_incidents": float(injuries),
+            "major_incidents": float(red_cards + injuries),
+            "total_lineup_changes": float(red_cards + key_substitutions + injuries)
+        }
+        
+        log.info("🔄 Lineup changes detected: %s red cards, %s subs, %s injuries", 
+                red_cards, key_substitutions, injuries)
+                
+        return lineup_metrics
+        
+    except Exception as e:
+        log.error("❌ Lineup change detection failed: %s", e)
+        return {
+            "red_cards_total": 0.0,
+            "key_substitutions": 0.0,
+            "injury_incidents": 0.0,
+            "major_incidents": 0.0,
+            "total_lineup_changes": 0.0
+        }
+
+# ───────── API-Football Predictions Integration ─────────
+def get_api_predictions(fixture_id: int) -> Optional[Dict]:
+    """Get algorithm-based predictions from API-Football"""
+    if not ENABLE_API_PREDICTIONS:
+        log.info("⏩ API predictions disabled")
+        return None
+        
+    log.info("🔮 Fetching API-Football predictions for fixture %s", fixture_id)
+    
+    # Check cache first
+    now = time.time()
+    cached = PREDICTIONS_CACHE.get(fixture_id)
+    if cached and now - cached[0] < 300:  # 5 minute cache
+        log.info("📦 Using cached predictions")
+        return cached[1]
+    
+    try:
+        response = _api_get(f"{BASE_URL}/predictions", {"fixture": fixture_id})
+        if response and "response" in response and response["response"]:
+            predictions = response["response"][0]  # First prediction object
+            PREDICTIONS_CACHE[fixture_id] = (now, predictions)
+            log.info("✅ API predictions fetched successfully")
+            return predictions
+        else:
+            log.warning("❌ No predictions available from API-Football")
+            return None
+            
+    except Exception as e:
+        log.error("❌ API predictions fetch failed: %s", e)
+        return None
+
+def blend_with_api_predictions(your_prob: float, api_prediction: Dict, market: str) -> float:
+    """Blend your model probability with API-Football's predictions"""
+    if not api_prediction:
+        return your_prob
+        
+    log.info("🔄 Blending probabilities with API-Football predictions for %s", market)
+    
+    try:
+        predictions = api_prediction.get("predictions", {})
+        api_prob = 0.5  # Default neutral probability
+        
+        if market == "BTTS" and "btts" in predictions:
+            api_prob = float(predictions["btts"].get("percentage", 50)) / 100
+            log.info("📊 API BTTS probability: %.1f%%", api_prob * 100)
+            
+        elif market.startswith("Over") and "goals" in predictions:
+            over_key = f"over_{_parse_ou_line_from_suggestion(market)}"
+            api_prob = float(predictions["goals"].get(over_key, {}).get("percentage", 50)) / 100
+            log.info("📊 API Over probability: %.1f%%", api_prob * 100)
+            
+        elif market.startswith("Under") and "goals" in predictions:
+            under_key = f"under_{_parse_ou_line_from_suggestion(market)}"
+            api_prob = float(predictions["goals"].get(under_key, {}).get("percentage", 50)) / 100
+            log.info("📊 API Under probability: %.1f%%", api_prob * 100)
+            
+        elif market == "1X2" and "winner" in predictions:
+            if "Home" in market:
+                api_prob = float(predictions["winner"].get("home", {}).get("percentage", 33)) / 100
+            elif "Away" in market:
+                api_prob = float(predictions["winner"].get("away", {}).get("percentage", 33)) / 100
+            log.info("📊 API 1X2 probability: %.1f%%", api_prob * 100)
+        
+        # Weighted blend (70% your model, 30% API)
+        blended_prob = (your_prob * 0.7) + (api_prob * 0.3)
+        log.info("🎯 Probability blend - Your model: %.1f%%, API: %.1f%%, Final: %.1f%%", 
+                your_prob * 100, api_prob * 100, blended_prob * 100)
+        
+        _metric_inc("api_predictions_blended")
+        return blended_prob
+        
+    except Exception as e:
+        log.error("❌ Probability blending failed: %s", e)
+        return your_prob
 
 # ───────── Performance Monitoring System ─────────
 class PerformanceMonitor:
@@ -598,7 +909,12 @@ class AdvancedEnsemblePredictor:
         log.info("🔮 STARTING 10-minute goal prediction")
         
         try:
+            # FIXED: Ensure minute is always available with proper fallback
             minute = features.get('minute', 1)
+            if minute <= 0:
+                minute = 1
+                log.warning("⚠️  Invalid minute value, using default: 1")
+                
             goals_sum = features.get('goals_sum', 0)
             goal_rate = goals_sum / max(1, minute)
             
@@ -657,7 +973,11 @@ class AdvancedEnsemblePredictor:
     def _calculate_pressure_index(self, features: Dict) -> float:
         """Calculate pressure index for goal prediction"""
         try:
+            # FIXED: Proper minute handling with fallback
             minute = features.get('minute', 1)
+            if minute <= 0:
+                minute = 1
+                
             goal_diff = abs(features.get('goals_diff', 0))
             total_goals = features.get('goals_sum', 0)
             
@@ -1393,6 +1713,8 @@ def _api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
             lbl = "events"
         elif "/fixtures" in url:
             lbl = "fixtures"
+        elif "/predictions" in url:
+            lbl = "predictions"
     except Exception:
         lbl = "unknown"
 
@@ -1594,7 +1916,13 @@ def extract_features(m: dict) -> Dict[str, float]:
     away   = m["teams"]["away"]["name"]
     gh     = m["goals"]["home"] or 0
     ga     = m["goals"]["away"] or 0
-    minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
+    
+    # FIXED: Proper minute extraction with fallback
+    minute_data = ((m.get("fixture") or {}).get("status") or {})
+    minute = int(minute_data.get("elapsed") or 1)  # Default to 1, not 0
+    if minute <= 0:
+        minute = 1
+        log.warning("⚠️  Invalid minute detected, using default: 1")
 
     stats: Dict[str, Dict[str, Any]] = {}
     for s in (m.get("statistics") or []):
@@ -1713,6 +2041,12 @@ def advanced_predict_probability(
         }
         context_score = ensemble_predictor.analyze_match_context(match_data)
         log.debug("🎭 Context score applied: %.3f", context_score)
+    
+    # Blend with API-Football predictions if available
+    if ENABLE_API_PREDICTIONS and match_id:
+        api_predictions = get_api_predictions(match_id)
+        if api_predictions:
+            ensemble_prob = blend_with_api_predictions(ensemble_prob, api_predictions, market)
     
     data_richness = min(1.0, float(features.get("minute", 0)) / 60.0)
     if data_richness > 0.7:
@@ -2488,7 +2822,12 @@ def production_scan() -> Tuple[int, int]:
                         log.debug("⏩ Skipping match %s due to duplicate cooldown", fid)
                         continue
 
-                feat   = extract_features(m)
+                # Use enhanced features if enabled
+                if ENABLE_ENHANCED_FEATURES:
+                    feat = extract_enhanced_features(m)
+                else:
+                    feat = extract_features(m)
+                    
                 minute = int(feat.get("minute", 0))
                 log.info("⏱️ Match minute: %s, TIP_MIN_MINUTE: %s", minute, TIP_MIN_MINUTE)
                 
@@ -3179,7 +3518,11 @@ def http_system_status():
             "performance_monitor": ENABLE_PERFORMANCE_MONITOR,
             "multi_book_odds": ENABLE_MULTI_BOOK_ODDS,
             "timing_optimization": ENABLE_TIMING_OPTIMIZATION,
-            "incremental_learning": ENABLE_INCREMENTAL_LEARNING
+            "incremental_learning": ENABLE_INCREMENTAL_LEARNING,
+            "enhanced_features": ENABLE_ENHANCED_FEATURES,
+            "historical_context": ENABLE_HISTORICAL_CONTEXT,
+            "api_predictions": ENABLE_API_PREDICTIONS,
+            "player_impact": ENABLE_PLAYER_IMPACT
         }
     })
 
