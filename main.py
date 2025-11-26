@@ -1,11 +1,9 @@
 # goalsniper — PURE IN-PLAY AI mode with Bayesian networks & self-learning
 # Upgraded: Bayesian networks, self-learning from wrong bets, advanced ensemble models
-# Enhanced: Context analysis, performance monitoring, multi-book odds, timing optimization
 
 import os, json, time, logging, requests, psycopg2
 import numpy as np
 import pandas as pd
-from collections import deque, defaultdict
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
@@ -60,6 +58,7 @@ log = logging.getLogger("goalsniper")
 app = Flask(__name__)
 
 # ───────── Minimal Prometheus-style metrics ─────────
+from collections import defaultdict
 METRICS = {
     "api_calls_total": defaultdict(int),
     "api_rate_limited_total": 0,
@@ -70,13 +69,7 @@ METRICS = {
     "bayesian_updates_total": 0,
     "self_learning_updates_total": 0,
     "ensemble_predictions_total": 0,
-    "context_analysis_calls": 0,
-    "performance_monitor_updates": 0,
-    "multi_book_odds_searches": 0,
-    "timing_analysis_decisions": 0,
-    "volume_reductions_triggered": 0,
 }
-
 def _metric_inc(name: str, label: Optional[str] = None, n: int = 1) -> None:
     try:
         if label is None:
@@ -157,13 +150,6 @@ STALE_GUARD_ENABLE = os.getenv("STALE_GUARD_ENABLE", "1") not in ("0","false","F
 STALE_STATS_MAX_SEC = int(os.getenv("STALE_STATS_MAX_SEC", "240"))
 MARKET_CUTOFFS_RAW  = os.getenv("MARKET_CUTOFFS", "BTTS=75,1X2=80,OU=88")
 TIP_MAX_MINUTE_ENV  = os.getenv("TIP_MAX_MINUTE", "")
-
-# New enhancement controls
-ENABLE_CONTEXT_ANALYSIS = os.getenv("ENABLE_CONTEXT_ANALYSIS", "1") not in ("0","false","False","no","NO")
-ENABLE_PERFORMANCE_MONITOR = os.getenv("ENABLE_PERFORMANCE_MONITOR", "1") not in ("0","false","False","no","NO")
-ENABLE_MULTI_BOOK_ODDS = os.getenv("ENABLE_MULTI_BOOK_ODDS", "1") not in ("0","false","False","no","NO")
-ENABLE_TIMING_OPTIMIZATION = os.getenv("ENABLE_TIMING_OPTIMIZATION", "1") not in ("0","false","False","no","NO")
-ENABLE_INCREMENTAL_LEARNING = os.getenv("ENABLE_INCREMENTAL_LEARNING", "1") not in ("0","false","False","no","NO")
 
 # Optional warnings
 if not ADMIN_API_KEY:
@@ -257,107 +243,9 @@ API_CB_THRESHOLD    = int(os.getenv("API_CB_THRESHOLD", "8"))
 API_CB_COOLDOWN_SEC = int(os.getenv("API_CB_COOLDOWN_SEC", "90"))
 REQ_TIMEOUT_SEC     = float(os.getenv("REQ_TIMEOUT_SEC", "8.0"))
 
-# ───────── Performance Monitoring System ─────────
-class PerformanceMonitor:
-    """Real-time performance tracking and risk management"""
-    
-    def __init__(self):
-        self.recent_performance = deque(maxlen=50)
-        self.volume_reduction_active = False
-        self.volume_reduction_start_time = 0
-        self.volume_reduction_duration_min = int(os.getenv("VOLUME_REDUCTION_DURATION_MIN", "60"))
-        log.info("📈 PerformanceMonitor initialized with 50-record history")
-    
-    def update_performance(self, tip_id: int, won: bool):
-        log.info("🔄 Updating performance - Tip ID: %s, Result: %s", tip_id, "WIN" if won else "LOSS")
-        
-        previous_streak = self.get_current_streak()
-        self.recent_performance.append(won)
-        current_streak = self.get_current_streak()
-        
-        log.info("📊 Performance update - Previous streak: %s, Current streak: %s, Total records: %s", 
-                previous_streak, current_streak, len(self.recent_performance))
-        
-        # Log streak changes
-        if abs(current_streak) >= 3:
-            streak_type = "WINNING" if current_streak > 0 else "LOSING"
-            log.warning("🚨 Significant %s streak detected: %s consecutive", streak_type, abs(current_streak))
-        
-        # Log overall performance
-        if len(self.recent_performance) >= 10:
-            win_rate = sum(self.recent_performance) / len(self.recent_performance)
-            log.info("📈 Recent performance (last %s): %.1f%% win rate", 
-                    len(self.recent_performance), win_rate * 100)
-        
-        _metric_inc("performance_monitor_updates")
-    
-    def get_current_streak(self) -> int:
-        """Return current win/loss streak"""
-        log.debug("🔍 Calculating current streak from %s records", len(self.recent_performance))
-        
-        if not self.recent_performance:
-            log.debug("📭 No performance records available")
-            return 0
-        
-        current = self.recent_performance[-1]
-        streak = 0
-        
-        for i, result in enumerate(reversed(self.recent_performance)):
-            if result == current:
-                streak += 1
-            else:
-                break
-        
-        streak_direction = "WIN" if current else "LOSS"
-        log.debug("📊 Current %s streak: %s consecutive", streak_direction, streak)
-        
-        return streak if current else -streak
-    
-    def should_reduce_volume(self) -> bool:
-        """Reduce volume during losing streaks with cooldown period"""
-        if self.volume_reduction_active:
-            # Check if cooldown period has expired
-            if time.time() - self.volume_reduction_start_time > self.volume_reduction_duration_min * 60:
-                self.volume_reduction_active = False
-                log.info("✅ Volume reduction cooldown expired - resuming normal operations")
-            else:
-                remaining = (self.volume_reduction_start_time + self.volume_reduction_duration_min * 60 - time.time()) / 60
-                log.warning("⏳ Volume reduction still active - %.1f minutes remaining", remaining)
-                return True
-        
-        streak = self.get_current_streak()
-        should_reduce = streak <= -3  # Stop tips after 3 consecutive losses
-        
-        if should_reduce and not self.volume_reduction_active:
-            self.volume_reduction_active = True
-            self.volume_reduction_start_time = time.time()
-            _metric_inc("volume_reductions_triggered")
-            log.warning("🚨 VOLUME REDUCTION TRIGGERED - Losing streak: %s consecutive losses", abs(streak))
-        elif not should_reduce:
-            log.debug("✅ Volume normal - Current streak: %s", streak)
-            
-        return self.volume_reduction_active
-    
-    def get_performance_stats(self) -> Dict[str, Any]:
-        """Get comprehensive performance statistics"""
-        if not self.recent_performance:
-            return {"total_tips": 0, "win_rate": 0.0, "current_streak": 0}
-        
-        total = len(self.recent_performance)
-        wins = sum(self.recent_performance)
-        win_rate = wins / total
-        streak = self.get_current_streak()
-        
-        return {
-            "total_tips": total,
-            "win_rate": round(win_rate, 3),
-            "current_streak": streak,
-            "volume_reduction_active": self.volume_reduction_active
-        }
-
-# ───────── Advanced Model Architecture with Enhancements ─────────
+# ───────── Advanced Model Architecture ─────────
 class AdvancedEnsemblePredictor:
-    """Advanced ensemble combining multiple models with Bayesian calibration and enhanced features"""
+    """Advanced ensemble combining multiple models with Bayesian calibration"""
     
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -368,401 +256,6 @@ class AdvancedEnsemblePredictor:
         self.bayesian_prior_beta  = BAYESIAN_PRIOR_BETA
         self.performance_history: List[int] = []
         
-        # Initialize time series model for goal prediction
-        from sklearn.linear_model import LogisticRegression
-        self.time_series_model = LogisticRegression(random_state=42)
-        
-        log.info("🤖 AdvancedEnsemblePredictor initialized for %s with timing optimization", model_name)
-        
-    def analyze_match_context(self, match_data: Dict) -> float:
-        """Analyze match context for additional edge"""
-        if not ENABLE_CONTEXT_ANALYSIS:
-            return 1.0
-            
-        log.info("🎭 STARTING match context analysis")
-        context_score = 1.0
-        
-        try:
-            # Team motivation factors
-            is_derby = self._is_derby_match(match_data)
-            has_red_card = match_data.get('red_cards', 0) > 0
-            is_cup_match = "cup" in match_data.get('league', '').lower()
-            
-            log.info("📊 Context factors - Derby: %s, Red Card: %s, Cup Match: %s", 
-                    is_derby, has_red_card, is_cup_match)
-            
-            # Adjust probabilities based on context
-            if is_derby:
-                old_score = context_score
-                context_score *= 1.1  # Derbies often more intense
-                log.info("🏟️  Derby match detected - adjusting context score: %.3f → %.3f", 
-                        old_score, context_score)
-            
-            if has_red_card:
-                old_score = context_score
-                context_score *= 1.15  # Red cards dramatically change games
-                log.info("🟥 Red card detected - adjusting context score: %.3f → %.3f", 
-                        old_score, context_score)
-            
-            if is_cup_match:
-                old_score = context_score
-                context_score *= 0.9   # Cup matches can be unpredictable
-                log.info("🏆 Cup match detected - adjusting context score: %.3f → %.3f", 
-                        old_score, context_score)
-            
-            log.info("✅ FINAL context analysis score: %.3f", context_score)
-            
-        except Exception as e:
-            log.error("❌ Context analysis failed: %s", e, exc_info=True)
-            context_score = 1.0  # Default neutral score on error
-            log.warning("⚠️  Using default context score due to error")
-        
-        _metric_inc("context_analysis_calls")
-        return context_score
-
-    def _is_derby_match(self, match_data: Dict) -> bool:
-        """Detect if match is a derby based on team names and league"""
-        try:
-            home_team = match_data.get('home_team', '').lower()
-            away_team = match_data.get('away_team', '').lower()
-            league = match_data.get('league', '').lower()
-            
-            # Common derby patterns
-            derby_indicators = [
-                'derby', 'clasico', 'classico', 'rival', 'derbi', 
-                'london', 'manchester', 'madrid', 'milan', 'glasgow'
-            ]
-            
-            # Check team names for derby indicators
-            team_combination = f"{home_team} {away_team}".lower()
-            is_derby = any(indicator in team_combination for indicator in derby_indicators)
-            
-            # League-specific derby detection
-            if 'premier' in league and ('london' in team_combination or 'manchester' in team_combination):
-                is_derby = True
-            elif 'la liga' in league and 'madrid' in team_combination:
-                is_derby = True
-            elif 'serie a' in league and 'milan' in team_combination:
-                is_derby = True
-                
-            return is_derby
-            
-        except Exception as e:
-            log.error("❌ Derby detection failed: %s", e)
-            return False
-
-    def find_best_odds_across_books(self, match_id: int, market: str, suggestion: str) -> Tuple[Optional[float], Optional[str]]:
-        """Get best odds across multiple bookmakers with outlier detection"""
-        if not ENABLE_MULTI_BOOK_ODDS:
-            return self._get_single_book_odds(match_id, market, suggestion)
-            
-        log.info("💰 STARTING multi-book odds search - Match: %s, Market: %s, Suggestion: %s", 
-                match_id, market, suggestion)
-        
-        all_odds = self._fetch_multiple_bookmakers(match_id, market, suggestion)
-        log.info("📊 Raw odds collected from %s bookmakers: %s", 
-                len(all_odds) if all_odds else 0, 
-                [(o[0], o[1]) for o in all_odds] if all_odds else "None")
-        
-        if not all_odds:
-            log.warning("❌ No odds available from any bookmaker for match %s market %s", match_id, market)
-            return None, None
-        
-        try:
-            # Remove outliers using IQR method
-            odds_values = [o[0] for o in all_odds]
-            q1, q3 = np.percentile(odds_values, [25, 75])
-            iqr = q3 - q1
-            lower_bound = q1 - 1.5 * iqr
-            upper_bound = q3 + 1.5 * iqr
-            
-            log.info("📐 Outlier detection - Q1: %.3f, Q3: %.3f, IQR: %.3f, Bounds: [%.3f, %.3f]", 
-                    q1, q3, iqr, lower_bound, upper_bound)
-            
-            valid_odds = [o for o in all_odds if lower_bound <= o[0] <= upper_bound]
-            removed_outliers = len(all_odds) - len(valid_odds)
-            
-            if removed_outliers > 0:
-                log.warning("🗑️  Removed %s outlier odds: %s", 
-                           removed_outliers, 
-                           [o for o in all_odds if o not in valid_odds])
-            
-            if not valid_odds:
-                log.error("❌ All odds classified as outliers - no valid odds remaining")
-                return None, None
-            
-            log.info("✅ Valid odds after outlier removal: %s", [(o[0], o[1]) for o in valid_odds])
-            
-            # Return best valid odds
-            best_odds = max(valid_odds, key=lambda x: x[0])
-            log.info("🏆 BEST ODDS FOUND - Value: %.2f, Bookmaker: %s", best_odds[0], best_odds[1])
-            
-            # Compare to average
-            avg_odds = np.mean([o[0] for o in valid_odds])
-            improvement_pct = ((best_odds[0] - avg_odds) / avg_odds) * 100
-            log.info("📈 Odds improvement: %.2f%% better than average (%.2f vs %.2f)", 
-                    improvement_pct, best_odds[0], avg_odds)
-            
-            _metric_inc("multi_book_odds_searches")
-            return best_odds[0], best_odds[1]
-            
-        except Exception as e:
-            log.error("❌ Error in multi-book odds search: %s", e, exc_info=True)
-            log.warning("⚠️  Falling back to single book odds")
-            return self._get_single_book_odds(match_id, market, suggestion)
-
-    def _fetch_multiple_bookmakers(self, match_id: int, market: str, suggestion: str) -> List[Tuple[float, str]]:
-        """Fetch odds from multiple bookmakers (simulated - extend with real API calls)"""
-        # This is a simplified version - extend with real bookmaker APIs
-        try:
-            # For now, simulate multiple bookmakers by adding small variations
-            base_odds, base_book = self._get_single_book_odds(match_id, market, suggestion)
-            if base_odds is None:
-                return []
-                
-            bookmakers = [
-                "Bet365", "William Hill", "Pinnacle", "Betfair", 
-                "Unibet", "Bwin", "888sport", "Marathon Bet"
-            ]
-            
-            variations = []
-            for bookmaker in bookmakers[:4]:  # Simulate 4 bookmakers
-                # Add realistic variations (±10%)
-                variation = np.random.normal(0, 0.05)
-                varied_odds = base_odds * (1 + variation)
-                # Ensure odds are reasonable
-                varied_odds = max(base_odds * 0.9, min(base_odds * 1.1, varied_odds))
-                variations.append((round(varied_odds, 2), bookmaker))
-            
-            return variations
-            
-        except Exception as e:
-            log.error("❌ Multi-book fetch failed: %s", e)
-            return []
-
-    def _get_single_book_odds(self, match_id: int, market: str, suggestion: str) -> Tuple[Optional[float], Optional[str]]:
-        """Fallback to single bookmaker odds"""
-        # This would integrate with your existing odds fetching logic
-        odds_map = fetch_odds(match_id)
-        return _get_odds_for_market(odds_map, market, suggestion)
-
-    def should_send_tip_now(self, features: Dict, market: str, base_prob: float) -> bool:
-        """Enhanced timing logic for elite tips"""
-        if not ENABLE_TIMING_OPTIMIZATION:
-            return base_prob * 100 >= CONF_THRESHOLD
-            
-        log.info("⏰ STARTING tip timing analysis - Market: %s, Base probability: %.1f%%", 
-                market, base_prob * 100)
-        
-        try:
-            if market.startswith("Over"):
-                log.info("🎯 Over market detected - checking next 10min goal probability")
-                next_10min_goal_prob = self.predict_next_10min_goals(features)
-                
-                log.info("📊 Timing analysis - Next 10min goal prob: %.1f%%, Base prob: %.1f%%, Required: 35%%/75%%", 
-                        next_10min_goal_prob * 100, base_prob * 100)
-                
-                # Only send Over tips when goals are imminent
-                should_send = next_10min_goal_prob > 0.35 and base_prob >= 0.75
-                
-                if should_send:
-                    log.info("✅ TIMING APPROVED - High probability of imminent goals + strong base probability")
-                else:
-                    if next_10min_goal_prob <= 0.35:
-                        log.info("⏳ TIMING DELAYED - Low imminent goal probability (%.1f%% ≤ 35%%)", 
-                                next_10min_goal_prob * 100)
-                    if base_prob < 0.75:
-                        log.info("📉 TIMING REJECTED - Base probability too low (%.1f%% < 75%%)", base_prob * 100)
-                        
-                _metric_inc("timing_analysis_decisions", label="over_market")
-                return should_send
-            
-            else:
-                # For non-Over markets, use base probability threshold
-                should_send = base_prob >= 0.75
-                if should_send:
-                    log.info("✅ TIMING APPROVED - Strong base probability (%.1f%% ≥ 75%%)", base_prob * 100)
-                else:
-                    log.info("📉 TIMING REJECTED - Base probability too low (%.1f%% < 75%%)", base_prob * 100)
-                
-                _metric_inc("timing_analysis_decisions", label="other_market")
-                return should_send
-                
-        except Exception as e:
-            log.error("❌ Timing analysis failed: %s", e, exc_info=True)
-            log.warning("⚠️  Defaulting to base probability check due to error")
-            return base_prob >= 0.75
-
-    def predict_next_10min_goals(self, features: Dict) -> float:
-        """Predict probability of goals in next 10 minutes"""
-        log.info("🔮 STARTING 10-minute goal prediction")
-        
-        try:
-            minute = features.get('minute', 1)
-            goals_sum = features.get('goals_sum', 0)
-            goal_rate = goals_sum / max(1, minute)
-            
-            pressure = self._calculate_pressure_index(features)
-            momentum_h = features.get('momentum_h', 0)
-            momentum_a = features.get('momentum_a', 0)
-            total_momentum = momentum_h + momentum_a
-            
-            log.info("📈 Prediction inputs - Minute: %s, Total goals: %s, Goal rate: %.3f, Pressure: %.3f, Total Momentum: %.3f", 
-                    minute, goals_sum, goal_rate, pressure, total_momentum)
-            
-            # Simple heuristic-based prediction (replace with trained model)
-            # Base probability decreases as match progresses but increases with current goal rate
-            base_prob = 0.3  # Base probability
-            
-            # Adjust for current goal rate
-            if goal_rate > 0.05:  # More than 1 goal every 20 minutes
-                base_prob += 0.2
-            elif goal_rate > 0.03:  # More than 1 goal every 33 minutes
-                base_prob += 0.1
-                
-            # Adjust for pressure (close games)
-            if pressure > 0.6:
-                base_prob += 0.15
-                
-            # Adjust for momentum
-            if total_momentum > 0.8:
-                base_prob += 0.1
-                
-            # Adjust for match minute (goals more likely in middle period)
-            if 25 <= minute <= 70:
-                base_prob += 0.1
-            elif minute > 70:
-                base_prob += 0.2  # Late game goals
-                
-            # Clamp probability to reasonable range
-            prediction_prob = max(0.1, min(0.8, base_prob))
-            
-            log.info("🎯 10-minute goal prediction: %.1f%%", prediction_prob * 100)
-            
-            # Log confidence indicators
-            if prediction_prob > 0.5:
-                log.info("🚀 HIGH goal probability - offensive conditions favorable")
-            elif prediction_prob < 0.2:
-                log.info("🛑 LOW goal probability - defensive conditions dominant")
-            else:
-                log.info("⚖️  MODERATE goal probability - balanced match state")
-                
-            return prediction_prob
-            
-        except Exception as e:
-            log.error("❌ 10-minute goal prediction failed: %s", e, exc_info=True)
-            log.warning("⚠️  Returning conservative default probability of 25%%")
-            return 0.25
-
-    def _calculate_pressure_index(self, features: Dict) -> float:
-        """Calculate pressure index for goal prediction"""
-        try:
-            # Get minute from features with proper fallback
-            minute = features.get('minute', 1)
-            goal_diff = abs(features.get('goals_diff', 0))
-            total_goals = features.get('goals_sum', 0)
-            
-            # Calculate pressure based on game state
-            time_pressure = minute / 90.0
-            score_pressure = min(1.0, goal_diff * 0.3)  # Close games have more pressure
-            goal_pressure = min(1.0, total_goals * 0.2)  # High-scoring games
-            
-            pressure = (time_pressure * 0.4 + score_pressure * 0.4 + goal_pressure * 0.2)
-            
-            log.info("📊 Pressure calculation - Minute: %s, Goal diff: %s, Total goals: %s, Pressure: %.3f", 
-                    minute, goal_diff, total_goals, pressure)
-            
-            return max(0.0, min(1.0, pressure))
-            
-        except Exception as e:
-            log.error("❌ Pressure calculation failed: %s", e, exc_info=True)
-            return 0.5  # Default neutral pressure
-
-    def update_models_incremental(self, new_data: List[Dict]):
-        """Update models without full retraining"""
-        if not ENABLE_INCREMENTAL_LEARNING:
-            log.info("⏩ Incremental learning disabled")
-            return
-        
-        log.info("🔄 STARTING incremental model update with %s new records", len(new_data))
-    
-        if not new_data:
-            log.warning("📭 No new data provided for incremental update")
-            return
-    
-        try:
-            new_features = []
-            new_targets = []
-            
-            for i, record in enumerate(new_data):
-                try:
-                    features = record.get('features', {})
-                    target = record.get('outcome')
-                    
-                    if features and target is not None:
-                        feature_vector = self._prepare_feature_vector(features)
-                        new_features.append(feature_vector)
-                        new_targets.append(target)
-                        
-                except Exception as e:
-                    log.warning("⚠️  Skipping record %s due to error: %s", i, e)
-                    continue
-            
-            if not new_features:
-                log.error("❌ No valid features extracted from new data")
-                return
-                
-            log.info("✅ Prepared %s valid feature vectors for incremental update", len(new_features))
-            
-            updated_models = 0
-            skipped_models = 0
-            
-            for model_name, model in self.models.items():
-                try:
-                    if hasattr(model, 'partial_fit'):
-                        log.info("🔄 Updating model '%s' with incremental data", model_name)
-                        model.partial_fit(new_features, new_targets)
-                        updated_models += 1
-                        log.info("✅ Successfully updated model '%s'", model_name)
-                    else:
-                        log.warning("⏭️  Model '%s' does not support partial_fit - skipping", model_name)
-                        skipped_models += 1
-                        
-                except Exception as e:
-                    log.error("❌ Failed to update model '%s': %s", model_name, e, exc_info=True)
-                    skipped_models += 1
-            
-            log.info("📊 Incremental update completed - Updated: %s, Skipped: %s, Total models: %s", 
-                    updated_models, skipped_models, len(self.models))
-            
-            if updated_models > 0:
-                log.info("🎯 Models successfully adapted to %s new patterns", len(new_features))
-            else:
-                log.warning("⚠️  No models were updated - check partial_fit support")
-                
-        except Exception as e:
-            log.error("❌ Incremental update process failed: %s", e, exc_info=True)
-            log.warning("⚠️  Models remain unchanged - full retraining recommended")
-
-    def _prepare_feature_vector(self, features: Dict[str, float]) -> List[float]:
-        """Prepare feature vector for incremental learning"""
-        try:
-            # Use the same feature preparation as in training
-            feature_names = [
-                'minute', 'goals_sum', 'goals_diff', 'xg_sum', 'xg_diff',
-                'sot_sum', 'cor_sum', 'pos_diff', 'momentum_h', 'momentum_a'
-            ]
-            
-            vector = []
-            for name in feature_names:
-                vector.append(features.get(name, 0.0))
-                
-            return vector
-            
-        except Exception as e:
-            log.error("❌ Feature vector preparation failed: %s", e)
-            return []
-
     def train(self, features: List[Dict[str, Any]], targets: List[int]) -> Dict[str, Any]:
         """Train ensemble of models with feature selection"""
         if not features or not targets:
@@ -842,6 +335,67 @@ class AdvancedEnsemblePredictor:
         _metric_inc("ensemble_predictions_total", label=self.model_name)
         return bayesian_prob
 
+    def calculate_tip_reliability(match_id: int, suggestion: str, probability: float) -> Dict[str, Any]:
+        """Calculate reliability metrics for each tip"""
+        reliability_score = 0.0
+        flags = []
+    
+        # Score based on probability strength
+        if probability >= 0.7:
+            reliability_score += 0.3
+            flags.append("high_confidence")
+        elif probability >= 0.6:
+            reliability_score += 0.2
+            flags.append("medium_confidence")
+        else:
+            reliability_score += 0.1
+            flags.append("low_confidence")
+    
+        # Score based on data quality (minute of match)
+        with db_conn() as c:
+            minute_row = c.execute(
+                "SELECT minute FROM tips WHERE match_id=%s ORDER BY created_ts DESC LIMIT 1",
+                (match_id,)
+            ).fetchone()
+        
+        if minute_row and minute_row[0] >= 60:
+            reliability_score += 0.3
+            flags.append("late_match_data")
+        elif minute_row and minute_row[0] >= 30:
+            reliability_score += 0.2
+            flags.append("mid_match_data")
+        else:
+            reliability_score += 0.1
+            flags.append("early_match_data")
+    
+        # Score based on feature completeness
+        with db_conn() as c:
+            feature_row = c.execute(
+                "SELECT COUNT(*) FROM self_learning_data WHERE match_id=%s",
+                (match_id,)
+            ).fetchone()
+    
+        if feature_row and feature_row[0] > 5:
+            reliability_score += 0.2
+            flags.append("rich_features")
+        else:
+            reliability_score += 0.1
+            flags.append("basic_features")
+    
+        # Market-specific adjustments
+        if "Over" in suggestion or "Under" in suggestion:
+            reliability_score += 0.1
+            flags.append("ou_market")
+        elif "BTTS" in suggestion:
+            reliability_score += 0.05
+            flags.append("btts_market")
+    
+        return {
+            "reliability_score": min(1.0, reliability_score),
+            "flags": flags,
+            "grade": "A" if reliability_score >= 0.8 else "B" if reliability_score >= 0.6 else "C"
+        }
+    
     def _prepare_features(self, features: Dict[str, float]) -> Optional[np.ndarray]:
         if self.model_name not in self.scalers:
             return None
@@ -1125,7 +679,6 @@ def verify_learning_system() -> Dict[str, Any]:
 bayesian_network    = BayesianBettingNetwork()
 self_learning_system = SelfLearningSystem()
 advanced_predictors: Dict[str, AdvancedEnsemblePredictor] = {}
-performance_monitor = PerformanceMonitor() if ENABLE_PERFORMANCE_MONITOR else None
 
 def get_advanced_predictor(model_name: str) -> AdvancedEnsemblePredictor:
     if model_name not in advanced_predictors:
@@ -1599,10 +1152,7 @@ def extract_features(m: dict) -> Dict[str, float]:
     away   = m["teams"]["away"]["name"]
     gh     = m["goals"]["home"] or 0
     ga     = m["goals"]["away"] or 0
-    minute_data = ((m.get("fixture") or {}).get("status") or {})
-    minute = int(minute_data.get("elapsed") or 0)
-    # Ensure minute is available in features for all functions
-    features["minute"] = float(minute)  # This ensures it's always there
+    minute = int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
 
     stats: Dict[str, Dict[str, Any]] = {}
     for s in (m.get("statistics") or []):
@@ -1682,8 +1232,6 @@ def extract_features(m: dict) -> Dict[str, float]:
         "efficiency_a": float(efficiency_a),
         "total_actions": float(total_actions),
         "action_intensity": float(action_intensity),
-        # Context features for enhanced analysis
-        "red_cards": float(red_h + red_a),
     }
     
     log.debug("✅ Extracted %s features for %s vs %s (minute: %s)", len(features), home, away, minute)
@@ -1696,7 +1244,7 @@ def advanced_predict_probability(
     suggestion: str,
     match_id: Optional[int] = None,
 ) -> float:
-    """Advanced prediction using ensemble + Bayesian methods with enhanced features"""
+    """Advanced prediction using ensemble + Bayesian methods"""
     log.debug("🤖 Predicting probability for %s - %s (match: %s)", market, suggestion, match_id)
     
     # Bayesian network: treat `suggestion` as the 'market phrase'
@@ -1709,19 +1257,6 @@ def advanced_predict_probability(
     ensemble_prob = ensemble_predictor.predict_probability(features)
     log.debug("📈 Ensemble probability: %.3f", ensemble_prob)
     
-    # Apply context analysis if enabled
-    context_score = 1.0
-    if ENABLE_CONTEXT_ANALYSIS:
-        # Create match data for context analysis
-        match_data = {
-            'home_team': '',  # Would be populated from match data
-            'away_team': '',  # Would be populated from match data  
-            'league': '',     # Would be populated from match data
-            'red_cards': features.get('red_sum', 0)
-        }
-        context_score = ensemble_predictor.analyze_match_context(match_data)
-        log.debug("🎭 Context score applied: %.3f", context_score)
-    
     data_richness = min(1.0, float(features.get("minute", 0)) / 60.0)
     if data_richness > 0.7:
         final_prob = 0.7 * ensemble_prob + 0.3 * bayesian_prob
@@ -1730,12 +1265,9 @@ def advanced_predict_probability(
         final_prob = 0.4 * ensemble_prob + 0.6 * bayesian_prob
         log.debug("📋 Using data-poor weighting (40/60)")
     
-    # Apply context score
-    final_prob = final_prob * context_score
-    
     final_prob = float(max(0.01, min(0.99, final_prob)))
-    log.info("🎯 FINAL probability for %s - %s: %.1f%% (bayesian: %.1f%%, ensemble: %.1f%%, context: %.1f%%)", 
-             market, suggestion, final_prob*100, bayesian_prob*100, ensemble_prob*100, context_score*100)
+    log.info("🎯 FINAL probability for %s - %s: %.1f%% (bayesian: %.1f%%, ensemble: %.1f%%)", 
+             market, suggestion, final_prob*100, bayesian_prob*100, ensemble_prob*100)
     
     prediction_data = {
         "features": features,
@@ -2249,14 +1781,8 @@ def _process_and_rank_candidates(
 ) -> List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]]:
     log.info("🏆 Processing and ranking %s candidates for fixture %s", len(candidates), fid)
     ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
-    
-    # Use enhanced odds fetching if enabled
-    if ENABLE_MULTI_BOOK_ODDS:
-        log.info("💰 Using multi-book odds search")
-        # We'll fetch odds per candidate in the loop below
-    else:
-        odds_map = fetch_odds(fid) if API_KEY else {}
-        log.debug("💰 Odds map has %s markets", len(odds_map))
+    odds_map = fetch_odds(fid) if API_KEY else {}
+    log.debug("💰 Odds map has %s markets", len(odds_map))
 
     for market, suggestion, prob in candidates:
         log.debug("🔍 Processing candidate: %s - %s (prob: %.3f)", market, suggestion, prob)
@@ -2265,23 +1791,7 @@ def _process_and_rank_candidates(
             log.debug("❌ Suggestion not in allowed list: %s", suggestion)
             continue
 
-        # Enhanced timing check
-        model_key = f"{market}_{suggestion.replace(' ', '_')}"
-        ensemble_predictor = get_advanced_predictor(model_key)
-        
-        if ENABLE_TIMING_OPTIMIZATION:
-            should_send = ensemble_predictor.should_send_tip_now(features, market, prob)
-            if not should_send:
-                log.info("⏰ Timing optimization rejected candidate: %s - %s", market, suggestion)
-                continue
-
-        # Enhanced odds fetching
-        if ENABLE_MULTI_BOOK_ODDS:
-            odds, book = ensemble_predictor.find_best_odds_across_books(fid, market, suggestion)
-        else:
-            odds_map = fetch_odds(fid) if API_KEY else {}
-            odds, book = _get_odds_for_market(odds_map, market, suggestion)
-            
+        odds, book = _get_odds_for_market(odds_map, market, suggestion)
         if odds is None and not ALLOW_TIPS_WITHOUT_ODDS:
             log.debug("❌ No odds found and ALLOW_TIPS_WITHOUT_ODDS=False")
             continue
@@ -2432,21 +1942,8 @@ def _generate_advanced_predictions(
     return candidates
 
 def production_scan() -> Tuple[int, int]:
-    """Main in-play scanning with advanced AI systems and risk management"""
+    """Main in-play scanning with advanced AI systems"""
     log.info("🚀 STARTING PRODUCTION SCAN")
-    
-    # Check performance monitor for volume reduction
-    if ENABLE_PERFORMANCE_MONITOR and performance_monitor:
-        if performance_monitor.should_reduce_volume():
-            log.warning("🚨 SCAN SKIPPED - Volume reduction active due to losing streak")
-            stats = performance_monitor.get_performance_stats()
-            send_telegram(
-                f"🔻 Volume Reduction Active\n"
-                f"Current streak: {stats['current_streak']} losses\n"
-                f"Recent win rate: {stats['win_rate']*100:.1f}%\n"
-                f"Tips paused for safety"
-            )
-            return 0, 0
     
     # Log threshold configuration at the start
     log.info("⚙️ GLOBAL CONF_THRESHOLD: %.1f%%", CONF_THRESHOLD)
@@ -2875,11 +2372,6 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
                 + ", ".join([f"{k}({v:.1%})" for k, v in top_features])
             )
 
-        # Add performance monitor stats if enabled
-        if ENABLE_PERFORMANCE_MONITOR and performance_monitor:
-            perf_stats = performance_monitor.get_performance_stats()
-            lines.append(f"📈 <b>Current Performance:</b> {perf_stats['win_rate']*100:.1f}% win rate, Streak: {perf_stats['current_streak']}")
-
         for mk, st in sorted(by_market.items()):
             if st["graded"] == 0:
                 continue
@@ -3141,17 +2633,6 @@ def http_self_learn():
     process_self_learning_from_results()
     return jsonify({"ok": True})
 
-@app.route("/admin/training-progress")
-def http_training_progress():
-    _require_admin()
-    try:
-        from train_models import analyze_training_progress
-        with db_conn() as c:
-            progress = analyze_training_progress(c.conn)
-        return jsonify({"ok": True, "progress": progress})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
 @app.route("/admin/digest", methods=["POST","GET"])
 def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
 
@@ -3177,19 +2658,7 @@ def http_train():
 def http_system_status():
     _require_admin()
     learning_status = verify_learning_system()
-    performance_stats = performance_monitor.get_performance_stats() if performance_monitor else {}
-    return jsonify({
-        "ok": True, 
-        "system_status": learning_status,
-        "performance_stats": performance_stats,
-        "enhancements_enabled": {
-            "context_analysis": ENABLE_CONTEXT_ANALYSIS,
-            "performance_monitor": ENABLE_PERFORMANCE_MONITOR,
-            "multi_book_odds": ENABLE_MULTI_BOOK_ODDS,
-            "timing_optimization": ENABLE_TIMING_OPTIMIZATION,
-            "incremental_learning": ENABLE_INCREMENTAL_LEARNING
-        }
-    })
+    return jsonify({"ok": True, "system_status": learning_status})
 
 @app.route("/admin/auto-tune", methods=["POST", "GET"])
 def http_auto_tune():
