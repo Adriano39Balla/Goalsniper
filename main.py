@@ -860,49 +860,31 @@ class AdvancedEnsemblePredictor:
     def should_send_tip_now(self, features: Dict, market: str, base_prob: float) -> bool:
         """Enhanced timing logic for elite tips"""
         if not ENABLE_TIMING_OPTIMIZATION:
-            return base_prob * 100 >= CONF_THRESHOLD
-            
+            return base_prob * 100 >= CONF_THRESHOLD  # Use actual threshold
+        
         log.info("⏰ STARTING tip timing analysis - Market: %s, Base probability: %.1f%%", 
                 market, base_prob * 100)
-        
+    
         try:
             if market.startswith("Over"):
                 log.info("🎯 Over market detected - checking next 10min goal probability")
                 next_10min_goal_prob = self.predict_next_10min_goals(features)
-                
-                log.info("📊 Timing analysis - Next 10min goal prob: %.1f%%, Base prob: %.1f%%, Required: 35%%/75%%", 
-                        next_10min_goal_prob * 100, base_prob * 100)
-                
-                # Only send Over tips when goals are imminent
-                should_send = next_10min_goal_prob > 0.35 and base_prob >= 0.75
-                
-                if should_send:
-                    log.info("✅ TIMING APPROVED - High probability of imminent goals + strong base probability")
-                else:
-                    if next_10min_goal_prob <= 0.35:
-                        log.info("⏳ TIMING DELAYED - Low imminent goal probability (%.1f%% ≤ 35%%)", 
-                                next_10min_goal_prob * 100)
-                    if base_prob < 0.75:
-                        log.info("📉 TIMING REJECTED - Base probability too low (%.1f%% < 75%%)", base_prob * 100)
-                        
-                _metric_inc("timing_analysis_decisions", label="over_market")
-                return should_send
+            
+                # FIX: Use CONF_THRESHOLD instead of hardcoded 75%
+                threshold_decimal = CONF_THRESHOLD / 100.0
+                should_send = next_10min_goal_prob > 0.35 and base_prob >= threshold_decimal
             
             else:
-                # For non-Over markets, use base probability threshold
-                should_send = base_prob >= 0.75
-                if should_send:
-                    log.info("✅ TIMING APPROVED - Strong base probability (%.1f%% ≥ 75%%)", base_prob * 100)
-                else:
-                    log.info("📉 TIMING REJECTED - Base probability too low (%.1f%% < 75%%)", base_prob * 100)
-                
-                _metric_inc("timing_analysis_decisions", label="other_market")
-                return should_send
-                
+                # FIX: Use CONF_THRESHOLD instead of hardcoded 75%
+                threshold_decimal = CONF_THRESHOLD / 100.0
+                should_send = base_prob >= threshold_decimal
+            
+            return should_send
+        
         except Exception as e:
             log.error("❌ Timing analysis failed: %s", e, exc_info=True)
-            log.warning("⚠️  Defaulting to base probability check due to error")
-            return base_prob >= 0.75
+            # Fallback to basic threshold check
+            return base_prob * 100 >= CONF_THRESHOLD
 
     def predict_next_10min_goals(self, features: Dict) -> float:
         """Predict probability of goals in next 10 minutes"""
@@ -1156,6 +1138,21 @@ class AdvancedEnsemblePredictor:
         
         _metric_inc("ensemble_predictions_total", label=self.model_name)
         return bayesian_prob
+
+    def advanced_predict_probability(...):
+        # Add detailed probability tracking
+        log.info("🎯 PROBABILITY FLOW for %s - %s:", market, suggestion)
+        log.info("   ├── Bayesian probability: %.1f%%", bayesian_prob * 100)
+        log.info("   ├── Ensemble probability: %.1f%%", ensemble_prob * 100) 
+        log.info("   ├── Context score: %.3f", context_score)
+    
+        if ENABLE_API_PREDICTIONS and match_id:
+            api_predictions = get_api_predictions(match_id)
+            if api_predictions:
+                log.info("   ├── API predictions blended")
+    
+        log.info("   ├── Data richness: %.1f%%", data_richness * 100)
+        log.info("   └── FINAL probability: %.1f%%", final_prob * 100)
 
     def _prepare_features(self, features: Dict[str, float]) -> Optional[np.ndarray]:
         if self.model_name not in self.scalers:
@@ -3459,6 +3456,41 @@ def http_scan():
     _require_admin()
     s, l = production_scan()
     return jsonify({"ok": True, "saved": s, "live_seen": l})
+
+@app.route("/debug/probability-flow")
+def debug_probability_flow():
+    """Test the probability calculation with a mock match"""
+    mock_features = {
+        'minute': 35.0,
+        'goals_h': 1.0, 
+        'goals_a': 0.0,
+        'goals_sum': 1.0,
+        'goals_diff': 1.0,
+        'xg_h': 1.2, 'xg_a': 0.8, 'xg_sum': 2.0, 'xg_diff': 0.4,
+        'sot_h': 5.0, 'sot_a': 3.0, 'sot_sum': 8.0,
+        'cor_h': 4.0, 'cor_a': 2.0, 'cor_sum': 6.0,
+        'pos_h': 55.0, 'pos_a': 45.0, 'pos_diff': 10.0
+    }
+    
+    test_cases = [
+        ("Over/Under 2.5", "Over 2.5 Goals"),
+        ("BTTS", "BTTS: Yes"), 
+        ("1X2", "Home Win")
+    ]
+    
+    results = []
+    for market, suggestion in test_cases:
+        prob = advanced_predict_probability(mock_features, market, suggestion, 12345)
+        meets_threshold = prob * 100 >= _get_market_threshold(market)
+        results.append({
+            'market': market,
+            'suggestion': suggestion, 
+            'probability': round(prob * 100, 1),
+            'threshold': _get_market_threshold(market),
+            'meets_threshold': meets_threshold
+        })
+    
+    return jsonify({"test_results": results})
 
 @app.route("/admin/backfill-results", methods=["POST", "GET"])
 def http_backfill():
