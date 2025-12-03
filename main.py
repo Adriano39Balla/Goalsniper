@@ -12,6 +12,10 @@ import numpy as np
 from loguru import logger
 import joblib
 import traceback
+import psutil  # ensure psutil is available for health checks
+
+# Ensure logs directory exists before adding file handler
+Path("logs").mkdir(parents=True, exist_ok=True)
 
 # Remove default handler and add custom format
 logger.remove()
@@ -192,16 +196,25 @@ class ModelTrainer:
         scaler_path = model_dir / "scalers.pkl"
         joblib.dump(self.scalers, scaler_path)
         
-        # Update current symlink
+        # Update current symlink (fallback to copy on Windows)
         current_path = Path("models/current")
-        if current_path.exists():
-            if current_path.is_symlink():
-                current_path.unlink()
-            elif current_path.is_dir():
+        try:
+            if current_path.exists():
+                if current_path.is_symlink():
+                    current_path.unlink()
+                elif current_path.is_dir():
+                    import shutil
+                    shutil.rmtree(current_path)
+            # Attempt symlink
+            try:
+                current_path.symlink_to(model_dir, target_is_directory=True)
+            except Exception:
+                # Fallback: copy directory (Windows may require elevated privileges for symlink)
                 import shutil
-                shutil.rmtree(current_path)
+                shutil.copytree(model_dir, current_path)
+        except Exception as e:
+            logger.warning(f"Could not create/update models/current: {e}")
         
-        current_path.symlink_to(model_dir)
         logger.info(f"Models saved to {model_dir}")
 
 class PredictionEngine:
@@ -247,20 +260,23 @@ class PredictionEngine:
         # Match progress
         status = fixture.get('status', {})
         features['minute'] = status.get('elapsed', 0) or 0
-        features['time_ratio'] = min(features['minute'] / 90, 1.0)
+        features['time_ratio'] = min(features['minute'] / 90, 1.0) if features['minute'] else 0.0
         
         # League info
         features['league_rank'] = league.get('rank', 50)
         
         # Time features
-        match_time = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')) if 'date' in fixture else datetime.now()
+        try:
+            match_time = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')) if 'date' in fixture else datetime.now()
+        except Exception:
+            match_time = datetime.now()
         features['hour_of_day'] = match_time.hour
         features['day_of_week'] = match_time.weekday()
         features['month'] = match_time.month
         
         # Derived features
-        features['momentum'] = features['goal_difference'] * features['time_ratio']
-        features['scoring_pressure'] = features['total_goals'] / max(features['time_ratio'], 0.1)
+        features['momentum'] = features['goal_difference'] * features.get('time_ratio', 0)
+        features['scoring_pressure'] = features['total_goals'] / max(features.get('time_ratio', 0.1), 0.1)
         
         # Fill missing values with defaults
         default_features = {
@@ -318,11 +334,11 @@ class PredictionEngine:
                         # Predict
                         if hasattr(model, 'predict_proba'):
                             proba = model.predict_proba(features_scaled)[0]
-                            predictions[target] = model.predict(features_scaled)[0]
+                            predictions[target] = int(model.predict(features_scaled)[0])
                             probabilities[target] = float(proba[1]) if len(proba) > 1 else float(proba[0])
                         else:
-                            pred = model.predict(features_scaled)[0]
-                            predictions[target] = int(pred)
+                            pred = int(model.predict(features_scaled)[0])
+                            predictions[target] = pred
                             probabilities[target] = float(pred)
                     except Exception as e:
                         logger.error(f"Error predicting {target}: {e}")
@@ -471,7 +487,7 @@ class BettingPredictor:
     
     def __init__(self):
         self.settings = Settings()
-        self.db = DatabaseManager()
+        self.db = DatabaseManager(self.settings.DATABASE_URL)
         self.api_client = APIFootballClient(self.settings.API_FOOTBALL_KEY)
         self.prediction_engine = PredictionEngine(self.db)
         self.telegram_bot = TelegramBot(self.settings.TELEGRAM_BOT_TOKEN, self.settings.TELEGRAM_CHAT_ID)
@@ -592,7 +608,7 @@ class BettingPredictor:
                 'memory': psutil.virtual_memory().percent,
                 'disk': psutil.disk_usage('/').percent
             }
-        except:
+        except Exception:
             health['system'] = {'error': 'Could not get system metrics'}
         
         # Update status if any component is down
