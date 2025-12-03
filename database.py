@@ -45,3 +45,47 @@ class DatabaseManager:
             json.dumps(prediction['features']),
             prediction['timestamp']
         ))
+
+    def check_recent_prediction(self, match_id: int, minutes: int = 15) -> bool:
+        """
+        Returns True if a prediction for this match already exists 
+        within the last X minutes.
+        """
+        query = """
+        SELECT timestamp FROM predictions
+        WHERE match_id = %s
+        AND timestamp >= NOW() - INTERVAL '%s minutes'
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """
+        rows = self.execute_query(query, (match_id, minutes))
+        return len(rows) > 0
+    
+
+    def get_recent_predictions(self, minutes: int = 60):
+        """
+        Fetch all predictions stored within the last X minutes.
+        Useful for monitoring or auto-tuning.
+        """
+        query = """
+        SELECT * FROM predictions
+        WHERE timestamp >= NOW() - INTERVAL '%s minutes'
+        ORDER BY timestamp DESC
+        """
+        return self.execute_query(query, (minutes,))
+    
+
+    def log_error(self, source: str, message: str, details: dict = None):
+        """
+        Store backend errors for debugging + learning loops.
+        Create an errors table first.
+        """
+        query = """
+        INSERT INTO errors (source, message, details, timestamp)
+        VALUES (%s, %s, %s, NOW())
+        """
+        self.execute_query(query, (
+            source,
+            message,
+            json.dumps(details or {})
+        ))
