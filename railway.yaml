@@ -1,0 +1,12 @@
+build:
+    buildCommand: pip install -r requirements.txt
+
+deploy:
+  startCommand: python main.py --mode=live
+
+environment:
+  - NODE_ENV=production
+  - PYTHONUNBUFFERED=true
+
+healthCheckPath: /health
+healthCheckTimeout: 60
