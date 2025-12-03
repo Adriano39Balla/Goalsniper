@@ -231,43 +231,50 @@ class BettingPredictor:
     
     def predict_match(self, features: Dict[str, np.ndarray]) -> Dict[str, Any]:
         """Predict all outcomes for a match"""
-        
+    
         predictions = {}
-        
+    
         for model_type, model in self.models.items():
             if model.model is None:
                 logger.warning(f"Model {model_type} not trained")
                 continue
-            
+        
             model_features = features.get(model_type)
             if model_features is None:
-                continue
-            
-            # Get probabilities
-            proba = model.predict_proba(model_features.reshape(1, -1))[0]
-            
-            if model_type == '1X2':
-                # Home, Draw, Away probabilities
-                if len(proba) == 3:
-                    predictions['1X2'] = {
-                        'home_win': float(proba[0]),
-                        'draw': float(proba[1]),
-                        'away_win': float(proba[2]),
-                        'prediction': model.classes_[np.argmax(proba)]
-                    }
-            elif model_type == 'over_under':
-                # Over/Under 2.5 goals
-                predictions['over_under'] = {
-                    'over': float(proba[0]),
-                    'under': float(proba[1]),
-                    'prediction': 'over' if proba[0] > proba[1] else 'under'
-                }
-            elif model_type == 'btts':
-                # Both teams to score
-                predictions['btts'] = {
-                    'yes': float(proba[0]),
-                    'no': float(proba[1]),
-                    'prediction': 'yes' if proba[0] > proba[1] else 'no'
-                }
+            continue
         
+            try:
+                # Ensure features are 2D array
+                if len(model_features.shape) == 1:
+                    model_features = model_features.reshape(1, -1)
+            
+                # Get probabilities
+                proba = model.predict_proba(model_features)[0]
+            
+                if model_type == '1X2':
+                    # Home, Draw, Away probabilities
+                    if len(proba) == 3:
+                        predictions['1X2'] = {
+                            'home_win': float(proba[0]),
+                            'draw': float(proba[1]),
+                            'away_win': float(proba[2]),
+                            'prediction': model.classes_[np.argmax(proba)]
+                        }
+                elif model_type == 'over_under':
+                    # Over/Under 2.5 goals
+                    predictions['over_under'] = {
+                        'over': float(proba[0]),
+                        'under': float(proba[1]),
+                        'prediction': 'over' if proba[0] > proba[1] else 'under'
+                    }
+                elif model_type == 'btts':
+                    # Both teams to score
+                    predictions['btts'] = {
+                        'yes': float(proba[0]),
+                        'no': float(proba[1]),
+                        'prediction': 'yes' if proba[0] > proba[1] else 'no'
+                    }
+            except Exception as e:
+                logger.error(f"Error predicting with {model_type} model: {e}")
+    
         return predictions
