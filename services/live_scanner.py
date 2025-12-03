@@ -1,7 +1,8 @@
 import asyncio
 import aiohttp
+import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,7 +23,7 @@ class LiveMatchScanner:
         self.executor = ThreadPoolExecutor(max_workers=10)
         self.active_scans = {}
         
-    async def scan_live_matches(self, leagues: Optional[List[int]] = None):
+    async def scan_live_matches(self, leagues: Optional[List[int]] = None) -> List[Dict]:
         """Scan for live matches and generate predictions"""
         
         try:
@@ -38,7 +39,9 @@ class LiveMatchScanner:
             predictions = []
             for match in live_matches:
                 # Only process matches between 20-80 minutes
-                minute = match.get('fixture', {}).get('status', {}).get('elapsed', 0)
+                fixture = match.get('fixture', {})
+                status = fixture.get('status', {})
+                minute = status.get('elapsed', 0)
                 
                 if 20 <= minute <= 80:
                     try:
@@ -46,7 +49,7 @@ class LiveMatchScanner:
                         if prediction:
                             predictions.append(prediction)
                     except Exception as e:
-                        logger.error(f"Error analyzing match {match.get('fixture', {}).get('id')}: {e}")
+                        logger.error(f"Error analyzing match {fixture.get('id')}: {e}")
             
             return predictions
             
@@ -61,6 +64,7 @@ class LiveMatchScanner:
         
         # Check if already being analyzed
         if match_id in self.active_scans:
+            logger.debug(f"Match {match_id} already being analyzed, skipping")
             return None
         
         self.active_scans[match_id] = True
@@ -70,6 +74,7 @@ class LiveMatchScanner:
             stats = await self.api.get_match_statistics(match_id)
             
             if not stats:
+                logger.warning(f"No statistics available for match {match_id}")
                 return None
             
             # Extract features for prediction
@@ -79,19 +84,26 @@ class LiveMatchScanner:
             predictions = self.predictor.predict_match(features)
             
             if not predictions:
+                logger.debug(f"No predictions generated for match {match_id}")
                 return None
             
             # Calculate confidence and filter
             filtered_predictions = self.filter_predictions(predictions)
             
             if filtered_predictions:
+                # Prepare prediction data
+                fixture = match_data['fixture']
+                teams = match_data['teams']
+                goals = match_data.get('goals', {})
+                league = match_data.get('league', {})
+                
                 prediction_data = {
                     'match_id': match_id,
-                    'league_id': match_data['league']['id'],
-                    'home_team': match_data['teams']['home']['name'],
-                    'away_team': match_data['teams']['away']['name'],
-                    'current_score': match_data['goals'],
-                    'minute': match_data['fixture']['status']['elapsed'],
+                    'league_id': league.get('id'),
+                    'home_team': teams['home']['name'],
+                    'away_team': teams['away']['name'],
+                    'current_score': f"{goals.get('home', 0)}-{goals.get('away', 0)}",
+                    'minute': fixture['status']['elapsed'],
                     'predictions': filtered_predictions,
                     'features': features,
                     'match_time': datetime.utcnow(),
@@ -99,118 +111,144 @@ class LiveMatchScanner:
                 }
                 
                 # Save to database
-                prediction_id = self.db.save_prediction(prediction_data)
-                prediction_data['prediction_id'] = prediction_id
-                
-                logger.info(f"Prediction generated for match {match_id}")
-                return prediction_data
+                try:
+                    prediction_id = self.db.save_prediction(prediction_data)
+                    prediction_data['prediction_id'] = prediction_id
+                    
+                    logger.info(f"Prediction generated for match {match_id}: {filtered_predictions}")
+                    return prediction_data
+                except Exception as e:
+                    logger.error(f"Error saving prediction for match {match_id}: {e}")
+                    return None
             
             return None
             
+        except Exception as e:
+            logger.error(f"Error analyzing match {match_id}: {e}")
+            return None
         finally:
-            del self.active_scans[match_id]
+            if match_id in self.active_scans:
+                del self.active_scans[match_id]
     
     def extract_live_features(self, match_data: Dict, stats: Dict) -> Dict[str, np.ndarray]:
         """Extract features from live match data"""
         
-        # Basic match info
-        minute = match_data['fixture']['status']['elapsed']
-        score = match_data['goals']
-        home_score = score.get('home', 0)
-        away_score = score.get('away', 0)
+        # Extract match info
+        fixture = match_data.get('fixture', {})
+        status = fixture.get('status', {})
+        teams = match_data.get('teams', {})
+        goals = match_data.get('goals', {})
         
-        # Statistics
+        minute = status.get('elapsed', 0)
+        home_score = goals.get('home', 0)
+        away_score = goals.get('away', 0)
+        
+        # Parse statistics
         home_stats = {}
         away_stats = {}
         
-        for stat in stats.get('statistics', []):
-            if stat['team']['id'] == match_data['teams']['home']['id']:
-                home_stats = self.parse_statistics(stat['statistics'])
-            else:
-                away_stats = self.parse_statistics(stat['statistics'])
+        if isinstance(stats, list) and len(stats) > 0:
+            for team_stat in stats:
+                team_info = team_stat.get('team', {})
+                statistics = team_stat.get('statistics', [])
+                
+                if team_info['id'] == teams['home']['id']:
+                    home_stats = self.parse_statistics(statistics)
+                elif team_info['id'] == teams['away']['id']:
+                    away_stats = self.parse_statistics(statistics)
         
         # Calculate derived features
-        features = {}
+        total_goals = home_score + away_score
+        goal_difference = home_score - away_score
         
         # 1X2 features
-        features['1X2'] = np.array([
-            minute / 90,  # Match progress
-            home_score,
-            away_score,
-            home_stats.get('shots_on_goal', 0),
-            away_stats.get('shots_on_goal', 0),
-            home_stats.get('possession', 50) / 100,
-            home_stats.get('pass_accuracy', 50) / 100,
-            away_stats.get('pass_accuracy', 50) / 100,
-            home_stats.get('corners', 0),
-            away_stats.get('corners', 0),
-            home_stats.get('yellow_cards', 0),
-            away_stats.get('yellow_cards', 0),
-            # Add momentum features
-            (home_score - away_score),  # Goal difference
-            (home_stats.get('shots_on_goal', 0) - away_stats.get('shots_on_goal', 0)),
-            # Recent form (would need historical data)
-        ])
+        features_1x2 = [
+            minute / 90.0,  # Match progress
+            float(home_score),
+            float(away_score),
+            float(home_stats.get('shots_on_goal', 0)),
+            float(away_stats.get('shots_on_goal', 0)),
+            float(home_stats.get('possession', 50)) / 100.0,
+            float(home_stats.get('pass_accuracy', 50)) / 100.0,
+            float(away_stats.get('pass_accuracy', 50)) / 100.0,
+            float(home_stats.get('corners', 0)),
+            float(away_stats.get('corners', 0)),
+            float(home_stats.get('yellow_cards', 0)),
+            float(away_stats.get('yellow_cards', 0)),
+            float(goal_difference),
+            float(home_stats.get('shots_on_goal', 0) - away_stats.get('shots_on_goal', 0)),
+            0.5,  # Placeholder for recent form (would need historical data)
+        ]
         
         # Over/Under features
-        total_goals = home_score + away_score
-        expected_goals = (home_stats.get('expected_goals', 0) + 
-                         away_stats.get('expected_goals', 0))
+        home_xg = home_stats.get('expected_goals', 0.0)
+        away_xg = away_stats.get('expected_goals', 0.0)
+        expected_goals = float(home_xg) + float(away_xg)
         
-        features['over_under'] = np.array([
-            minute / 90,
-            total_goals,
-            expected_goals,
-            home_stats.get('shots_total', 0),
-            away_stats.get('shots_total', 0),
-            home_stats.get('shots_on_goal', 0),
-            away_stats.get('shots_on_goal', 0),
-            (home_stats.get('shots_on_goal', 0) + 
-             away_stats.get('shots_on_goal', 0)) / max(minute, 1),
-            home_stats.get('corners', 0),
-            away_stats.get('corners', 0),
-            # Attack intensity
-            (home_stats.get('attacks', 0) + away_stats.get('attacks', 0)) / max(minute, 1),
-        ])
+        features_over_under = [
+            minute / 90.0,
+            float(total_goals),
+            float(expected_goals),
+            float(home_stats.get('shots_total', 0)),
+            float(away_stats.get('shots_total', 0)),
+            float(home_stats.get('shots_on_goal', 0)),
+            float(away_stats.get('shots_on_goal', 0)),
+            float(home_stats.get('shots_on_goal', 0) + away_stats.get('shots_on_goal', 0)) / max(minute, 1),
+            float(home_stats.get('corners', 0)),
+            float(away_stats.get('corners', 0)),
+            float(home_stats.get('attacks', 0) + away_stats.get('attacks', 0)) / max(minute, 1),
+        ]
         
         # BTTS features
-        both_scored = int(home_score > 0 and away_score > 0)
+        both_scored = 1.0 if home_score > 0 and away_score > 0 else 0.0
         
-        features['btts'] = np.array([
-            minute / 90,
+        features_btts = [
+            minute / 90.0,
             both_scored,
-            home_score,
-            away_score,
-            home_stats.get('shots_on_goal', 0),
-            away_stats.get('shots_on_goal', 0),
-            home_stats.get('shots_inside_box', 0),
-            away_stats.get('shots_inside_box', 0),
-            home_stats.get('dangerous_attacks', 0) / max(minute, 1),
-            away_stats.get('dangerous_attacks', 0) / max(minute, 1),
-            # Defensive pressure
-            home_stats.get('tackles', 0),
-            away_stats.get('tackles', 0),
-        ])
+            float(home_score),
+            float(away_score),
+            float(home_stats.get('shots_on_goal', 0)),
+            float(away_stats.get('shots_on_goal', 0)),
+            float(home_stats.get('shots_inside_box', 0)),
+            float(away_stats.get('shots_inside_box', 0)),
+            float(home_stats.get('dangerous_attacks', 0)) / max(minute, 1),
+            float(away_stats.get('dangerous_attacks', 0)) / max(minute, 1),
+            float(home_stats.get('tackles', 0)),
+            float(away_stats.get('tackles', 0)),
+        ]
         
-        return features
+        return {
+            '1X2': np.array(features_1x2, dtype=np.float32),
+            'over_under': np.array(features_over_under, dtype=np.float32),
+            'btts': np.array(features_btts, dtype=np.float32)
+        }
     
     def parse_statistics(self, stats_list: List[Dict]) -> Dict[str, float]:
         """Parse API statistics into a dictionary"""
         parsed = {}
         
+        if not stats_list:
+            return parsed
+        
         for stat in stats_list:
+            stat_type = stat.get('type', '').lower().replace(' ', '_')
             value = stat.get('value')
+            
             if value is None:
                 continue
             
-            # Convert percentage strings
-            if isinstance(value, str) and '%' in value:
-                try:
-                    value = float(value.strip('%'))
-                except:
-                    continue
-            
-            parsed[stat['type'].lower().replace(' ', '_')] = value
+            try:
+                # Convert percentage strings
+                if isinstance(value, str):
+                    if '%' in value:
+                        value = value.replace('%', '')
+                    # Try to convert to float
+                    value = float(value)
+                
+                parsed[stat_type] = float(value)
+            except (ValueError, TypeError):
+                # Skip if conversion fails
+                continue
         
         return parsed
     
@@ -223,27 +261,29 @@ class LiveMatchScanner:
         
         for pred_type, pred_data in predictions.items():
             if pred_type == '1X2':
-                # Suppress draws, focus on clear winners
+                # Home, Draw, Away probabilities
                 home_win = pred_data.get('home_win', 0)
                 away_win = pred_data.get('away_win', 0)
                 draw = pred_data.get('draw', 0)
                 
                 # Find highest probability that's not draw
-                if home_win > away_win and home_win > draw:
+                max_prob = max(home_win, away_win, draw)
+                
+                if max_prob == home_win and home_win > draw:
                     confidence = home_win - max(away_win, draw)
                     if confidence >= confidence_threshold and home_win >= probability_threshold:
                         filtered[pred_type] = {
                             'prediction': 'home_win',
-                            'probability': home_win,
-                            'confidence': confidence
+                            'probability': float(home_win),
+                            'confidence': float(confidence)
                         }
-                elif away_win > home_win and away_win > draw:
+                elif max_prob == away_win and away_win > draw:
                     confidence = away_win - max(home_win, draw)
                     if confidence >= confidence_threshold and away_win >= probability_threshold:
                         filtered[pred_type] = {
                             'prediction': 'away_win',
-                            'probability': away_win,
-                            'confidence': confidence
+                            'probability': float(away_win),
+                            'confidence': float(confidence)
                         }
             
             elif pred_type == 'over_under':
@@ -255,14 +295,14 @@ class LiveMatchScanner:
                     if over > under and over >= probability_threshold:
                         filtered[pred_type] = {
                             'prediction': 'over',
-                            'probability': over,
-                            'confidence': confidence
+                            'probability': float(over),
+                            'confidence': float(confidence)
                         }
                     elif under > over and under >= probability_threshold:
                         filtered[pred_type] = {
                             'prediction': 'under',
-                            'probability': under,
-                            'confidence': confidence
+                            'probability': float(under),
+                            'confidence': float(confidence)
                         }
             
             elif pred_type == 'btts':
@@ -274,14 +314,14 @@ class LiveMatchScanner:
                     if yes > no and yes >= probability_threshold:
                         filtered[pred_type] = {
                             'prediction': 'yes',
-                            'probability': yes,
-                            'confidence': confidence
+                            'probability': float(yes),
+                            'confidence': float(confidence)
                         }
                     elif no > yes and no >= probability_threshold:
                         filtered[pred_type] = {
                             'prediction': 'no',
-                            'probability': no,
-                            'confidence': confidence
+                            'probability': float(no),
+                            'confidence': float(confidence)
                         }
         
         return filtered
@@ -306,9 +346,17 @@ class LiveMatchScanner:
                 elapsed = time.time() - start_time
                 sleep_time = max(scan_interval - elapsed, 5)
                 
-                logger.debug(f"Scan completed in {elapsed:.2f}s. Sleeping for {sleep_time:.2f}s")
+                if predictions:
+                    logger.info(f"Scan completed in {elapsed:.2f}s. Found {len(predictions)} predictions.")
+                else:
+                    logger.debug(f"Scan completed in {elapsed:.2f}s. No predictions found.")
+                
+                logger.debug(f"Sleeping for {sleep_time:.2f}s")
                 await asyncio.sleep(sleep_time)
                 
+            except asyncio.CancelledError:
+                logger.info("Continuous scan cancelled")
+                break
             except Exception as e:
                 logger.error(f"Error in continuous scan: {e}")
                 await asyncio.sleep(60)  # Wait longer on error
@@ -316,17 +364,54 @@ class LiveMatchScanner:
     async def process_prediction(self, prediction: Dict):
         """Process a generated prediction"""
         
-        # Send to Telegram
-        await self.send_telegram_alert(prediction)
-        
-        # Log for monitoring
-        logger.info(f"Processed prediction: {prediction}")
-        
-        # Could add more processing here (e.g., auto-betting integration)
+        try:
+            # Send to Telegram
+            await self.send_telegram_alert(prediction)
+            
+            # Log for monitoring
+            logger.info(f"Processed prediction for match {prediction.get('match_id')}")
+            
+            # Store in cache for potential bet placement
+            await self.store_for_bet_placement(prediction)
+            
+        except Exception as e:
+            logger.error(f"Error processing prediction: {e}")
     
     async def send_telegram_alert(self, prediction: Dict):
         """Send prediction alert to Telegram"""
         
-        # This would integrate with your Telegram bot
-        # Implementation depends on your bot setup
-        pass
+        try:
+            from utils.telegram_bot import TelegramBot
+            telegram = TelegramBot()
+            
+            # Format message
+            match_info = {
+                'home_team': prediction.get('home_team'),
+                'away_team': prediction.get('away_team'),
+                'current_score': prediction.get('current_score'),
+                'minute': prediction.get('minute'),
+                'match_time': prediction.get('match_time')
+            }
+            
+            formatted_prediction = {
+                'match_info': match_info,
+                'predictions': prediction.get('predictions', {})
+            }
+            
+            await telegram.send_prediction(formatted_prediction)
+            
+        except ImportError:
+            logger.warning("Telegram bot not configured")
+        except Exception as e:
+            logger.error(f"Error sending Telegram alert: {e}")
+    
+    async def store_for_bet_placement(self, prediction: Dict):
+        """Store prediction for potential bet placement"""
+        
+        # This is where you would implement logic to decide if a bet should be placed
+        # and store it in a queue or database for further processing
+        
+        # For now, just log it
+        predictions = prediction.get('predictions', {})
+        if predictions:
+            logger.info(f"Prediction stored for potential bet: {predictions}")
