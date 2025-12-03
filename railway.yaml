@@ -1,12 +1,25 @@
 build:
-    buildCommand: pip install -r requirements.txt
+  builder: NIXPACKS
+  buildCommand: pip install -r requirements.txt
 
 deploy:
-  startCommand: python main.py --mode=live
+  startCommand: python main.py
 
 environment:
-  - NODE_ENV=production
-  - PYTHONUNBUFFERED=true
+  - name: DATABASE_URL
+  - name: API_FOOTBALL_KEY
+  - name: TELEGRAM_BOT_TOKEN
+  - name: TELEGRAM_CHAT_ID
+  - name: REDIS_URL
+    optional: true
 
 healthCheckPath: /health
 healthCheckTimeout: 60
+
+observability:
+  enabled: true
+  metrics:
+    enabled: true
+  logging:
+    enabled: true
+    retentionDays: 30
