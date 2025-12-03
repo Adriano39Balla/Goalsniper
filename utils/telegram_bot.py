@@ -43,16 +43,16 @@ class TelegramBot:
             return False
     
     async def send_prediction(self, prediction: Dict[str, Any]) -> bool:
-        """Format and send prediction alert"""
-        
-        match_info = prediction.get('match_info', {})
-        predictions = prediction.get('predictions', {})
-        
-        # Format message
-        message = self._format_prediction_message(match_info, predictions)
-        
-        # Send message
-        return await self.send_message(message)
+          """Format and send prediction alert"""
+    
+          match_info = prediction.get('match_info', {})
+          predictions = prediction.get('predictions', {})
+    
+          # Format message
+          message = self._format_prediction_message(match_info, predictions)
+    
+          # Send message
+          return await self.send_message(message)
     
     def _format_prediction_message(self, match_info: Dict, predictions: Dict) -> str:
         """Format prediction message for Telegram"""
