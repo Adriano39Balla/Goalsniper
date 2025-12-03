@@ -505,6 +505,7 @@ class PredictionEngine:
             home_win_prob > config.home_win_confidence):
             
             # Additional checks for home win
+            confidence = None
             if minute > 80:
                 if home_score > away_score:
                     confidence = 'high'
@@ -512,21 +513,22 @@ class PredictionEngine:
                     # Drawing late - less confident
                     if home_win_prob > 0.8:
                         confidence = 'medium'
-                    else:
-                        continue  # Skip if not confident enough
+                    # If not confident enough, skip this tip
                 else:
-                    continue  # Losing late - skip
+                    # Losing late - skip
+                    pass
             else:
                 confidence = 'high' if home_win_prob > 0.8 else 'medium'
             
-            potential_tips.append({
-                'type': '1X2',
-                'prediction': 'Home Win',
-                'probability': home_win_prob,
-                'confidence': confidence,
-                'market': 'match_winner',
-                'match_id': match_data.get('fixture', {}).get('id')
-            })
+            if confidence:
+                potential_tips.append({
+                    'type': '1X2',
+                    'prediction': 'Home Win',
+                    'probability': home_win_prob,
+                    'confidence': confidence,
+                    'market': 'match_winner',
+                    'match_id': match_data.get('fixture', {}).get('id')
+                })
         
         # Over 2.5 goals tip
         over_prob = probabilities.get('over_2_5', 0)
@@ -534,32 +536,37 @@ class PredictionEngine:
             over_prob > config.over_25_confidence):
             
             goals_needed = 3 - total_goals
+            confidence = None
+            
             if minute > 80:
                 if goals_needed <= 0:
                     confidence = 'high'
                 elif goals_needed == 1:
                     if over_prob > 0.75:
                         confidence = 'medium'
-                    else:
-                        continue
+                    # If not confident enough, skip
                 else:
-                    continue  # Need multiple goals late - skip
+                    # Need multiple goals late - skip
+                    pass
             else:
                 confidence = 'high' if over_prob > 0.78 else 'medium'
             
-            potential_tips.append({
-                'type': 'Over/Under',
-                'prediction': 'Over 2.5 Goals',
-                'probability': over_prob,
-                'confidence': confidence,
-                'market': 'total_goals',
-                'match_id': match_data.get('fixture', {}).get('id')
-            })
+            if confidence:
+                potential_tips.append({
+                    'type': 'Over/Under',
+                    'prediction': 'Over 2.5 Goals',
+                    'probability': over_prob,
+                    'confidence': confidence,
+                    'market': 'total_goals',
+                    'match_id': match_data.get('fixture', {}).get('id')
+                })
         
         # BTTS tip
         btts_prob = probabilities.get('btts', 0)
         if (predictions.get('btts', 0) == 1 and 
             btts_prob > config.btts_confidence):
+            
+            confidence = None
             
             if home_score > 0 and away_score > 0:
                 # Already happened
@@ -568,19 +575,19 @@ class PredictionEngine:
                 # Very late and one team hasn't scored
                 if btts_prob > 0.8:
                     confidence = 'low'
-                else:
-                    continue
+                # If not confident enough, skip
             else:
                 confidence = 'high' if btts_prob > 0.77 else 'medium'
             
-            potential_tips.append({
-                'type': 'BTTS',
-                'prediction': 'Both Teams to Score',
-                'probability': btts_prob,
-                'confidence': confidence,
-                'market': 'btts',
-                'match_id': match_data.get('fixture', {}).get('id')
-            })
+            if confidence:
+                potential_tips.append({
+                    'type': 'BTTS',
+                    'prediction': 'Both Teams to Score',
+                    'probability': btts_prob,
+                    'confidence': confidence,
+                    'market': 'btts',
+                    'match_id': match_data.get('fixture', {}).get('id')
+                })
         
         # Apply suppression logic
         filtered_tips = []
