@@ -1,5 +1,6 @@
 numpy==1.26.4
 pandas==2.2.2
+uvicorn
 scikit-learn==1.5.1
 scipy==1.14.1
 psycopg2-binary==2.9.9
