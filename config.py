@@ -1,6 +1,6 @@
 import os
 from pydantic_settings import BaseSettings
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
@@ -21,11 +21,25 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 class BettingConfig:
-    min_confidence: float = 0.65
-    min_ev: float = 0.1
-    max_tips_per_match: int = 3
+    # Calibrated thresholds
+    min_confidence: float = 0.68  # Increased from 0.65
+    min_ev: float = 0.15  # Increased from 0.1
+    max_tips_per_match: int = 2  # Reduced from 3
     bankroll_percentage: float = 0.02
     odds_format: str = "decimal"
+    
+    # Time-based calibration
+    late_game_minute: int = 80
+    extra_time_minute: int = 90
+    high_scoring_threshold: float = 2.5  # Goals per game
+    
+    # Market-specific thresholds
+    home_win_confidence: float = 0.75
+    over_25_confidence: float = 0.72
+    btts_confidence: float = 0.70
+    
+    # Minimum minutes for valid prediction
+    min_minutes_for_prediction: int = 20
 
 # Define consistent feature columns for all models
 FEATURE_COLUMNS = [
@@ -34,8 +48,118 @@ FEATURE_COLUMNS = [
     'league_rank', 'hour_of_day', 'day_of_week', 'month',
     'momentum', 'scoring_pressure', 'home_possession', 'away_possession',
     'home_shots_on_goal', 'away_shots_on_goal', 'implied_prob_home',
-    'implied_prob_draw', 'implied_prob_away'
+    'implied_prob_draw', 'implied_prob_away', 'is_late_game',
+    'is_extra_time', 'goals_needed_for_over', 'can_btts_happen'
 ]
+
+class CalibrationEngine:
+    """Engine to calibrate predictions based on game state"""
+    
+    @staticmethod
+    def calibrate_for_game_state(match_data: Dict, predictions: Dict, probabilities: Dict) -> Tuple[Dict, Dict]:
+        """Calibrate predictions based on current game state"""
+        minute = match_data.get('fixture', {}).get('status', {}).get('elapsed', 0)
+        home_score = match_data.get('goals', {}).get('home', 0)
+        away_score = match_data.get('goals', {}).get('away', 0)
+        total_goals = home_score + away_score
+        
+        calibrated_predictions = predictions.copy()
+        calibrated_probabilities = probabilities.copy()
+        
+        # Apply game state logic
+        if minute > 0:
+            # BTTS calibration
+            if 'btts' in calibrated_predictions:
+                # If both teams have scored, BTTS is already YES
+                if home_score > 0 and away_score > 0:
+                    calibrated_predictions['btts'] = 1
+                    calibrated_probabilities['btts'] = max(calibrated_probabilities.get('btts', 0), 0.95)
+                # If one team hasn't scored and it's late game, reduce probability
+                elif minute > 80 and (home_score == 0 or away_score == 0):
+                    calibrated_probabilities['btts'] *= 0.7
+            
+            # Over 2.5 calibration
+            if 'over_2_5' in calibrated_predictions:
+                goals_needed = 3 - total_goals
+                if goals_needed <= 0:
+                    # Already over 2.5
+                    calibrated_predictions['over_2_5'] = 1
+                    calibrated_probabilities['over_2_5'] = 0.99
+                elif minute > 80 and goals_needed > 0:
+                    # Late game, needs goals - reduce probability
+                    time_left = max(0, 90 - minute)
+                    probability_factor = time_left / 15  # 15 minutes is reasonable time for a goal
+                    calibrated_probabilities['over_2_5'] *= probability_factor
+            
+            # Home win calibration
+            if 'home_win' in calibrated_predictions:
+                if minute > 80:
+                    if home_score > away_score:
+                        # Already winning, high probability
+                        calibrated_predictions['home_win'] = 1
+                        calibrated_probabilities['home_win'] = max(calibrated_probabilities.get('home_win', 0), 0.85)
+                    elif home_score < away_score:
+                        # Losing late, very low probability
+                        calibrated_probabilities['home_win'] *= 0.3
+                    elif home_score == away_score:
+                        # Drawing late, medium probability
+                        calibrated_probabilities['home_win'] *= 0.7
+        
+        return calibrated_predictions, calibrated_probabilities
+    
+    @staticmethod
+    def should_suppress_tip(tip: Dict, match_data: Dict, other_tips: List[Dict]) -> bool:
+        """Determine if a tip should be suppressed based on game logic"""
+        minute = match_data.get('fixture', {}).get('status', {}).get('elapsed', 0)
+        home_score = match_data.get('goals', {}).get('home', 0)
+        away_score = match_data.get('goals', {}).get('away', 0)
+        total_goals = home_score + away_score
+        
+        tip_type = tip['type']
+        
+        # Suppress tips in very late game
+        if minute > 105 and tip_type in ['Over/Under', '1X2']:
+            return True
+        
+        # Check for conflicting tips
+        if tip_type == '1X2' and tip['prediction'] == 'Home Win':
+            # Don't recommend Home Win if it's a draw late in game
+            if minute > 80 and home_score == away_score:
+                return True
+        
+        if tip_type == 'Over/Under' and tip['prediction'] == 'Over 2.5 Goals':
+            # If we need multiple goals very late, suppress
+            if minute > 85 and (3 - total_goals) > 1:
+                return True
+        
+        # Don't recommend BTTS if one team hasn't scored and it's very late
+        if tip_type == 'BTTS' and minute > 85 and (home_score == 0 or away_score == 0):
+            return True
+        
+        return False
+    
+    @staticmethod
+    def calculate_time_adjusted_probability(base_prob: float, minute: int, prediction_type: str) -> float:
+        """Adjust probability based on game time"""
+        if minute <= 0:
+            return base_prob
+        
+        # Different decay rates for different prediction types
+        decay_rates = {
+            '1X2': 0.7,  # Outcome becomes more certain as time passes
+            'Over/Under': 0.8,  # Goals become less likely in late game
+            'BTTS': 0.75  # BTTS becomes less likely if teams haven't scored
+        }
+        
+        decay_rate = decay_rates.get(prediction_type, 0.8)
+        
+        # Apply time decay after 60 minutes
+        if minute > 60:
+            time_factor = 1 - ((minute - 60) / 30) * (1 - decay_rate)  # Linear decay from 60-90 minutes
+            time_factor = max(0.3, time_factor)  # Don't go below 30%
+            return base_prob * time_factor
+        
+        return base_prob
 
 class DatabaseManager:
     """Database manager for Supabase/PostgreSQL"""
@@ -119,6 +243,18 @@ class DatabaseManager:
                     )
                     """)
                     
+                    # Create calibration_logs table
+                    cur.execute("""
+                    CREATE TABLE IF NOT EXISTS calibration_logs (
+                        id SERIAL PRIMARY KEY,
+                        match_id INTEGER,
+                        original_probabilities JSONB,
+                        calibrated_probabilities JSONB,
+                        calibration_factors JSONB,
+                        timestamp TIMESTAMP DEFAULT NOW()
+                    )
+                    """)
+                    
                     # Create indices
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_match_id ON matches(match_id)")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_timestamp ON matches(timestamp)")
@@ -189,6 +325,21 @@ class DatabaseManager:
             prediction.get('timestamp')
         ), fetch=False)
     
+    def log_calibration(self, match_id: int, original_probs: Dict, calibrated_probs: Dict, factors: Dict):
+        """Log calibration changes"""
+        query = """
+        INSERT INTO calibration_logs 
+        (match_id, original_probabilities, calibrated_probabilities, calibration_factors)
+        VALUES (%s, %s, %s, %s)
+        """
+        
+        self.execute_query(query, (
+            match_id,
+            json.dumps(original_probs),
+            json.dumps(calibrated_probs),
+            json.dumps(factors)
+        ), fetch=False)
+    
     def check_recent_prediction(self, match_id: int, minutes: int = 5) -> bool:
         """Check if prediction was made recently for this match"""
         query = """
@@ -197,76 +348,3 @@ class DatabaseManager:
         """
         result = self.execute_query(query, (match_id, minutes))
         return result[0]['count'] > 0 if result else False
-    
-    def get_daily_performance(self) -> dict:
-        """Get daily performance metrics"""
-        query = """
-        SELECT 
-            COUNT(*) as total_predictions,
-            SUM(CASE WHEN is_correct THEN 1 ELSE 0 END) as correct_predictions,
-            AVG(CASE WHEN is_correct THEN 1.0 ELSE 0.0 END) as win_rate,
-            COALESCE(AVG(roi), 0) as roi
-        FROM predictions 
-        WHERE DATE(timestamp) = CURRENT_DATE
-        """
-        
-        result = self.execute_query(query)
-        if result:
-            row = result[0]
-            return {
-                'total_predictions': row['total_predictions'] or 0,
-                'correct_predictions': row['correct_predictions'] or 0,
-                'win_rate': float(row['win_rate'] or 0),
-                'roi': float(row['roi'] or 0)
-            }
-        return {'total_predictions': 0, 'correct_predictions': 0, 'win_rate': 0, 'roi': 0}
-    
-    def get_recent_accuracy(self, days: int = 7) -> float:
-        """Get recent prediction accuracy"""
-        query = """
-        SELECT 
-            AVG(CASE WHEN is_correct THEN 1.0 ELSE 0.0 END) as accuracy
-        FROM predictions 
-        WHERE timestamp > NOW() - INTERVAL '%s days'
-        AND is_correct IS NOT NULL
-        """
-        
-        result = self.execute_query(query, (days,))
-        if result and result[0]['accuracy']:
-            return float(result[0]['accuracy'])
-        return 0.0
-    
-    def store_match(self, match_data: dict):
-        """Store match data"""
-        query = """
-        INSERT INTO matches 
-        (match_id, home_team, away_team, home_score, away_score, timestamp, 
-         status, league, country, home_odds, draw_odds, away_odds,
-         over_2_5_odds, btts_yes_odds)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (match_id) DO UPDATE SET
-            home_score = EXCLUDED.home_score,
-            away_score = EXCLUDED.away_score,
-            status = EXCLUDED.status,
-            timestamp = EXCLUDED.timestamp
-        """
-        
-        # Extract odds from match data
-        odds = match_data.get('odds', {})
-        
-        self.execute_query(query, (
-            match_data.get('fixture', {}).get('id'),
-            match_data.get('teams', {}).get('home', {}).get('name'),
-            match_data.get('teams', {}).get('away', {}).get('name'),
-            match_data.get('goals', {}).get('home'),
-            match_data.get('goals', {}).get('away'),
-            match_data.get('fixture', {}).get('date'),
-            match_data.get('fixture', {}).get('status', {}).get('long'),
-            match_data.get('league', {}).get('name'),
-            match_data.get('league', {}).get('country'),
-            odds.get('home', 0),
-            odds.get('draw', 0),
-            odds.get('away', 0),
-            odds.get('over_2_5', 0),
-            odds.get('btts_yes', 0)
-        ), fetch=False)
