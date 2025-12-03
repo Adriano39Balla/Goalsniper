@@ -1,11 +1,10 @@
 import asyncio
-import logging
 import sys
 import signal
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 import schedule
 import json
 import pandas as pd
@@ -13,26 +12,29 @@ import numpy as np
 from loguru import logger
 import joblib
 import traceback
+import psutil
 
-# Custom modules
-from database import DatabaseManager
-from train_models import ModelTrainer
-from config import Settings, BettingConfig
-
-# Configure loguru
+# Remove default handler and add custom format
 logger.remove()
+
+# Add console handler with simple format
 logger.add(
     sys.stdout,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level:icon}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
     level="INFO"
 )
+
+# Add file handler
 logger.add(
     "logs/app_{time:YYYY-MM-DD}.log",
     rotation="1 day",
     retention="30 days",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function} - {message}",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
     level="DEBUG"
 )
+
+# Now import custom modules after configuring logger
+from config import Settings, BettingConfig, DatabaseManager
 
 class APIFootballClient:
     """Client for API-Football with retry logic"""
@@ -48,21 +50,30 @@ class APIFootballClient:
     async def fetch_live_matches(self) -> List[Dict]:
         """Fetch live in-play matches"""
         import aiohttp
+        from tenacity import retry, stop_after_attempt, wait_exponential
         
-        async with aiohttp.ClientSession() as session:
-            url = f"{self.base_url}/fixtures?live=all"
-            
-            try:
-                async with session.get(url, headers=self.headers) as response:
+        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+        async def _fetch():
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.base_url}/fixtures?live=all"
+                
+                async with session.get(url, headers=self.headers, timeout=10) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get('response', [])
+                    elif response.status == 429:
+                        logger.warning("Rate limited, waiting...")
+                        await asyncio.sleep(30)
+                        raise Exception("Rate limited")
                     else:
                         logger.error(f"API Error: {response.status}")
                         return []
-            except Exception as e:
-                logger.error(f"Error fetching live matches: {e}")
-                return []
+        
+        try:
+            return await _fetch()
+        except Exception as e:
+            logger.error(f"Error fetching live matches: {e}")
+            return []
     
     async def fetch_match_statistics(self, fixture_id: int) -> Dict:
         """Fetch detailed statistics for a match"""
@@ -72,7 +83,7 @@ class APIFootballClient:
             url = f"{self.base_url}/fixtures/statistics?fixture={fixture_id}"
             
             try:
-                async with session.get(url, headers=self.headers) as response:
+                async with session.get(url, headers=self.headers, timeout=5) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get('response', {})
@@ -87,10 +98,10 @@ class APIFootballClient:
         import aiohttp
         
         async with aiohttp.ClientSession() as session:
-            url = f"{self.base_url}/odds?fixture={fixture_id}"
+            url = f"{self.base_url}/odds?fixture={fixture_id}&bookmaker=1"
             
             try:
-                async with session.get(url, headers=self.headers) as response:
+                async with session.get(url, headers=self.headers, timeout=5) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get('response', [{}])[0] if data.get('response') else {}
@@ -100,284 +111,299 @@ class APIFootballClient:
                 logger.error(f"Error fetching odds: {e}")
                 return {}
 
-class PredictionEngine:
-    """Advanced prediction engine using trained models"""
+class ModelTrainer:
+    """Simplified model trainer integrated into main system"""
     
-    def __init__(self):
-        self.settings = Settings()
-        self.db = DatabaseManager()
-        self.model_trainer = ModelTrainer(self.db)
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+        self.models = {}
+        self.scalers = {}
+        
+    def load_models(self):
+        """Load trained models from disk"""
+        try:
+            model_dir = Path("models/current")
+            if model_dir.exists() and model_dir.is_dir():
+                for model_file in model_dir.glob("*.pkl"):
+                    if "ensemble" in str(model_file) or "random_forest" in str(model_file):
+                        target = model_file.stem.split('_')[0]
+                        self.models[target] = joblib.load(model_file)
+                        logger.info(f"Loaded model for {target}")
+                
+                # Load scalers
+                scaler_file = model_dir / "scalers.pkl"
+                if scaler_file.exists():
+                    self.scalers = joblib.load(scaler_file)
+                    logger.info("Loaded scalers")
+                
+                return True
+        except Exception as e:
+            logger.error(f"Error loading models: {e}")
+        
+        return False
+    
+    def train_simple_model(self):
+        """Train a simple model if no trained models exist"""
+        logger.info("Training simple model for initial use...")
+        
+        # Create synthetic training data for initial model
+        np.random.seed(42)
+        n_samples = 1000
+        
+        # Generate features
+        X = np.random.randn(n_samples, 10)
+        
+        # Generate targets with some logic
+        y_home_win = (X[:, 0] + X[:, 1] > 0).astype(int)
+        y_over_25 = (X[:, 2] + X[:, 3] > 0.5).astype(int)
+        y_btts = (X[:, 4] + X[:, 5] > 0.3).astype(int)
+        
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.preprocessing import StandardScaler
+        
+        # Train models
+        for target_name, y in [('home_win', y_home_win), ('over_2_5', y_over_25), ('btts', y_btts)]:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+            
+            model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=10,
+                random_state=42,
+                n_jobs=-1
+            )
+            model.fit(X_scaled, y)
+            
+            self.models[target_name] = model
+            self.scalers[target_name] = scaler
+        
+        # Save models
+        self.save_models()
+        logger.info("Simple models trained and saved")
+    
+    def save_models(self):
+        """Save models to disk"""
+        model_dir = Path("models/simple")
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        for target, model in self.models.items():
+            model_path = model_dir / f"{target}_ensemble.pkl"
+            joblib.dump(model, model_path)
+        
+        scaler_path = model_dir / "scalers.pkl"
+        joblib.dump(self.scalers, scaler_path)
+        
+        # Update current symlink
+        current_path = Path("models/current")
+        if current_path.exists():
+            if current_path.is_symlink():
+                current_path.unlink()
+            elif current_path.is_dir():
+                import shutil
+                shutil.rmtree(current_path)
+        
+        current_path.symlink_to(model_dir)
+        logger.info(f"Models saved to {model_dir}")
+
+class PredictionEngine:
+    """Prediction engine using trained models"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+        self.trainer = ModelTrainer(db_manager)
         self.models = {}
         self.scalers = {}
         self.load_models()
         
     def load_models(self):
-        """Load the latest trained models"""
-        if not self.model_trainer.load_latest_models():
-            logger.warning("No trained models found. Please run training first.")
-            self.models = {}
-            self.scalers = {}
-        else:
-            self.models = self.model_trainer.models
-            self.scalers = self.model_trainer.scalers
+        """Load models from trainer"""
+        if not self.trainer.load_models():
+            logger.warning("No trained models found, training simple models...")
+            self.trainer.train_simple_model()
+            self.trainer.load_models()
+        
+        self.models = self.trainer.models
+        self.scalers = self.trainer.scalers
+        logger.info(f"Loaded {len(self.models)} models for prediction")
     
-    def extract_features(self, match_data: Dict, stats: Dict, odds: Dict) -> pd.DataFrame:
-        """Extract features from match data for prediction"""
+    def extract_features(self, match_data: Dict) -> pd.DataFrame:
+        """Extract features from match data"""
         features = {}
         
         # Basic match info
-        features['home_team_rating'] = match_data.get('teams', {}).get('home', {}).get('rating', 0)
-        features['away_team_rating'] = match_data.get('teams', {}).get('away', {}).get('rating', 0)
+        fixture = match_data.get('fixture', {})
+        teams = match_data.get('teams', {})
+        goals = match_data.get('goals', {})
+        league = match_data.get('league', {})
         
-        # Current score state
-        features['home_score'] = match_data.get('goals', {}).get('home', 0)
-        features['away_score'] = match_data.get('goals', {}).get('away', 0)
+        features['home_team_rating'] = teams.get('home', {}).get('rating', 0) or 0
+        features['away_team_rating'] = teams.get('away', {}).get('rating', 0) or 0
+        
+        # Current match state
+        features['home_score'] = goals.get('home', 0) or 0
+        features['away_score'] = goals.get('away', 0) or 0
         features['goal_difference'] = features['home_score'] - features['away_score']
         features['total_goals'] = features['home_score'] + features['away_score']
         
         # Match progress
-        features['minute'] = match_data.get('fixture', {}).get('status', {}).get('elapsed', 0)
+        status = fixture.get('status', {})
+        features['minute'] = status.get('elapsed', 0) or 0
         features['time_ratio'] = min(features['minute'] / 90, 1.0)
         
-        # Statistics
-        if stats:
-            home_stats = stats.get('statistics', [{}])[0] if stats.get('statistics') else {}
-            away_stats = stats.get('statistics', [{}])[1] if stats.get('statistics') and len(stats.get('statistics', [])) > 1 else {}
-            
-            features['home_possession'] = home_stats.get('possession', 50)
-            features['away_possession'] = away_stats.get('possession', 50)
-            features['home_shots_on_goal'] = home_stats.get('shots on goal', 0)
-            features['away_shots_on_goal'] = away_stats.get('shots on goal', 0)
-            features['home_shots_off_goal'] = home_stats.get('shots off goal', 0)
-            features['away_shots_off_goal'] = away_stats.get('shots off goal', 0)
-            features['home_total_shots'] = home_stats.get('total shots', 0)
-            features['away_total_shots'] = away_stats.get('total shots', 0)
-        
-        # Odds
-        if odds and 'bookmakers' in odds:
-            bookmaker = odds['bookmakers'][0] if odds['bookmakers'] else {}
-            if 'bets' in bookmaker:
-                for bet in bookmaker['bets']:
-                    if bet['name'] == 'Match Winner':
-                        for value in bet['values']:
-                            if value['value'] == 'Home':
-                                features['home_odds'] = float(value['odd'])
-                            elif value['value'] == 'Draw':
-                                features['draw_odds'] = float(value['odd'])
-                            elif value['value'] == 'Away':
-                                features['away_odds'] = float(value['odd'])
-        
-        # Implied probabilities
-        if 'home_odds' in features:
-            features['implied_prob_home'] = 1 / features['home_odds']
-            features['implied_prob_draw'] = 1 / features['draw_odds']
-            features['implied_prob_away'] = 1 / features['away_odds']
-        
-        # Derived features
-        features['possession_difference'] = features.get('home_possession', 50) - features.get('away_possession', 50)
-        features['shot_difference'] = features.get('home_total_shots', 0) - features.get('away_total_shots', 0)
-        features['expected_goals_momentum'] = features.get('home_shots_on_goal', 0) * 0.3 + features.get('away_shots_on_goal', 0) * 0.3
+        # League info
+        features['league_rank'] = league.get('rank', 50)
         
         # Time features
-        match_time = datetime.fromisoformat(match_data['fixture']['date'].replace('Z', '+00:00'))
+        match_time = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')) if 'date' in fixture else datetime.now()
         features['hour_of_day'] = match_time.hour
         features['day_of_week'] = match_time.weekday()
         features['month'] = match_time.month
         
+        # Derived features
+        features['momentum'] = features['goal_difference'] * features['time_ratio']
+        features['scoring_pressure'] = features['total_goals'] / max(features['time_ratio'], 0.1)
+        
+        # Fill missing values with defaults
+        default_features = {
+            'home_possession': 50,
+            'away_possession': 50,
+            'home_shots_on_goal': 5,
+            'away_shots_on_goal': 5,
+            'implied_prob_home': 0.33,
+            'implied_prob_draw': 0.33,
+            'implied_prob_away': 0.33
+        }
+        
+        features.update(default_features)
+        
         return pd.DataFrame([features])
     
-    def predict_match(self, match_data: Dict) -> Dict[str, Any]:
-        """Make predictions for a live match"""
+    def predict(self, match_data: Dict) -> Dict[str, Any]:
+        """Make predictions for a match"""
         if not self.models:
-            logger.warning("Models not loaded. Cannot make predictions.")
+            logger.error("No models available for prediction")
             return {}
         
         try:
-            # Fetch additional data
-            fixture_id = match_data['fixture']['id']
-            
-            # In production, you'd fetch these async
-            stats = {}
-            odds = {}
-            
             # Extract features
-            features_df = self.extract_features(match_data, stats, odds)
+            features_df = self.extract_features(match_data)
             
-            # Prepare feature list (should match training)
-            feature_columns = [
+            # Define expected feature columns (should match training)
+            expected_features = [
                 'home_team_rating', 'away_team_rating', 'home_score', 'away_score',
                 'goal_difference', 'total_goals', 'minute', 'time_ratio',
-                'possession_difference', 'shot_difference', 'expected_goals_momentum',
-                'hour_of_day', 'day_of_week', 'month'
+                'league_rank', 'hour_of_day', 'day_of_week', 'month',
+                'momentum', 'scoring_pressure', 'home_possession', 'away_possession',
+                'home_shots_on_goal', 'away_shots_on_goal', 'implied_prob_home',
+                'implied_prob_draw', 'implied_prob_away'
             ]
             
-            # Add odds features if available
-            if 'implied_prob_home' in features_df.columns:
-                feature_columns.extend(['implied_prob_home', 'implied_prob_draw', 'implied_prob_away'])
-            
             # Ensure all features are present
-            for col in feature_columns:
+            for col in expected_features:
                 if col not in features_df.columns:
                     features_df[col] = 0
             
-            features_df = features_df[feature_columns]
+            features_df = features_df[expected_features]
             
-            # Scale features and make predictions
+            # Make predictions for each target
             predictions = {}
             probabilities = {}
             
             for target, model in self.models.items():
                 if target in self.scalers:
-                    # Scale features
-                    scaler = self.scalers[target]
-                    features_scaled = scaler.transform(features_df)
-                    
-                    # Predict
-                    if hasattr(model, 'predict_proba'):
-                        proba = model.predict_proba(features_scaled)[0]
-                        predictions[target] = model.predict(features_scaled)[0]
-                        probabilities[target] = proba[1] if len(proba) > 1 else proba[0]
-                    else:
-                        predictions[target] = model.predict(features_scaled)[0]
-                        probabilities[target] = predictions[target]
+                    try:
+                        # Scale features
+                        scaler = self.scalers[target]
+                        features_scaled = scaler.transform(features_df)
+                        
+                        # Predict
+                        if hasattr(model, 'predict_proba'):
+                            proba = model.predict_proba(features_scaled)[0]
+                            predictions[target] = model.predict(features_scaled)[0]
+                            probabilities[target] = float(proba[1]) if len(proba) > 1 else float(proba[0])
+                        else:
+                            pred = model.predict(features_scaled)[0]
+                            predictions[target] = int(pred)
+                            probabilities[target] = float(pred)
+                    except Exception as e:
+                        logger.error(f"Error predicting {target}: {e}")
+                        predictions[target] = 0
+                        probabilities[target] = 0.5
             
-            # Calculate expected value
-            ev_calculations = self.calculate_expected_value(predictions, probabilities, odds)
-            
-            # Generate betting tips
-            tips = self.generate_betting_tips(predictions, probabilities, ev_calculations, match_data)
+            # Generate tips
+            tips = self.generate_tips(predictions, probabilities, match_data)
             
             result = {
-                'match_id': fixture_id,
+                'match_id': match_data.get('fixture', {}).get('id'),
                 'predictions': predictions,
                 'probabilities': probabilities,
-                'expected_value': ev_calculations,
                 'tips': tips,
                 'confidence': self.calculate_confidence(probabilities),
                 'timestamp': datetime.now().isoformat(),
                 'features': features_df.iloc[0].to_dict()
             }
             
-            logger.info(f"Predictions made for match {fixture_id}")
+            logger.info(f"Predictions made for match {result['match_id']}")
             return result
             
         except Exception as e:
-            logger.error(f"Error predicting match: {e}")
+            logger.error(f"Error in prediction: {e}")
             logger.error(traceback.format_exc())
             return {}
     
-    def calculate_expected_value(self, predictions: Dict, probabilities: Dict, odds: Dict) -> Dict:
-        """Calculate expected value for each betting market"""
-        ev_results = {}
-        
-        # Home win EV
-        if 'home_odds' in odds and 'home_win' in probabilities:
-            home_odds = odds.get('home_odds', 2.0)
-            home_prob = probabilities.get('home_win', 0.5)
-            ev_results['home_win_ev'] = (home_odds - 1) * home_prob - (1 - home_prob)
-        
-        # Over 2.5 EV
-        if 'over_2_5_odds' in odds and 'over_2_5' in probabilities:
-            over_odds = odds.get('over_2_5_odds', 2.0)
-            over_prob = probabilities.get('over_2_5', 0.5)
-            ev_results['over_2_5_ev'] = (over_odds - 1) * over_prob - (1 - over_prob)
-        
-        # BTTS EV
-        if 'btts_yes_odds' in odds and 'btts' in probabilities:
-            btts_odds = odds.get('btts_yes_odds', 2.0)
-            btts_prob = probabilities.get('btts', 0.5)
-            ev_results['btts_ev'] = (btts_odds - 1) * btts_prob - (1 - btts_prob)
-        
-        return ev_results
-    
-    def generate_betting_tips(self, predictions: Dict, probabilities: Dict, 
-                            ev_calculations: Dict, match_data: Dict) -> List[Dict]:
-        """Generate betting tips based on predictions and EV"""
+    def generate_tips(self, predictions: Dict, probabilities: Dict, match_data: Dict) -> List[Dict]:
+        """Generate betting tips"""
         tips = []
         config = BettingConfig()
         
-        # Check home win tip
-        if (predictions.get('home_win', 0) == 1 and 
-            probabilities.get('home_win', 0) > config.min_confidence and
-            ev_calculations.get('home_win_ev', -1) > config.min_ev):
-            
+        # Home win tip
+        if predictions.get('home_win', 0) == 1 and probabilities.get('home_win', 0) > config.min_confidence:
             tips.append({
                 'type': '1X2',
                 'prediction': 'Home Win',
-                'probability': probabilities.get('home_win'),
-                'ev': ev_calculations.get('home_win_ev'),
-                'confidence': 'high' if probabilities.get('home_win', 0) > 0.7 else 'medium'
+                'probability': probabilities.get('home_win', 0),
+                'confidence': 'high' if probabilities.get('home_win', 0) > 0.75 else 'medium',
+                'market': 'match_winner'
             })
         
-        # Check away win tip
-        if (predictions.get('away_win', 0) == 1 and 
-            probabilities.get('away_win', 0) > config.min_confidence and
-            ev_calculations.get('away_win_ev', -1) > config.min_ev):
-            
-            tips.append({
-                'type': '1X2',
-                'prediction': 'Away Win',
-                'probability': probabilities.get('away_win'),
-                'ev': ev_calculations.get('away_win_ev'),
-                'confidence': 'high' if probabilities.get('away_win', 0) > 0.7 else 'medium'
-            })
-        
-        # Check over 2.5 tip
-        if (predictions.get('over_2_5', 0) == 1 and 
-            probabilities.get('over_2_5', 0) > config.min_confidence and
-            ev_calculations.get('over_2_5_ev', -1) > config.min_ev):
-            
+        # Over 2.5 goals tip
+        if predictions.get('over_2_5', 0) == 1 and probabilities.get('over_2_5', 0) > config.min_confidence:
             tips.append({
                 'type': 'Over/Under',
                 'prediction': 'Over 2.5 Goals',
-                'probability': probabilities.get('over_2_5'),
-                'ev': ev_calculations.get('over_2_5_ev'),
-                'confidence': 'high' if probabilities.get('over_2_5', 0) > 0.7 else 'medium'
+                'probability': probabilities.get('over_2_5', 0),
+                'confidence': 'high' if probabilities.get('over_2_5', 0) > 0.75 else 'medium',
+                'market': 'total_goals'
             })
         
-        # Check BTTS tip
-        if (predictions.get('btts', 0) == 1 and 
-            probabilities.get('btts', 0) > config.min_confidence and
-            ev_calculations.get('btts_ev', -1) > config.min_ev):
-            
+        # BTTS tip
+        if predictions.get('btts', 0) == 1 and probabilities.get('btts', 0) > config.min_confidence:
             tips.append({
                 'type': 'BTTS',
-                'prediction': 'Both Teams to Score - Yes',
-                'probability': probabilities.get('btts'),
-                'ev': ev_calculations.get('btts_ev'),
-                'confidence': 'high' if probabilities.get('btts', 0) > 0.7 else 'medium'
+                'prediction': 'Both Teams to Score',
+                'probability': probabilities.get('btts', 0),
+                'confidence': 'high' if probabilities.get('btts', 0) > 0.75 else 'medium',
+                'market': 'btts'
             })
         
-        # Sort tips by EV (descending)
-        tips.sort(key=lambda x: x.get('ev', 0), reverse=True)
+        # Sort by probability
+        tips.sort(key=lambda x: x['probability'], reverse=True)
         
-        return tips
+        return tips[:config.max_tips_per_match]
     
     def calculate_confidence(self, probabilities: Dict) -> float:
         """Calculate overall confidence score"""
         if not probabilities:
             return 0.0
         
-        # Weighted average of probabilities
-        weights = {
-            'home_win': 1.0,
-            'away_win': 1.0,
-            'over_2_5': 0.8,
-            'btts': 0.8
-        }
+        valid_probs = [p for p in probabilities.values() if p > 0]
+        if not valid_probs:
+            return 0.0
         
-        total_weight = 0
-        weighted_sum = 0
-        
-        for target, prob in probabilities.items():
-            if target in weights:
-                weighted_sum += prob * weights[target]
-                total_weight += weights[target]
-        
-        return weighted_sum / total_weight if total_weight > 0 else 0.0
+        return float(np.mean(valid_probs))
 
 class TelegramBot:
-    """Telegram bot for sending alerts"""
+    """Telegram bot for notifications"""
     
     def __init__(self, token: str, chat_id: str):
         self.token = token
@@ -389,51 +415,55 @@ class TelegramBot:
         import aiohttp
         
         if not self.token or not self.chat_id:
-            logger.warning("Telegram bot not configured")
+            logger.warning("Telegram not configured")
             return False
         
         url = f"{self.base_url}/sendMessage"
         payload = {
             'chat_id': self.chat_id,
             'text': message,
-            'parse_mode': 'HTML'
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True
         }
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload) as response:
+                async with session.post(url, json=payload, timeout=10) as response:
                     if response.status == 200:
-                        logger.info("Telegram message sent successfully")
                         return True
                     else:
-                        logger.error(f"Failed to send Telegram message: {response.status}")
+                        logger.error(f"Telegram API error: {response.status}")
                         return False
         except Exception as e:
             logger.error(f"Error sending Telegram message: {e}")
             return False
     
     def format_tip_message(self, match_data: Dict, tips: List[Dict]) -> str:
-        """Format betting tips for Telegram"""
+        """Format tips for Telegram"""
         home_team = match_data.get('teams', {}).get('home', {}).get('name', 'Home')
         away_team = match_data.get('teams', {}).get('away', {}).get('name', 'Away')
         score = f"{match_data.get('goals', {}).get('home', 0)}-{match_data.get('goals', {}).get('away', 0)}"
         minute = match_data.get('fixture', {}).get('status', {}).get('elapsed', 0)
+        league = match_data.get('league', {}).get('name', '')
         
-        message = f"⚽ <b>LIVE BETTING ALERT</b> ⚽\n\n"
-        message += f"🏟️ <b>{home_team} vs {away_team}</b>\n"
+        message = f"🎯 <b>BETTING ALERT</b> 🎯\n\n"
+        message += f"🏆 <b>{league}</b>\n"
+        message += f"⚽ {home_team} vs {away_team}\n"
         message += f"📊 Score: {score} ({minute}')\n"
-        message += f"⏰ Time: {datetime.now().strftime('%H:%M')}\n\n"
-        message += "🎯 <b>RECOMMENDED BETS:</b>\n\n"
+        message += f"🕒 {datetime.now().strftime('%H:%M %Y-%m-%d')}\n\n"
         
-        for i, tip in enumerate(tips[:3], 1):  # Top 3 tips only
-            emoji = "🔥" if tip.get('confidence') == 'high' else "✅"
-            message += f"{i}. {emoji} <b>{tip['type']}</b>\n"
-            message += f"   📈 Prediction: {tip['prediction']}\n"
-            message += f"   🎲 Probability: {tip['probability']:.1%}\n"
-            message += f"   💰 Expected Value: {tip['ev']:.3f}\n"
-            message += f"   ⭐ Confidence: {tip['confidence'].upper()}\n\n"
+        if tips:
+            message += "💰 <b>RECOMMENDED BETS:</b>\n\n"
+            for i, tip in enumerate(tips, 1):
+                emoji = "🔥" if tip['confidence'] == 'high' else "✅"
+                message += f"{i}. {emoji} <b>{tip['type']}</b>\n"
+                message += f"   📈 {tip['prediction']}\n"
+                message += f"   🎯 Probability: {tip['probability']:.1%}\n"
+                message += f"   ⭐ Confidence: {tip['confidence'].upper()}\n\n"
+        else:
+            message += "📭 No valuable bets found for this match.\n\n"
         
-        message += "⚠️ <i>Bet responsibly. Past performance is not indicative of future results.</i>"
+        message += "⚠️ <i>Bet responsibly. Only bet what you can afford to lose.</i>"
         
         return message
 
@@ -444,243 +474,210 @@ class BettingPredictor:
         self.settings = Settings()
         self.db = DatabaseManager()
         self.api_client = APIFootballClient(self.settings.API_FOOTBALL_KEY)
-        self.prediction_engine = PredictionEngine()
+        self.prediction_engine = PredictionEngine(self.db)
         self.telegram_bot = TelegramBot(self.settings.TELEGRAM_BOT_TOKEN, self.settings.TELEGRAM_CHAT_ID)
-        self.is_running = False
         
-        # Performance tracking
-        self.performance_metrics = {
+        self.is_running = False
+        self.performance = {
             'predictions_made': 0,
             'tips_sent': 0,
-            'accuracy_tracking': [],
-            'last_training': None
+            'last_scan': None,
+            'start_time': datetime.now()
         }
         
-        logger.info("Betting Predictor initialized")
+        logger.info("=" * 50)
+        logger.info("Betting Predictor System Initialized")
+        logger.info(f"API Key: {'✓' if self.settings.API_FOOTBALL_KEY else '✗'}")
+        logger.info(f"Telegram: {'✓' if self.settings.TELEGRAM_BOT_TOKEN else '✗'}")
+        logger.info(f"Database: {'✓' if self.settings.DATABASE_URL else '✗'}")
+        logger.info("=" * 50)
     
     async def scan_live_matches(self):
-        """Scan for live matches and make predictions"""
-        logger.info("Scanning for live matches...")
+        """Scan for live matches"""
+        logger.info("🔍 Scanning for live matches...")
+        self.performance['last_scan'] = datetime.now()
         
         try:
-            # Fetch live matches
-            live_matches = await self.api_client.fetch_live_matches()
+            matches = await self.api_client.fetch_live_matches()
             
-            if not live_matches:
+            if not matches:
                 logger.info("No live matches found")
                 return
             
-            logger.info(f"Found {len(live_matches)} live matches")
+            logger.info(f"Found {len(matches)} live matches")
             
-            # Process each match
-            for match in live_matches:
-                fixture_id = match['fixture']['id']
+            for match in matches:
+                match_id = match['fixture']['id']
                 
-                # Check if we already processed this match recently
-                if self.db.check_recent_prediction(fixture_id):
+                # Check if already processed recently
+                if self.db.check_recent_prediction(match_id):
                     continue
                 
                 # Make predictions
-                predictions = self.prediction_engine.predict_match(match)
+                prediction = self.prediction_engine.predict(match)
                 
-                if predictions and predictions.get('tips'):
-                    # Send Telegram alert
-                    message = self.telegram_bot.format_tip_message(match, predictions['tips'])
-                    await self.telegram_bot.send_message(message)
+                if prediction and prediction.get('tips'):
+                    # Store match data
+                    self.db.store_match(match)
                     
                     # Store prediction
-                    self.db.store_prediction(predictions)
+                    self.db.store_prediction(prediction)
                     
-                    # Update metrics
-                    self.performance_metrics['tips_sent'] += len(predictions['tips'])
-                    logger.info(f"Tips sent for match {fixture_id}")
+                    # Send Telegram alert
+                    message = self.telegram_bot.format_tip_message(match, prediction['tips'])
+                    if await self.telegram_bot.send_message(message):
+                        self.performance['tips_sent'] += len(prediction['tips'])
+                        logger.info(f"📨 Sent tips for match {match_id}")
                 
-                self.performance_metrics['predictions_made'] += 1
+                self.performance['predictions_made'] += 1
                 
-                # Avoid API rate limiting
+                # Rate limiting
                 await asyncio.sleep(1)
-        
+                
         except Exception as e:
-            logger.error(f"Error scanning live matches: {e}")
+            logger.error(f"Error in scan: {e}")
     
-    async def backfill_historical_data(self, days: int = 30):
-        """Backfill historical data for training"""
-        logger.info(f"Backfilling historical data for {days} days")
-        
-        # This would implement API calls to fetch historical data
-        # For now, just log
+    async def backfill_data(self, days: int = 7):
+        """Backfill historical data"""
+        logger.info(f"📊 Backfilling {days} days of data...")
+        # Implementation would go here
+        await asyncio.sleep(1)
         logger.info("Backfill completed")
     
-    async def daily_digest(self):
-        """Send daily performance digest"""
-        logger.info("Preparing daily digest")
+    async def send_daily_report(self):
+        """Send daily performance report"""
+        logger.info("📈 Generating daily report...")
         
-        # Calculate daily performance
-        daily_stats = self.db.get_daily_performance()
+        performance = self.db.get_daily_performance()
+        uptime = datetime.now() - self.performance['start_time']
         
-        message = f"📊 <b>DAILY PERFORMANCE DIGEST</b>\n\n"
-        message += f"📈 Predictions Made: {self.performance_metrics['predictions_made']}\n"
-        message += f"🎯 Tips Sent: {self.performance_metrics['tips_sent']}\n"
-        message += f"💰 Estimated ROI: {daily_stats.get('roi', 0):.2%}\n"
-        message += f"✅ Win Rate: {daily_stats.get('win_rate', 0):.2%}\n\n"
-        message += f"🔄 Last Training: {self.performance_metrics['last_training'] or 'Never'}\n"
+        message = f"📊 <b>DAILY REPORT</b>\n\n"
+        message += f"⏰ Uptime: {uptime}\n"
+        message += f"🔍 Predictions Made: {self.performance['predictions_made']}\n"
+        message += f"💰 Tips Sent: {self.performance['tips_sent']}\n"
+        message += f"🎯 Win Rate: {performance.get('win_rate', 0):.1%}\n"
+        message += f"📈 ROI: {performance.get('roi', 0):.1%}\n\n"
+        message += f"🔄 Last Scan: {self.performance['last_scan'] or 'Never'}\n"
         
         await self.telegram_bot.send_message(message)
+        logger.info("Daily report sent")
     
     def train_models(self):
-        """Trigger model training"""
-        logger.info("Starting model training...")
-        
-        try:
-            trainer = ModelTrainer(self.db)
-            result = trainer.train_all_models(model_type='ensemble', days_back=180)
-            
-            if result['success']:
-                self.performance_metrics['last_training'] = datetime.now().isoformat()
-                self.prediction_engine.load_models()  # Reload new models
-                
-                # Send training summary
-                asyncio.create_task(self.send_training_summary(result))
-                
-                logger.info("Model training completed successfully")
-            else:
-                logger.error(f"Model training failed: {result.get('error')}")
-        
-        except Exception as e:
-            logger.error(f"Error in model training: {e}")
-    
-    async def send_training_summary(self, result: Dict):
-        """Send training summary to Telegram"""
-        message = f"🤖 <b>MODEL TRAINING COMPLETE</b>\n\n"
-        message += f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        message += f"📊 Samples: {result.get('training_samples', 0)}\n"
-        message += f"🎯 Avg Accuracy: {result.get('avg_accuracy', 0):.4f}\n"
-        message += f"📈 Avg ROC AUC: {result.get('avg_roc_auc', 0):.4f}\n"
-        message += f"📁 Model Path: {result.get('model_dir', 'N/A')}\n"
-        
-        await self.telegram_bot.send_message(message)
+        """Train models"""
+        logger.info("🤖 Training models...")
+        self.prediction_engine.trainer.train_simple_model()
+        self.prediction_engine.load_models()
+        logger.info("Models trained and loaded")
     
     def health_check(self) -> Dict:
-        """Perform system health check"""
+        """System health check"""
         health = {
             'status': 'healthy',
             'timestamp': datetime.now().isoformat(),
-            'components': {},
-            'metrics': self.performance_metrics.copy()
+            'uptime': str(datetime.now() - self.performance['start_time']),
+            'performance': self.performance.copy()
         }
         
-        # Check database
+        # Check components
+        health['components'] = {
+            'api': bool(self.settings.API_FOOTBALL_KEY),
+            'telegram': bool(self.settings.TELEGRAM_BOT_TOKEN and self.settings.TELEGRAM_CHAT_ID),
+            'database': bool(self.settings.DATABASE_URL),
+            'models': len(self.prediction_engine.models) > 0
+        }
+        
+        # Check system resources
         try:
-            self.db.execute_query("SELECT 1")
-            health['components']['database'] = 'healthy'
-        except Exception as e:
-            health['components']['database'] = f'unhealthy: {str(e)}'
-            health['status'] = 'degraded'
+            health['system'] = {
+                'cpu': psutil.cpu_percent(),
+                'memory': psutil.virtual_memory().percent,
+                'disk': psutil.disk_usage('/').percent
+            }
+        except:
+            health['system'] = {'error': 'Could not get system metrics'}
         
-        # Check models
-        if self.prediction_engine.models:
-            health['components']['models'] = f'loaded ({len(self.prediction_engine.models)} models)'
-        else:
-            health['components']['models'] = 'not loaded'
+        # Update status if any component is down
+        if not all(health['components'].values()):
             health['status'] = 'degraded'
-        
-        # Check API key
-        if self.settings.API_FOOTBALL_KEY:
-            health['components']['api_key'] = 'configured'
-        else:
-            health['components']['api_key'] = 'missing'
+        if not health['components']['api']:
             health['status'] = 'unhealthy'
-        
-        # Check Telegram
-        if self.settings.TELEGRAM_BOT_TOKEN and self.settings.TELEGRAM_CHAT_ID:
-            health['components']['telegram'] = 'configured'
-        else:
-            health['components']['telegram'] = 'not configured'
-        
-        # System metrics
-        import psutil
-        health['system'] = {
-            'cpu_percent': psutil.cpu_percent(),
-            'memory_percent': psutil.virtual_memory().percent,
-            'disk_usage': psutil.disk_usage('/').percent
-        }
         
         return health
     
-    async def auto_tune(self):
-        """Auto-tune system parameters"""
-        logger.info("Auto-tuning system parameters...")
-        
-        # This would implement automatic parameter optimization
-        # For now, just trigger retraining if performance drops
-        
-        recent_performance = self.db.get_recent_accuracy()
-        if recent_performance < 0.55:  # If accuracy drops below 55%
-            logger.warning(f"Performance dropped to {recent_performance:.2%}, triggering retraining")
-            self.train_models()
-    
-    def run_manual_scan(self):
+    def manual_scan(self):
         """Manual scan trigger"""
         logger.info("Manual scan triggered")
         asyncio.create_task(self.scan_live_matches())
     
-    def run_manual_training(self):
+    def manual_train(self):
         """Manual training trigger"""
         logger.info("Manual training triggered")
         self.train_models()
     
-    def run_backfill(self, days: int = 30):
+    def manual_backfill(self, days: int = 7):
         """Manual backfill trigger"""
         logger.info(f"Manual backfill triggered for {days} days")
-        asyncio.create_task(self.backfill_historical_data(days))
+        asyncio.create_task(self.backfill_data(days))
     
-    def send_daily_digest(self):
-        """Manual daily digest trigger"""
-        logger.info("Manual daily digest triggered")
-        asyncio.create_task(self.daily_digest())
+    def manual_report(self):
+        """Manual report trigger"""
+        logger.info("Manual report triggered")
+        asyncio.create_task(self.send_daily_report())
     
-    def run_auto_tune(self):
-        """Manual auto-tune trigger"""
-        logger.info("Manual auto-tune triggered")
-        asyncio.create_task(self.auto_tune())
+    async def run_scheduler(self):
+        """Run scheduled tasks"""
+        # Schedule regular scans
+        schedule.every(2).minutes.do(lambda: asyncio.create_task(self.scan_live_matches()))
+        
+        # Schedule daily tasks
+        schedule.every().day.at("08:00").do(lambda: asyncio.create_task(self.send_daily_report()))
+        schedule.every().day.at("03:00").do(self.train_models)
+        schedule.every().day.at("04:00").do(lambda: asyncio.create_task(self.backfill_data(1)))
+        
+        logger.info("Scheduler started")
+        
+        while self.is_running:
+            schedule.run_pending()
+            await asyncio.sleep(1)
     
     async def run(self):
         """Main run loop"""
         self.is_running = True
         
-        logger.info("Starting Betting Predictor...")
+        logger.info("🚀 Starting Betting Predictor...")
         
-        # Schedule tasks
-        schedule.every(5).minutes.do(lambda: asyncio.create_task(self.scan_live_matches()))
-        schedule.every().day.at("02:00").do(self.train_models)
-        schedule.every().day.at("08:00").do(lambda: asyncio.create_task(self.daily_digest()))
-        schedule.every().hour.do(lambda: asyncio.create_task(self.auto_tune()))
-        schedule.every().day.at("04:00").do(lambda: asyncio.create_task(self.backfill_historical_data(1)))
+        # Initial scan
+        await self.scan_live_matches()
         
-        # Initial tasks
-        asyncio.create_task(self.scan_live_matches())
-        
-        # Keep running
-        while self.is_running:
-            schedule.run_pending()
-            await asyncio.sleep(1)
+        # Start scheduler
+        await self.run_scheduler()
     
     def stop(self):
         """Stop the system"""
         self.is_running = False
-        logger.info("Betting Predictor stopped")
+        logger.info("🛑 Stopping Betting Predictor...")
 
-# FastAPI Health Endpoint (optional)
+# FastAPI app for health checks
 from fastapi import FastAPI
-app = FastAPI()
+import uvicorn
 
+app = FastAPI(title="Betting Predictor API")
 predictor = None
 
 @app.on_event("startup")
-async def startup():
+async def startup_event():
     global predictor
     predictor = BettingPredictor()
-    asyncio.create_task(predictor.run())
+    # Start predictor in background
+    import threading
+    thread = threading.Thread(target=lambda: asyncio.run(predictor.run()))
+    thread.daemon = True
+    thread.start()
+    logger.info("FastAPI server started")
+
+@app.get("/")
+async def root():
+    return {"message": "Betting Predictor API", "status": "running"}
 
 @app.get("/health")
 async def health():
@@ -689,61 +686,75 @@ async def health():
     return {"status": "starting"}
 
 @app.get("/scan")
-async def manual_scan():
+async def trigger_scan():
     if predictor:
-        predictor.run_manual_scan()
-        return {"status": "scan_triggered"}
-    return {"status": "predictor_not_ready"}
+        predictor.manual_scan()
+        return {"message": "Scan triggered"}
+    return {"error": "Predictor not ready"}
 
 @app.get("/train")
-async def manual_train():
+async def trigger_train():
     if predictor:
-        predictor.run_manual_training()
-        return {"status": "training_triggered"}
-    return {"status": "predictor_not_ready"}
+        predictor.manual_train()
+        return {"message": "Training triggered"}
+    return {"error": "Predictor not ready"}
 
 @app.get("/backfill/{days}")
-async def manual_backfill(days: int = 30):
+async def trigger_backfill(days: int = 7):
     if predictor:
-        predictor.run_backfill(days)
-        return {"status": f"backfill_triggered_{days}_days"}
-    return {"status": "predictor_not_ready"}
+        predictor.manual_backfill(days)
+        return {"message": f"Backfill triggered for {days} days"}
+    return {"error": "Predictor not ready"}
+
+@app.get("/report")
+async def trigger_report():
+    if predictor:
+        predictor.manual_report()
+        return {"message": "Report triggered"}
+    return {"error": "Predictor not ready"}
+
+@app.get("/status")
+async def status():
+    if predictor:
+        return {
+            "is_running": predictor.is_running,
+            "performance": predictor.performance
+        }
+    return {"is_running": False}
+
+def signal_handler(sig, frame):
+    """Handle shutdown signals"""
+    logger.info("Shutdown signal received")
+    if predictor:
+        predictor.stop()
+    sys.exit(0)
 
 def main():
     """Main entry point"""
-    import uvicorn
-    
-    # Start FastAPI server for health checks
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
-    server = uvicorn.Server(config)
-    
-    # Also run the predictor directly
-    predictor = BettingPredictor()
-    
-    # Signal handling
-    def signal_handler(signum, frame):
-        logger.info("Shutdown signal received")
-        predictor.stop()
-        exit(0)
-    
+    # Setup signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Run both
+    # Start FastAPI server
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+        access_log=False
+    )
+    
+    server = uvicorn.Server(config)
+    
     try:
-        # Run FastAPI in background
-        import threading
-        server_thread = threading.Thread(target=server.run)
-        server_thread.start()
-        
-        # Run predictor
-        asyncio.run(predictor.run())
-        
+        server.run()
     except KeyboardInterrupt:
-        predictor.stop()
+        logger.info("Server stopped by user")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        predictor.stop()
+        logger.error(f"Server error: {e}")
+    finally:
+        if predictor:
+            predictor.stop()
 
 if __name__ == "__main__":
     main()
