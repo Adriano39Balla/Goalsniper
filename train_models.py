@@ -1,371 +1,463 @@
-#!/usr/bin/env python3
-"""
-Model training module with 80/20 train-test split
-"""
-
-import numpy as np
 import pandas as pd
-from datetime import datetime
-from typing import Dict, List, Tuple
+import numpy as np
+import pickle
 import joblib
+from datetime import datetime, timedelta
+import logging
+import sys
+import os
 from pathlib import Path
+from typing import Dict, Tuple, List, Optional, Any
+import warnings
+warnings.filterwarnings('ignore')
 
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix
+# Machine Learning
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, cross_val_score, TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, confusion_matrix
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.impute import SimpleImputer
+import xgboost as xgb
+import lightgbm as lgb
+import catboost as cb
 
-from utils.logger import logger
-from utils.database import DatabaseManager
-from models.random_forest import BettingPredictor, EnhancedRandomForest
-from utils.feature_engineering import FeatureEngineer
+# Custom imports
+sys.path.append(str(Path(__file__).parent))
+from database import DatabaseManager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 class ModelTrainer:
-    """Model trainer with comprehensive training pipeline"""
+    """Advanced model trainer for betting predictions"""
     
-    def __init__(self, db: DatabaseManager):
-        self.db = db
-        self.predictor = BettingPredictor()
-        self.feature_engineer = FeatureEngineer()
+    def __init__(self, db_manager=None):
+        self.db_manager = db_manager or DatabaseManager()
+        self.models = {}
         self.scalers = {}
-        self.label_encoders = {}
+        self.feature_importance = {}
+        self.target_columns = ['home_win', 'draw', 'away_win', 'over_2_5', 'btts']
         
-    def prepare_training_data(self, limit: int = 20000) -> Tuple[Dict, Dict, Dict, Dict]:
-        """Prepare training and testing data with 80/20 split"""
+    def fetch_training_data(self, days_back: int = 365) -> pd.DataFrame:
+        """Fetch historical data for training"""
+        logger.info(f"Fetching training data for last {days_back} days")
         
-        logger.info("Preparing training data...")
+        query = """
+        SELECT 
+            *,
+            CASE WHEN home_score > away_score THEN 1 ELSE 0 END as home_win,
+            CASE WHEN home_score = away_score THEN 1 ELSE 0 END as draw,
+            CASE WHEN home_score < away_score THEN 1 ELSE 0 END as away_win,
+            CASE WHEN home_score + away_score > 2.5 THEN 1 ELSE 0 END as over_2_5,
+            CASE WHEN home_score > 0 AND away_score > 0 THEN 1 ELSE 0 END as btts
+        FROM matches 
+        WHERE timestamp > NOW() - INTERVAL '%s days'
+        AND status = 'FT'
+        AND home_score IS NOT NULL
+        AND away_score IS NOT NULL
+        ORDER BY timestamp
+        """
         
-        # Get historical data
-        training_data = self.db.get_training_data(limit=limit)
+        df = self.db_manager.execute_query(query, (days_back,))
         
-        if len(training_data) < 1000:
-            logger.warning(f"Insufficient training data: {len(training_data)} records")
-            return {}, {}, {}, {}
+        if df.empty:
+            logger.warning("No training data found")
+            return df
         
-        # Separate data by prediction type
-        data_by_type = {'1X2': [], 'over_under': [], 'btts': []}
-        
-        for record in training_data:
-            pred_type = record['prediction_type']
-            if pred_type in data_by_type:
-                data_by_type[pred_type].append(record)
-        
-        # Prepare features and labels for each type
-        X_train_all, X_test_all, y_train_all, y_test_all = {}, {}, {}, {}
-        
-        for pred_type, records in data_by_type.items():
-            if len(records) < 100:
-                logger.warning(f"Insufficient {pred_type} records: {len(records)}")
-                continue
-            
-            # Extract features and labels
-            X, y = self.extract_features_labels(records, pred_type)
-            
-            if len(X) == 0:
-                continue
-            
-            # Split data 80/20
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y
-            )
-            
-            # Scale features
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_test_scaled = scaler.transform(X_test)
-            
-            self.scalers[pred_type] = scaler
-            
-            # Store prepared data
-            X_train_all[pred_type] = X_train_scaled
-            X_test_all[pred_type] = X_test_scaled
-            y_train_all[pred_type] = y_train
-            y_test_all[pred_type] = y_test
-            
-            logger.info(f"{pred_type}: {len(X_train)} train, {len(X_test)} test samples")
-        
-        return X_train_all, X_test_all, y_train_all, y_test_all
+        logger.info(f"Loaded {len(df)} matches for training")
+        return df
     
-    def extract_features_labels(self, records: List[Dict], pred_type: str):
-        """Extract features and labels from records"""
+    def create_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+        """Create advanced features for prediction"""
+        logger.info("Creating advanced features")
         
-        features = []
-        labels = []
+        # Make a copy to avoid modifying original
+        df_features = df.copy()
         
-        for record in records:
-            # Extract features from stored JSON
-            raw_features = record.get('features', {})
-            
-            if not raw_features or pred_type not in raw_features:
-                continue
-            
-            # Get features for specific prediction type
-            feature_vector = raw_features.get(pred_type)
-            
-            if feature_vector is None:
-                continue
-            
-            # Convert to numpy array
-            try:
-                if isinstance(feature_vector, list):
-                    feature_array = np.array(feature_vector)
-                else:
-                    feature_array = np.array([feature_vector])
+        # Basic features
+        features = {
+            'momentum_features': [],
+            'form_features': [],
+            'h2h_features': [],
+            'statistical_features': [],
+            'time_features': []
+        }
+        
+        # Team momentum features (last 5 games)
+        for team_type in ['home', 'away']:
+            df_features[f'{team_type}_form_last5'] = 0
+            df_features[f'{team_type}_goals_scored_last5'] = 0
+            df_features[f'{team_type}_goals_conceded_last5'] = 0
+            features['momentum_features'].extend([
+                f'{team_type}_form_last5',
+                f'{team_type}_goals_scored_last5',
+                f'{team_type}_goals_conceded_last5'
+            ])
+        
+        # Head-to-head features
+        df_features['h2h_avg_goals'] = 2.5  # Default
+        features['h2h_features'].append('h2h_avg_goals')
+        
+        # Statistical features
+        df_features['total_goals_avg'] = df_features.get('avg_goals', 2.5)
+        df_features['btts_percentage'] = df_features.get('btts_rate', 0.5)
+        features['statistical_features'].extend(['total_goals_avg', 'btts_percentage'])
+        
+        # Time features
+        df_features['hour_of_day'] = pd.to_datetime(df_features['timestamp']).dt.hour
+        df_features['day_of_week'] = pd.to_datetime(df_features['timestamp']).dt.dayofweek
+        df_features['month'] = pd.to_datetime(df_features['timestamp']).dt.month
+        features['time_features'].extend(['hour_of_day', 'day_of_week', 'month'])
+        
+        # Market features if available
+        if 'home_odds' in df_features.columns:
+            df_features['implied_prob_home'] = 1 / df_features['home_odds']
+            df_features['implied_prob_draw'] = 1 / df_features['draw_odds']
+            df_features['implied_prob_away'] = 1 / df_features['away_odds']
+            features['market_features'] = [
+                'implied_prob_home', 'implied_prob_draw', 'implied_prob_away'
+            ]
+        
+        # Combine all features
+        all_features = []
+        for feature_list in features.values():
+            all_features.extend(feature_list)
+        
+        # Handle missing values
+        imputer = SimpleImputer(strategy='median')
+        df_features[all_features] = imputer.fit_transform(df_features[all_features])
+        
+        logger.info(f"Created {len(all_features)} features")
+        return df_features[all_features], features
+    
+    def prepare_data(self, df: pd.DataFrame) -> Tuple[Dict[str, tuple], Dict[str, Any]]:
+        """Prepare data for each target variable"""
+        logger.info("Preparing training data")
+        
+        if df.empty:
+            raise ValueError("No data available for training")
+        
+        # Create features
+        X, feature_groups = self.create_features(df)
+        
+        # Prepare datasets for each target
+        datasets = {}
+        for target in self.target_columns:
+            if target in df.columns:
+                y = df[target].values
                 
-                features.append(feature_array)
+                # Split with time series validation
+                tscv = TimeSeriesSplit(n_splits=5)
                 
-                # Get label
-                actual_result = record.get('actual_result')
-                if actual_result:
-                    labels.append(actual_result)
-                    
-            except Exception as e:
-                logger.debug(f"Error processing features: {e}")
-                continue
+                # Use 80/20 split respecting time order
+                split_idx = int(len(X) * 0.8)
+                X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+                y_train, y_test = y[:split_idx], y[split_idx:]
+                
+                # Scale features
+                scaler = RobustScaler()
+                X_train_scaled = scaler.fit_transform(X_train)
+                X_test_scaled = scaler.transform(X_test)
+                
+                self.scalers[target] = scaler
+                datasets[target] = (X_train_scaled, X_test_scaled, y_train, y_test)
+                
+                logger.info(f"{target}: Train={len(X_train)}, Test={len(X_test)}")
         
-        if not features or not labels:
-            return np.array([]), np.array([])
-        
-        # Encode labels
-        if pred_type not in self.label_encoders:
-            self.label_encoders[pred_type] = LabelEncoder()
-        
-        le = self.label_encoders[pred_type]
-        labels_encoded = le.fit_transform(labels)
-        
-        # Convert to numpy arrays
-        X = np.vstack(features)
-        y = np.array(labels_encoded)
-        
-        return X, y
+        return datasets, feature_groups
     
-    def train_all_models(self, optimize: bool = True):
-        """Train all prediction models"""
+    def train_random_forest(self, X_train: np.ndarray, y_train: np.ndarray, 
+                           target_name: str) -> RandomForestClassifier:
+        """Train optimized Random Forest model"""
+        logger.info(f"Training Random Forest for {target_name}")
         
-        logger.info("Starting model training...")
+        # Optimized hyperparameters based on target
+        rf_params = {
+            'n_estimators': 200,
+            'max_depth': 15 if target_name in ['home_win', 'away_win'] else 10,
+            'min_samples_split': 5,
+            'min_samples_leaf': 2,
+            'max_features': 'sqrt',
+            'bootstrap': True,
+            'n_jobs': -1,
+            'random_state': 42,
+            'class_weight': 'balanced_subsample'
+        }
         
-        # Prepare data
-        X_train, X_test, y_train, y_test = self.prepare_training_data()
+        rf = RandomForestClassifier(**rf_params)
+        rf.fit(X_train, y_train)
         
-        if not X_train:
-            logger.error("No training data available")
-            return
+        # Calibrate probabilities
+        calibrated_rf = CalibratedClassifierCV(rf, method='sigmoid', cv=5)
+        calibrated_rf.fit(X_train, y_train)
         
-        # Train models
-        results = self.predictor.train_all(X_train, y_train, X_test, y_test)
+        # Store feature importance
+        self.feature_importance[target_name] = {
+            'features': list(range(X_train.shape[1])),
+            'importance': calibrated_rf.base_estimator.feature_importances_.tolist()
+        }
         
-        # Save scalers and encoders
-        self.save_preprocessors()
-        
-        # Log training results
-        self.log_training_results(results)
-        
-        # Save performance metrics to database
-        self.save_performance_metrics(results)
-        
-        logger.info("Model training completed")
-        return results
+        return calibrated_rf
     
-    def save_preprocessors(self):
-        """Save scalers and label encoders"""
+    def train_ensemble(self, X_train: np.ndarray, y_train: np.ndarray,
+                      target_name: str) -> VotingClassifier:
+        """Train ensemble model combining multiple algorithms"""
+        logger.info(f"Training Ensemble model for {target_name}")
         
-        preprocessors_dir = Path('data/models/preprocessors')
-        preprocessors_dir.mkdir(exist_ok=True)
+        # Define individual models
+        rf = RandomForestClassifier(
+            n_estimators=150,
+            max_depth=12,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1
+        )
+        
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            n_jobs=-1
+        )
+        
+        lgb_model = lgb.LGBMClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            num_leaves=31,
+            random_state=42,
+            n_jobs=-1
+        )
+        
+        # Create voting classifier
+        ensemble = VotingClassifier(
+            estimators=[
+                ('rf', rf),
+                ('xgb', xgb_model),
+                ('lgb', lgb_model)
+            ],
+            voting='soft',
+            weights=[1.5, 1.0, 1.0]  # Weight RF more heavily as requested
+        )
+        
+        ensemble.fit(X_train, y_train)
+        
+        # Calibrate the ensemble
+        calibrated_ensemble = CalibratedClassifierCV(ensemble, method='isotonic', cv=5)
+        calibrated_ensemble.fit(X_train, y_train)
+        
+        return calibrated_ensemble
+    
+    def evaluate_model(self, model, X_test: np.ndarray, y_test: np.ndarray, 
+                      target_name: str) -> Dict[str, float]:
+        """Evaluate model performance comprehensively"""
+        y_pred = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else y_pred
+        
+        metrics = {
+            'accuracy': accuracy_score(y_test, y_pred),
+            'precision': precision_score(y_test, y_pred, zero_division=0),
+            'recall': recall_score(y_test, y_pred, zero_division=0),
+            'f1': f1_score(y_test, y_pred, zero_division=0),
+            'roc_auc': roc_auc_score(y_test, y_pred_proba) if len(np.unique(y_test)) > 1 else 0,
+            'brier_score': np.mean((y_pred_proba - y_test) ** 2),
+            'log_loss': -np.mean(y_test * np.log(y_pred_proba + 1e-10) + 
+                                (1 - y_test) * np.log(1 - y_pred_proba + 1e-10))
+        }
+        
+        # Confusion matrix
+        cm = confusion_matrix(y_test, y_pred)
+        metrics['confusion_matrix'] = cm.tolist()
+        metrics['true_positives'] = cm[1, 1]
+        metrics['false_positives'] = cm[0, 1]
+        metrics['true_negatives'] = cm[0, 0]
+        metrics['false_negatives'] = cm[1, 0]
+        
+        logger.info(f"{target_name} Evaluation:")
+        for metric, value in metrics.items():
+            if isinstance(value, (int, float)):
+                logger.info(f"  {metric}: {value:.4f}")
+        
+        return metrics
+    
+    def save_models(self, model_type: str = 'ensemble'):
+        """Save trained models and scalers"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_dir = Path(f"models/{timestamp}")
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save models
+        for target, model in self.models.items():
+            model_path = model_dir / f"{target}_{model_type}.pkl"
+            joblib.dump(model, model_path)
+            logger.info(f"Saved model for {target} to {model_path}")
         
         # Save scalers
-        for pred_type, scaler in self.scalers.items():
-            joblib.dump(scaler, preprocessors_dir / f"{pred_type}_scaler.joblib")
+        scalers_path = model_dir / "scalers.pkl"
+        joblib.dump(self.scalers, scalers_path)
         
-        # Save label encoders
-        for pred_type, encoder in self.label_encoders.items():
-            joblib.dump(encoder, preprocessors_dir / f"{pred_type}_encoder.joblib")
+        # Save feature importance
+        importance_path = model_dir / "feature_importance.pkl"
+        joblib.dump(self.feature_importance, importance_path)
         
-        logger.info("Preprocessors saved")
+        # Update current model pointer
+        current_path = Path("models/current")
+        if current_path.exists():
+            current_path.unlink()
+        current_path.symlink_to(model_dir)
+        
+        logger.info(f"Models saved to {model_dir}")
+        return str(model_dir)
     
-    def log_training_results(self, results: Dict[str, Dict]):
-        """Log detailed training results"""
+    def load_latest_models(self) -> bool:
+        """Load the latest trained models"""
+        current_path = Path("models/current")
+        if not current_path.exists():
+            logger.warning("No current models found")
+            return False
         
-        logger.info("=== Training Results ===")
-        
-        for model_type, metrics in results.items():
-            logger.info(f"\n{model_type} Model:")
-            for metric, value in metrics.items():
-                logger.info(f"  {metric}: {value:.4f}")
+        try:
+            # Load models
+            for target in self.target_columns:
+                model_path = current_path / f"{target}_ensemble.pkl"
+                if model_path.exists():
+                    self.models[target] = joblib.load(model_path)
             
-            # Cross-validation scores
-            if model_type in self.predictor.models:
-                model = self.predictor.models[model_type]
-                if model.model and hasattr(model, 'classes_') and len(model.classes_) > 0:
-                    # Perform cross-validation
-                    X = np.vstack([self.X_train_all.get(model_type, []), 
-                                  self.X_test_all.get(model_type, [])])
-                    y = np.concatenate([self.y_train_all.get(model_type, []), 
-                                       self.y_test_all.get(model_type, [])])
-                    
-                    if len(X) > 0 and len(y) > 0:
-                        cv_scores = cross_val_score(
-                            model.model, X, y, cv=5, scoring='accuracy'
-                        )
-                        logger.info(f"  CV Accuracy: {cv_scores.mean():.4f} (±{cv_scores.std():.4f})")
+            # Load scalers
+            scalers_path = current_path / "scalers.pkl"
+            if scalers_path.exists():
+                self.scalers = joblib.load(scalers_path)
+            
+            logger.info("Loaded latest models successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading models: {e}")
+            return False
     
-    def save_performance_metrics(self, results: Dict[str, Dict]):
-        """Save performance metrics to database"""
+    def train_all_models(self, model_type: str = 'ensemble', days_back: int = 365) -> Dict:
+        """Train all prediction models"""
+        logger.info("Starting model training pipeline")
         
-        for model_type, metrics in results.items():
-            query = """
-            INSERT INTO model_performance (
-                model_type, version, accuracy, precision,
-                recall, f1_score, roc_auc, parameters,
-                feature_importance, training_date
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
+        try:
+            # Fetch data
+            df = self.fetch_training_data(days_back)
             
-            params = (
-                model_type,
-                os.getenv('MODEL_VERSION', 'v1.0'),
-                metrics.get('accuracy', 0),
-                metrics.get('precision', 0),
-                metrics.get('recall', 0),
-                metrics.get('f1_score', 0),
-                metrics.get('roc_auc', 0),
-                Json(self.predictor.models[model_type].best_params 
-                     if hasattr(self.predictor.models[model_type], 'best_params') 
-                     else {}),
-                Json(self.predictor.models[model_type].feature_importance 
-                     if hasattr(self.predictor.models[model_type], 'feature_importance') 
-                     else {}),
-                datetime.utcnow()
-            )
+            if df.empty or len(df) < 100:
+                logger.warning(f"Insufficient data: {len(df)} samples. Need at least 100.")
+                return {"success": False, "message": "Insufficient training data"}
             
-            self.db.execute_query(query, params)
-        
-        logger.info("Performance metrics saved to database")
-    
-    def evaluate_models(self):
-        """Evaluate models on test set"""
-        
-        logger.info("Evaluating models...")
-        
-        # Load test data
-        _, X_test, _, y_test = self.prepare_training_data(limit=5000)
-        
-        if not X_test:
-            logger.warning("No test data available")
-            return
-        
-        evaluations = {}
-        
-        for model_type, model in self.predictor.models.items():
-            if model.model is None:
-                continue
+            # Prepare data
+            datasets, feature_groups = self.prepare_data(df)
             
-            X_test_data = X_test.get(model_type)
-            y_test_data = y_test.get(model_type)
+            # Train models for each target
+            all_metrics = {}
+            for target, (X_train, X_test, y_train, y_test) in datasets.items():
+                logger.info(f"\nTraining model for {target}")
+                
+                # Train model
+                if model_type == 'ensemble':
+                    model = self.train_ensemble(X_train, y_train, target)
+                else:
+                    model = self.train_random_forest(X_train, y_train, target)
+                
+                # Evaluate
+                metrics = self.evaluate_model(model, X_test, y_test, target)
+                
+                # Store model
+                self.models[target] = model
+                all_metrics[target] = metrics
             
-            if X_test_data is None or y_test_data is None:
-                continue
+            # Save models
+            model_dir = self.save_models(model_type)
             
-            # Make predictions
-            y_pred = model.predict(X_test_data)
-            y_pred_proba = model.predict_proba(X_test_data)
+            # Calculate overall performance
+            avg_accuracy = np.mean([m['accuracy'] for m in all_metrics.values()])
+            avg_roc_auc = np.mean([m['roc_auc'] for m in all_metrics.values() 
+                                  if m['roc_auc'] > 0])
             
-            # Calculate metrics
-            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-            
-            metrics = {
-                'accuracy': accuracy_score(y_test_data, y_pred),
-                'precision': precision_score(y_test_data, y_pred, average='weighted'),
-                'recall': recall_score(y_test_data, y_pred, average='weighted'),
-                'f1': f1_score(y_test_data, y_pred, average='weighted')
+            result = {
+                "success": True,
+                "model_dir": model_dir,
+                "metrics": all_metrics,
+                "avg_accuracy": avg_accuracy,
+                "avg_roc_auc": avg_roc_auc,
+                "training_samples": len(df),
+                "feature_groups": feature_groups
             }
             
-            # Add ROC AUC for binary classification
-            if len(model.classes_) == 2:
-                from sklearn.metrics import roc_auc_score
-                metrics['roc_auc'] = roc_auc_score(y_test_data, y_pred_proba[:, 1])
+            logger.info(f"\nTraining completed:")
+            logger.info(f"Average Accuracy: {avg_accuracy:.4f}")
+            logger.info(f"Average ROC AUC: {avg_roc_auc:.4f}")
+            logger.info(f"Models saved to: {model_dir}")
             
-            evaluations[model_type] = metrics
+            # Log to database
+            self.log_training_session(result)
             
-            # Log detailed classification report
-            logger.info(f"\n{classification_report(y_test_data, y_pred)}")
+            return result
             
-            # Log confusion matrix
-            cm = confusion_matrix(y_test_data, y_pred)
-            logger.info(f"Confusion Matrix:\n{cm}")
-        
-        return evaluations
+        except Exception as e:
+            logger.error(f"Training failed: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
     
-    def optimize_thresholds(self):
-        """Optimize prediction thresholds for maximum profit"""
-        
-        logger.info("Optimizing prediction thresholds...")
-        
-        # This would analyze historical predictions to find optimal thresholds
-        # Implementation depends on your specific profit optimization goals
-        
-        # For now, use ROC curve to find optimal thresholds
-        optimal_thresholds = {}
-        
-        for model_type, model in self.predictor.models.items():
-            if model.model is None:
-                continue
+    def log_training_session(self, result: Dict):
+        """Log training session to database"""
+        try:
+            query = """
+            INSERT INTO training_sessions 
+            (timestamp, model_type, avg_accuracy, avg_roc_auc, 
+             training_samples, metrics, model_path)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """
             
-            # Load validation data
-            _, X_val, _, y_val = self.prepare_training_data(limit=3000)
-            
-            X_val_data = X_val.get(model_type)
-            y_val_data = y_val.get(model_type)
-            
-            if X_val_data is None or y_val_data is None:
-                continue
-            
-            # Get probabilities
-            y_proba = model.predict_proba(X_val_data)
-            
-            if len(model.classes_) == 2:
-                # Find optimal threshold using Youden's J statistic
-                from sklearn.metrics import roc_curve
-                
-                fpr, tpr, thresholds = roc_curve(y_val_data, y_proba[:, 1])
-                j_scores = tpr - fpr
-                optimal_idx = np.argmax(j_scores)
-                optimal_threshold = thresholds[optimal_idx]
-                
-                optimal_thresholds[model_type] = optimal_threshold
-                
-                logger.info(f"{model_type} optimal threshold: {optimal_threshold:.3f}")
-        
-        # Save optimal thresholds
-        thresholds_path = Path('data/models/optimal_thresholds.json')
-        import json
-        with open(thresholds_path, 'w') as f:
-            json.dump(optimal_thresholds, f)
-        
-        logger.info(f"Optimal thresholds saved to {thresholds_path}")
-        return optimal_thresholds
+            self.db_manager.execute_query(
+                query,
+                (
+                    datetime.now(),
+                    'ensemble',
+                    result['avg_accuracy'],
+                    result['avg_roc_auc'],
+                    result['training_samples'],
+                    str(result['metrics']),
+                    result['model_dir']
+                )
+            )
+            logger.info("Training session logged to database")
+        except Exception as e:
+            logger.error(f"Failed to log training session: {e}")
 
 def main():
     """Main training function"""
+    trainer = ModelTrainer()
     
-    from dotenv import load_dotenv
-    load_dotenv()
+    print("Starting model training...")
+    print("=" * 50)
     
-    # Initialize
-    db = DatabaseManager()
-    trainer = ModelTrainer(db)
+    result = trainer.train_all_models(model_type='ensemble', days_back=180)
     
-    # Create tables if needed
-    db.create_tables()
+    if result['success']:
+        print(f"\n✅ Training successful!")
+        print(f"📊 Average Accuracy: {result['avg_accuracy']:.4f}")
+        print(f"🎯 Average ROC AUC: {result['avg_roc_auc']:.4f}")
+        print(f"📁 Models saved to: {result['model_dir']}")
+    else:
+        print(f"\n❌ Training failed: {result.get('error', 'Unknown error')}")
     
-    # Train models
-    trainer.train_all_models(optimize=True)
-    
-    # Evaluate
-    trainer.evaluate_models()
-    
-    # Optimize thresholds
-    trainer.optimize_thresholds()
-    
-    logger.info("Training pipeline completed successfully")
+    return result
 
 if __name__ == "__main__":
     main()
