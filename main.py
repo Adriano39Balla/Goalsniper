@@ -12,7 +12,6 @@ import numpy as np
 from loguru import logger
 import joblib
 import traceback
-import psutil
 
 # Remove default handler and add custom format
 logger.remove()
