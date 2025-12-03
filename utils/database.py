@@ -45,35 +45,50 @@ class DatabaseManager:
                     return cursor.fetchall()
                 conn.commit()
     
-    def save_prediction(self, prediction_data: Dict[str, Any]) -> str:
+    def save_prediction(self, prediction_data: Dict[str, Any]) -> Optional[str]:
         """Save prediction to database"""
-        query = """
-        INSERT INTO predictions (
-            match_id, league_id, home_team, away_team,
-            prediction_type, prediction_value, confidence,
-            probability, features, model_version,
-            created_at, match_time
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-        """
+    
+        try:
+            query = """
+            INSERT INTO predictions (
+                match_id, league_id, home_team, away_team,
+                prediction_type, prediction_value, confidence,
+                probability, features, model_version,
+                created_at, match_time
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """
         
-        params = (
-            prediction_data['match_id'],
-            prediction_data['league_id'],
-            prediction_data['home_team'],
-            prediction_data['away_team'],
-            prediction_data['prediction_type'],
-            prediction_data['prediction_value'],
-            prediction_data['confidence'],
-            Json(prediction_data.get('probability', {})),
-            Json(prediction_data.get('features', {})),
-            prediction_data.get('model_version', 'v1.0'),
-            datetime.utcnow(),
-            prediction_data.get('match_time')
-        )
+            # Extract predictions
+            predictions = prediction_data.get('predictions', {})
         
-        result = self.execute_query(query, params, fetch=True)
-        return result[0]['id'] if result else None
+            # For now, save first prediction type found
+            # You might want to modify this to save all prediction types
+            for pred_type, pred_data in predictions.items():
+                params = (
+                    prediction_data.get('match_id'),
+                    prediction_data.get('league_id'),
+                    prediction_data.get('home_team'),
+                    prediction_data.get('away_team'),
+                    pred_type,
+                    pred_data.get('prediction'),
+                    float(pred_data.get('confidence', 0)),
+                    Json({'probability': pred_data.get('probability')}),
+                    Json(prediction_data.get('features', {})),
+                    os.getenv('MODEL_VERSION', 'v1.0'),
+                    datetime.utcnow(),
+                    prediction_data.get('match_time')
+                )
+            
+                result = self.execute_query(query, params, fetch=True)
+                if result:
+                    return str(result[0]['id'])
+        
+            return None
+        
+        except Exception as e:
+            logger.error(f"Error saving prediction: {e}")
+            return None
     
     def save_bet_result(self, prediction_id: str, result_data: Dict[str, Any]):
         """Save actual bet result for self-learning"""
