@@ -21,6 +21,7 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from collections import deque  # ADDED: For LRU cache
 
 # ───────── Env bootstrap ─────────
 try:
@@ -68,7 +69,7 @@ MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
 MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
 MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
-MOTD_HOUR               = int(os.getenv("MOTD_HOUR", "10"))
+MOTD_HOUR               = int(os.getenv("MOTD_HOUR", "19"))
 MOTD_MINUTE             = int(os.getenv("MOTD_MINUTE", "15"))
 MOTD_CONF_MIN           = float(os.getenv("MOTD_CONF_MIN", "70"))
 try:
@@ -91,10 +92,10 @@ TOTAL_MATCH_MINUTES   = int(os.getenv("TOTAL_MATCH_MINUTES", "95"))
 PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "2"))
 
 # ───────── Odds/EV controls ─────────
-MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU",   "1.30"))
+MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU", "1.30"))
 MIN_ODDS_BTTS = float(os.getenv("MIN_ODDS_BTTS", "1.30"))
-MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2",  "1.30"))
-MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL",  "20.0"))
+MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2", "1.30"))
+MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL", "20.0"))
 EDGE_MIN_BPS  = int(os.getenv("EDGE_MIN_BPS", "300"))  # 300 = +3.00%
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")  # optional API-Football book id
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","1") not in ("0","false","False","no","NO")
@@ -118,10 +119,58 @@ INPLAY_STATUSES = {"1H","HT","2H","ET","BT","P"}
 session = requests.Session()
 session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503,504], respect_retry_after_header=True)))
 
-# ───────── Caches & timezones ─────────
-STATS_CACHE:  Dict[int, Tuple[float, list]] = {}
-EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
-ODDS_CACHE:   Dict[int, Tuple[float, dict]] = {}
+# ───────── FIXED: LRU Caches with TTL and size limits ─────────
+class LRUCache:
+    """LRU cache with TTL and max size"""
+    def __init__(self, maxsize: int = 1000, ttl: int = 120):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self.cache = {}
+        self.order = deque()
+    
+    def get(self, key):
+        if key not in self.cache:
+            return None
+        
+        entry = self.cache[key]
+        if time.time() - entry['timestamp'] > self.ttl:
+            self.delete(key)
+            return None
+        
+        # Move to end (most recently used)
+        self.order.remove(key)
+        self.order.append(key)
+        return entry['value']
+    
+    def set(self, key, value):
+        if key in self.cache:
+            self.order.remove(key)
+        elif len(self.cache) >= self.maxsize:
+            # Remove least recently used
+            old_key = self.order.popleft()
+            del self.cache[old_key]
+        
+        self.cache[key] = {
+            'value': value,
+            'timestamp': time.time()
+        }
+        self.order.append(key)
+    
+    def delete(self, key):
+        if key in self.cache:
+            del self.cache[key]
+            if key in self.order:
+                self.order.remove(key)
+    
+    def clear(self):
+        self.cache.clear()
+        self.order.clear()
+
+# Initialize caches with size limits
+STATS_CACHE = LRUCache(maxsize=500, ttl=90)
+EVENTS_CACHE = LRUCache(maxsize=500, ttl=90)
+ODDS_CACHE = LRUCache(maxsize=200, ttl=120)
+
 SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
@@ -129,7 +178,9 @@ TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
 # ───────── Optional import: trainer ─────────
 try:
     from train_models import train_models
+    TRAIN_MODELS_AVAILABLE = True  # ADDED: Track availability
 except Exception as e:
+    TRAIN_MODELS_AVAILABLE = False  # ADDED
     _IMPORT_ERR = repr(e)
     def train_models(*args, **kwargs):  # type: ignore
         log.warning("train_models not available: %s", _IMPORT_ERR)
@@ -148,8 +199,15 @@ class PooledConn:
 
 def _init_pool():
     global POOL
-    dsn = DATABASE_URL + (("&" if "?" in DATABASE_URL else "?") + "sslmode=require" if "sslmode=" not in DATABASE_URL else "")
-    POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
+    dsn = DATABASE_URL
+    # FIXED: Proper SSL mode logic
+    if "sslmode=" not in dsn:
+        separator = "&" if "?" in dsn else "?"
+        dsn = dsn + separator + "sslmode=require"
+    
+    # FIXED: Increase max connections for better performance
+    max_conn = int(os.getenv("DB_POOL_MAX", "10"))
+    POOL = SimpleConnectionPool(minconn=1, maxconn=max_conn, dsn=dsn)
 
 def db_conn(): 
     if not POOL: _init_pool()
@@ -165,7 +223,11 @@ class _TTLCache:
         if time.time()-ts>self.ttl: self.data.pop(k,None); return None
         return val
     def set(self,k,v): self.data[k]=(time.time(),v)
-    def invalidate(self,k=None): self.data.clear() if k is None else self.data.pop(k,None)
+    def invalidate(self,k=None): 
+        if k is None: 
+            self.data.clear()
+        elif k in self.data:  # FIXED: Only clear specific key
+            self.data.pop(k,None)
 
 _SETTINGS_CACHE, _MODELS_CACHE = _TTLCache(SETTINGS_TTL), _TTLCache(MODELS_TTL)
 
@@ -184,7 +246,9 @@ def get_setting_cached(key: str) -> Optional[str]:
     return v
 
 def invalidate_model_caches_for_key(key: str):
-    if key.lower().startswith(("model","model_latest","model_v2","pre_")): _MODELS_CACHE.invalidate()
+    # FIXED: Only invalidate specific model, not entire cache
+    if key.lower().startswith(("model","model_latest","model_v2","pre_")):
+        _MODELS_CACHE.invalidate(key)
 
 # ───────── Init DB ─────────
 def init_db():
@@ -222,21 +286,36 @@ def init_db():
 
 # ───────── Telegram ─────────
 def send_telegram(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: 
+        log.warning("Telegram credentials missing")
+        return False
     try:
         r=session.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                        data={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}, timeout=10)
-        return r.ok
-    except Exception:
+        if r.ok:
+            log.info(f"Telegram sent: {text[:100]}...")
+            return True
+        else:
+            log.warning(f"Telegram failed: {r.status_code}")
+            return False
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
         return False
 
 # ───────── API helpers ─────────
 def _api_get(url: str, params: dict, timeout: int = 15):
-    if not API_KEY: return None
+    if not API_KEY: 
+        log.error("API_KEY missing")
+        return None
     try:
         r=session.get(url, headers=HEADERS, params=params, timeout=timeout)
+        if r.status_code == 429:
+            log.warning("API rate limited, waiting...")
+            time.sleep(60)
+            return None
         return r.json() if r.ok else None
-    except Exception:
+    except Exception as e:
+        log.error(f"API error {url}: {e}")
         return None
 
 # ───────── League filter ─────────
@@ -255,18 +334,20 @@ def _blocked_league(league_obj: dict) -> bool:
 
 # ───────── Live fetches ─────────
 def fetch_match_stats(fid: int) -> list:
-    now=time.time()
-    if fid in STATS_CACHE and now-STATS_CACHE[fid][0] < 90: return STATS_CACHE[fid][1]
+    cached = STATS_CACHE.get(fid)
+    if cached is not None: return cached
     js=_api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
     out=js.get("response",[]) if isinstance(js,dict) else []
-    STATS_CACHE[fid]=(now,out); return out
+    STATS_CACHE.set(fid, out)
+    return out
 
 def fetch_match_events(fid: int) -> list:
-    now=time.time()
-    if fid in EVENTS_CACHE and now-EVENTS_CACHE[fid][0] < 90: return EVENTS_CACHE[fid][1]
+    cached = EVENTS_CACHE.get(fid)
+    if cached is not None: return cached
     js=_api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
     out=js.get("response",[]) if isinstance(js,dict) else []
-    EVENTS_CACHE[fid]=(now,out); return out
+    EVENTS_CACHE.set(fid, out)
+    return out
 
 def fetch_live_matches() -> List[dict]:
     js=_api_get(FOOTBALL_API_URL, {"live":"all"}) or {}
@@ -291,8 +372,8 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
     return js.get("response",[]) if isinstance(js,dict) else []
 
 def _collect_todays_prematch_fixtures() -> List[dict]:
-    today_local=datetime.now(ZoneInfo("Europe/Berlin")).date()
-    start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=ZoneInfo("Europe/Berlin"))
+    today_local=datetime.now(BERLIN_TZ).date()
+    start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
     end_local=start_local+timedelta(days=1)
     dates_utc={start_local.astimezone(TZ_UTC).date(), (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
     fixtures=[]
@@ -424,11 +505,8 @@ def _min_odds_for_market(market: str) -> float:
     return 1.01
 
 def _odds_cache_get(fid: int) -> Optional[dict]:
-    rec=ODDS_CACHE.get(fid)
-    if not rec: return None
-    ts,data=rec
-    if time.time()-ts>120: ODDS_CACHE.pop(fid,None); return None
-    return data
+    cached = ODDS_CACHE.get(fid)
+    return cached
 
 def _market_name_normalize(s: str) -> str:
     s=(s or "").lower()
@@ -450,6 +528,7 @@ def fetch_odds(fid: int) -> dict:
     """
     cached=_odds_cache_get(fid)
     if cached is not None: return cached
+    
     params={"fixture": fid}
     if ODDS_BOOKMAKER_ID: params["bookmaker"] = ODDS_BOOKMAKER_ID
     js=_api_get(f"{BASE_URL}/odds", params) or {}
@@ -492,18 +571,21 @@ def fetch_odds(fid: int) -> dict:
                                 by_line.setdefault(key,{}).update({side: {"odds":float(v.get("odd") or 0),"book":book_name}})
                             except: pass
                     for k,v in by_line.items(): out[k]=v
-        ODDS_CACHE[fid]=(time.time(), out)
-    except Exception:
+        ODDS_CACHE.set(fid, out)
+    except Exception as e:
+        log.error(f"Failed to parse odds for fixture {fid}: {e}")
         out={}
     return out
 
-def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
+def _price_gate(market_text: str, suggestion: str, fid: int, probability: float) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
     Return (pass, odds, book, ev_pct). If odds missing:
       - pass if ALLOW_TIPS_WITHOUT_ODDS else block.
     """
     odds_map=fetch_odds(fid) if API_KEY else {}
     odds=None; book=None
+    
+    # FIXED: Extract target correctly
     if market_text=="BTTS":
         d=odds_map.get("BTTS",{})
         tgt="Yes" if suggestion.endswith("Yes") else "No"
@@ -513,20 +595,38 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
         tgt="Home" if suggestion=="Home Win" else ("Away" if suggestion=="Away Win" else None)
         if tgt and tgt in d: odds=d[tgt]["odds"]; book=d[tgt]["book"]
     elif market_text.startswith("Over/Under"):
-        ln=_fmt_line(float(suggestion.split()[1]))
-        d=odds_map.get(f"OU_{ln}",{})
-        tgt="Over" if suggestion.startswith("Over") else "Under"
-        if tgt in d: odds=d[tgt]["odds"]; book=d[tgt]["book"]
+        parts = suggestion.split()
+        if len(parts) >= 2:
+            try:
+                ln=float(parts[1])
+                line_key = _fmt_line(ln)
+                d=odds_map.get(f"OU_{line_key}",{})
+                tgt="Over" if suggestion.startswith("Over") else "Under"
+                if tgt in d: odds=d[tgt]["odds"]; book=d[tgt]["book"]
+            except ValueError:
+                pass
 
     if odds is None:
+        log.debug(f"No odds found for {market_text}: {suggestion}")
         return (ALLOW_TIPS_WITHOUT_ODDS, None, None, None)
 
     # price range gates
     min_odds=_min_odds_for_market(market_text)
     if not (min_odds <= odds <= MAX_ODDS_ALL):
+        log.debug(f"Odds {odds} outside range {min_odds}-{MAX_ODDS_ALL}")
         return (False, odds, book, None)
 
-    return (True, odds, book, None)
+    # FIXED: Calculate EV properly
+    ev_decimal = _ev(probability, odds)
+    ev_pct = round(ev_decimal * 100.0, 1)
+    ev_bps = int(round(ev_decimal * 10000))
+    
+    if ev_bps < EDGE_MIN_BPS:
+        log.debug(f"EV {ev_bps}bps below threshold {EDGE_MIN_BPS}bps")
+        return (False, odds, book, ev_pct)
+
+    log.debug(f"Price gate passed: odds={odds}, ev={ev_pct}%")
+    return (True, odds, book, ev_pct)
 
 # ───────── Snapshots ─────────
 def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
@@ -703,7 +803,7 @@ def production_scan() -> Tuple[int,int]:
                 if minute < TIP_MIN_MINUTE: continue
                 if HARVEST_MODE and minute>=TRAIN_MIN_MINUTE and minute%3==0:
                     try: save_snapshot_from_match(m, feat)
-                    except: pass
+                    except Exception as e: log.error(f"Snapshot error: {e}")
 
                 league_id, league=_league_name(m); home,away=_teams(m); score=_pretty_score(m)
                 candidates: List[Tuple[str,str,float]]=[]
@@ -743,16 +843,10 @@ def production_scan() -> Tuple[int,int]:
                     if suggestion not in ALLOWED_SUGGESTIONS: continue
                     if per_match >= max(1,PREDICTIONS_PER_MATCH): break
 
-                    # Odds/EV gate
-                    pass_odds, odds, book, _ = _price_gate(market_txt, suggestion, fid)
+                    # FIXED: Pass probability to _price_gate
+                    pass_odds, odds, book, ev_pct = _price_gate(market_txt, suggestion, fid, prob)
                     if not pass_odds: 
                         continue
-                    ev_pct=None
-                    if odds is not None:
-                        edge=_ev(prob, odds)  # decimal (e.g. 0.05)
-                        ev_pct=round(edge*100.0,1)
-                        if int(round(edge*10000)) < EDGE_MIN_BPS:  # basis points compare
-                            continue
 
                     created_ts=base_now+idx
                     raw=float(prob); prob_pct=round(raw*100.0,1)
@@ -765,6 +859,10 @@ def production_scan() -> Tuple[int,int]:
                          (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None))
                     )
 
+                    # FIXED: Define _send_tip function
+                    def _send_tip(home,away,league,minute,score,suggestion,prob_pct,feat,odds=None,book=None,ev_pct=None)->bool:
+                        return send_telegram(_format_tip_message(home,away,league,minute,score,suggestion,prob_pct,feat,odds,book,ev_pct))
+                    
                     sent=_send_tip(home,away,league,minute,score,suggestion,float(prob_pct),feat,odds,book,ev_pct)
                     if sent:
                         c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(fid,created_ts))
@@ -826,6 +924,7 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, 
         f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}"
     )
 
+# FIXED: Define _send_tip function properly
 def _send_tip(home,away,league,minute,score,suggestion,prob_pct,feat,odds=None,book=None,ev_pct=None)->bool:
     return send_telegram(_format_tip_message(home,away,league,minute,score,suggestion,prob_pct,feat,odds,book,ev_pct))
 
@@ -868,8 +967,8 @@ def prematch_scan_save() -> int:
         for idx,(mk,sug,prob) in enumerate(candidates):
             if sug not in ALLOWED_SUGGESTIONS: continue
             if per_match>=max(1,PREDICTIONS_PER_MATCH): break
-            # Odds/EV gate
-            pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ",""), sug, fid)
+            # FIXED: Pass probability to _price_gate
+            pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ",""), sug, fid, prob)
             if not pass_odds: continue
             ev_pct=None
             if odds is not None:
@@ -884,9 +983,14 @@ def prematch_scan_save() -> int:
             saved+=1; per_match+=1
     log.info("[PREMATCH] saved=%d", saved); return saved
 
-# ───────── Auto-train / tune / retry (unchanged signatures) ─────────
+# ───────── Auto-train / tune / retry ─────────
 def auto_train_job():
-    if not TRAIN_ENABLE: send_telegram("🤖 Training skipped: TRAIN_ENABLE=0"); return
+    if not TRAIN_ENABLE: 
+        send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
+        return
+    if not TRAIN_MODELS_AVAILABLE:
+        send_telegram("⚠️ Training skipped: train_models module not available")
+        return
     send_telegram("🤖 Training started.")
     try:
         res=train_models() or {}; ok=bool(res.get("ok"))
@@ -987,8 +1091,8 @@ def send_match_of_the_day() -> bool:
         if prob_pct < MOTD_CONF_MIN:
             continue
 
-        # Odds/EV (reuse in-play price gate; market text must be without "PRE ")
-        pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
+        # FIXED: Pass probability to _price_gate
+        pass_odds, odds, book, _ = _price_gate(mk, sug, fid, prob)
         if not pass_odds:
             continue
 
