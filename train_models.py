@@ -10,9 +10,11 @@ import time
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 import psycopg2
+from pathlib import Path
 from psycopg2 import OperationalError
 
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -80,6 +82,9 @@ ADVANCED_FEATURES: List[str] = [
 ]
 
 FEATURES = BASE_FEATURES + ADVANCED_FEATURES
+
+MODEL_DIR = Path("models")
+MODEL_DIR.mkdir(exist_ok=True)
 
 EPS = 1e-6
 
@@ -485,6 +490,47 @@ class AdvancedEnsembleModel:
         self.selector: Optional[SelectKBest] = None
         self.selected_features: List[str] = []
         log.info(f"🎯 Initializing AdvancedEnsembleModel for {market}")
+
+    def save_model(self, market: str):
+        """Save trained model to disk"""
+        try:
+            model_data = {
+                'market': market,
+                'models': self.models,
+                'scaler': self.scaler,
+                'selector': self.selector,
+                'selected_features': self.selected_features,
+                'training_time': time.time()
+            }
+            
+            model_path = MODEL_DIR / f"{market}.joblib"
+            joblib.dump(model_data, model_path)
+            log.info(f"💾 Saved model to {model_path}")
+            return True
+        except Exception as e:
+            log.error(f"❌ Failed to save model for {market}: {e}")
+            return False
+
+    @classmethod
+    def load_model(cls, market: str):
+        """Load trained model from disk"""
+        try:
+            model_path = MODEL_DIR / f"{market}.joblib"
+            if not model_path.exists():
+                return None
+                
+            model_data = joblib.load(model_path)
+            model = cls(market)
+            model.models = model_data.get('models', {})
+            model.scaler = model_data.get('scaler')
+            model.selector = model_data.get('selector')
+            model.selected_features = model_data.get('selected_features', [])
+            
+            log.info(f"✅ Loaded trained model for {market}")
+            return model
+        except Exception as e:
+            log.error(f"❌ Failed to load model for {market}: {e}")
+            return None
 
     def train(
         self,
@@ -993,6 +1039,9 @@ def train_advanced_market_model(
         log.error("Training error for %s: %s", market, res["error"])
         return None
 
+    # Save the actual sklearn model to disk
+    model.save_model(market)
+    
     return {
         "model_type": "advanced_ensemble",
         "selected_features": res["selected_features"],
@@ -1310,7 +1359,7 @@ def train_models(
                     _store_advanced_model(conn, key, mdl)
                     results["trained"][market] = True
                     results["models_trained"] += 1
-                    log.info(f"✅ Successfully trained {market}")
+                    log.info(f"✅ Successfully trained and saved {market}")
                 else:
                     results["trained"][market] = False
                     results["errors"].append(
