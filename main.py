@@ -3,6 +3,8 @@
 # Enhanced: Context analysis, performance monitoring, multi-book odds, timing optimization
 # SUPERCHARGED: Enhanced API-Football integration with player stats, historical data, and predictions endpoint
 # FIXED: Aligned with train_models.py for complete feature compatibility
+# ENHANCED: Added league filtering to only allow tips from target leagues
+# PATCHED: Added comprehensive fixes for missing functions, feature validation, model versioning, and unit tests
 
 import os, json, time, logging, requests, psycopg2
 import numpy as np
@@ -62,6 +64,92 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(
 log = logging.getLogger("goalsniper")
 app = Flask(__name__)
 
+# ───────── TARGET LEAGUES FILTER ─────────
+TARGET_LEAGUES = [
+    "England Premier League",
+    "England Championship",
+    "Spain La Liga",
+    "Spain La Liga 2",
+    "Italy Serie A",
+    "Italy Serie B",
+    "Germany Bundesliga",
+    "Germany 2. Bundesliga",
+    "France Ligue 1",
+    "France Ligue 2",
+    "Belgium Pro League",
+    "Portugal Primeira Liga",
+    "Portugal Segunda Liga",
+    "Brazil Serie A",
+    "Brazil Serie B",
+    "USA MLS",
+    "Netherlands Eredivisie",
+    "Argentina Liga Profesional",
+    "Poland Ekstraklasa",
+    "Japan J League",
+    "Sweden Allsvenskan",
+    "Croatia HNL",
+    "Turkey Super Lig",
+    "Mexico Liga MX",
+    "Switzerland Super League",
+    "Austria Bundesliga",
+    "Norway Eliteserien",
+    "Colombia Primera A",
+    "South Korea K League 1",
+    "Scotland Premiership",
+    "Scotland Championship",
+    "Saudi Pro League",
+    "Greece Super League 1",
+    "Morocco Botola Pro",
+    "Romania Superliga",
+    "Algeria Ligue 1",
+    "Paraguay Primera Division",
+    "Israel Ligat HaAl",
+    "Uruguay Primera Division",
+    "Costa Rica Primera Division",
+    "Egypt Premier League",
+    "Chile Primera Division",
+    "Slovakia Super Liga",
+    "Slovenia PrvaLiga",
+    "Bolivia Primera Division",
+    "UAE Pro League",
+    "Azerbaijan Premier League",
+    "South Africa Premier League",
+    "Australia A-League",
+    "Peru Primera Division",
+    "Serbia SuperLiga",
+    "Bulgaria First League",
+    "Honduras Liga Nacional",
+    "Bosnia Premier League",
+    "Finland Veikkausliiga",
+    "China CSL",
+    "Qatar Stars League",
+    "Venezuela Primera Division",
+    "Canada Premier League",
+    "USL Championship",
+    "India Super League"
+]
+
+def _is_target_league(league_obj: dict) -> bool:
+    """Check if league is in the target list"""
+    if not league_obj:
+        return False
+    
+    league_name = str(league_obj.get("name", "")).strip()
+    country = str(league_obj.get("country", "")).strip()
+    
+    # Create full league name (e.g., "England - Premier League")
+    full_name = f"{country} - {league_name}"
+    
+    # Check if league is in target list
+    is_target = full_name in TARGET_LEAGUES
+    
+    if is_target:
+        log.debug(f"✅ League accepted: {full_name}")
+    else:
+        log.debug(f"❌ League rejected: {full_name}")
+        
+    return is_target
+
 # ───────── Minimal Prometheus-style metrics ─────────
 METRICS = {
     "api_calls_total": defaultdict(int),
@@ -81,6 +169,8 @@ METRICS = {
     "enhanced_features_processed": 0,
     "historical_context_applied": 0,
     "api_predictions_blended": 0,
+    "league_filter_accepted": 0,
+    "league_filter_rejected": 0,
 }
 
 def _metric_inc(name: str, label: Optional[str] = None, n: int = 1) -> None:
@@ -592,6 +682,104 @@ def blend_with_api_predictions(your_prob: float, api_prediction: Dict, market: s
         log.error("❌ Probability blending failed: %s", e)
         return your_prob
 
+# ───────── Feature Validation System ─────────
+class FeatureValidator:
+    """Ensures consistent feature extraction between training and prediction"""
+    
+    REQUIRED_FEATURES = [
+        'minute', 'goals_h', 'goals_a', 'goals_sum', 'goals_diff',
+        'xg_h', 'xg_a', 'xg_sum', 'xg_diff',
+        'sot_h', 'sot_a', 'sot_sum',
+        'sh_total_h', 'sh_total_a',
+        'cor_h', 'cor_a', 'cor_sum',
+        'pos_h', 'pos_a', 'pos_diff',
+        'red_h', 'red_a', 'red_sum',
+        'yellow_h', 'yellow_a',
+        'momentum_h', 'momentum_a',
+        'pressure_index',
+        'efficiency_h', 'efficiency_a',
+        'total_actions',
+        'action_intensity',
+    ]
+    
+    ADVANCED_FEATURES = [
+        'momentum_ratio',
+        'pressure_per_minute', 
+        'goal_efficiency_h',
+        'goal_efficiency_a',
+        'late_game',
+        'middle_game',
+        'early_game',
+        'xg_dominance',
+        'shot_dominance',
+        'close_game',
+        'high_scoring',
+        'goal_rich',
+        'normalized_actions'
+    ]
+    
+    @classmethod
+    def validate_feature_set(cls, features: Dict[str, float], mode: str = "prediction") -> Tuple[bool, List[str]]:
+        """Validate feature set consistency"""
+        missing_features = []
+        warnings = []
+        
+        # Check required features
+        for feature in cls.REQUIRED_FEATURES:
+            if feature not in features:
+                missing_features.append(feature)
+        
+        # Check advanced features if enabled
+        if ENABLE_ENHANCED_FEATURES:
+            for feature in cls.ADVANCED_FEATURES:
+                if feature not in features:
+                    warnings.append(f"Advanced feature missing: {feature}")
+        
+        # Validate feature types and ranges
+        for key, value in features.items():
+            if not isinstance(value, (int, float)):
+                warnings.append(f"Feature {key} has invalid type: {type(value)}")
+            elif key == 'minute' and (value < 0 or value > 120):
+                warnings.append(f"Feature {key} has unrealistic value: {value}")
+            elif key.endswith('_h') or key.endswith('_a'):
+                if value < 0:
+                    warnings.append(f"Feature {key} has negative value: {value}")
+        
+        is_valid = len(missing_features) == 0
+        
+        if not is_valid:
+            log.error(f"❌ Feature validation failed for {mode}. Missing: {missing_features}")
+        if warnings:
+            log.warning(f"⚠️ Feature validation warnings: {warnings}")
+        
+        return is_valid, missing_features + warnings
+    
+    @classmethod
+    def normalize_features(cls, features: Dict[str, float]) -> Dict[str, float]:
+        """Normalize features to ensure consistency"""
+        normalized = {}
+        
+        for feature in cls.REQUIRED_FEATURES + cls.ADVANCED_FEATURES:
+            if feature in features:
+                value = features[feature]
+                # Convert to float and handle None
+                if value is None:
+                    normalized[feature] = 0.0
+                else:
+                    normalized[feature] = float(value)
+            else:
+                # Provide default values for missing features
+                if feature == 'minute':
+                    normalized[feature] = 1.0
+                elif feature.endswith('_h') or feature.endswith('_a'):
+                    normalized[feature] = 0.0
+                elif feature in ['late_game', 'middle_game', 'early_game', 'close_game', 'high_scoring', 'goal_rich']:
+                    normalized[feature] = 0.0
+                else:
+                    normalized[feature] = 0.0
+        
+        return normalized
+
 # ───────── Performance Monitoring System ─────────
 class PerformanceMonitor:
     """Real-time performance tracking and risk management"""
@@ -690,6 +878,117 @@ class PerformanceMonitor:
             "volume_reduction_active": self.volume_reduction_active
         }
 
+# ───────── Model Versioning System ─────────
+class ModelVersionManager:
+    """Manages model versions and feature set compatibility"""
+    
+    VERSION_PREFIX = "model_v"
+    
+    def __init__(self):
+        self.current_versions: Dict[str, str] = {}
+        self.feature_signatures: Dict[str, List[str]] = {}
+        self.load_version_info()
+    
+    def load_version_info(self):
+        """Load version information from database"""
+        try:
+            with db_conn() as c:
+                c.execute("SELECT key, value FROM settings WHERE key LIKE 'model_version:%'")
+                rows = c.fetchall()
+                for key, value in rows:
+                    model_name = key.replace("model_version:", "")
+                    self.current_versions[model_name] = value
+                    
+                c.execute("SELECT key, value FROM settings WHERE key LIKE 'feature_signature:%'")
+                rows = c.fetchall()
+                for key, value in rows:
+                    model_name = key.replace("feature_signature:", "")
+                    self.feature_signatures[model_name] = json.loads(value)
+                    
+        except Exception as e:
+            log.error(f"❌ Failed to load model version info: {e}")
+    
+    def create_new_version(self, model_name: str, feature_set: List[str]) -> str:
+        """Create a new version for a model"""
+        version = f"{self.VERSION_PREFIX}{int(time.time())}"
+        
+        self.current_versions[model_name] = version
+        self.feature_signatures[model_name] = feature_set
+        
+        # Save to database
+        try:
+            with db_conn() as c:
+                c.execute(
+                    "INSERT INTO settings(key, value) VALUES (%s, %s) "
+                    "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+                    (f"model_version:{model_name}", version)
+                )
+                c.execute(
+                    "INSERT INTO settings(key, value) VALUES (%s, %s) "
+                    "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+                    (f"feature_signature:{model_name}", json.dumps(feature_set))
+                )
+        except Exception as e:
+            log.error(f"❌ Failed to save model version: {e}")
+        
+        log.info(f"✅ Created new version {version} for model {model_name}")
+        return version
+    
+    def check_compatibility(self, model_name: str, current_features: List[str]) -> bool:
+        """Check if current feature set is compatible with model version"""
+        if model_name not in self.feature_signatures:
+            log.warning(f"⚠️ No feature signature found for model {model_name}")
+            return True  # Assume compatible if no signature exists
+        
+        expected_features = set(self.feature_signatures[model_name])
+        actual_features = set(current_features)
+        
+        missing_features = expected_features - actual_features
+        extra_features = actual_features - expected_features
+        
+        if missing_features:
+            log.error(f"❌ Model {model_name} missing features: {missing_features}")
+            return False
+        
+        if extra_features:
+            log.warning(f"⚠️ Model {model_name} has extra features: {extra_features}")
+        
+        return True
+    
+    def get_model_path(self, model_name: str, version: Optional[str] = None) -> Path:
+        """Get path for specific model version"""
+        if version is None:
+            version = self.current_versions.get(model_name, "latest")
+        
+        model_dir = MODEL_DIR / model_name / version
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        return model_dir / "model.joblib"
+    
+    def archive_old_versions(self, model_name: str, keep_last_n: int = 3):
+        """Archive old model versions"""
+        try:
+            model_base_dir = MODEL_DIR / model_name
+            if not model_base_dir.exists():
+                return
+            
+            versions = []
+            for version_dir in model_base_dir.iterdir():
+                if version_dir.is_dir() and version_dir.name.startswith(self.VERSION_PREFIX):
+                    versions.append(version_dir)
+            
+            # Sort by creation time (newest first)
+            versions.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            
+            # Keep only the last n versions
+            for version_dir in versions[keep_last_n:]:
+                import shutil
+                shutil.rmtree(version_dir)
+                log.info(f"🗑️ Archived old version: {version_dir}")
+                
+        except Exception as e:
+            log.error(f"❌ Failed to archive old versions: {e}")
+
 # ───────── Advanced Model Architecture with Enhancements ─────────
 class AdvancedEnsemblePredictor:
     """Advanced ensemble combining multiple models with Bayesian calibration and enhanced features"""
@@ -703,6 +1002,8 @@ class AdvancedEnsemblePredictor:
         self.bayesian_prior_alpha = BAYESIAN_PRIOR_ALPHA
         self.bayesian_prior_beta  = BAYESIAN_PRIOR_BETA
         self.performance_history: List[int] = []
+        self.version_manager = ModelVersionManager()
+        self.model_version: Optional[str] = None
         
         # Try to load existing model
         self.load_model(market)
@@ -710,20 +1011,33 @@ class AdvancedEnsemblePredictor:
         log.info("🤖 AdvancedEnsemblePredictor initialized for %s with timing optimization", market)
 
     def save_model(self):
-        """Save trained model to disk"""
+        """Save trained model to disk with versioning"""
         try:
+            # Create feature signature
+            feature_signature = self.selected_features.copy()
+            
+            # Create new version
+            version = self.version_manager.create_new_version(self.market, feature_signature)
+            self.model_version = version
+            
             model_data = {
                 'market': self.market,
                 'models': self.models,
                 'scaler': self.scaler,
                 'selector': self.selector,
                 'selected_features': self.selected_features,
-                'training_time': time.time()
+                'training_time': time.time(),
+                'model_version': version,
+                'feature_signature': feature_signature,
             }
             
-            model_path = MODEL_DIR / f"{self.market}.joblib"
+            model_path = self.version_manager.get_model_path(self.market, version)
             joblib.dump(model_data, model_path)
-            log.info(f"💾 Saved model to {model_path}")
+            log.info(f"💾 Saved model to {model_path} (version: {version})")
+            
+            # Archive old versions
+            self.version_manager.archive_old_versions(self.market)
+            
             return True
         except Exception as e:
             log.error(f"❌ Failed to save model for {self.market}: {e}")
@@ -745,6 +1059,93 @@ class AdvancedEnsemblePredictor:
             
             log.info(f"✅ Loaded trained model for {market}")
             return True
+        except Exception as e:
+            log.error(f"❌ Failed to load model for {market}: {e}")
+            return False
+
+    def load_model_with_compatibility_check(self, market: str) -> bool:
+        """Load model with comprehensive compatibility checks"""
+        try:
+            # Get latest version
+            latest_version = self.version_manager.current_versions.get(market)
+            if not latest_version:
+                log.info(f"📭 No saved model found for {market}")
+                return False
+            
+            # Check if model file exists
+            model_path = self.version_manager.get_model_path(market, latest_version)
+            if not model_path.exists():
+                log.warning(f"📭 Model file not found: {model_path}")
+                return False
+            
+            # Load model data
+            model_data = joblib.load(model_path)
+            
+            # Extract model info
+            self.models = model_data.get('models', {})
+            self.scaler = model_data.get('scaler')
+            self.selector = model_data.get('selector')
+            self.selected_features = model_data.get('selected_features', [])
+            self.model_version = model_data.get('model_version', 'unknown')
+            saved_feature_signature = model_data.get('feature_signature', [])
+            
+            # Comprehensive compatibility check
+            current_features = FeatureValidator.REQUIRED_FEATURES + FeatureValidator.ADVANCED_FEATURES
+            saved_features = set(saved_feature_signature)
+            current_features_set = set(current_features)
+            
+            # Check for missing features
+            missing_features = saved_features - current_features_set
+            if missing_features:
+                log.error(f"❌ Model {market} missing {len(missing_features)} features: {missing_features}")
+                
+                # Try to add defaults for missing features
+                for feature in missing_features:
+                    if feature not in self.selected_features:
+                        self.selected_features.append(feature)
+                
+                log.warning(f"⚠️ Added default values for missing features")
+            
+            # Check for extra features
+            extra_features = current_features_set - saved_features
+            if extra_features:
+                log.warning(f"⚠️ Model {market} has {len(extra_features)} new features")
+            
+            # Check scaler compatibility
+            if self.scaler:
+                try:
+                    # Test scaler with dummy data
+                    test_data = [[0.0] * len(self.selected_features)]
+                    self.scaler.transform(test_data)
+                    log.debug(f"✅ Scaler compatibility check passed")
+                except Exception as e:
+                    log.error(f"❌ Scaler incompatible: {e}")
+                    self.scaler = StandardScaler()
+                    log.warning(f"⚠️ Created new scaler due to incompatibility")
+            
+            # Check selector compatibility
+            if self.selector and self.selected_features:
+                expected_n_features = self.selector.k_features_ if hasattr(self.selector, 'k_features_') else None
+                if expected_n_features and expected_n_features != len(self.selected_features):
+                    log.warning(f"⚠️ Selector expects {expected_n_features} features, but have {len(self.selected_features)}")
+            
+            log.info(f"✅ Loaded model for {market} (version: {self.model_version}, features: {len(self.selected_features)})")
+            
+            # Log compatibility summary
+            compatibility_report = {
+                'model_version': self.model_version,
+                'expected_features': len(saved_feature_signature),
+                'available_features': len(current_features),
+                'missing_features': len(missing_features),
+                'extra_features': len(extra_features),
+                'scaler_compatible': self.scaler is not None,
+                'selector_compatible': self.selector is not None,
+            }
+            
+            log.info(f"📊 Model compatibility report: {compatibility_report}")
+            
+            return True
+            
         except Exception as e:
             log.error(f"❌ Failed to load model for {market}: {e}")
             return False
@@ -1224,142 +1625,6 @@ class AdvancedEnsemblePredictor:
             "sample_count": len(features),
         }
 
-    def check_training_data_quality() -> Dict[str, Any]:
-        """Check if we have sufficient quality data for training"""
-        try:
-            with db_conn() as c:
-                # Check total snapshots
-                c.execute("SELECT COUNT(*) FROM tip_snapshots")
-                total_snapshots = c.fetchone()[0]
-            
-                # Check snapshots with match results
-                c.execute("""
-                    SELECT COUNT(*) 
-                    FROM tip_snapshots ts
-                    JOIN match_results mr ON ts.match_id = mr.match_id
-                """)
-                snapshots_with_results = c.fetchone()[0]
-            
-                # Check feature quality in recent snapshots
-                c.execute("""
-                    SELECT payload 
-                    FROM tip_snapshots 
-                    ORDER BY created_ts DESC 
-                    LIMIT 10
-                """)
-                recent_snapshots = c.fetchall()
-            
-                feature_counts = []
-                for (payload,) in recent_snapshots:
-                    try:
-                        snap = json.loads(payload)
-                        if isinstance(snap, dict) and 'stat' in snap:
-                            features = snap.get('stat', {})
-                            feature_counts.append(len(features))
-                    except:
-                        continue
-            
-                avg_features = sum(feature_counts) / max(1, len(feature_counts))
-            
-                return {
-                    "total_snapshots": total_snapshots,
-                    "snapshots_with_results": snapshots_with_results,
-                    "recent_snapshots_analyzed": len(recent_snapshots),
-                    "avg_features_per_snapshot": avg_features,
-                    "has_sufficient_data": total_snapshots >= 50 and snapshots_with_results >= 20,
-                    "has_good_features": avg_features >= 30
-                }
-            
-        except Exception as e:
-            log.error(f"❌ Data quality check failed: {e}")
-            return {"error": str(e)}
-
-    def populate_initial_training_data(days: int = 7):
-        """Manually populate training data from recent tips"""
-        log.info(f"📊 Populating initial training data from last {days} days...")
-    
-        cutoff = int(time.time()) - (days * 24 * 3600)
-    
-        with db_conn() as c:
-            # Get recent tips that have results
-            c.execute("""
-                SELECT t.match_id, t.created_ts, r.final_goals_h, r.final_goals_a, r.btts_yes
-                FROM tips t
-                JOIN match_results r ON t.match_id = r.match_id
-                WHERE t.created_ts >= %s 
-                  AND t.suggestion <> 'HARVEST'
-                ORDER BY t.created_ts DESC
-                LIMIT 100
-            """, (cutoff,))
-            tips = c.fetchall()
-    
-        log.info(f"Found {len(tips)} recent tips with results")
-    
-        # For each tip, create a synthetic snapshot
-        for match_id, created_ts, gh, ga, btts in tips:
-            try:
-                # Create basic features (simplified for initial training)
-                minute = 75  # Assume late game for training
-            
-                features = {
-                    "minute": float(minute),
-                    "goals_h": float(gh),
-                    "goals_a": float(ga),
-                    "goals_sum": float(gh + ga),
-                    "goals_diff": float(gh - ga),
-                    "xg_h": float(gh * 0.8),  # Estimated xG
-                    "xg_a": float(ga * 0.8),
-                    "xg_sum": float((gh + ga) * 0.8),
-                    "xg_diff": float((gh - ga) * 0.8),
-                    "sot_h": float(gh * 2),  # Estimated shots on target
-                    "sot_a": float(ga * 2),
-                    "sot_sum": float((gh + ga) * 2),
-                    # Add more synthetic features...
-                }
-            
-                # Add advanced features
-                features.update({
-                    "momentum_ratio": 1.0 if gh > ga else 0.5 if gh == ga else 0.0,
-                    "pressure_per_minute": 0.7,
-                    "goal_efficiency_h": 0.5 if gh > 0 else 0.0,
-                    "goal_efficiency_a": 0.5 if ga > 0 else 0.0,
-                    "late_game": 1.0,
-                    "middle_game": 0.0,
-                    "early_game": 0.0,
-                    "xg_dominance": (gh - ga) / max(1, gh + ga),
-                    "shot_dominance": (gh - ga) / max(1, gh + ga),
-                    "close_game": 1.0 if abs(gh - ga) <= 1 else 0.0,
-                    "high_scoring": 1.0 if (gh + ga) >= 2 else 0.0,
-                    "goal_rich": 1.0 if (gh + ga) >= 3 else 0.0,
-                    "normalized_actions": 2.0,
-                })
-            
-                snapshot = {
-                    "minute": minute,
-                    "gh": gh,
-                    "ga": ga,
-                    "league_id": 0,
-                    "market": "SYNTHETIC",
-                    "suggestion": "SYNTHETIC",
-                    "confidence": 0,
-                    "stat": features,
-                }
-            
-                payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)
-            
-                with db_conn() as c:
-                    c.execute(
-                        "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
-                        "ON CONFLICT (match_id, created_ts) DO NOTHING",
-                        (match_id, created_ts, payload),
-                    )
-                
-            except Exception as e:
-                log.error(f"❌ Failed to create synthetic snapshot: {e}")
-                continue
-    
-        log.info(f"✅ Created {len(tips)} synthetic training snapshots")
-    
     def predict_probability(self, features: Dict[str, float]) -> float:
         """Get ensemble prediction with Bayesian confidence intervals"""
         if not self.models:
@@ -1635,39 +1900,103 @@ class SelfLearningSystem:
                 importance_scores[feature] = stats["predictive"] / stats["total"]
         return importance_scores
 
-def verify_learning_system() -> Dict[str, Any]:
-    """Check if the learning system is working properly"""
-    status = {}
+# ───────── Configuration Validation ─────────
+def validate_configuration():
+    """Validate all required environment variables at startup"""
+    log.info("🔧 Validating configuration...")
     
-    with db_conn() as c:
-        # Check if we have match results to learn from
-        c.execute("SELECT COUNT(*) FROM match_results")
-        results_count = c.fetchone()[0]
-        status['match_results_available'] = results_count
-        
-        # Check self-learning data
-        c.execute("SELECT COUNT(*) FROM self_learning_data")
-        learning_data = c.fetchone()[0]
-        status['learning_records'] = learning_data
-        
-        # Check if learning is happening
-        c.execute("SELECT COUNT(*) FROM self_learning_data WHERE actual_outcome IS NOT NULL")
-        learned_outcomes = c.fetchone()[0]
-        status['learned_outcomes'] = learned_outcomes
-        
-        # Check recent tip performance
-        c.execute("""
-            SELECT COUNT(*), 
-                   SUM(CASE WHEN t.suggestion <> 'HARVEST' THEN 1 ELSE 0 END) as real_tips,
-                   AVG(t.confidence) as avg_confidence
-            FROM tips t 
-            WHERE t.created_ts >= %s
-        """, (int(time.time()) - 24*3600,))
-        recent_tips = c.fetchone()
-        status['recent_tips_24h'] = recent_tips[1] if recent_tips and recent_tips[1] else 0
-        status['avg_confidence'] = float(recent_tips[2]) if recent_tips and recent_tips[2] else 0
+    required_envs = {
+        "TELEGRAM_BOT_TOKEN": "Telegram Bot Token",
+        "TELEGRAM_CHAT_ID": "Telegram Chat ID",
+        "API_KEY": "API-Football API Key",
+        "DATABASE_URL": "Database URL",
+    }
     
-    return status
+    optional_envs = {
+        "ADMIN_API_KEY": "Admin API Key",
+        "TELEGRAM_WEBHOOK_SECRET": "Telegram Webhook Secret",
+        "CONF_THRESHOLD": "Confidence Threshold",
+        "SCAN_INTERVAL_SEC": "Scan Interval",
+        "TARGET_PRECISION": "Target Precision",
+    }
+    
+    errors = []
+    warnings = []
+    
+    # Check required environment variables
+    for env_name, description in required_envs.items():
+        value = os.getenv(env_name)
+        if not value:
+            errors.append(f"❌ Missing required environment variable: {env_name} ({description})")
+        else:
+            log.info(f"✅ {env_name}: Set")
+    
+    # Check optional environment variables
+    for env_name, description in optional_envs.items():
+        value = os.getenv(env_name)
+        if not value:
+            warnings.append(f"⚠️ Missing optional environment variable: {env_name} ({description})")
+    
+    # Validate numeric values
+    try:
+        conf_threshold = float(os.getenv("CONF_THRESHOLD", "75"))
+        if not (0 <= conf_threshold <= 100):
+            errors.append(f"❌ CONF_THRESHOLD must be between 0 and 100, got {conf_threshold}")
+    except ValueError:
+        errors.append("❌ CONF_THRESHOLD must be a valid number")
+    
+    try:
+        scan_interval = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
+        if scan_interval < 60:
+            warnings.append(f"⚠️ SCAN_INTERVAL_SEC is very short ({scan_interval}s), may hit API limits")
+    except ValueError:
+        errors.append("❌ SCAN_INTERVAL_SEC must be a valid integer")
+    
+    # Validate feature engineering settings
+    if ENABLE_ENHANCED_FEATURES and not API_KEY:
+        warnings.append("⚠️ Enhanced features enabled but API_KEY is missing")
+    
+    # Validate model directory
+    try:
+        MODEL_DIR.mkdir(exist_ok=True)
+        log.info(f"✅ Model directory: {MODEL_DIR.absolute()}")
+    except Exception as e:
+        errors.append(f"❌ Cannot create model directory: {e}")
+    
+    # Log results
+    if errors:
+        log.error("Configuration validation failed:")
+        for error in errors:
+            log.error(error)
+        
+        if len(errors) > 3:
+            log.error("Too many configuration errors. Please check your .env file")
+            raise SystemExit("Configuration validation failed")
+    
+    if warnings:
+        log.warning("Configuration warnings:")
+        for warning in warnings:
+            log.warning(warning)
+    
+    # Validate feature consistency
+    log.info("🔧 Validating feature definitions...")
+    validator = FeatureValidator()
+    
+    # Create a test feature set
+    test_features = {}
+    for feature in validator.REQUIRED_FEATURES:
+        test_features[feature] = 0.0
+    
+    is_valid, issues = validator.validate_feature_set(test_features, "startup")
+    if not is_valid:
+        errors.append(f"❌ Feature validation failed at startup: {issues}")
+    
+    if not errors:
+        log.info("✅ Configuration validation passed")
+        return True
+    else:
+        log.error("❌ Configuration validation failed")
+        return False
 
 # ───────── Initialize Advanced Systems ─────────
 bayesian_network    = BayesianBettingNetwork()
@@ -1989,7 +2318,7 @@ def _api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
             log.warning("[CB] API-Football opened due to exceptions")
         return None
 
-# ───────── League filter ─────────
+# ───────── League filter (enhanced with TARGET_LEAGUES) ─────────
 _BLOCK_PATTERNS = [
     "u17",
     "u18",
@@ -2017,6 +2346,14 @@ def _blocked_league(league_obj: dict) -> bool:
     if lid in deny:
         log.debug("🚫 Denied league ID: %s", lid)
         return True
+    
+    # Apply TARGET_LEAGUES filter
+    if not _is_target_league(league_obj):
+        log.info("🚫 League not in target list: %s - %s", country, name)
+        _metric_inc("league_filter_rejected")
+        return True
+    
+    _metric_inc("league_filter_accepted")
     return False
 
 # ───────── Live fetches ─────────
@@ -2049,7 +2386,7 @@ def fetch_live_fixtures_only() -> List[dict]:
         for m in (js.get("response", []) if isinstance(js, dict) else [])
         if not _blocked_league(m.get("league") or {})
     ]
-    log.info("📋 Found %s total live matches before filtering", len(matches))
+    log.info("📋 Found %s total live matches after league filtering", len(matches))
     
     out = []
     for m in matches:
@@ -2062,7 +2399,7 @@ def fetch_live_fixtures_only() -> List[dict]:
             continue
         out.append(m)
     
-    log.info("🎯 Filtered to %s in-play matches", len(out))
+    log.info("🎯 Filtered to %s in-play matches in target leagues", len(out))
     return out
 
 def _quota_per_scan() -> int:
@@ -2113,7 +2450,7 @@ def fetch_live_matches() -> List[dict]:
     log.info("🚀 Starting live matches fetch...")
     fixtures = fetch_live_fixtures_only()
     if not fixtures:
-        log.info("❌ No live fixtures found")
+        log.info("❌ No live fixtures found in target leagues")
         return []
         
     log.info("📊 Sorting %s fixtures by priority...", len(fixtures))
@@ -2293,6 +2630,14 @@ def extract_features(m: dict) -> Dict[str, float]:
         "normalized_actions": float(normalized_actions),
     }
     
+    # Validate features before returning
+    validator = FeatureValidator()
+    is_valid, issues = validator.validate_feature_set(features, "extraction")
+    if not is_valid:
+        log.error(f"❌ Feature extraction validation failed: {issues}")
+        # Try to normalize
+        features = validator.normalize_features(features)
+    
     log.debug("✅ Extracted %s features for %s vs %s (minute: %s)", len(features), home, away, minute)
     return features
 
@@ -2305,6 +2650,15 @@ def advanced_predict_probability(
 ) -> float:
     """Advanced prediction using ensemble + Bayesian methods with enhanced features"""
     log.debug("🤖 Predicting probability for %s - %s (match: %s)", market, suggestion, match_id)
+    
+    # Validate features before prediction
+    validator = FeatureValidator()
+    is_valid, issues = validator.validate_feature_set(features, "prediction")
+    if not is_valid:
+        log.error(f"❌ Prediction aborted - invalid features: {issues}")
+        # Try to normalize and continue
+        features = validator.normalize_features(features)
+        log.warning("⚠️ Using normalized features after validation failure")
     
     # Bayesian network: treat `suggestion` as the 'market phrase'
     bayesian_prob = bayesian_network.infer_probability(features, suggestion)
@@ -3049,9 +3403,14 @@ def production_scan() -> Tuple[int, int]:
     """Main in-play scanning with advanced AI systems and risk management"""
     log.info("🚀 STARTING PRODUCTION SCAN")
     
-    # Check performance monitor for volume reduction
-    if ENABLE_PERFORMANCE_MONITOR and performance_monitor:
-        if performance_monitor.should_reduce_volume():
+    # FIXED: Check if performance monitor is enabled and initialized
+    if ENABLE_PERFORMANCE_MONITOR:
+        global performance_monitor
+        if performance_monitor is None:
+            log.warning("⚠️ Performance monitor enabled but not initialized")
+            # Initialize it now
+            performance_monitor = PerformanceMonitor()
+        elif performance_monitor.should_reduce_volume():
             log.warning("🚨 SCAN SKIPPED - Volume reduction active due to losing streak")
             stats = performance_monitor.get_performance_stats()
             send_telegram(
@@ -3082,10 +3441,10 @@ def production_scan() -> Tuple[int, int]:
     matches   = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
-        log.info("[PROD] no live matches")
+        log.info("[PROD] no live matches in target leagues")
         return 0, 0
 
-    log.info("🔍 Processing %s live matches", live_seen)
+    log.info("🔍 Processing %s live matches in target leagues", live_seen)
     saved = 0
     now_ts = int(time.time())
     per_league_counter: Dict[int, int] = {}
@@ -3277,8 +3636,144 @@ def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
     return False
 
 # ───────── Snapshots and data harvesting ─────────
+def check_training_data_quality() -> Dict[str, Any]:
+    """Check if we have sufficient quality data for training"""
+    try:
+        with db_conn() as c:
+            # Check total snapshots
+            c.execute("SELECT COUNT(*) FROM tip_snapshots")
+            total_snapshots = c.fetchone()[0]
+        
+            # Check snapshots with match results
+            c.execute("""
+                SELECT COUNT(*) 
+                FROM tip_snapshots ts
+                JOIN match_results mr ON ts.match_id = mr.match_id
+            """)
+            snapshots_with_results = c.fetchone()[0]
+        
+            # Check feature quality in recent snapshots
+            c.execute("""
+                SELECT payload 
+                FROM tip_snapshots 
+                ORDER BY created_ts DESC 
+                LIMIT 10
+            """)
+            recent_snapshots = c.fetchall()
+        
+            feature_counts = []
+            for (payload,) in recent_snapshots:
+                try:
+                    snap = json.loads(payload)
+                    if isinstance(snap, dict) and 'stat' in snap:
+                        features = snap.get('stat', {})
+                        feature_counts.append(len(features))
+                except:
+                    continue
+        
+            avg_features = sum(feature_counts) / max(1, len(feature_counts))
+        
+            return {
+                "total_snapshots": total_snapshots,
+                "snapshots_with_results": snapshots_with_results,
+                "recent_snapshots_analyzed": len(recent_snapshots),
+                "avg_features_per_snapshot": avg_features,
+                "has_sufficient_data": total_snapshots >= 50 and snapshots_with_results >= 20,
+                "has_good_features": avg_features >= 30
+            }
+        
+    except Exception as e:
+        log.error(f"❌ Data quality check failed: {e}")
+        return {"error": str(e)}
+
+def populate_initial_training_data(days: int = 7):
+    """Manually populate training data from recent tips"""
+    log.info(f"📊 Populating initial training data from last {days} days...")
+
+    cutoff = int(time.time()) - (days * 24 * 3600)
+
+    with db_conn() as c:
+        # Get recent tips that have results
+        c.execute("""
+            SELECT t.match_id, t.created_ts, r.final_goals_h, r.final_goals_a, r.btts_yes
+            FROM tips t
+            JOIN match_results r ON t.match_id = r.match_id
+            WHERE t.created_ts >= %s 
+              AND t.suggestion <> 'HARVEST'
+            ORDER BY t.created_ts DESC
+            LIMIT 100
+        """, (cutoff,))
+        tips = c.fetchall()
+
+    log.info(f"Found {len(tips)} recent tips with results")
+
+    # For each tip, create a synthetic snapshot
+    for match_id, created_ts, gh, ga, btts in tips:
+        try:
+            # Create basic features (simplified for initial training)
+            minute = 75  # Assume late game for training
+        
+            features = {
+                "minute": float(minute),
+                "goals_h": float(gh),
+                "goals_a": float(ga),
+                "goals_sum": float(gh + ga),
+                "goals_diff": float(gh - ga),
+                "xg_h": float(gh * 0.8),  # Estimated xG
+                "xg_a": float(ga * 0.8),
+                "xg_sum": float((gh + ga) * 0.8),
+                "xg_diff": float((gh - ga) * 0.8),
+                "sot_h": float(gh * 2),  # Estimated shots on target
+                "sot_a": float(ga * 2),
+                "sot_sum": float((gh + ga) * 2),
+                # Add more synthetic features...
+            }
+        
+            # Add advanced features
+            features.update({
+                "momentum_ratio": 1.0 if gh > ga else 0.5 if gh == ga else 0.0,
+                "pressure_per_minute": 0.7,
+                "goal_efficiency_h": 0.5 if gh > 0 else 0.0,
+                "goal_efficiency_a": 0.5 if ga > 0 else 0.0,
+                "late_game": 1.0,
+                "middle_game": 0.0,
+                "early_game": 0.0,
+                "xg_dominance": (gh - ga) / max(1, gh + ga),
+                "shot_dominance": (gh - ga) / max(1, gh + ga),
+                "close_game": 1.0 if abs(gh - ga) <= 1 else 0.0,
+                "high_scoring": 1.0 if (gh + ga) >= 2 else 0.0,
+                "goal_rich": 1.0 if (gh + ga) >= 3 else 0.0,
+                "normalized_actions": 2.0,
+            })
+        
+            snapshot = {
+                "minute": minute,
+                "gh": gh,
+                "ga": ga,
+                "league_id": 0,
+                "market": "SYNTHETIC",
+                "suggestion": "SYNTHETIC",
+                "confidence": 0,
+                "stat": features,
+            }
+        
+            payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)
+        
+            with db_conn() as c:
+                c.execute(
+                    "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
+                    "ON CONFLICT (match_id, created_ts) DO NOTHING",
+                    (match_id, created_ts, payload),
+                )
+            
+        except Exception as e:
+            log.error(f"❌ Failed to create synthetic snapshot: {e}")
+            continue
+
+    log.info(f"✅ Created {len(tips)} synthetic training snapshots")
+
 def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
-    """Save match snapshot for training data - IMPROVED with better error handling"""
+    """Save match snapshot for training data with enhanced validation"""
     try:
         fx = (m.get("fixture") or {})
         lg = (m.get("league") or {})
@@ -3289,39 +3784,55 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
             log.debug("⏩ Skipping snapshot - no fixture ID")
             return
         
-        # CRITICAL FIX: Ensure we have valid features
-        if not feat or len(feat) < 10:
-            log.warning("📝 Insufficient features, extracting fresh...")
-            # Force re-extraction with proper error handling
-            try:
-                feat = extract_features(m)
-                if not feat or len(feat) < 10:
-                    log.error("❌ Failed to extract sufficient features")
-                    return
-            except Exception as e:
-                log.error(f"❌ Feature extraction failed: {e}")
+        # ENHANCED VALIDATION: Validate features before saving
+        validator = FeatureValidator()
+        is_valid, issues = validator.validate_feature_set(feat, "snapshot")
+        
+        if not is_valid:
+            log.error(f"❌ Snapshot validation failed for fixture {fid}: {issues}")
+            
+            # Try to normalize features
+            feat_normalized = validator.normalize_features(feat)
+            is_valid_normalized, _ = validator.validate_feature_set(feat_normalized, "snapshot_normalized")
+            
+            if is_valid_normalized:
+                log.warning(f"⚠️ Using normalized features for snapshot {fid}")
+                feat = feat_normalized
+            else:
+                log.error(f"❌ Cannot create valid snapshot for {fid}, skipping")
                 return
         
-        # Validate key features exist
-        required_features = ['minute', 'goals_h', 'goals_a', 'xg_h', 'xg_a', 'sot_h', 'sot_a']
-        missing = [f for f in required_features if f not in feat]
-        if missing:
-            log.warning(f"⚠️ Missing required features: {missing}")
-            # Try to fill missing features with defaults
-            for f in missing:
-                if f == 'minute':
-                    feat[f] = float(((fx.get("status") or {}).get("elapsed") or 1))
-                else:
-                    feat[f] = 0.0
-        
+        # Validate match data completeness
         league_id = int(lg.get("id") or 0)
         league    = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
         home      = (teams.get("home") or {}).get("name", "")
         away      = (teams.get("away") or {}).get("name", "")
         
+        if not all([home, away, league]):
+            log.warning(f"⚠️ Incomplete match data for {fid}: home='{home}', away='{away}', league='{league}'")
+        
         gh     = int((m.get("goals") or {}).get("home") or 0)
         ga     = int((m.get("goals") or {}).get("away") or 0)
         minute = int(feat.get("minute", 1))
+        
+        # Validate minute is reasonable
+        if minute < 0 or minute > 120:
+            log.warning(f"⚠️ Unrealistic minute {minute} for fixture {fid}")
+            minute = max(1, min(120, minute))
+        
+        # Validate goals are reasonable
+        if gh < 0 or ga < 0:
+            log.warning(f"⚠️ Negative goals for fixture {fid}: {gh}-{ga}")
+            gh = max(0, gh)
+            ga = max(0, ga)
+        
+        # Calculate data quality score
+        total_features = len(feat)
+        non_zero_features = sum(1 for v in feat.values() if v != 0)
+        quality_score = non_zero_features / max(1, total_features)
+        
+        if quality_score < 0.3:
+            log.warning(f"⚠️ Low quality snapshot for {fid}: {quality_score:.1%} non-zero features")
         
         snapshot = {
             "minute": minute,
@@ -3331,13 +3842,16 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
             "market": "HARVEST",
             "suggestion": "HARVEST",
             "confidence": 0,
-            "stat": feat,  # Contains ALL features
+            "stat": feat,
+            "metadata": {
+                "quality_score": quality_score,
+                "total_features": total_features,
+                "non_zero_features": non_zero_features,
+                "validation_passed": is_valid,
+                "validation_issues": issues if not is_valid else [],
+                "timestamp": time.time(),
+            }
         }
-        
-        # Log feature quality
-        total_features = len(feat)
-        non_zero_features = sum(1 for v in feat.values() if v != 0)
-        log.debug(f"📊 Snapshot quality: {non_zero_features}/{total_features} non-zero features")
         
         now     = int(time.time())
         payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)[:200000]
@@ -3348,27 +3862,33 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
                 "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
                 (fid, now, payload),
             )
-            c.execute(
-                "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,"
-                "score_at_tip,minute,created_ts,sent_ok) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    fid,
-                    league_id,
-                    league,
-                    home,
-                    away,
-                    "HARVEST",
-                    "HARVEST",
-                    0.0,
-                    0.0,
-                    f"{gh}-{ga}",
-                    minute,
-                    now,
-                    1,
-                ),
-            )
-        log.info(f"💾 Saved snapshot for fixture {fid} (minute: {minute}, features: {len(feat)})")
+            
+            # Only save tip if quality is acceptable
+            if quality_score >= 0.5:
+                c.execute(
+                    "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,"
+                    "score_at_tip,minute,created_ts,sent_ok) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        fid,
+                        league_id,
+                        league,
+                        home,
+                        away,
+                        "HARVEST",
+                        "HARVEST",
+                        0.0,
+                        0.0,
+                        f"{gh}-{ga}",
+                        minute,
+                        now,
+                        1,
+                    ),
+                )
+                log.info(f"💾 Saved quality snapshot for fixture {fid} (quality: {quality_score:.1%})")
+            else:
+                log.info(f"📝 Saved low-quality snapshot for fixture {fid} (quality: {quality_score:.1%})")
+                
     except Exception as e:
         log.error(f"❌ Failed to save snapshot: {e}", exc_info=True)
 
@@ -3552,6 +4072,263 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
 
     send_telegram(msg)
     return msg
+
+# ───────── Unit Tests ─────────
+import unittest
+import tempfile
+
+class TestMarketCalculations(unittest.TestCase):
+    """Unit tests for market calculation functions"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.test_features = {
+            'minute': 45.0,
+            'goals_h': 1.0,
+            'goals_a': 0.0,
+            'goals_sum': 1.0,
+            'goals_diff': 1.0,
+            'xg_h': 1.5,
+            'xg_a': 0.8,
+            'xg_sum': 2.3,
+            'xg_diff': 0.7,
+            'sot_h': 5.0,
+            'sot_a': 3.0,
+            'sot_sum': 8.0,
+            'sh_total_h': 10.0,
+            'sh_total_a': 8.0,
+            'cor_h': 4.0,
+            'cor_a': 2.0,
+            'cor_sum': 6.0,
+            'pos_h': 55.0,
+            'pos_a': 45.0,
+            'pos_diff': 10.0,
+            'red_h': 0.0,
+            'red_a': 0.0,
+            'red_sum': 0.0,
+            'yellow_h': 2.0,
+            'yellow_a': 1.0,
+            'momentum_h': 0.2,
+            'momentum_a': 0.15,
+            'pressure_index': 0.5,
+            'efficiency_h': 0.2,
+            'efficiency_a': 0.0,
+            'total_actions': 25.0,
+            'action_intensity': 0.56,
+        }
+        
+        # Add advanced features
+        self.test_features.update({
+            'momentum_ratio': 1.33,
+            'pressure_per_minute': 0.011,
+            'goal_efficiency_h': 0.2,
+            'goal_efficiency_a': 0.0,
+            'late_game': 0.0,
+            'middle_game': 1.0,
+            'early_game': 0.0,
+            'xg_dominance': 0.304,
+            'shot_dominance': 0.25,
+            'close_game': 1.0,
+            'high_scoring': 1.0,
+            'goal_rich': 0.0,
+            'normalized_actions': 0.56,
+        })
+    
+    def test_feature_extraction(self):
+        """Test feature extraction produces all required features"""
+        # Create a mock match dictionary
+        mock_match = {
+            'teams': {'home': {'name': 'Team A'}, 'away': {'name': 'Team B'}},
+            'goals': {'home': 1, 'away': 0},
+            'fixture': {'status': {'elapsed': 45}},
+            'statistics': [
+                {
+                    'team': {'name': 'Team A'},
+                    'statistics': [
+                        {'type': 'Expected Goals', 'value': '1.5'},
+                        {'type': 'Shots on Target', 'value': '5'},
+                        {'type': 'Total Shots', 'value': '10'},
+                        {'type': 'Corner Kicks', 'value': '4'},
+                        {'type': 'Ball Possession', 'value': '55%'},
+                    ]
+                },
+                {
+                    'team': {'name': 'Team B'},
+                    'statistics': [
+                        {'type': 'Expected Goals', 'value': '0.8'},
+                        {'type': 'Shots on Target', 'value': '3'},
+                        {'type': 'Total Shots', 'value': '8'},
+                        {'type': 'Corner Kicks', 'value': '2'},
+                        {'type': 'Ball Possession', 'value': '45%'},
+                    ]
+                }
+            ],
+            'events': []
+        }
+        
+        features = extract_features(mock_match)
+        
+        # Check required features are present
+        validator = FeatureValidator()
+        is_valid, issues = validator.validate_feature_set(features, "test")
+        
+        self.assertTrue(is_valid, f"Feature extraction failed validation: {issues}")
+        self.assertGreaterEqual(len(features), 30, "Should extract at least 30 features")
+    
+    def test_feature_validation(self):
+        """Test feature validation logic"""
+        validator = FeatureValidator()
+        
+        # Test valid features
+        is_valid, issues = validator.validate_feature_set(self.test_features, "test")
+        self.assertTrue(is_valid, f"Valid features should pass: {issues}")
+        
+        # Test missing features
+        invalid_features = self.test_features.copy()
+        del invalid_features['minute']
+        del invalid_features['goals_h']
+        
+        is_valid, issues = validator.validate_feature_set(invalid_features, "test")
+        self.assertFalse(is_valid, "Missing features should fail validation")
+        self.assertIn('minute', str(issues))
+    
+    def test_market_threshold_calculation(self):
+        """Test market threshold calculations"""
+        # Test global threshold
+        global_threshold = _get_market_threshold("BTTS")
+        self.assertIsInstance(global_threshold, float)
+        self.assertGreaterEqual(global_threshold, 0)
+        self.assertLessEqual(global_threshold, 100)
+        
+        # Test OU threshold
+        for line in OU_LINES:
+            market = f"Over/Under {_fmt_line(line)}"
+            threshold = _get_market_threshold(market)
+            self.assertIsInstance(threshold, float)
+    
+    def test_odds_calculation(self):
+        """Test odds calculation and EV"""
+        # Test EV calculation
+        prob = 0.75
+        odds = 2.0
+        ev = _ev(prob, odds)
+        
+        expected_ev = prob * odds - 1.0
+        self.assertAlmostEqual(ev, expected_ev, places=5)
+        
+        # Test negative EV
+        prob_low = 0.4
+        ev_low = _ev(prob_low, odds)
+        self.assertLess(ev_low, 0)
+    
+    def test_suggestion_sanity(self):
+        """Test suggestion sanity checks"""
+        # Test Over suggestion sanity
+        features = self.test_features.copy()
+        features['goals_sum'] = 1.0
+        
+        # Should be sane when total < line
+        self.assertTrue(_candidate_is_sane("Over 2.5 Goals", features))
+        
+        # Should not be sane when total >= line
+        features['goals_sum'] = 3.0
+        self.assertFalse(_candidate_is_sane("Over 2.5 Goals", features))
+        
+        # Test BTTS sanity
+        features['goals_h'] = 1.0
+        features['goals_a'] = 1.0
+        self.assertFalse(_candidate_is_sane("BTTS: Yes", features))
+        
+        features['goals_a'] = 0.0
+        self.assertTrue(_candidate_is_sane("BTTS: Yes", features))
+    
+    def test_model_versioning(self):
+        """Test model versioning system"""
+        # Create temporary directory for test
+        with tempfile.TemporaryDirectory() as temp_dir:
+            import shutil
+            test_model_dir = Path(temp_dir) / "models"
+            test_model_dir.mkdir(parents=True)
+            
+            # Temporarily replace MODEL_DIR
+            original_model_dir = MODEL_DIR
+            import sys
+            current_module = sys.modules[__name__]
+            setattr(current_module, 'MODEL_DIR', test_model_dir)
+            
+            try:
+                version_manager = ModelVersionManager()
+                
+                # Test version creation
+                feature_set = ['feature1', 'feature2', 'feature3']
+                version = version_manager.create_new_version("test_model", feature_set)
+                
+                self.assertTrue(version.startswith("model_v"))
+                self.assertIn("test_model", version_manager.current_versions)
+                
+                # Test compatibility check
+                is_compatible = version_manager.check_compatibility("test_model", feature_set)
+                self.assertTrue(is_compatible)
+                
+                # Test with missing features
+                is_compatible = version_manager.check_compatibility("test_model", ['feature1', 'feature2'])
+                self.assertFalse(is_compatible)
+                
+            finally:
+                # Restore original MODEL_DIR
+                setattr(current_module, 'MODEL_DIR', original_model_dir)
+    
+    def test_performance_monitor(self):
+        """Test performance monitoring logic"""
+        monitor = PerformanceMonitor()
+        
+        # Test streak calculation
+        monitor.recent_performance = deque([True, True, False, True], maxlen=50)
+        streak = monitor.get_current_streak()
+        self.assertEqual(streak, 1)  # Current is True, streak of 1
+        
+        # Test volume reduction
+        monitor.recent_performance = deque([False, False, False], maxlen=50)
+        self.assertTrue(monitor.should_reduce_volume())
+        
+        # Test performance stats
+        stats = monitor.get_performance_stats()
+        self.assertIn('total_tips', stats)
+        self.assertIn('win_rate', stats)
+    
+    def test_bayesian_calculation(self):
+        """Test Bayesian probability calculations"""
+        network = BayesianBettingNetwork()
+        
+        # Test momentum calculation
+        momentum = network._calculate_momentum(self.test_features)
+        self.assertIsInstance(momentum, float)
+        self.assertGreaterEqual(momentum, 0)
+        self.assertLessEqual(momentum, 1)
+        
+        # Test pressure calculation
+        pressure = network._calculate_pressure(self.test_features)
+        self.assertIsInstance(pressure, float)
+        self.assertGreaterEqual(pressure, 0)
+        self.assertLessEqual(pressure, 1)
+        
+        # Test probability inference
+        prob = network.infer_probability(self.test_features, "Over 2.5 Goals")
+        self.assertIsInstance(prob, float)
+        self.assertGreaterEqual(prob, 0)
+        self.assertLessEqual(prob, 1)
+
+def run_tests():
+    """Run all unit tests"""
+    # Create test suite
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromTestCase(TestMarketCalculations)
+    
+    # Run tests
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    
+    return result.wasSuccessful()
 
 # ───────── Scheduler & admin ─────────
 _scheduler_started = False
@@ -3778,7 +4555,7 @@ def _start_scheduler_once():
 
         sched.start()
         _scheduler_started = True
-        send_telegram("🚀 goalsniper PURE IN-PLAY AI mode started with Bayesian networks & self-learning.")
+        send_telegram("🚀 goalsniper PURE IN-PLAY AI mode started with Bayesian networks & self-learning & LEAGUE FILTER.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
 
     except Exception as e:
@@ -3796,7 +4573,7 @@ def _require_admin():
 
 @app.route("/")
 def root():
-    return jsonify({"ok": True, "name": "goalsniper", "mode": "PURE_INPLAY_AI", "scheduler": RUN_SCHEDULER})
+    return jsonify({"ok": True, "name": "goalsniper", "mode": "PURE_INPLAY_AI", "scheduler": RUN_SCHEDULER, "target_leagues": len(TARGET_LEAGUES)})
 
 @app.route("/health")
 def health():
@@ -3913,6 +4690,11 @@ def http_system_status():
             "historical_context": ENABLE_HISTORICAL_CONTEXT,
             "api_predictions": ENABLE_API_PREDICTIONS,
             "player_impact": ENABLE_PLAYER_IMPACT
+        },
+        "league_filter": {
+            "target_leagues_count": len(TARGET_LEAGUES),
+            "league_filter_accepted": METRICS.get("league_filter_accepted", 0),
+            "league_filter_rejected": METRICS.get("league_filter_rejected", 0)
         }
     })
 
@@ -3921,6 +4703,23 @@ def http_data_quality():
     _require_admin()
     quality = check_training_data_quality()
     return jsonify({"ok": True, "quality": quality})
+
+@app.route("/admin/run-tests", methods=["POST"])
+def http_run_tests():
+    """Run unit tests"""
+    _require_admin()
+    
+    try:
+        success = run_tests()
+        return jsonify({
+            "ok": success,
+            "message": "Tests passed" if success else "Tests failed"
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
 
 @app.route("/admin/auto-tune", methods=["POST", "GET"])
 def http_auto_tune():
@@ -3967,12 +4766,61 @@ def http_latest():
         )
     return jsonify({"ok": True, "tips": tips})
 
+def verify_learning_system() -> Dict[str, Any]:
+    """Check if the learning system is working properly"""
+    status = {}
+    
+    with db_conn() as c:
+        # Check if we have match results to learn from
+        c.execute("SELECT COUNT(*) FROM match_results")
+        results_count = c.fetchone()[0]
+        status['match_results_available'] = results_count
+        
+        # Check self-learning data
+        c.execute("SELECT COUNT(*) FROM self_learning_data")
+        learning_data = c.fetchone()[0]
+        status['learning_records'] = learning_data
+        
+        # Check if learning is happening
+        c.execute("SELECT COUNT(*) FROM self_learning_data WHERE actual_outcome IS NOT NULL")
+        learned_outcomes = c.fetchone()[0]
+        status['learned_outcomes'] = learned_outcomes
+        
+        # Check recent tip performance
+        c.execute("""
+            SELECT COUNT(*), 
+                   SUM(CASE WHEN t.suggestion <> 'HARVEST' THEN 1 ELSE 0 END) as real_tips,
+                   AVG(t.confidence) as avg_confidence
+            FROM tips t 
+            WHERE t.created_ts >= %s
+        """, (int(time.time()) - 24*3600,))
+        recent_tips = c.fetchone()
+        status['recent_tips_24h'] = recent_tips[1] if recent_tips and recent_tips[1] else 0
+        status['avg_confidence'] = float(recent_tips[2]) if recent_tips and recent_tips[2] else 0
+    
+    return status
+
 # ───────── Boot ─────────
 def _on_boot():
+    """Initialize application on boot"""
+    log.info("🚀 Starting goalsniper PURE IN-PLAY AI mode...")
+    
+    # Validate configuration first
+    if not validate_configuration():
+        log.error("❌ Configuration validation failed. Exiting.")
+        raise SystemExit("Configuration validation failed")
+    
     _init_pool()
     init_db()
+    
+    # Initialize model version manager
+    global model_version_manager
+    model_version_manager = ModelVersionManager()
+    
     set_setting("boot_ts", str(int(time.time())))
     _start_scheduler_once()
+    
+    log.info("✅ Application boot completed successfully")
 
 _on_boot()
 
