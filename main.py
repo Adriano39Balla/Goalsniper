@@ -913,61 +913,61 @@ class ModelVersionManager:
     
       VERSION_PREFIX = "model_v"
     
-    def __init__(self):
-        self.current_versions: Dict[str, str] = {}
-        self.feature_signatures: Dict[str, List[str]] = {}
-        self.load_version_info()
+      def __init__(self):
+          self.current_versions: Dict[str, str] = {}
+          self.feature_signatures: Dict[str, List[str]] = {}
+          self.load_version_info()
     
-    def load_version_info(self):
-        """Load version information from database - FIXED ERROR HANDLING"""
-        try:
-            with db_conn() as c:
-                # FIXED: Handle empty results properly
-                try:
-                    c.execute("SELECT key, value FROM settings WHERE key LIKE 'model_version:%'")
-                    rows = c.fetchall()
+      def load_version_info(self):
+          """Load version information from database - FIXED ERROR HANDLING"""
+          try:
+              with db_conn() as c:
+                  # FIXED: Handle empty results properly
+                  try:
+                      c.execute("SELECT key, value FROM settings WHERE key LIKE 'model_version:%'")
+                      rows = c.fetchall()
                     
-                    if rows:
-                        for row in rows:
-                            if len(row) >= 2:  # FIXED: Check tuple length
-                                key = str(row[0])
-                                value = str(row[1])
-                                model_name = key.replace("model_version:", "")
-                                self.current_versions[model_name] = value
-                            else:
-                                log.warning(f"⚠️ Invalid row structure in model_version query: {row}")
-                    else:
-                        log.info("📭 No model version settings found in database")
+                      if rows:
+                         for row in rows:
+                              if len(row) >= 2:  # FIXED: Check tuple length
+                                  key = str(row[0])
+                                  value = str(row[1])
+                                  model_name = key.replace("model_version:", "")
+                                  self.current_versions[model_name] = value
+                              else:
+                                  log.warning(f"⚠️ Invalid row structure in model_version query: {row}")
+                      else:
+                          log.info("📭 No model version settings found in database")
                         
-                except Exception as e:
-                    log.error(f"❌ Error fetching model versions: {e}")
+                  except Exception as e:
+                      log.error(f"❌ Error fetching model versions: {e}")
                 
-                # FIXED: Handle empty results for feature signatures
-                try:
-                    c.execute("SELECT key, value FROM settings WHERE key LIKE 'feature_signature:%'")
-                    rows = c.fetchall()
+                  # FIXED: Handle empty results for feature signatures
+                  try:
+                      c.execute("SELECT key, value FROM settings WHERE key LIKE 'feature_signature:%'")
+                      rows = c.fetchall()
                     
-                    if rows:
-                        for row in rows:
-                            if len(row) >= 2:  # FIXED: Check tuple length
-                                key = str(row[0])
-                                value = str(row[1])
-                                model_name = key.replace("feature_signature:", "")
-                                try:
-                                    self.feature_signatures[model_name] = json.loads(value)
-                                except json.JSONDecodeError:
-                                    log.error(f"❌ Failed to parse feature signature JSON for {model_name}: {value}")
-                                    self.feature_signatures[model_name] = []
-                            else:
-                                log.warning(f"⚠️ Invalid row structure in feature_signature query: {row}")
-                    else:
-                        log.info("📭 No feature signature settings found in database")
+                      if rows:
+                          for row in rows:
+                              if len(row) >= 2:  # FIXED: Check tuple length
+                                  key = str(row[0])
+                                  value = str(row[1])
+                                  model_name = key.replace("feature_signature:", "")
+                                  try:
+                                      self.feature_signatures[model_name] = json.loads(value)
+                                  except json.JSONDecodeError:
+                                      log.error(f"❌ Failed to parse feature signature JSON for {model_name}: {value}")
+                                      self.feature_signatures[model_name] = []
+                              else:
+                                  log.warning(f"⚠️ Invalid row structure in feature_signature query: {row}")
+                      else:
+                          log.info("📭 No feature signature settings found in database")
                         
-                except Exception as e:
-                    log.error(f"❌ Error fetching feature signatures: {e}")
+                  except Exception as e:
+                      log.error(f"❌ Error fetching feature signatures: {e}")
                     
-        except Exception as e:
-            log.error(f"❌ Failed to load model version info: {e}")
+          except Exception as e:
+              log.error(f"❌ Failed to load model version info: {e}")
     
     def create_new_version(self, model_name: str, feature_set: List[str]) -> str:
         """Create a new version for a model"""
