@@ -2,6 +2,7 @@
 # Upgraded: Bayesian networks, self-learning from wrong bets, advanced ensemble models
 # Enhanced: Context analysis, performance monitoring, multi-book odds, timing optimization
 # SUPERCHARGED: Enhanced API-Football integration with player stats, historical data, and predictions endpoint
+# FIXED: Aligned with train_models.py for complete feature compatibility
 
 import os, json, time, logging, requests, psycopg2
 import numpy as np
@@ -201,10 +202,10 @@ PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "1"))
 PER_LEAGUE_CAP        = int(os.getenv("PER_LEAGUE_CAP", "2"))
 
 # ───────── Odds/EV controls ─────────
-MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU",   "1.50"))
+MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU", "1.50"))
 MIN_ODDS_BTTS = float(os.getenv("MIN_ODDS_BTTS", "1.50"))
-MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2",  "1.50"))
-MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL",  "20.0"))
+MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2", "1.50"))
+MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL", "20.0"))
 EDGE_MIN_BPS  = int(os.getenv("EDGE_MIN_BPS", "600"))
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","0") not in ("0","false","False","no","NO")
@@ -274,16 +275,33 @@ REQ_TIMEOUT_SEC     = float(os.getenv("REQ_TIMEOUT_SEC", "8.0"))
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
+# ───────── Define ADVANCED_FEATURES to match train_models.py ─────────
+ADVANCED_FEATURES = [
+    "momentum_ratio",
+    "pressure_per_minute", 
+    "goal_efficiency_h",
+    "goal_efficiency_a",
+    "late_game",
+    "middle_game",
+    "early_game",
+    "xg_dominance",
+    "shot_dominance",
+    "close_game",
+    "high_scoring",
+    "goal_rich",
+    "normalized_actions"
+]
+
 # ───────── Enhanced Feature Extraction System ─────────
 def extract_enhanced_features(m: dict) -> Dict[str, float]:
     """Enhanced feature extraction with player impact and advanced metrics"""
     log.info("🔧 EXTRACTING ENHANCED FEATURES")
     
-    # Get basic features first
+    # Get COMPLETE features including advanced ones
     basic_features = extract_features(m)
     
     if not ENABLE_ENHANCED_FEATURES:
-        log.info("⏩ Enhanced features disabled, returning basic features")
+        log.info("⏩ Enhanced features disabled, returning full features")
         return basic_features
     
     try:
@@ -293,23 +311,23 @@ def extract_enhanced_features(m: dict) -> Dict[str, float]:
         
         # Enhanced player impact metrics
         player_metrics = extract_player_impact_metrics(events, home, away)
-        log.info("🎯 Player impact metrics extracted: %s", player_metrics)
+        log.info("🎯 Player impact metrics extracted: %s features", len(player_metrics))
         
         # Enhanced historical context
         historical_context = add_historical_context(m.get("fixture", {}).get("id"), home, away)
-        log.info("📊 Historical context applied: %s", historical_context)
+        log.info("📊 Historical context applied: %s features", len(historical_context))
         
         # Enhanced team strength metrics
         team_strength = calculate_team_strength_metrics(basic_features, home, away)
-        log.info("💪 Team strength metrics calculated: %s", team_strength)
+        log.info("💪 Team strength metrics calculated: %s features", len(team_strength))
         
         # Enhanced lineup changes detection
         lineup_changes = detect_lineup_changes(events)
-        log.info("🔄 Lineup changes detected: %s", lineup_changes)
+        log.info("🔄 Lineup changes detected: %s features", len(lineup_changes))
         
         # Combine all enhanced features
         enhanced_features = {
-            **basic_features,
+            **basic_features,  # Now contains ALL features including advanced ones
             **player_metrics,
             **historical_context,
             **team_strength,
@@ -324,7 +342,7 @@ def extract_enhanced_features(m: dict) -> Dict[str, float]:
     except Exception as e:
         log.error("❌ Enhanced feature extraction failed: %s", e, exc_info=True)
         log.warning("⚠️  Falling back to basic features")
-        return basic_features
+        return basic_features  # Fallback to complete features
 
 def extract_player_impact_metrics(events: List[Dict], home_team: str, away_team: str) -> Dict[str, float]:
     """Extract player-level impact metrics from events"""
@@ -1029,14 +1047,61 @@ class AdvancedEnsemblePredictor:
             
             # Pressure increases with close scorelines and late minutes
             time_pressure = min(1.0, minute / 90.0)
-            score_pressure = 1.0 - min(1.0, goal_diff / 3.0)  # Closer games = more pressure
+            score_pressure = min(1.0, goal_diff / 3.0)  # Fixed: match train_models.py logic
             
-            pressure = (time_pressure * 0.6) + (score_pressure * 0.4)
+            pressure = (time_pressure * 0.5) + (score_pressure * 0.3) + 0.2
             return max(0.0, min(1.0, pressure))
             
         except Exception as e:
             log.error("❌ Pressure index calculation failed: %s", e)
             return 0.5
+
+    def _prepare_feature_vector(self, features: Dict[str, float]) -> List[float]:
+        """Prepare feature vector for incremental learning - aligned with train_models"""
+        try:
+            # Use COMPLETE feature set matching train_models.py
+            feature_names = [
+                # Base features
+                'minute', 'goals_h', 'goals_a', 'goals_sum', 'goals_diff',
+                'xg_h', 'xg_a', 'xg_sum', 'xg_diff',
+                'sot_h', 'sot_a', 'sot_sum',
+                'sh_total_h', 'sh_total_a',
+                'cor_h', 'cor_a', 'cor_sum',
+                'pos_h', 'pos_a', 'pos_diff',
+                'red_h', 'red_a', 'red_sum',
+                'yellow_h', 'yellow_a',
+                'momentum_h', 'momentum_a',
+                'pressure_index',
+                'efficiency_h', 'efficiency_a',
+                'total_actions',
+                'action_intensity',
+                # Advanced features from train_models.py
+                'momentum_ratio',
+                'pressure_per_minute', 
+                'goal_efficiency_h',
+                'goal_efficiency_a',
+                'late_game',
+                'middle_game',
+                'early_game',
+                'xg_dominance',
+                'shot_dominance',
+                'close_game',
+                'high_scoring',
+                'goal_rich',
+                'normalized_actions'
+            ]
+            
+            vector = []
+            for name in feature_names:
+                # Use 0.0 as default for any missing features
+                vector.append(features.get(name, 0.0))
+                
+            log.debug("🔧 Prepared feature vector with %s features", len(vector))
+            return vector
+            
+        except Exception as e:
+            log.error("❌ Feature vector preparation failed: %s", e)
+            return []
 
     def update_models_incremental(self, new_data: List[Dict]):
         """Update models without full retraining"""
@@ -1104,25 +1169,6 @@ class AdvancedEnsemblePredictor:
         except Exception as e:
             log.error("❌ Incremental update process failed: %s", e, exc_info=True)
             log.warning("⚠️  Models remain unchanged - full retraining recommended")
-
-    def _prepare_feature_vector(self, features: Dict[str, float]) -> List[float]:
-        """Prepare feature vector for incremental learning"""
-        try:
-            # Use the same feature preparation as in training
-            feature_names = [
-                'minute', 'goals_sum', 'goals_diff', 'xg_sum', 'xg_diff',
-                'sot_sum', 'cor_sum', 'pos_diff', 'momentum_h', 'momentum_a'
-            ]
-            
-            vector = []
-            for name in feature_names:
-                vector.append(features.get(name, 0.0))
-                
-            return vector
-            
-        except Exception as e:
-            log.error("❌ Feature vector preparation failed: %s", e)
-            return []
 
     def train(self, features: List[Dict[str, Any]], targets: List[int]) -> Dict[str, Any]:
         """Train ensemble of models with feature selection"""
@@ -1313,7 +1359,8 @@ class BayesianBettingNetwork:
         minute          = float(features.get("minute", 0.0))
         goal_difference = abs(float(features.get("goals_diff", 0.0)))
         time_pressure   = minute / 90.0
-        pressure        = time_pressure * 0.5 + (goal_difference * 0.1) * 0.3 + 0.2
+        score_pressure  = min(1.0, goal_difference / 3.0)  # Fixed to match train_models.py
+        pressure        = time_pressure * 0.5 + score_pressure * 0.3 + 0.2
         return float(min(1.0, max(0.0, pressure)))
     
     def _get_historical_context(self, features: Dict[str, float]) -> float:
@@ -1951,7 +1998,7 @@ def fetch_live_matches() -> List[dict]:
     log.info("✅ Completed live matches fetch: %s fixtures, ppf=%s", len(out), ppf)
     return out
 
-# ───────── Advanced Feature Extraction ─────────
+# ───────── Enhanced Feature Extraction ─────────
 def _num(v) -> float:
     try:
         if isinstance(v, str) and v.endswith("%"):
@@ -2023,20 +2070,54 @@ def extract_features(m: dict) -> Dict[str, float]:
     efficiency_a    = ga / max(1, sot_a) if sot_a > 0 else 0.0
     total_actions   = sot_h + sot_a + cor_h + cor_a
     action_intensity= total_actions / max(1, minute)
+    
+    # Advanced features matching train_models.py - FIXED
+    goal_diff = gh - ga
+    total_goals = gh + ga
+    xg_diff = xg_h - xg_a
+    xg_sum_val = xg_h + xg_a
+    sot_sum_val = sot_h + sot_a
+    
+    # Momentum ratio
+    momentum_ratio = momentum_h / max(0.001, momentum_a) if momentum_a > 0 else (2.0 if momentum_h > 0 else 1.0)
+    
+    # Pressure per minute
+    pressure_per_minute = pressure_index / (minute + 1)
+    
+    # Goal efficiency
+    goal_efficiency_h = gh / (sot_h + 1)
+    goal_efficiency_a = ga / (sot_a + 1)
+    
+    # Time-based features
+    late_game = minute > 70
+    middle_game = 30 <= minute <= 70
+    early_game = minute < 30
+    
+    # Dominance indicators
+    xg_dominance = xg_diff / (xg_sum_val + 0.001) if xg_sum_val > 0 else 0.0
+    shot_dominance = (sot_h - sot_a) / (sot_sum_val + 0.001) if sot_sum_val > 0 else 0.0
+    
+    # Game state features
+    close_game = abs(goal_diff) <= 1
+    high_scoring = total_goals >= 2
+    goal_rich = total_goals >= 3
+    
+    # Normalized actions
+    normalized_actions = total_actions / minute if minute > 0 else total_actions
 
     features = {
         "minute": float(minute),
         "goals_h": float(gh),
         "goals_a": float(ga),
-        "goals_sum": float(gh + ga),
-        "goals_diff": float(gh - ga),
+        "goals_sum": float(total_goals),
+        "goals_diff": float(goal_diff),
         "xg_h": float(xg_h),
         "xg_a": float(xg_a),
-        "xg_sum": float(xg_h + xg_a),
-        "xg_diff": float(xg_h - xg_a),
+        "xg_sum": float(xg_sum_val),
+        "xg_diff": float(xg_diff),
         "sot_h": float(sot_h),
         "sot_a": float(sot_a),
-        "sot_sum": float(sot_h + sot_a),
+        "sot_sum": float(sot_sum_val),
         "sh_total_h": float(sh_total_h),
         "sh_total_a": float(sh_total_a),
         "cor_h": float(cor_h),
@@ -2050,7 +2131,7 @@ def extract_features(m: dict) -> Dict[str, float]:
         "red_sum": float(red_h + red_a),
         "yellow_h": float(yellow_h),
         "yellow_a": float(yellow_a),
-        # Advanced features
+        # Advanced features from original
         "momentum_h": float(momentum_h),
         "momentum_a": float(momentum_a),
         "pressure_index": float(pressure_index),
@@ -2060,6 +2141,20 @@ def extract_features(m: dict) -> Dict[str, float]:
         "action_intensity": float(action_intensity),
         # Context features for enhanced analysis
         "red_cards": float(red_h + red_a),
+        # NEW: Advanced features matching train_models.py - FIXED
+        "momentum_ratio": float(momentum_ratio),
+        "pressure_per_minute": float(pressure_per_minute),
+        "goal_efficiency_h": float(goal_efficiency_h),
+        "goal_efficiency_a": float(goal_efficiency_a),
+        "late_game": float(late_game),
+        "middle_game": float(middle_game),
+        "early_game": float(early_game),
+        "xg_dominance": float(xg_dominance),
+        "shot_dominance": float(shot_dominance),
+        "close_game": float(close_game),
+        "high_scoring": float(high_scoring),
+        "goal_rich": float(goal_rich),
+        "normalized_actions": float(normalized_actions),
     }
     
     log.debug("✅ Extracted %s features for %s vs %s (minute: %s)", len(features), home, away, minute)
@@ -3047,63 +3142,80 @@ def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
 
 # ───────── Snapshots and data harvesting ─────────
 def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
-    fx    = (m.get("fixture") or {})
-    lg    = (m.get("league") or {})
-    teams = (m.get("teams") or {})
-
-    fid = int(fx.get("id") or 0)
-    if not fid:
-        return
-
-    league_id = int(lg.get("id") or 0)
-    league    = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-    home      = (teams.get("home") or {}).get("name", "")
-    away      = (teams.get("away") or {}).get("name", "")
-
-    gh     = int((m.get("goals") or {}).get("home") or 0)
-    ga     = int((m.get("goals") or {}).get("away") or 0)
-    minute = int(feat.get("minute", 0))
-
-    snapshot = {
-        "minute": minute,
-        "gh": gh,
-        "ga": ga,
-        "league_id": league_id,
-        "market": "HARVEST",
-        "suggestion": "HARVEST",
-        "confidence": 0,
-        "stat": feat,
-    }
-
-    now     = int(time.time())
-    payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)[:200000]
-
-    with db_conn() as c:
-        c.execute(
-            "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
-            "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
-            (fid, now, payload),
-        )
-        c.execute(
-            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,"
-            "score_at_tip,minute,created_ts,sent_ok) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (
-                fid,
-                league_id,
-                league,
-                home,
-                away,
-                "HARVEST",
-                "HARVEST",
-                0.0,
-                0.0,
-                f"{gh}-{ga}",
-                minute,
-                now,
-                1,
-            ),
-        )
+    """Save match snapshot for training data - called from production_scan - FIXED"""
+    try:
+        fx = (m.get("fixture") or {})
+        lg = (m.get("league") or {})
+        teams = (m.get("teams") or {})
+        
+        fid = int(fx.get("id") or 0)
+        if not fid:
+            log.debug("⏩ Skipping snapshot - no fixture ID")
+            return
+        
+        # Ensure feat contains ALL advanced features
+        # Check if we have the advanced features from train_models.py
+        if not any(key in feat for key in ['momentum_ratio', 'xg_dominance', 'goal_rich']):
+            log.warning("📝 Snapshot features incomplete, re-extracting with advanced features...")
+            # Re-extract features to ensure we have all advanced features
+            feat = extract_features(m)
+        
+        league_id = int(lg.get("id") or 0)
+        league    = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
+        home      = (teams.get("home") or {}).get("name", "")
+        away      = (teams.get("away") or {}).get("name", "")
+        
+        gh     = int((m.get("goals") or {}).get("home") or 0)
+        ga     = int((m.get("goals") or {}).get("away") or 0)
+        minute = int(feat.get("minute", 0))
+        
+        snapshot = {
+            "minute": minute,
+            "gh": gh,
+            "ga": ga,
+            "league_id": league_id,
+            "market": "HARVEST",
+            "suggestion": "HARVEST",
+            "confidence": 0,
+            "stat": feat,  # Contains ALL features including advanced ones
+        }
+        
+        # Verify we have advanced features
+        advanced_feature_count = sum(1 for key in ADVANCED_FEATURES if key in feat)
+        log.debug(f"📊 Snapshot contains {advanced_feature_count} advanced features out of {len(ADVANCED_FEATURES)}")
+        
+        now     = int(time.time())
+        payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)[:200000]
+        
+        with db_conn() as c:
+            c.execute(
+                "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
+                "ON CONFLICT (match_id, created_ts) DO UPDATE SET payload=EXCLUDED.payload",
+                (fid, now, payload),
+            )
+            c.execute(
+                "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,"
+                "score_at_tip,minute,created_ts,sent_ok) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    fid,
+                    league_id,
+                    league,
+                    home,
+                    away,
+                    "HARVEST",
+                    "HARVEST",
+                    0.0,
+                    0.0,
+                    f"{gh}-{ga}",
+                    minute,
+                    now,
+                    1,
+                ),
+            )
+        log.debug("💾 Saved complete snapshot for fixture %s (minute: %s)", fid, minute)
+    except Exception as e:
+        log.error("❌ Failed to save snapshot: %s", e)
 
 # ───────── Results processing ─────────
 def _tip_outcome_for_result(suggestion: str, res: Dict[str, Any]) -> Optional[int]:
@@ -3308,21 +3420,52 @@ def _run_with_pg_lock(lock_key: int, fn, *a, **k):
 def auto_train_job():
     if not TRAIN_ENABLE:
         return send_telegram("🤖 Training skipped: TRAIN_ENABLE=0")
+    
     send_telegram("🤖 Advanced training started.")
     try:
         res = train_models() or {}
         ok  = bool(res.get("ok"))
+        
         if not ok:
             reason = res.get("reason") or res.get("error") or "unknown"
             return send_telegram(f"⚠️ Training finished: <b>SKIPPED</b>\nReason: {escape(str(reason))}")
-
-        trained = [k for k, v in (res.get("trained") or {}).items() if v]
-        lines   = ["🤖 <b>Advanced Model Training OK</b>"]
-        if trained:
-            lines.append("• Trained: " + ", ".join(sorted(trained)))
-        lines.append("• Features: Bayesian networks + Ensemble methods")
+        
+        # RELOAD MODELS AFTER TRAINING
+        trained_markets = []
+        for market, trained in (res.get("trained") or {}).items():
+            if trained:
+                trained_markets.append(market)
+                # Reload the predictor for this market
+                if market in advanced_predictors:
+                    advanced_predictors[market] = AdvancedEnsemblePredictor(market)
+                    log.info(f"🔄 Reloaded model for {market} after training")
+        
+        # Send comprehensive training report
+        lines = ["🤖 <b>Advanced Model Training COMPLETE</b>"]
+        if trained_markets:
+            lines.append(f"• Trained & Reloaded: {', '.join(sorted(trained_markets))}")
+            lines.append(f"• Total models: {len(trained_markets)}")
+        
+        # Add training metrics if available
+        if res.get('models_trained'):
+            lines.append(f"• Models trained: {res['models_trained']}")
+        
+        # Add feature engineering info
+        feat_info = res.get('feature_engineering', {})
+        if feat_info:
+            lines.append(f"• Features: {feat_info.get('total_features', 0)} total ({feat_info.get('advanced_features', 0)} advanced)")
+        
+        # Add training analysis if available
+        analysis = res.get('training_analysis', {})
+        if analysis.get('status') == 'success':
+            summary = analysis.get('summary', {})
+            if summary:
+                lines.append(f"• Accuracy trend: {summary.get('avg_accuracy', 0):.1%}")
+                lines.append(f"• Models improving: {summary.get('models_with_improvement', 0)}")
+        
         lines.append("• Learning: Self-correcting from bet outcomes")
         send_telegram("\n".join(lines))
+        
     except Exception as e:
         log.exception("[TRAIN] job failed: %s", e)
         send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
@@ -3573,12 +3716,38 @@ def http_train():
 @app.route("/admin/system-status")
 def http_system_status():
     _require_admin()
+    
+    # Get learning system status
     learning_status = verify_learning_system()
-    performance_stats = performance_monitor.get_performance_stats() if performance_monitor else {}
+    
+    # Get performance stats if monitor enabled
+    performance_stats = {}
+    if ENABLE_PERFORMANCE_MONITOR and performance_monitor:
+        performance_stats = performance_monitor.get_performance_stats()
+    
+    # Check model training status
+    model_status = {}
+    for market, predictor in advanced_predictors.items():
+        model_status[market] = {
+            "has_models": len(predictor.models) > 0,
+            "model_count": len(predictor.models),
+            "has_scaler": predictor.scaler is not None,
+            "feature_count": len(predictor.selected_features) if predictor.selected_features else 0
+        }
+    
+    # Check for training metadata
+    training_meta = get_setting("advanced_training_metadata")
+    last_train = get_setting("last_advanced_train_ts")
+    
     return jsonify({
         "ok": True, 
         "system_status": learning_status,
         "performance_stats": performance_stats,
+        "model_status": model_status,
+        "training_info": {
+            "last_training": last_train,
+            "training_metadata": json.loads(training_meta) if training_meta else None
+        },
         "enhancements_enabled": {
             "context_analysis": ENABLE_CONTEXT_ANALYSIS,
             "performance_monitor": ENABLE_PERFORMANCE_MONITOR,
