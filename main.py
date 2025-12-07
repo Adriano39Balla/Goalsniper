@@ -1223,6 +1223,142 @@ class AdvancedEnsemblePredictor:
             "feature_count": len(self.selected_features),
             "sample_count": len(features),
         }
+
+    def check_training_data_quality() -> Dict[str, Any]:
+        """Check if we have sufficient quality data for training"""
+        try:
+            with db_conn() as c:
+                # Check total snapshots
+                c.execute("SELECT COUNT(*) FROM tip_snapshots")
+                total_snapshots = c.fetchone()[0]
+            
+                # Check snapshots with match results
+                c.execute("""
+                    SELECT COUNT(*) 
+                    FROM tip_snapshots ts
+                    JOIN match_results mr ON ts.match_id = mr.match_id
+                """)
+                snapshots_with_results = c.fetchone()[0]
+            
+                # Check feature quality in recent snapshots
+                c.execute("""
+                    SELECT payload 
+                    FROM tip_snapshots 
+                    ORDER BY created_ts DESC 
+                    LIMIT 10
+                """)
+                recent_snapshots = c.fetchall()
+            
+                feature_counts = []
+                for (payload,) in recent_snapshots:
+                    try:
+                        snap = json.loads(payload)
+                        if isinstance(snap, dict) and 'stat' in snap:
+                            features = snap.get('stat', {})
+                            feature_counts.append(len(features))
+                    except:
+                        continue
+            
+                avg_features = sum(feature_counts) / max(1, len(feature_counts))
+            
+                return {
+                    "total_snapshots": total_snapshots,
+                    "snapshots_with_results": snapshots_with_results,
+                    "recent_snapshots_analyzed": len(recent_snapshots),
+                    "avg_features_per_snapshot": avg_features,
+                    "has_sufficient_data": total_snapshots >= 50 and snapshots_with_results >= 20,
+                    "has_good_features": avg_features >= 30
+                }
+            
+        except Exception as e:
+            log.error(f"❌ Data quality check failed: {e}")
+            return {"error": str(e)}
+
+    def populate_initial_training_data(days: int = 7):
+        """Manually populate training data from recent tips"""
+        log.info(f"📊 Populating initial training data from last {days} days...")
+    
+        cutoff = int(time.time()) - (days * 24 * 3600)
+    
+        with db_conn() as c:
+            # Get recent tips that have results
+            c.execute("""
+                SELECT t.match_id, t.created_ts, r.final_goals_h, r.final_goals_a, r.btts_yes
+                FROM tips t
+                JOIN match_results r ON t.match_id = r.match_id
+                WHERE t.created_ts >= %s 
+                  AND t.suggestion <> 'HARVEST'
+                ORDER BY t.created_ts DESC
+                LIMIT 100
+            """, (cutoff,))
+            tips = c.fetchall()
+    
+        log.info(f"Found {len(tips)} recent tips with results")
+    
+        # For each tip, create a synthetic snapshot
+        for match_id, created_ts, gh, ga, btts in tips:
+            try:
+                # Create basic features (simplified for initial training)
+                minute = 75  # Assume late game for training
+            
+                features = {
+                    "minute": float(minute),
+                    "goals_h": float(gh),
+                    "goals_a": float(ga),
+                    "goals_sum": float(gh + ga),
+                    "goals_diff": float(gh - ga),
+                    "xg_h": float(gh * 0.8),  # Estimated xG
+                    "xg_a": float(ga * 0.8),
+                    "xg_sum": float((gh + ga) * 0.8),
+                    "xg_diff": float((gh - ga) * 0.8),
+                    "sot_h": float(gh * 2),  # Estimated shots on target
+                    "sot_a": float(ga * 2),
+                    "sot_sum": float((gh + ga) * 2),
+                    # Add more synthetic features...
+                }
+            
+                # Add advanced features
+                features.update({
+                    "momentum_ratio": 1.0 if gh > ga else 0.5 if gh == ga else 0.0,
+                    "pressure_per_minute": 0.7,
+                    "goal_efficiency_h": 0.5 if gh > 0 else 0.0,
+                    "goal_efficiency_a": 0.5 if ga > 0 else 0.0,
+                    "late_game": 1.0,
+                    "middle_game": 0.0,
+                    "early_game": 0.0,
+                    "xg_dominance": (gh - ga) / max(1, gh + ga),
+                    "shot_dominance": (gh - ga) / max(1, gh + ga),
+                    "close_game": 1.0 if abs(gh - ga) <= 1 else 0.0,
+                    "high_scoring": 1.0 if (gh + ga) >= 2 else 0.0,
+                    "goal_rich": 1.0 if (gh + ga) >= 3 else 0.0,
+                    "normalized_actions": 2.0,
+                })
+            
+                snapshot = {
+                    "minute": minute,
+                    "gh": gh,
+                    "ga": ga,
+                    "league_id": 0,
+                    "market": "SYNTHETIC",
+                    "suggestion": "SYNTHETIC",
+                    "confidence": 0,
+                    "stat": features,
+                }
+            
+                payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)
+            
+                with db_conn() as c:
+                    c.execute(
+                        "INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
+                        "ON CONFLICT (match_id, created_ts) DO NOTHING",
+                        (match_id, created_ts, payload),
+                    )
+                
+            except Exception as e:
+                log.error(f"❌ Failed to create synthetic snapshot: {e}")
+                continue
+    
+        log.info(f"✅ Created {len(tips)} synthetic training snapshots")
     
     def predict_probability(self, features: Dict[str, float]) -> float:
         """Get ensemble prediction with Bayesian confidence intervals"""
@@ -3142,7 +3278,7 @@ def is_feed_stale(fid: int, m: dict, minute: int) -> bool:
 
 # ───────── Snapshots and data harvesting ─────────
 def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
-    """Save match snapshot for training data - called from production_scan - FIXED"""
+    """Save match snapshot for training data - IMPROVED with better error handling"""
     try:
         fx = (m.get("fixture") or {})
         lg = (m.get("league") or {})
@@ -3153,12 +3289,30 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
             log.debug("⏩ Skipping snapshot - no fixture ID")
             return
         
-        # Ensure feat contains ALL advanced features
-        # Check if we have the advanced features from train_models.py
-        if not any(key in feat for key in ['momentum_ratio', 'xg_dominance', 'goal_rich']):
-            log.warning("📝 Snapshot features incomplete, re-extracting with advanced features...")
-            # Re-extract features to ensure we have all advanced features
-            feat = extract_features(m)
+        # CRITICAL FIX: Ensure we have valid features
+        if not feat or len(feat) < 10:
+            log.warning("📝 Insufficient features, extracting fresh...")
+            # Force re-extraction with proper error handling
+            try:
+                feat = extract_features(m)
+                if not feat or len(feat) < 10:
+                    log.error("❌ Failed to extract sufficient features")
+                    return
+            except Exception as e:
+                log.error(f"❌ Feature extraction failed: {e}")
+                return
+        
+        # Validate key features exist
+        required_features = ['minute', 'goals_h', 'goals_a', 'xg_h', 'xg_a', 'sot_h', 'sot_a']
+        missing = [f for f in required_features if f not in feat]
+        if missing:
+            log.warning(f"⚠️ Missing required features: {missing}")
+            # Try to fill missing features with defaults
+            for f in missing:
+                if f == 'minute':
+                    feat[f] = float(((fx.get("status") or {}).get("elapsed") or 1))
+                else:
+                    feat[f] = 0.0
         
         league_id = int(lg.get("id") or 0)
         league    = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
@@ -3167,7 +3321,7 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
         
         gh     = int((m.get("goals") or {}).get("home") or 0)
         ga     = int((m.get("goals") or {}).get("away") or 0)
-        minute = int(feat.get("minute", 0))
+        minute = int(feat.get("minute", 1))
         
         snapshot = {
             "minute": minute,
@@ -3177,12 +3331,13 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
             "market": "HARVEST",
             "suggestion": "HARVEST",
             "confidence": 0,
-            "stat": feat,  # Contains ALL features including advanced ones
+            "stat": feat,  # Contains ALL features
         }
         
-        # Verify we have advanced features
-        advanced_feature_count = sum(1 for key in ADVANCED_FEATURES if key in feat)
-        log.debug(f"📊 Snapshot contains {advanced_feature_count} advanced features out of {len(ADVANCED_FEATURES)}")
+        # Log feature quality
+        total_features = len(feat)
+        non_zero_features = sum(1 for v in feat.values() if v != 0)
+        log.debug(f"📊 Snapshot quality: {non_zero_features}/{total_features} non-zero features")
         
         now     = int(time.time())
         payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=False)[:200000]
@@ -3213,9 +3368,9 @@ def save_snapshot_from_match(m: dict, feat: Dict[str, float]) -> None:
                     1,
                 ),
             )
-        log.debug("💾 Saved complete snapshot for fixture %s (minute: %s)", fid, minute)
+        log.info(f"💾 Saved snapshot for fixture {fid} (minute: {minute}, features: {len(feat)})")
     except Exception as e:
-        log.error("❌ Failed to save snapshot: %s", e)
+        log.error(f"❌ Failed to save snapshot: {e}", exc_info=True)
 
 # ───────── Results processing ─────────
 def _tip_outcome_for_result(suggestion: str, res: Dict[str, Any]) -> Optional[int]:
@@ -3760,6 +3915,12 @@ def http_system_status():
             "player_impact": ENABLE_PLAYER_IMPACT
         }
     })
+
+@app.route("/admin/data-quality")
+def http_data_quality():
+    _require_admin()
+    quality = check_training_data_quality()
+    return jsonify({"ok": True, "quality": quality})
 
 @app.route("/admin/auto-tune", methods=["POST", "GET"])
 def http_auto_tune():
