@@ -24,6 +24,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import SelectKBest, f_classif
+from pathlib import Path
 
 # ───────── Env bootstrap ─────────
 try:
@@ -269,6 +270,10 @@ API_CB_THRESHOLD    = int(os.getenv("API_CB_THRESHOLD", "8"))
 API_CB_COOLDOWN_SEC = int(os.getenv("API_CB_COOLDOWN_SEC", "90"))
 REQ_TIMEOUT_SEC     = float(os.getenv("REQ_TIMEOUT_SEC", "8.0"))
 
+# ───────── Model Directory Setup ─────────
+MODEL_DIR = Path("models")
+MODEL_DIR.mkdir(exist_ok=True)
+
 # ───────── Enhanced Feature Extraction System ─────────
 def extract_enhanced_features(m: dict) -> Dict[str, float]:
     """Enhanced feature extraction with player impact and advanced metrics"""
@@ -385,14 +390,15 @@ def add_historical_context(match_id: Optional[int], home_team: str, away_team: s
     try:
         with db_conn() as c:
             # Get last 5 meetings between these teams
-            h2h_results = c.execute("""
+            c.execute("""
                 SELECT mr.final_goals_h, mr.final_goals_a, mr.btts_yes
                 FROM match_results mr
                 JOIN tips t ON mr.match_id = t.match_id
                 WHERE t.home = %s AND t.away = %s
                 ORDER BY t.created_ts DESC 
                 LIMIT 5
-            """, (home_team, away_team)).fetchall()
+            """, (home_team, away_team))
+            h2h_results = c.fetchall()
             
         if h2h_results:
             home_wins = sum(1 for gh, ga, _ in h2h_results if gh > ga)
@@ -549,7 +555,7 @@ def blend_with_api_predictions(your_prob: float, api_prediction: Dict, market: s
             api_prob = float(predictions["goals"].get(under_key, {}).get("percentage", 50)) / 100
             log.info("📊 API Under probability: %.1f%%", api_prob * 100)
             
-        elif market == "1X2" and "winner" in predictions:
+        elif "Win" in market and "winner" in predictions:
             if "Home" in market:
                 api_prob = float(predictions["winner"].get("home", {}).get("percentage", 33)) / 100
             elif "Away" in market:
@@ -670,21 +676,61 @@ class PerformanceMonitor:
 class AdvancedEnsemblePredictor:
     """Advanced ensemble combining multiple models with Bayesian calibration and enhanced features"""
     
-    def __init__(self, model_name: str):
-        self.model_name = model_name
-        self.models: Dict[str, Any] = {}
-        self.scalers: Dict[str, StandardScaler] = {}
-        self.feature_selector: Optional[SelectKBest] = None
+    def __init__(self, market: str):
+        self.market = market
+        self.models: Dict[str, CalibratedClassifierCV] = {}
+        self.scaler: Optional[StandardScaler] = None
+        self.selector: Optional[SelectKBest] = None
+        self.selected_features: List[str] = []
         self.bayesian_prior_alpha = BAYESIAN_PRIOR_ALPHA
         self.bayesian_prior_beta  = BAYESIAN_PRIOR_BETA
         self.performance_history: List[int] = []
         
-        # Initialize time series model for goal prediction
-        from sklearn.linear_model import LogisticRegression
-        self.time_series_model = LogisticRegression(random_state=42)
+        # Try to load existing model
+        self.load_model(market)
         
-        log.info("🤖 AdvancedEnsemblePredictor initialized for %s with timing optimization", model_name)
-        
+        log.info("🤖 AdvancedEnsemblePredictor initialized for %s with timing optimization", market)
+
+    def save_model(self):
+        """Save trained model to disk"""
+        try:
+            model_data = {
+                'market': self.market,
+                'models': self.models,
+                'scaler': self.scaler,
+                'selector': self.selector,
+                'selected_features': self.selected_features,
+                'training_time': time.time()
+            }
+            
+            model_path = MODEL_DIR / f"{self.market}.joblib"
+            joblib.dump(model_data, model_path)
+            log.info(f"💾 Saved model to {model_path}")
+            return True
+        except Exception as e:
+            log.error(f"❌ Failed to save model for {self.market}: {e}")
+            return False
+
+    def load_model(self, market: str):
+        """Load trained model from disk"""
+        try:
+            model_path = MODEL_DIR / f"{market}.joblib"
+            if not model_path.exists():
+                log.info(f"📭 No saved model found for {market}, will train new one")
+                return False
+                
+            model_data = joblib.load(model_path)
+            self.models = model_data.get('models', {})
+            self.scaler = model_data.get('scaler')
+            self.selector = model_data.get('selector')
+            self.selected_features = model_data.get('selected_features', [])
+            
+            log.info(f"✅ Loaded trained model for {market}")
+            return True
+        except Exception as e:
+            log.error(f"❌ Failed to load model for {market}: {e}")
+            return False
+
     def analyze_match_context(self, match_data: Dict) -> float:
         """Analyze match context for additional edge"""
         if not ENABLE_CONTEXT_ANALYSIS:
@@ -1091,17 +1137,16 @@ class AdvancedEnsemblePredictor:
         
         # Feature selection
         if len(df.columns) > 5:
-            self.feature_selector = SelectKBest(f_classif, k=min(10, len(df.columns)))
-            X_selected = self.feature_selector.fit_transform(df.values, np.array(targets, dtype=int))
-            selected_features = df.columns[self.feature_selector.get_support()].tolist()
+            self.selector = SelectKBest(f_classif, k=min(10, len(df.columns)))
+            X_selected = self.selector.fit_transform(df.values, np.array(targets, dtype=int))
+            self.selected_features = df.columns[self.selector.get_support()].tolist()
         else:
             X_selected = df.values
-            selected_features = df.columns.tolist()
+            self.selected_features = df.columns.tolist()
         
         # Scale features
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X_selected)
-        self.scalers[self.model_name] = scaler
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X_selected)
         
         # Train ensemble models
         models_to_train = {
@@ -1110,7 +1155,7 @@ class AdvancedEnsemblePredictor:
             "gradient_boost": GradientBoostingClassifier(n_estimators=100, random_state=42),
         }
         
-        self.models[self.model_name] = {}
+        self.models = {}
         y = np.array(targets, dtype=int)
         for name, model in models_to_train.items():
             try:
@@ -1119,28 +1164,32 @@ class AdvancedEnsemblePredictor:
                 else:
                     calibrated_model = CalibratedClassifierCV(model, method="sigmoid", cv=3)
                 calibrated_model.fit(X_scaled, y)
-                self.models[self.model_name][name] = calibrated_model
+                self.models[name] = calibrated_model
             except Exception as e:
-                log.error("Failed to train %s for %s: %s", name, self.model_name, e)
+                log.error("Failed to train %s for %s: %s", name, self.market, e)
+        
+        # Save the trained model
+        self.save_model()
         
         return {
             "ok": True,
-            "trained_models": list(self.models[self.model_name].keys()),
-            "feature_count": len(selected_features),
+            "trained_models": list(self.models.keys()),
+            "feature_count": len(self.selected_features),
             "sample_count": len(features),
         }
     
     def predict_probability(self, features: Dict[str, float]) -> float:
         """Get ensemble prediction with Bayesian confidence intervals"""
-        if not self.models.get(self.model_name):
-            return 0.5  # Neutral prior
+        if not self.models:
+            log.warning(f"⚠️ No models loaded for {self.market}, returning neutral probability")
+            return 0.5
             
         feature_vector = self._prepare_features(features)
         if feature_vector is None:
             return 0.5
             
         predictions: List[float] = []
-        for model_name, model in self.models[self.model_name].items():
+        for model_name, model in self.models.items():
             try:
                 prob = float(model.predict_proba(feature_vector.reshape(1, -1))[0][1])
                 predictions.append(prob)
@@ -1154,25 +1203,24 @@ class AdvancedEnsemblePredictor:
         ensemble_prob = float(np.mean(predictions))
         bayesian_prob = self._apply_bayesian_prior(ensemble_prob)
         
-        _metric_inc("ensemble_predictions_total", label=self.model_name)
+        _metric_inc("ensemble_predictions_total", label=self.market)
         return bayesian_prob
 
     def _prepare_features(self, features: Dict[str, float]) -> Optional[np.ndarray]:
-        if self.model_name not in self.scalers:
+        if not self.scaler:
             return None
             
         feature_df = pd.DataFrame([features]).fillna(0)
         
-        if self.feature_selector:
+        if self.selector:
             try:
-                X_selected = self.feature_selector.transform(feature_df.values)
+                X_selected = self.selector.transform(feature_df.values)
             except Exception:
                 X_selected = feature_df.values
         else:
             X_selected = feature_df.values
             
-        scaler = self.scalers[self.model_name]
-        return scaler.transform(X_selected)[0]
+        return self.scaler.transform(X_selected)[0]
     
     def _apply_bayesian_prior(self, ensemble_prob: float) -> float:
         if not self.performance_history:
@@ -1197,7 +1245,7 @@ class AdvancedEnsemblePredictor:
         self.performance_history.append(int(outcome))
         if len(self.performance_history) > 100:
             self.performance_history = self.performance_history[-100:]
-        _metric_inc("bayesian_updates_total", label=self.model_name)
+        _metric_inc("bayesian_updates_total", label=self.market)
 
 # ───────── Bayesian Network Implementation ─────────
 class BayesianBettingNetwork:
@@ -1410,28 +1458,30 @@ def verify_learning_system() -> Dict[str, Any]:
     
     with db_conn() as c:
         # Check if we have match results to learn from
-        results_count = c.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM match_results")
+        results_count = c.fetchone()[0]
         status['match_results_available'] = results_count
         
         # Check self-learning data
-        learning_data = c.execute("SELECT COUNT(*) FROM self_learning_data").fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM self_learning_data")
+        learning_data = c.fetchone()[0]
         status['learning_records'] = learning_data
         
         # Check if learning is happening
-        learned_outcomes = c.execute(
-            "SELECT COUNT(*) FROM self_learning_data WHERE actual_outcome IS NOT NULL"
-        ).fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM self_learning_data WHERE actual_outcome IS NOT NULL")
+        learned_outcomes = c.fetchone()[0]
         status['learned_outcomes'] = learned_outcomes
         
         # Check recent tip performance
-        recent_tips = c.execute("""
+        c.execute("""
             SELECT COUNT(*), 
                    SUM(CASE WHEN t.suggestion <> 'HARVEST' THEN 1 ELSE 0 END) as real_tips,
                    AVG(t.confidence) as avg_confidence
             FROM tips t 
             WHERE t.created_ts >= %s
-        """, (int(time.time()) - 24*3600,)).fetchone()
-        status['recent_tips_24h'] = recent_tips[1] if recent_tips else 0
+        """, (int(time.time()) - 24*3600,))
+        recent_tips = c.fetchone()
+        status['recent_tips_24h'] = recent_tips[1] if recent_tips and recent_tips[1] else 0
         status['avg_confidence'] = float(recent_tips[2]) if recent_tips and recent_tips[2] else 0
     
     return status
@@ -1487,6 +1537,12 @@ class PooledConn:
             _metric_inc("db_errors_total", n=1)
             log.error("DB execute failed: %s\nSQL: %s\nParams: %s", e, sql, params)
             raise
+    
+    def fetchall(self):
+        return self.cur.fetchall() if self.cur else []
+    
+    def fetchone(self):
+        return self.cur.fetchone() if self.cur else None
 
 def _init_pool():
     global POOL
@@ -2105,7 +2161,7 @@ def process_self_learning_from_results() -> None:
         
     cutoff_ts = int(time.time()) - 24 * 3600
     with db_conn() as c:
-        rows = c.execute(
+        c.execute(
             """
             SELECT sl.id, sl.match_id, sl.market, sl.features, sl.prediction_probability,
                    mr.final_goals_h, mr.final_goals_a, mr.btts_yes
@@ -2116,7 +2172,8 @@ def process_self_learning_from_results() -> None:
             LIMIT %s
         """,
             (cutoff_ts, SELF_LEARN_BATCH_SIZE),
-        ).fetchall()
+        )
+        rows = c.fetchall()
     
     log.info("🤖 Processing %s self-learning records", len(rows))
     processed = 0
@@ -2814,10 +2871,11 @@ def production_scan() -> Tuple[int, int]:
                 
                 if DUP_COOLDOWN_MIN > 0:
                     cutoff = now_ts - DUP_COOLDOWN_MIN * 60
-                    dup_check = c.execute(
+                    c.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s AND suggestion<>'HARVEST' LIMIT 1",
                         (fid, cutoff),
-                    ).fetchone()
+                    )
+                    dup_check = c.fetchone()
                     if dup_check:
                         log.debug("⏩ Skipping match %s due to duplicate cooldown", fid)
                         continue
@@ -3095,7 +3153,7 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     cutoff = now_ts - BACKFILL_DAYS * 24 * 3600
     updated = 0
     with db_conn() as c:
-        rows = c.execute(
+        c.execute(
             """
             WITH last AS (
                 SELECT match_id, MAX(created_ts) last_ts
@@ -3111,7 +3169,8 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
             LIMIT %s
             """,
             (cutoff, max_rows),
-        ).fetchall()
+        )
+        rows = c.fetchall()
         
     log.info("🔍 Backfilling results for %s matches", len(rows))
     for (mid,) in rows:
@@ -3149,7 +3208,7 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
 
     cutoff = int((datetime.now(BERLIN_TZ) - timedelta(days=window_days)).timestamp())
     with db_conn() as c:
-        rows = c.execute(
+        c.execute(
             """
             SELECT t.market, t.suggestion, t.confidence, t.confidence_raw, t.created_ts,
                    t.odds, r.final_goals_h, r.final_goals_a, r.btts_yes
@@ -3160,7 +3219,8 @@ def daily_accuracy_digest(window_days: int = 1) -> Optional[str]:
               AND t.sent_ok = 1
         """,
             (cutoff,),
-        ).fetchall()
+        )
+        rows = c.fetchall()
 
     total = graded = wins = 0
     roi_by_market: Dict[str, Dict[str, float]] = {}
@@ -3232,7 +3292,8 @@ _scheduler_started = False
 def _run_with_pg_lock(lock_key: int, fn, *a, **k):
     try:
         with db_conn() as c:
-            got = c.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
+            c.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            got = c.fetchone()[0]
             if not got:
                 log.info("[LOCK %s] busy; skipped.", lock_key)
                 return None
@@ -3290,18 +3351,19 @@ def auto_tune_thresholds(days: int = 14) -> Dict[str, float]:
     except Exception as e:
         log.exception("[AUTO-TUNE] failed: %s", e)
         send_telegram(f"❌ Auto-tune FAILED\n{escape(str(e))}")
-        return {}
+        return tuned
 
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
     cutoff  = int(time.time()) - minutes * 60
     retried = 0
     with db_conn() as c:
-        rows = c.execute(
+        c.execute(
             "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,"
             "minute,created_ts,odds,book,ev_pct "
             "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",
             (cutoff, limit),
-        ).fetchall()
+        )
+        rows = c.fetchall()
 
         for (
             mid,
@@ -3442,7 +3504,8 @@ def root():
 def health():
     try:
         with db_conn() as c:
-            n = c.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM tips")
+            n = c.fetchone()[0]
         return jsonify({"ok": True, "db": "ok", "tips_count": int(n)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3484,7 +3547,10 @@ def http_training_progress():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/admin/digest", methods=["POST","GET"])
-def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
+def http_digest(): 
+    _require_admin()
+    msg = daily_accuracy_digest()
+    return jsonify({"ok": True, "sent": bool(msg)})
 
 @app.route("/admin/reset-thresholds", methods=["POST", "GET"])
 def http_reset_thresholds():
@@ -3542,12 +3608,13 @@ def http_retry_unsent():
 def http_latest():
     limit = int(request.args.get("limit", "50"))
     with db_conn() as c:
-        rows = c.execute(
+        c.execute(
             "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,"
             "score_at_tip,minute,created_ts,odds,book,ev_pct "
             "FROM tips WHERE suggestion<>'HARVEST' ORDER BY created_ts DESC LIMIT %s",
             (max(1, min(500, limit)),),
-        ).fetchall()
+        )
+        rows = c.fetchall()
     tips = []
     for r in rows:
         tips.append(
