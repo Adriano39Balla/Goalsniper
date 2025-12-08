@@ -22,20 +22,22 @@ from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ───────── Env bootstrap ─────────
-try:
-    from dotenv import load_dotenv
-    log.info("🔧 Loading environment variables from .env file")
-    load_dotenv()
-    log.info("✅ Environment variables loaded successfully")
-except Exception as e:
-    log.info("ℹ️ No .env file found or error loading: %s", e)
-    pass
-
 # ───────── App / logging ─────────
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 log = logging.getLogger("goalsniper")
 app = Flask(__name__)
+
+log.info("🚀 Starting goalsniper application")
+
+# ───────── Env bootstrap ─────────
+log.info("🔧 Loading environment variables")
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    log.info("✅ Environment variables loaded from .env file")
+except Exception as e:
+    log.info("ℹ️ No .env file found or error loading: %s", e)
+    pass
 
 # ───────── Core env ─────────
 log.info("📋 Loading core environment variables")
@@ -93,7 +95,7 @@ def _parse_lines(env_val: str, default: List[float]) -> List[float]:
         try: out.append(float(t))
         except: pass
     result = out or default
-    log.info("📐 Parsed lines: %s (default: %s)", result, default)
+    log.debug("📐 Parsed lines: %s (default: %s)", result, default)
     return result
 
 log.info("🎯 Loading OU lines configuration")
@@ -246,9 +248,9 @@ def _is_target_league(league_obj: dict) -> bool:
             break
     
     if is_target:
-        log.info("✅ League accepted: %s - %s", country, league_name)
+        log.debug("✅ League accepted: %s - %s", country, league_name)
     else:
-        log.info("❌ League rejected: %s - %s", country, league_name)
+        log.debug("❌ League rejected: %s - %s", country, league_name)
         
     return is_target
 
@@ -496,7 +498,8 @@ def _api_get(url: str, params: dict, timeout: int = 15):
             log.warning("⚠️ API request failed: %s - %s (took %.2fs)", r.status_code, r.text, elapsed)
             return None
     except Exception as e:
-        log.error("❌ API request error: %s (took %.2fs)", e, time.time() - start_time if 'start_time' in locals() else 0)
+        elapsed = time.time() - start_time if 'start_time' in locals() else 0
+        log.error("❌ API request error: %s (took %.2fs)", e, elapsed)
         return None
 
 # ───────── League filter ─────────
@@ -595,7 +598,7 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
 
 def _collect_todays_prematch_fixtures() -> List[dict]:
     log.info("📅 Collecting today's prematch fixtures")
-    today_local=datetime.now(ZoneInfo("Europe/Berlin")).date()
+    today_local=datetime.now(BERLIN_TZ).date()
     start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=ZoneInfo("Europe/Berlin"))
     end_local=start_local+timedelta(days=1)
     dates_utc={start_local.astimezone(TZ_UTC).date(), (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
