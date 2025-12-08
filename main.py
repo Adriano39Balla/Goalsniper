@@ -100,7 +100,7 @@ ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")  # optional API-Football book
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","1") not in ("0","false","False","no","NO")
 
 # ───────── Markets allow-list (draw suppressed) ─────────
-ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
+ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "OU 2.5", "OU 3.5", "Home Win", "Away Win"}
 def _fmt_line(line: float) -> str: return f"{line}".rstrip("0").rstrip(".")
 for _ln in OU_LINES:
     s=_fmt_line(_ln); ALLOWED_SUGGESTIONS.add(f"Over {s} Goals"); ALLOWED_SUGGESTIONS.add(f"Under {s} Goals")
