@@ -137,16 +137,28 @@ def _is_target_league(league_obj: dict) -> bool:
     league_name = str(league_obj.get("name", "")).strip()
     country = str(league_obj.get("country", "")).strip()
     
-    # Create full league name (e.g., "England - Premier League")
-    full_name = f"{country} - {league_name}"
+    # Log what we're actually getting from the API
+    log.debug(f"🔍 Checking league: country='{country}', name='{league_name}'")
     
-    # Check if league is in target list
-    is_target = full_name in TARGET_LEAGUES
+    # Try multiple formats
+    possible_names = [
+        f"{country} - {league_name}",
+        f"{league_name}",
+        f"{country} {league_name}",
+        f"{league_name} - {country}"
+    ]
+    
+    is_target = False
+    for possible_name in possible_names:
+        if possible_name in TARGET_LEAGUES:
+            is_target = True
+            log.debug(f"✅ Matched as: {possible_name}")
+            break
     
     if is_target:
-        log.debug(f"✅ League accepted: {full_name}")
+        log.info(f"✅ League accepted: {country} - {league_name}")
     else:
-        log.debug(f"❌ League rejected: {full_name}")
+        log.info(f"❌ League rejected: {country} - {league_name}")
         
     return is_target
 
@@ -381,6 +393,258 @@ ADVANCED_FEATURES = [
     "goal_rich",
     "normalized_actions"
 ]
+
+# ───────── Model Versioning System ─────────
+class ModelVersionManager:
+    """Manages model versions and feature set compatibility"""
+    
+    VERSION_PREFIX = "model_v"
+    
+    def __init__(self):
+        self.current_versions: Dict[str, str] = {}
+        self.feature_signatures: Dict[str, List[str]] = {}
+        self.load_version_info()
+    
+    def load_version_info(self):
+        """Load version information from database"""
+        try:
+            with db_conn() as c:
+                c.execute("SELECT key, value FROM settings WHERE key LIKE 'model_version:%'")
+                rows = c.fetchall()
+                
+                for row in rows:
+                    if row and len(row) >= 2:
+                        key = str(row[0])
+                        value = str(row[1])
+                        model_name = key.replace("model_version:", "")
+                        self.current_versions[model_name] = value
+                
+                c.execute("SELECT key, value FROM settings WHERE key LIKE 'feature_signature:%'")
+                rows = c.fetchall()
+                
+                for row in rows:
+                    if row and len(row) >= 2:
+                        key = str(row[0])
+                        value = str(row[1])
+                        model_name = key.replace("feature_signature:", "")
+                        try:
+                            self.feature_signatures[model_name] = json.loads(value)
+                        except json.JSONDecodeError:
+                            log.error(f"❌ Failed to parse feature signature JSON for {model_name}: {value}")
+                            self.feature_signatures[model_name] = []
+        except Exception as e:
+            log.error(f"❌ Failed to load model version info: {e}")
+    
+    def create_new_version(self, model_name: str, feature_set: List[str]) -> str:
+        """Create a new version for a model"""
+        version = f"{self.VERSION_PREFIX}{int(time.time())}"
+        
+        self.current_versions[model_name] = version
+        self.feature_signatures[model_name] = feature_set
+        
+        # Save to database
+        try:
+            with db_conn() as c:
+                c.execute(
+                    "INSERT INTO settings(key, value) VALUES (%s, %s) "
+                    "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+                    (f"model_version:{model_name}", version)
+                )
+                c.execute(
+                    "INSERT INTO settings(key, value) VALUES (%s, %s) "
+                    "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+                    (f"feature_signature:{model_name}", json.dumps(feature_set))
+                )
+        except Exception as e:
+            log.error(f"❌ Failed to save model version: {e}")
+        
+        log.info(f"✅ Created new version {version} for model {model_name}")
+        return version
+    
+    def check_compatibility(self, model_name: str, current_features: List[str]) -> bool:
+        """Check if current feature set is compatible with model version"""
+        if model_name not in self.feature_signatures:
+            log.warning(f"⚠️ No feature signature found for model {model_name}")
+            return True  # Assume compatible if no signature exists
+        
+        expected_features = set(self.feature_signatures[model_name])
+        actual_features = set(current_features)
+        
+        missing_features = expected_features - actual_features
+        extra_features = actual_features - expected_features
+        
+        if missing_features:
+            log.error(f"❌ Model {model_name} missing features: {missing_features}")
+            return False
+        
+        if extra_features:
+            log.warning(f"⚠️ Model {model_name} has extra features: {extra_features}")
+        
+        return True
+    
+    def get_model_path(self, model_name: str, version: Optional[str] = None) -> Path:
+        """Get path for specific model version"""
+        if version is None:
+            version = self.current_versions.get(model_name, "latest")
+        
+        model_dir = MODEL_DIR / model_name / version
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        return model_dir / "model.joblib"
+    
+    def archive_old_versions(self, model_name: str, keep_last_n: int = 3):
+        """Archive old model versions"""
+        try:
+            model_base_dir = MODEL_DIR / model_name
+            if not model_base_dir.exists():
+                return
+            
+            versions = []
+            for version_dir in model_base_dir.iterdir():
+                if version_dir.is_dir() and version_dir.name.startswith(self.VERSION_PREFIX):
+                    versions.append(version_dir)
+            
+            # Sort by creation time (newest first)
+            versions.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            
+            # Keep only the last n versions
+            for version_dir in versions[keep_last_n:]:
+                import shutil
+                shutil.rmtree(version_dir)
+                log.info(f"🗑️ Archived old version: {version_dir}")
+                
+        except Exception as e:
+            log.error(f"❌ Failed to archive old versions: {e}")
+
+# ───────── Feature Validation System ─────────
+class FeatureValidator:
+    """Ensures consistent feature extraction between training and prediction"""
+    
+    REQUIRED_FEATURES = [
+        'minute', 'goals_h', 'goals_a', 'goals_sum', 'goals_diff',
+        'xg_h', 'xg_a', 'xg_sum', 'xg_diff',
+        'sot_h', 'sot_a', 'sot_sum',
+        'sh_total_h', 'sh_total_a',
+        'cor_h', 'cor_a', 'cor_sum',
+        'pos_h', 'pos_a', 'pos_diff',
+        'red_h', 'red_a', 'red_sum',
+        'yellow_h', 'yellow_a',
+        'momentum_h', 'momentum_a',
+        'pressure_index',
+        'efficiency_h', 'efficiency_a',
+        'total_actions',
+        'action_intensity',
+    ]
+    
+    ADVANCED_FEATURES = [
+        'momentum_ratio',
+        'pressure_per_minute', 
+        'goal_efficiency_h',
+        'goal_efficiency_a',
+        'late_game',
+        'middle_game',
+        'early_game',
+        'xg_dominance',
+        'shot_dominance',
+        'close_game',
+        'high_scoring',
+        'goal_rich',
+        'normalized_actions'
+    ]
+    
+    @classmethod
+    def validate_feature_set(cls, features: Dict[str, float], mode: str = "prediction") -> Tuple[bool, List[str]]:
+        """Validate feature set consistency - FIXED: Handle missing advanced features gracefully"""
+        missing_features = []
+        warnings = []
+        
+        # Check required features - these are ALWAYS required
+        for feature in cls.REQUIRED_FEATURES:
+            if feature not in features:
+                missing_features.append(feature)
+        
+        # FIXED: Only check advanced features if ENABLE_ENHANCED_FEATURES is True
+        # Otherwise, they're optional
+        if ENABLE_ENHANCED_FEATURES:
+            for feature in cls.ADVANCED_FEATURES:
+                if feature not in features:
+                    # For extraction mode, this is a warning
+                    # For prediction mode with enhanced features enabled, it's an error
+                    if mode == "extraction":
+                        warnings.append(f"Advanced feature missing during extraction: {feature}")
+                    else:
+                        missing_features.append(feature)
+        
+        # Validate feature types and ranges - FIXED: Only check features that exist
+        for key, value in features.items():
+            if not isinstance(value, (int, float)):
+                warnings.append(f"Feature {key} has invalid type: {type(value)}")
+            elif key == 'minute' and (value < 0 or value > 120):
+                warnings.append(f"Feature {key} has unrealistic value: {value}")
+            elif key.endswith('_h') or key.endswith('_a'):
+                if value < 0:
+                    warnings.append(f"Feature {key} has negative value: {value}")
+        
+        is_valid = len(missing_features) == 0
+        
+        if not is_valid:
+            log.error(f"❌ Feature validation failed for {mode}. Missing: {missing_features}")
+        if warnings:
+            log.warning(f"⚠️ Feature validation warnings for {mode}: {warnings}")
+        
+        return is_valid, missing_features + warnings
+    
+    @classmethod
+    def normalize_features(cls, features: Dict[str, float]) -> Dict[str, float]:
+        """Normalize features to ensure consistency - FIXED: Better defaults"""
+        normalized = {}
+        
+        # Always include required features
+        for feature in cls.REQUIRED_FEATURES:
+            if feature in features:
+                value = features[feature]
+                # Convert to float and handle None
+                if value is None:
+                    normalized[feature] = 0.0
+                else:
+                    normalized[feature] = float(value)
+            else:
+                # Provide smart default values for missing features
+                if feature == 'minute':
+                    normalized[feature] = 1.0
+                elif feature.endswith('_h') or feature.endswith('_a'):
+                    normalized[feature] = 0.0
+                elif feature in ['momentum_h', 'momentum_a', 'pressure_index', 'efficiency_h', 'efficiency_a', 'action_intensity']:
+                    normalized[feature] = 0.0
+                elif feature in ['total_actions', 'red_sum', 'cor_sum', 'sot_sum', 'xg_sum']:
+                    normalized[feature] = 0.0
+                else:
+                    normalized[feature] = 0.0
+        
+        # Only include advanced features if enabled
+        if ENABLE_ENHANCED_FEATURES:
+            for feature in cls.ADVANCED_FEATURES:
+                if feature in features:
+                    value = features[feature]
+                    if value is None:
+                        normalized[feature] = 0.0
+                    else:
+                        normalized[feature] = float(value)
+                else:
+                    # Provide smart defaults for advanced features
+                    if feature in ['late_game', 'middle_game', 'early_game', 'close_game', 'high_scoring', 'goal_rich']:
+                        normalized[feature] = 0.0
+                    elif feature in ['momentum_ratio', 'xg_dominance', 'shot_dominance']:
+                        normalized[feature] = 0.0  # Neutral
+                    elif 'efficiency' in feature:
+                        normalized[feature] = 0.0
+                    else:
+                        normalized[feature] = 0.0
+        
+        return normalized
+
+# Initialize model version manager
+model_version_manager: Optional[ModelVersionManager] = None
 
 # ───────── Enhanced Feature Extraction System ─────────
 def extract_enhanced_features(m: dict) -> Dict[str, float]:
@@ -649,19 +913,35 @@ def blend_with_api_predictions(your_prob: float, api_prediction: Dict, market: s
         predictions = api_prediction.get("predictions", {})
         api_prob = 0.5  # Default neutral probability
         
+        # Helper function to parse line from suggestion
+        def parse_line_from_suggestion(s: str) -> Optional[float]:
+            try:
+                for token in s.split():
+                    try:
+                        return float(token)
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+            return None
+        
         if market == "BTTS" and "btts" in predictions:
             api_prob = float(predictions["btts"].get("percentage", 50)) / 100
             log.info("📊 API BTTS probability: %.1f%%", api_prob * 100)
             
         elif market.startswith("Over") and "goals" in predictions:
-            over_key = f"over_{_parse_ou_line_from_suggestion(market)}"
-            api_prob = float(predictions["goals"].get(over_key, {}).get("percentage", 50)) / 100
-            log.info("📊 API Over probability: %.1f%%", api_prob * 100)
+            line = parse_line_from_suggestion(market)
+            if line:
+                over_key = f"over_{line}"
+                api_prob = float(predictions["goals"].get(over_key, {}).get("percentage", 50)) / 100
+                log.info("📊 API Over probability: %.1f%%", api_prob * 100)
             
         elif market.startswith("Under") and "goals" in predictions:
-            under_key = f"under_{_parse_ou_line_from_suggestion(market)}"
-            api_prob = float(predictions["goals"].get(under_key, {}).get("percentage", 50)) / 100
-            log.info("📊 API Under probability: %.1f%%", api_prob * 100)
+            line = parse_line_from_suggestion(market)
+            if line:
+                under_key = f"under_{line}"
+                api_prob = float(predictions["goals"].get(under_key, {}).get("percentage", 50)) / 100
+                log.info("📊 API Under probability: %.1f%%", api_prob * 100)
             
         elif "Win" in market and "winner" in predictions:
             if "Home" in market:
@@ -681,133 +961,6 @@ def blend_with_api_predictions(your_prob: float, api_prediction: Dict, market: s
     except Exception as e:
         log.error("❌ Probability blending failed: %s", e)
         return your_prob
-
-# ───────── Feature Validation System ─────────
-class FeatureValidator:
-      """Ensures consistent feature extraction between training and prediction"""
-    
-      REQUIRED_FEATURES = [
-          'minute', 'goals_h', 'goals_a', 'goals_sum', 'goals_diff',
-          'xg_h', 'xg_a', 'xg_sum', 'xg_diff',
-          'sot_h', 'sot_a', 'sot_sum',
-          'sh_total_h', 'sh_total_a',
-          'cor_h', 'cor_a', 'cor_sum',
-          'pos_h', 'pos_a', 'pos_diff',
-          'red_h', 'red_a', 'red_sum',
-          'yellow_h', 'yellow_a',
-          'momentum_h', 'momentum_a',
-          'pressure_index',
-          'efficiency_h', 'efficiency_a',
-          'total_actions',
-          'action_intensity',
-      ]
-    
-      ADVANCED_FEATURES = [
-          'momentum_ratio',
-          'pressure_per_minute', 
-          'goal_efficiency_h',
-          'goal_efficiency_a',
-          'late_game',
-          'middle_game',
-          'early_game',
-          'xg_dominance',
-          'shot_dominance',
-          'close_game',
-          'high_scoring',
-          'goal_rich',
-          'normalized_actions'
-      ]
-    
-      @classmethod
-      def validate_feature_set(cls, features: Dict[str, float], mode: str = "prediction") -> Tuple[bool, List[str]]:
-          """Validate feature set consistency - FIXED: Handle missing advanced features gracefully"""
-          missing_features = []
-          warnings = []
-        
-          # Check required features - these are ALWAYS required
-          for feature in cls.REQUIRED_FEATURES:
-              if feature not in features:
-                  missing_features.append(feature)
-        
-          # FIXED: Only check advanced features if ENABLE_ENHANCED_FEATURES is True
-          # Otherwise, they're optional
-          if ENABLE_ENHANCED_FEATURES:
-              for feature in cls.ADVANCED_FEATURES:
-                  if feature not in features:
-                      # For extraction mode, this is a warning
-                      # For prediction mode with enhanced features enabled, it's an error
-                      if mode == "extraction":
-                          warnings.append(f"Advanced feature missing during extraction: {feature}")
-                      else:
-                          missing_features.append(feature)
-        
-          # Validate feature types and ranges - FIXED: Only check features that exist
-          for key, value in features.items():
-              if not isinstance(value, (int, float)):
-                  warnings.append(f"Feature {key} has invalid type: {type(value)}")
-              elif key == 'minute' and (value < 0 or value > 120):
-                  warnings.append(f"Feature {key} has unrealistic value: {value}")
-              elif key.endswith('_h') or key.endswith('_a'):
-                  if value < 0:
-                      warnings.append(f"Feature {key} has negative value: {value}")
-        
-          is_valid = len(missing_features) == 0
-        
-          if not is_valid:
-              log.error(f"❌ Feature validation failed for {mode}. Missing: {missing_features}")
-          if warnings:
-              log.warning(f"⚠️ Feature validation warnings for {mode}: {warnings}")
-        
-          return is_valid, missing_features + warnings
-    
-      @classmethod
-      def normalize_features(cls, features: Dict[str, float]) -> Dict[str, float]:
-          """Normalize features to ensure consistency - FIXED: Better defaults"""
-          normalized = {}
-        
-          # Always include required features
-          for feature in cls.REQUIRED_FEATURES:
-              if feature in features:
-                  value = features[feature]
-                  # Convert to float and handle None
-                  if value is None:
-                      normalized[feature] = 0.0
-                  else:
-                      normalized[feature] = float(value)
-              else:
-                  # Provide smart default values for missing features
-                  if feature == 'minute':
-                      normalized[feature] = 1.0
-                  elif feature.endswith('_h') or feature.endswith('_a'):
-                      normalized[feature] = 0.0
-                  elif feature in ['momentum_h', 'momentum_a', 'pressure_index', 'efficiency_h', 'efficiency_a', 'action_intensity']:
-                      normalized[feature] = 0.0
-                  elif feature in ['total_actions', 'red_sum', 'cor_sum', 'sot_sum', 'xg_sum']:
-                      normalized[feature] = 0.0
-                  else:
-                      normalized[feature] = 0.0
-        
-          # Only include advanced features if enabled
-          if ENABLE_ENHANCED_FEATURES:
-              for feature in cls.ADVANCED_FEATURES:
-                  if feature in features:
-                      value = features[feature]
-                      if value is None:
-                          normalized[feature] = 0.0
-                      else:
-                          normalized[feature] = float(value)
-                  else:
-                      # Provide smart defaults for advanced features
-                      if feature in ['late_game', 'middle_game', 'early_game', 'close_game', 'high_scoring', 'goal_rich']:
-                          normalized[feature] = 0.0
-                      elif feature in ['momentum_ratio', 'xg_dominance', 'shot_dominance']:
-                          normalized[feature] = 0.0  # Neutral
-                      elif 'efficiency' in feature:
-                          normalized[feature] = 0.0
-                      else:
-                          normalized[feature] = 0.0
-        
-          return normalized
 
 # ───────── Performance Monitoring System ─────────
 class PerformanceMonitor:
@@ -907,149 +1060,6 @@ class PerformanceMonitor:
             "volume_reduction_active": self.volume_reduction_active
         }
 
-# ───────── Model Versioning System ─────────
-class ModelVersionManager:
-      """Manages model versions and feature set compatibility"""
-    
-      VERSION_PREFIX = "model_v"
-    
-      def __init__(self):
-          self.current_versions: Dict[str, str] = {}
-          self.feature_signatures: Dict[str, List[str]] = {}
-          self.load_version_info()
-    
-      def load_version_info(self):
-          """Load version information from database - FIXED ERROR HANDLING"""
-          try:
-              with db_conn() as c:
-                  # FIXED: Handle empty results properly
-                  try:
-                      c.execute("SELECT key, value FROM settings WHERE key LIKE 'model_version:%'")
-                      rows = c.fetchall()
-                    
-                      if rows:
-                         for row in rows:
-                              if len(row) >= 2:  # FIXED: Check tuple length
-                                  key = str(row[0])
-                                  value = str(row[1])
-                                  model_name = key.replace("model_version:", "")
-                                  self.current_versions[model_name] = value
-                              else:
-                                  log.warning(f"⚠️ Invalid row structure in model_version query: {row}")
-                      else:
-                          log.info("📭 No model version settings found in database")
-                        
-                  except Exception as e:
-                      log.error(f"❌ Error fetching model versions: {e}")
-                
-                  # FIXED: Handle empty results for feature signatures
-                  try:
-                      c.execute("SELECT key, value FROM settings WHERE key LIKE 'feature_signature:%'")
-                      rows = c.fetchall()
-                    
-                      if rows:
-                          for row in rows:
-                              if len(row) >= 2:  # FIXED: Check tuple length
-                                  key = str(row[0])
-                                  value = str(row[1])
-                                  model_name = key.replace("feature_signature:", "")
-                                  try:
-                                      self.feature_signatures[model_name] = json.loads(value)
-                                  except json.JSONDecodeError:
-                                      log.error(f"❌ Failed to parse feature signature JSON for {model_name}: {value}")
-                                      self.feature_signatures[model_name] = []
-                              else:
-                                  log.warning(f"⚠️ Invalid row structure in feature_signature query: {row}")
-                      else:
-                          log.info("📭 No feature signature settings found in database")
-                        
-                  except Exception as e:
-                      log.error(f"❌ Error fetching feature signatures: {e}")
-                    
-          except Exception as e:
-              log.error(f"❌ Failed to load model version info: {e}")
-    
-    def create_new_version(self, model_name: str, feature_set: List[str]) -> str:
-        """Create a new version for a model"""
-        version = f"{self.VERSION_PREFIX}{int(time.time())}"
-        
-        self.current_versions[model_name] = version
-        self.feature_signatures[model_name] = feature_set
-        
-        # Save to database
-        try:
-            with db_conn() as c:
-                c.execute(
-                    "INSERT INTO settings(key, value) VALUES (%s, %s) "
-                    "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
-                    (f"model_version:{model_name}", version)
-                )
-                c.execute(
-                    "INSERT INTO settings(key, value) VALUES (%s, %s) "
-                    "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
-                    (f"feature_signature:{model_name}", json.dumps(feature_set))
-                )
-        except Exception as e:
-            log.error(f"❌ Failed to save model version: {e}")
-        
-        log.info(f"✅ Created new version {version} for model {model_name}")
-        return version
-    
-    def check_compatibility(self, model_name: str, current_features: List[str]) -> bool:
-        """Check if current feature set is compatible with model version"""
-        if model_name not in self.feature_signatures:
-            log.warning(f"⚠️ No feature signature found for model {model_name}")
-            return True  # Assume compatible if no signature exists
-        
-        expected_features = set(self.feature_signatures[model_name])
-        actual_features = set(current_features)
-        
-        missing_features = expected_features - actual_features
-        extra_features = actual_features - expected_features
-        
-        if missing_features:
-            log.error(f"❌ Model {model_name} missing features: {missing_features}")
-            return False
-        
-        if extra_features:
-            log.warning(f"⚠️ Model {model_name} has extra features: {extra_features}")
-        
-        return True
-    
-    def get_model_path(self, model_name: str, version: Optional[str] = None) -> Path:
-        """Get path for specific model version"""
-        if version is None:
-            version = self.current_versions.get(model_name, "latest")
-        
-        model_dir = MODEL_DIR / model_name / version
-        model_dir.mkdir(parents=True, exist_ok=True)
-        
-        return model_dir / "model.joblib"
-    
-    def archive_old_versions(self, model_name: str, keep_last_n: int = 3):
-        """Archive old model versions"""
-        try:
-            model_base_dir = MODEL_DIR / model_name
-            if not model_base_dir.exists():
-                return
-            
-            versions = []
-            for version_dir in model_base_dir.iterdir():
-                if version_dir.is_dir() and version_dir.name.startswith(self.VERSION_PREFIX):
-                    versions.append(version_dir)
-            
-            # Sort by creation time (newest first)
-            versions.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-            
-            # Keep only the last n versions
-            for version_dir in versions[keep_last_n:]:
-                import shutil
-                shutil.rmtree(version_dir)
-                log.info(f"🗑️ Archived old version: {version_dir}")
-                
-        except Exception as e:
-            log.error(f"❌ Failed to archive old versions: {e}")
-
 # ───────── Advanced Model Architecture with Enhancements ─────────
 class AdvancedEnsemblePredictor:
     """Advanced ensemble combining multiple models with Bayesian calibration and enhanced features"""
@@ -1063,11 +1073,10 @@ class AdvancedEnsemblePredictor:
         self.bayesian_prior_alpha = BAYESIAN_PRIOR_ALPHA
         self.bayesian_prior_beta  = BAYESIAN_PRIOR_BETA
         self.performance_history: List[int] = []
-        self.version_manager = ModelVersionManager()
         self.model_version: Optional[str] = None
         
         # Try to load existing model
-        self.load_model(market)
+        self.load_model_with_compatibility_check(market)
         
         log.info("🤖 AdvancedEnsemblePredictor initialized for %s with timing optimization", market)
 
@@ -1078,28 +1087,32 @@ class AdvancedEnsemblePredictor:
             feature_signature = self.selected_features.copy()
             
             # Create new version
-            version = self.version_manager.create_new_version(self.market, feature_signature)
-            self.model_version = version
-            
-            model_data = {
-                'market': self.market,
-                'models': self.models,
-                'scaler': self.scaler,
-                'selector': self.selector,
-                'selected_features': self.selected_features,
-                'training_time': time.time(),
-                'model_version': version,
-                'feature_signature': feature_signature,
-            }
-            
-            model_path = self.version_manager.get_model_path(self.market, version)
-            joblib.dump(model_data, model_path)
-            log.info(f"💾 Saved model to {model_path} (version: {version})")
-            
-            # Archive old versions
-            self.version_manager.archive_old_versions(self.market)
-            
-            return True
+            if model_version_manager:
+                version = model_version_manager.create_new_version(self.market, feature_signature)
+                self.model_version = version
+                
+                model_data = {
+                    'market': self.market,
+                    'models': self.models,
+                    'scaler': self.scaler,
+                    'selector': self.selector,
+                    'selected_features': self.selected_features,
+                    'training_time': time.time(),
+                    'model_version': version,
+                    'feature_signature': feature_signature,
+                }
+                
+                model_path = model_version_manager.get_model_path(self.market, version)
+                joblib.dump(model_data, model_path)
+                log.info(f"💾 Saved model to {model_path} (version: {version})")
+                
+                # Archive old versions
+                model_version_manager.archive_old_versions(self.market)
+                
+                return True
+            else:
+                log.error("❌ ModelVersionManager not initialized")
+                return False
         except Exception as e:
             log.error(f"❌ Failed to save model for {self.market}: {e}")
             return False
@@ -1127,14 +1140,18 @@ class AdvancedEnsemblePredictor:
     def load_model_with_compatibility_check(self, market: str) -> bool:
         """Load model with comprehensive compatibility checks"""
         try:
+            if not model_version_manager:
+                log.info(f"📭 ModelVersionManager not initialized for {market}")
+                return False
+            
             # Get latest version
-            latest_version = self.version_manager.current_versions.get(market)
+            latest_version = model_version_manager.current_versions.get(market)
             if not latest_version:
                 log.info(f"📭 No saved model found for {market}")
                 return False
             
             # Check if model file exists
-            model_path = self.version_manager.get_model_path(market, latest_version)
+            model_path = model_version_manager.get_model_path(market, latest_version)
             if not model_path.exists():
                 log.warning(f"📭 Model file not found: {model_path}")
                 return False
@@ -1692,14 +1709,14 @@ class AdvancedEnsemblePredictor:
             log.warning(f"⚠️ No models loaded for {self.market}, returning neutral probability")
             return 0.5
             
-        feature_vector = self._prepare_features(features)
-        if feature_vector is None:
+        feature_vector = self._prepare_features_for_prediction(features)
+        if feature_vector is None or feature_vector.shape[1] == 0:
             return 0.5
             
         predictions: List[float] = []
         for model_name, model in self.models.items():
             try:
-                prob = float(model.predict_proba(feature_vector.reshape(1, -1))[0][1])
+                prob = float(model.predict_proba(feature_vector)[0][1])
                 predictions.append(prob)
             except Exception as e:
                 log.error("Prediction failed for %s: %s", model_name, e)
@@ -1714,7 +1731,8 @@ class AdvancedEnsemblePredictor:
         _metric_inc("ensemble_predictions_total", label=self.market)
         return bayesian_prob
 
-    def _prepare_features(self, features: Dict[str, float]) -> Optional[np.ndarray]:
+    def _prepare_features_for_prediction(self, features: Dict[str, float]) -> Optional[np.ndarray]:
+        """Prepare features for prediction"""
         if not self.scaler:
             return None
             
@@ -1728,7 +1746,7 @@ class AdvancedEnsemblePredictor:
         else:
             X_selected = feature_df.values
             
-        return self.scaler.transform(X_selected)[0]
+        return self.scaler.transform(X_selected)
     
     def _apply_bayesian_prior(self, ensemble_prob: float) -> float:
         if not self.performance_history:
@@ -1963,7 +1981,7 @@ class SelfLearningSystem:
 
 # ───────── Configuration Validation ─────────
 def validate_configuration():
-    """Validate all required environment variables at startup - FIXED: Don't validate features at startup"""
+    """Validate all required environment variables at startup"""
     log.info("🔧 Validating configuration...")
     
     required_envs = {
@@ -2038,9 +2056,6 @@ def validate_configuration():
         log.warning("Configuration warnings:")
         for warning in warnings:
             log.warning(warning)
-    
-    # FIXED: DON'T validate features at startup - they're created dynamically
-    # Feature validation happens during runtime when features are actually extracted
     
     if not errors:
         log.info("✅ Configuration validation passed")
@@ -2398,7 +2413,7 @@ def _blocked_league(league_obj: dict) -> bool:
         log.debug("🚫 Denied league ID: %s", lid)
         return True
     
-    # Apply TARGET_LEAGUES filter
+    # Apply TARGET_LEAGUES filter - if NOT in target list, block it
     if not _is_target_league(league_obj):
         log.info("🚫 League not in target list: %s - %s", country, name)
         _metric_inc("league_filter_rejected")
@@ -2432,12 +2447,28 @@ def fetch_match_stats(fid: int) -> list:
 def fetch_live_fixtures_only() -> List[dict]:
     log.info("🌐 Fetching live fixtures...")
     js = _api_get(FOOTBALL_API_URL, {"live": "all"}) or {}
-    matches = [
-        m
-        for m in (js.get("response", []) if isinstance(js, dict) else [])
-        if not _blocked_league(m.get("league") or {})
-    ]
-    log.info("📋 Found %s total live matches after league filtering", len(matches))
+    all_matches = js.get("response", []) if isinstance(js, dict) else []
+    
+    log.info(f"📋 Found {len(all_matches)} total live matches from API")
+    
+    matches = []
+    rejected_leagues = []
+    
+    for m in all_matches:
+        league_obj = m.get("league") or {}
+        league_name = league_obj.get("name", "")
+        country = league_obj.get("country", "")
+        
+        if _blocked_league(league_obj):
+            rejected_leagues.append(f"{country} - {league_name}")
+            continue
+        
+        matches.append(m)
+    
+    log.info(f"📋 Found {len(matches)} live matches after league filtering")
+    
+    if rejected_leagues:
+        log.info(f"🚫 Rejected {len(rejected_leagues)} leagues: {', '.join(set(rejected_leagues[:10]))}")
     
     out = []
     for m in matches:
@@ -3006,7 +3037,19 @@ def _get_odds_for_market(odds_map: dict, market: str, suggestion: str) -> Tuple[
         else:
             log.debug("❌ No 1X2 odds found for %s", tgt)
     elif market.startswith("Over/Under"):
-        ln_val = _parse_ou_line_from_suggestion(suggestion)
+        # Parse line from suggestion
+        def parse_line_from_suggestion(s: str) -> Optional[float]:
+            try:
+                for token in s.split():
+                    try:
+                        return float(token)
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+            return None
+            
+        ln_val = parse_line_from_suggestion(suggestion)
         d      = odds_map.get(f"OU_{_fmt_line(ln_val)}", {}) if ln_val is not None else {}
         tgt    = "Over" if suggestion.startswith("Over") else "Under"
         if tgt in d:
