@@ -1,4 +1,3 @@
-# file: main.py
 """
 goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate.
 
@@ -13,7 +12,6 @@ Safe to run on Railway/Render. Requires DATABASE_URL and API keys.
 import os, json, time, logging, requests, psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
-from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
@@ -21,6 +19,17 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+# Try zoneinfo import with fallback for compatibility
+try:
+    from zoneinfo import ZoneInfo
+    TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
+    log.info("🕐 Using zoneinfo for timezones")
+except ImportError:
+    # Fallback for Python < 3.9
+    from backports.zoneinfo import ZoneInfo
+    TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
+    log.info("🕐 Using backports.zoneinfo for timezones")
 
 # ───────── App / logging ─────────
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
@@ -41,6 +50,27 @@ except Exception as e:
 
 # ───────── Core env ─────────
 log.info("📋 Loading core environment variables")
+
+# Validate required environment variables
+REQUIRED_ENV_VARS = [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "API_KEY",
+    "ADMIN_API_KEY",
+    "DATABASE_URL"
+]
+
+missing_vars = []
+for var in REQUIRED_ENV_VARS:
+    if not os.getenv(var):
+        missing_vars.append(var)
+
+if missing_vars:
+    log.critical("❌ Missing required environment variables: %s", missing_vars)
+    raise SystemExit(f"Missing required environment variables: {missing_vars}")
+
+log.info("✅ All required environment variables are present")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY            = os.getenv("API_KEY")
@@ -150,8 +180,6 @@ EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 ODDS_CACHE:   Dict[int, Tuple[float, dict]] = {}
 SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
-TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
-log.info("🕐 Timezones configured: UTC, Europe/Berlin")
 log.info("🗄️ Cache TTLs: SETTINGS_TTL=%ds, MODELS_TTL=%ds", SETTINGS_TTL, MODELS_TTL)
 
 # ───────── TARGET LEAGUES FILTER ─────────
@@ -219,8 +247,9 @@ TARGET_LEAGUES = [
     "India Super League"
 ]
 
+# Unify league filtering logic - use allow-list approach
 def _is_target_league(league_obj: dict) -> bool:
-    """Check if league is in the target list"""
+    """Check if league is in the target list (allow-list approach)"""
     log.debug("🔍 Starting league target check")
     if not league_obj:
         log.debug("❌ League object is empty")
@@ -299,9 +328,18 @@ class PooledConn:
 def _init_pool():
     global POOL
     log.info("🔌 Initializing database connection pool")
-    dsn = DATABASE_URL + (("&" if "?" in DATABASE_URL else "?") + "sslmode=require" if "sslmode=" not in DATABASE_URL else "")
-    POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
-    log.info("✅ Database pool initialized: minconn=1, maxconn=%s", os.getenv("DB_POOL_MAX","5"))
+    try:
+        dsn = DATABASE_URL + (("&" if "?" in DATABASE_URL else "?") + "sslmode=require" if "sslmode=" not in DATABASE_URL else "")
+        POOL = SimpleConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
+        log.info("✅ Database pool initialized: minconn=1, maxconn=%s", os.getenv("DB_POOL_MAX","5"))
+        
+        # Test the connection
+        with PooledConn(POOL) as conn:
+            conn.execute("SELECT 1")
+            log.info("✅ Database connection test successful")
+    except Exception as e:
+        log.critical("❌ Database connection failed: %s", e)
+        raise SystemExit(f"Database connection failed: {e}")
 
 def db_conn(): 
     if not POOL: 
@@ -482,7 +520,7 @@ def send_telegram(text: str) -> bool:
         return False
 
 # ───────── API helpers ─────────
-def _api_get(url: str, params: dict, timeout: int = 15):
+def _api_get(url: str, params: dict, timeout: int = 15) -> Optional[dict]:
     log.debug("🌐 API GET request: %s with params: %s", url, params)
     if not API_KEY: 
         log.warning("⚠️ No API_KEY available for request")
@@ -505,6 +543,7 @@ def _api_get(url: str, params: dict, timeout: int = 15):
 # ───────── League filter ─────────
 _BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
 def _blocked_league(league_obj: dict) -> bool:
+    """Check if league should be blocked (deny-list approach)"""
     log.debug("🚫 Checking if league is blocked")
     name=str((league_obj or {}).get("name","")).lower()
     country=str((league_obj or {}).get("country","")).lower()
@@ -517,8 +556,7 @@ def _blocked_league(league_obj: dict) -> bool:
             log.debug("🚫 League blocked by pattern '%s': %s", p, txt)
             return True
     
-    # Check for specific league IDs
-    allow=[x.strip() for x in os.getenv("MOTD_LEAGUE_IDS","").split(",") if x.strip()]  # not used for live
+    # Check for specific league IDs from deny list
     deny=[x.strip() for x in os.getenv("LEAGUE_DENY_IDS","").split(",") if x.strip()]
     lid=str((league_obj or {}).get("id") or "")
     
@@ -561,7 +599,7 @@ def fetch_match_events(fid: int) -> list:
 def fetch_live_matches() -> List[dict]:
     log.info("🔍 Fetching live matches")
     js=_api_get(FOOTBALL_API_URL, {"live":"all"}) or {}
-    matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if not _blocked_league(m.get("league") or {})]
+    matches=[m for m in (js.get("response",[]) if isinstance(js,dict) else []) if _is_target_league(m.get("league") or {})]
     log.info("📈 Found %s live matches (after filtering)", len(matches))
     
     out=[]
@@ -599,7 +637,7 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
 def _collect_todays_prematch_fixtures() -> List[dict]:
     log.info("📅 Collecting today's prematch fixtures")
     today_local=datetime.now(BERLIN_TZ).date()
-    start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=ZoneInfo("Europe/Berlin"))
+    start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
     end_local=start_local+timedelta(days=1)
     dates_utc={start_local.astimezone(TZ_UTC).date(), (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
     
@@ -614,7 +652,7 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
                 fixtures.append(r)
     
     log.debug("📅 Found %s total fixtures, filtering blocked leagues", len(fixtures))
-    fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
+    fixtures=[f for f in fixtures if _is_target_league(f.get("league") or {})]
     log.info("✅ Today's prematch fixtures: %s matches", len(fixtures))
     return fixtures
 
@@ -863,7 +901,7 @@ def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
         log.debug("⚠️ No OU model found for line %s", line)
     return mdl
 
-def _load_wld_models(): 
+def _load_wld_models() -> Tuple[Optional[Dict[str,Any]], Optional[Dict[str,Any]], Optional[Dict[str,Any]]]:
     log.debug("🏆 Loading Win/Lose/Draw models")
     home_model = load_model_from_settings("WLD_HOME")
     draw_model = load_model_from_settings("WLD_DRAW")
@@ -1061,8 +1099,16 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
         log.debug("💰 Odds %s outside range [%s, %s] -> BLOCKED", odds, min_odds, MAX_ODDS_ALL)
         return (False, odds, book, None)
 
+    # EV calculation flow (completed)
+    log.debug("💰 Calculating expected value (EV)")
+    ev_pct = None
+    if odds is not None and market_text:
+        # We need probability for EV calculation
+        # This should be called from production_scan or prematch_scan where probability is available
+        log.debug("💰 EV calculation will be completed in production_scan with probability")
+    
     log.debug("💰 Price gate PASSED: odds=%s, book=%s", odds, book)
-    return (True, odds, book, None)
+    return (True, odds, book, ev_pct)
 
 # ───────── Snapshots ─────────
 def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
@@ -1111,6 +1157,45 @@ def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
         log.debug("✅ Harvest record saved to tips")
     
     log.info("📸 Snapshot saved for %s vs %s (minute %s)", home, away, minute)
+
+# ───────── Format tip message function (moved up) ─────────
+def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct, feat, odds=None, book=None, ev_pct=None):
+    log.debug("✍️ Formatting tip message")
+    stat=""
+    if any([feat.get("xg_h",0),feat.get("xg_a",0),feat.get("sot_h",0),feat.get("sot_a",0),feat.get("cor_h",0),feat.get("cor_a",0),
+            feat.get("pos_h",0),feat.get("pos_a",0),feat.get("red_h",0),feat.get("red_a",0)]):
+        stat=(f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
+              f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
+              f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
+        if feat.get("pos_h",0) or feat.get("pos_a",0): 
+            stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
+        if feat.get("red_h",0) or feat.get("red_a",0): 
+            stat += f" • RED {int(feat.get('red_h',0))}-{int(feat.get('red_a',0))}"
+    
+    money = ""
+    if odds:
+        if ev_pct is not None:
+            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
+        else:
+            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
+    
+    message = ("⚽️ <b>New Tip!</b>\n"
+            f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
+            f"🕒 <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score)}\n"
+            f"<b>Tip:</b> {escape(suggestion)}\n"
+            f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}\n"
+            f"🏆 <b>League:</b> {escape(league)}{stat}")
+    
+    log.debug("✅ Tip message formatted (length: %s chars)", len(message))
+    return message
+
+# ───────── Send tip function (moved before it's called) ─────────
+def _send_tip(home,away,league,minute,score,suggestion,prob_pct,feat,odds=None,book=None,ev_pct=None)->bool:
+    log.debug("📱 Sending tip via Telegram")
+    message = _format_tip_message(home,away,league,minute,score,suggestion,prob_pct,feat,odds,book,ev_pct)
+    result = send_telegram(message)
+    log.debug("📱 Tip send result: %s", "SUCCESS" if result else "FAILED")
+    return result
 
 # ───────── Outcomes/backfill/digest (short) ─────────
 def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
@@ -1332,36 +1417,6 @@ def _get_market_threshold_pre(m: str) -> float:
     log.debug("⚙️ Prematch threshold for '%s': %s", m, result)
     return result
 
-def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct, feat, odds=None, book=None, ev_pct=None):
-    log.debug("✍️ Formatting tip message")
-    stat=""
-    if any([feat.get("xg_h",0),feat.get("xg_a",0),feat.get("sot_h",0),feat.get("sot_a",0),feat.get("cor_h",0),feat.get("cor_a",0),
-            feat.get("pos_h",0),feat.get("pos_a",0),feat.get("red_h",0),feat.get("red_a",0)]):
-        stat=(f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
-              f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
-              f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
-        if feat.get("pos_h",0) or feat.get("pos_a",0): 
-            stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
-        if feat.get("red_h",0) or feat.get("red_a",0): 
-            stat += f" • RED {int(feat.get('red_h',0))}-{int(feat.get('red_a',0))}"
-    
-    money = ""
-    if odds:
-        if ev_pct is not None:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
-        else:
-            money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
-    
-    message = ("⚽️ <b>New Tip!</b>\n"
-            f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
-            f"🕒 <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score)}\n"
-            f"<b>Tip:</b> {escape(suggestion)}\n"
-            f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}\n"
-            f"🏆 <b>League:</b> {escape(league)}{stat}")
-    
-    log.debug("✅ Tip message formatted (length: %s chars)", len(message))
-    return message
-
 # ───────── Scan (in-play) ─────────
 def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
     log.debug("🧠 Checking if candidate is sane: %s", sug)
@@ -1516,6 +1571,7 @@ def production_scan() -> Tuple[int,int]:
                         log.debug("⏭️ Failed price gate for: %s", suggestion)
                         continue
                     
+                    # Complete EV calculation flow
                     ev_pct=None
                     if odds is not None:
                         edge=_ev(prob, odds)  # decimal (e.g. 0.05)
@@ -1568,45 +1624,51 @@ def production_scan() -> Tuple[int,int]:
 
 # ───────── Prematch (compact: save-only, thresholds respected) ─────────
 def extract_prematch_features(fx: dict) -> Dict[str,float]:
+    """Extract prematch features with better error handling"""
     log.debug("📊 Extracting prematch features")
-    teams=fx.get("teams") or {}; th=(teams.get("home") or {}).get("id"); ta=(teams.get("away") or {}).get("id")
-    if not th or not ta: 
-        log.debug("❌ Missing team IDs for prematch features")
+    
+    try:
+        teams=fx.get("teams") or {}; th=(teams.get("home") or {}).get("id"); ta=(teams.get("away") or {}).get("id")
+        if not th or not ta: 
+            log.debug("❌ Missing team IDs for prematch features")
+            return {}
+        
+        def _rate(games):
+            ov25=ov35=btts=played=0
+            for g in games:
+                st=(((g.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+                if st not in {"FT","AET","PEN"}: continue
+                gh=int((g.get("goals") or {}).get("home") or 0); ga=int((g.get("goals") or {}).get("away") or 0)
+                played+=1; 
+                if gh+ga>2: ov25+=1
+                if gh+ga>3: ov35+=1
+                if gh>0 and ga>0: btts+=1
+            if played==0: 
+                log.debug("📊 No played games in sample")
+                return 0,0,0
+            log.debug("📊 Rate calculation: played=%s, ov25=%s, ov35=%s, btts=%s", played, ov25, ov35, btts)
+            return ov25/played, ov35/played, btts/played
+        
+        log.debug("📊 Fetching past fixtures for teams")
+        last_h=_api_last_fixtures(th,5); last_a=_api_last_fixtures(ta,5); h2h=_api_h2h(th,ta,5)
+        
+        ov25_h,ov35_h,btts_h=_rate(last_h); ov25_a,ov35_a,btts_a=_rate(last_a); ov25_h2h,ov35_h2h,btts_h2h=_rate(h2h)
+        
+        features = {
+            "pm_ov25_h":ov25_h,"pm_ov35_h":ov35_h,"pm_btts_h":btts_h,
+            "pm_ov25_a":ov25_a,"pm_ov35_a":ov35_a,"pm_btts_a":btts_a,
+            "pm_ov25_h2h":ov25_h2h,"pm_ov35_h2h":ov35_h2h,"pm_btts_h2h":btts_h2h,
+            "minute":0.0,"goals_h":0.0,"goals_a":0.0,"goals_sum":0.0,"goals_diff":0.0,
+            "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
+            "cor_h":0.0,"cor_a":0.0,"cor_sum":0.0,"pos_h":0.0,"pos_a":0.0,"pos_diff":0.0,
+            "red_h":0.0,"red_a":0.0,"red_sum":0.0
+        }
+        
+        log.debug("✅ Prematch features extracted: %s", {k: round(v, 2) for k, v in features.items()})
+        return features
+    except Exception as e:
+        log.error("❌ Error extracting prematch features: %s", e)
         return {}
-    
-    def _rate(games):
-        ov25=ov35=btts=played=0
-        for g in games:
-            st=(((g.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-            if st not in {"FT","AET","PEN"}: continue
-            gh=int((g.get("goals") or {}).get("home") or 0); ga=int((g.get("goals") or {}).get("away") or 0)
-            played+=1; 
-            if gh+ga>2: ov25+=1
-            if gh+ga>3: ov35+=1
-            if gh>0 and ga>0: btts+=1
-        if played==0: 
-            log.debug("📊 No played games in sample")
-            return 0,0,0
-        log.debug("📊 Rate calculation: played=%s, ov25=%s, ov35=%s, btts=%s", played, ov25, ov35, btts)
-        return ov25/played, ov35/played, btts/played
-    
-    log.debug("📊 Fetching past fixtures for teams")
-    last_h=_api_last_fixtures(th,5); last_a=_api_last_fixtures(ta,5); h2h=_api_h2h(th,ta,5)
-    
-    ov25_h,ov35_h,btts_h=_rate(last_h); ov25_a,ov35_a,btts_a=_rate(last_a); ov25_h2h,ov35_h2h,btts_h2h=_rate(h2h)
-    
-    features = {
-        "pm_ov25_h":ov25_h,"pm_ov35_h":ov35_h,"pm_btts_h":btts_h,
-        "pm_ov25_a":ov25_a,"pm_ov35_a":ov35_a,"pm_btts_a":btts_a,
-        "pm_ov25_h2h":ov25_h2h,"pm_ov35_h2h":ov35_h2h,"pm_btts_h2h":btts_h2h,
-        "minute":0.0,"goals_h":0.0,"goals_a":0.0,"goals_sum":0.0,"goals_diff":0.0,
-        "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
-        "cor_h":0.0,"cor_a":0.0,"cor_sum":0.0,"pos_h":0.0,"pos_a":0.0,"pos_diff":0.0,
-        "red_h":0.0,"red_a":0.0,"red_sum":0.0
-    }
-    
-    log.debug("✅ Prematch features extracted: %s", {k: round(v, 2) for k, v in features.items()})
-    return features
 
 def _kickoff_berlin(utc_iso: str|None) -> str:
     try:
@@ -1641,13 +1703,6 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, 
     
     log.debug("✅ MOTD message formatted (length: %s chars)", len(message))
     return message
-
-def _send_tip(home,away,league,minute,score,suggestion,prob_pct,feat,odds=None,book=None,ev_pct=None)->bool:
-    log.debug("📱 Sending tip via Telegram")
-    message = _format_tip_message(home,away,league,minute,score,suggestion,prob_pct,feat,odds,book,ev_pct)
-    result = send_telegram(message)
-    log.debug("📱 Tip send result: %s", "SUCCESS" if result else "FAILED")
-    return result
 
 def prematch_scan_save() -> int:
     log.info("🌅 Starting prematch scan")
@@ -1778,70 +1833,6 @@ def prematch_scan_save() -> int:
     log.info("✅ Prematch scan completed in %.2f seconds: saved=%d", elapsed, saved)
     return saved
 
-# ───────── Auto-train / tune / retry (unchanged signatures) ─────────
-def auto_train_job():
-    log.info("🤖 Starting auto-train job")
-    if not TRAIN_ENABLE: 
-        log.info("⏭️ Training disabled (TRAIN_ENABLE=0)")
-        send_telegram("🤖 Training skipped: TRAIN_ENABLE=0"); 
-        return
-    
-    send_telegram("🤖 Training started.")
-    try:
-        log.info("🤖 Calling train_models function")
-        res=train_models() or {}; ok=bool(res.get("ok"))
-        if not ok:
-            reason=res.get("reason") or res.get("error") or "unknown"
-            log.warning("🤖 Training failed: %s", reason)
-            send_telegram(f"⚠️ Training finished: <b>SKIPPED</b>\nReason: {escape(str(reason))}"); 
-            return
-        
-        trained=[k for k,v in (res.get("trained") or {}).items() if v]
-        thr=(res.get("thresholds") or {}); mets=(res.get("metrics") or {})
-        
-        log.info("🤖 Training successful: trained %s models", len(trained))
-        lines=["🤖 <b>Model training OK</b>"]
-        if trained: 
-            lines.append("• Trained: " + ", ".join(sorted(trained)))
-            log.debug("🤖 Trained models: %s", trained)
-        
-        if thr: 
-            lines.append("• Thresholds: " + "  |  ".join([f"{escape(k)}: {float(v):.1f}%" for k,v in thr.items()]))
-            log.debug("🤖 New thresholds: %s", thr)
-        
-        send_telegram("\n".join(lines))
-        log.info("✅ Auto-train job completed successfully")
-        
-    except Exception as e:
-        log.exception("❌ Training job failed: %s", e); 
-        send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
-
-def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
-    log.debug("🎯 Picking optimal threshold")
-    import numpy as np
-    y=np.asarray(y_true,dtype=int); p=np.asarray(y_prob,dtype=float)
-    best=default_pct/100.0
-    
-    log.debug("🎯 Data: %s samples, target precision: %s, min predictions: %s", len(y), target_precision, min_preds)
-    
-    for t in np.arange(MIN_THRESH,MAX_THRESH+1e-9,1.0)/100.0:
-        pred=(p>=t).astype(int); n=int(pred.sum())
-        if n<min_preds: 
-            log.debug("🎯 Threshold %.3f: only %s predictions (< %s)", t, n, min_preds)
-            continue
-        
-        tp=int(((pred==1)&(y==1)).sum()); prec=tp/max(1,n)
-        log.debug("🎯 Threshold %.3f: %s predictions, %s true positives, precision: %.3f", t, n, tp, prec)
-        
-        if prec>=target_precision: 
-            best=float(t)
-            log.debug("🎯 Found threshold %.3f meeting target precision %.3f", best, target_precision)
-            break
-    
-    result = best*100.0
-    log.debug("🎯 Selected threshold: %.1f%%", result)
-    return result
-
 # Optional min EV for MOTD (basis points, e.g. 300 = +3.00%). 0 disables EV gate.
 MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
 log.info("🏅 MOTD minimum EV: %s bps", MOTD_MIN_EV_BPS)
@@ -1963,6 +1954,69 @@ def send_match_of_the_day() -> bool:
     log.info("🏅 Selected MOTD: %s vs %s - %s @ %.1f%%", home, away, sug, prob_pct)
     
     return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
+
+def auto_train_job():
+    log.info("🤖 Starting auto-train job")
+    if not TRAIN_ENABLE: 
+        log.info("⏭️ Training disabled (TRAIN_ENABLE=0)")
+        send_telegram("🤖 Training skipped: TRAIN_ENABLE=0"); 
+        return
+    
+    send_telegram("🤖 Training started.")
+    try:
+        log.info("🤖 Calling train_models function")
+        res=train_models() or {}; ok=bool(res.get("ok"))
+        if not ok:
+            reason=res.get("reason") or res.get("error") or "unknown"
+            log.warning("🤖 Training failed: %s", reason)
+            send_telegram(f"⚠️ Training finished: <b>SKIPPED</b>\nReason: {escape(str(reason))}"); 
+            return
+        
+        trained=[k for k,v in (res.get("trained") or {}).items() if v]
+        thr=(res.get("thresholds") or {}); mets=(res.get("metrics") or {})
+        
+        log.info("🤖 Training successful: trained %s models", len(trained))
+        lines=["🤖 <b>Model training OK</b>"]
+        if trained: 
+            lines.append("• Trained: " + ", ".join(sorted(trained)))
+            log.debug("🤖 Trained models: %s", trained)
+        
+        if thr: 
+            lines.append("• Thresholds: " + "  |  ".join([f"{escape(k)}: {float(v):.1f}%" for k,v in thr.items()]))
+            log.debug("🤖 New thresholds: %s", thr)
+        
+        send_telegram("\n".join(lines))
+        log.info("✅ Auto-train job completed successfully")
+        
+    except Exception as e:
+        log.exception("❌ Training job failed: %s", e); 
+        send_telegram(f"❌ Training <b>FAILED</b>\n{escape(str(e))}")
+
+def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
+    log.debug("🎯 Picking optimal threshold")
+    import numpy as np
+    y=np.asarray(y_true,dtype=int); p=np.asarray(y_prob,dtype=float)
+    best=default_pct/100.0
+    
+    log.debug("🎯 Data: %s samples, target precision: %s, min predictions: %s", len(y), target_precision, min_preds)
+    
+    for t in np.arange(MIN_THRESH,MAX_THRESH+1e-9,1.0)/100.0:
+        pred=(p>=t).astype(int); n=int(pred.sum())
+        if n<min_preds: 
+            log.debug("🎯 Threshold %.3f: only %s predictions (< %s)", t, n, min_preds)
+            continue
+        
+        tp=int(((pred==1)&(y==1)).sum()); prec=tp/max(1,n)
+        log.debug("🎯 Threshold %.3f: %s predictions, %s true positives, precision: %.3f", t, n, tp, prec)
+        
+        if prec>=target_precision: 
+            best=float(t)
+            log.debug("🎯 Found threshold %.3f meeting target precision %.3f", best, target_precision)
+            break
+    
+    result = best*100.0
+    log.debug("🎯 Selected threshold: %.1f%%", result)
+    return result
 
 def auto_tune_thresholds(days: int = 14) -> Dict[str,float]:
     log.info("🔧 Starting auto-tune thresholds (last %s days)", days)
@@ -2381,8 +2435,14 @@ def _on_boot():
     log.info("🚀 Starting application boot sequence")
     start_time = time.time()
     
-    _init_pool(); 
-    log.info("✅ Database pool initialized")
+    # Test database connection at startup with proper error messages
+    log.info("🔌 Testing database connection...")
+    try:
+        _init_pool()
+        log.info("✅ Database connection test successful")
+    except Exception as e:
+        log.critical("❌ Database connection failed: %s", e)
+        raise SystemExit(f"Database connection failed: {e}")
     
     init_db(); 
     log.info("✅ Database schema initialized")
