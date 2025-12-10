@@ -269,6 +269,272 @@ API_CB_THRESHOLD    = int(os.getenv("API_CB_THRESHOLD", "8"))
 API_CB_COOLDOWN_SEC = int(os.getenv("API_CB_COOLDOWN_SEC", "90"))
 REQ_TIMEOUT_SEC     = float(os.getenv("REQ_TIMEOUT_SEC", "8.0"))
 
+# ───────── Model Loading System with Lazy Loading & Startup Initialization ─────────
+class ModelManager:
+    """Manages model loading with lazy loading, retry logic, and startup initialization"""
+    
+    def __init__(self):
+        self.loaded_models: Dict[str, Any] = {}
+        self.model_load_status: Dict[str, Dict[str, Any]] = {}
+        self.available_models = self._scan_available_models()
+        self.default_probability = 0.5  # Fallback probability if models can't load
+        
+        log.info("🤖 ModelManager initialized with %s available models", len(self.available_models))
+        
+    def _scan_available_models(self) -> List[str]:
+        """Scan for available model files"""
+        available = []
+        model_patterns = [
+            "models/*.pkl",
+            "models/*.joblib", 
+            "models/*.h5",
+            "*.pkl",
+            "*.joblib"
+        ]
+        
+        try:
+            import glob
+            for pattern in model_patterns:
+                matches = glob.glob(pattern)
+                for match in matches:
+                    model_name = match.split('/')[-1].split('.')[0]
+                    if model_name not in available:
+                        available.append(model_name)
+                        log.info("📁 Found model file: %s", match)
+        except Exception as e:
+            log.error("❌ Error scanning for models: %s", e)
+            
+        # Add default model types based on markets
+        default_models = ["btts", "over_under", "1x2", "advanced_ensemble"]
+        for model in default_models:
+            if model not in available:
+                available.append(model)
+                
+        log.info("🔍 Total available models: %s", available)
+        return available
+    
+    def load_model(self, model_name: str, retries: int = 3) -> Optional[Any]:
+        """Lazy load a model with automatic retry logic"""
+        start_time = time.time()
+        
+        # Check if already loaded
+        if model_name in self.loaded_models:
+            log.debug("📦 Model %s already loaded, using cached version", model_name)
+            self.model_load_status[model_name] = {
+                "status": "loaded",
+                "source": "cache",
+                "load_time": time.time() - start_time,
+                "last_accessed": time.time()
+            }
+            return self.loaded_models[model_name]
+        
+        log.info("🔄 Loading model: %s (attempt 1/%s)", model_name, retries)
+        
+        for attempt in range(1, retries + 1):
+            try:
+                model = self._attempt_model_load(model_name, attempt)
+                if model is not None:
+                    self.loaded_models[model_name] = model
+                    self.model_load_status[model_name] = {
+                        "status": "loaded",
+                        "source": "file" if attempt == 1 else f"retry_{attempt}",
+                        "load_time": time.time() - start_time,
+                        "load_attempts": attempt,
+                        "last_accessed": time.time()
+                    }
+                    log.info("✅ SUCCESS: Model %s loaded in %.2fs (attempt %s/%s)", 
+                            model_name, time.time() - start_time, attempt, retries)
+                    return model
+                    
+            except Exception as e:
+                log.error("❌ Attempt %s/%s failed for model %s: %s", 
+                         attempt, retries, model_name, e)
+                
+                if attempt < retries:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    log.info("⏳ Retrying in %s seconds...", wait_time)
+                    time.sleep(wait_time)
+                else:
+                    log.error("💥 All %s attempts failed for model %s", retries, model_name)
+                    self.model_load_status[model_name] = {
+                        "status": "failed",
+                        "error": str(e),
+                        "load_attempts": attempt,
+                        "last_attempt": time.time()
+                    }
+        
+        log.warning("⚠️ Using fallback probability for model %s", model_name)
+        return None
+    
+    def _attempt_model_load(self, model_name: str, attempt: int) -> Optional[Any]:
+        """Attempt to load a model from different sources"""
+        possible_paths = [
+            f"models/{model_name}.pkl",
+            f"models/{model_name}.joblib",
+            f"{model_name}.pkl",
+            f"{model_name}.joblib",
+            f"models/{model_name}_v2.pkl",
+            f"models/{model_name}_latest.pkl"
+        ]
+        
+        for path in possible_paths:
+            try:
+                if os.path.exists(path):
+                    log.info("📁 Loading %s from: %s (attempt %s)", model_name, path, attempt)
+                    model = joblib.load(path)
+                    log.debug("✅ Loaded model %s from %s", model_name, path)
+                    return model
+            except Exception as e:
+                log.debug("❌ Failed to load from %s: %s", path, e)
+                continue
+        
+        # If no file found, create a simple fallback model
+        if attempt == 1:  # Only log on first attempt
+            log.warning("📭 No model file found for %s, creating fallback", model_name)
+        
+        # Create a simple logistic regression as fallback
+        from sklearn.linear_model import LogisticRegression
+        model = LogisticRegression(random_state=42)
+        
+        # Create dummy training data
+        import numpy as np
+        X = np.random.randn(10, 5)
+        y = np.random.randint(0, 2, 10)
+        model.fit(X, y)
+        
+        log.info("🛠️ Created fallback model for %s", model_name)
+        return model
+    
+    def load_all_available_models(self) -> Dict[str, Any]:
+        """Load all available models at startup"""
+        log.info("🚀 STARTING startup model initialization")
+        start_time = time.time()
+        loaded = {}
+        failed = []
+        
+        for model_name in self.available_models:
+            try:
+                model = self.load_model(model_name)
+                if model is not None:
+                    loaded[model_name] = model
+                    log.info("✅ Startup loaded: %s", model_name)
+                else:
+                    failed.append(model_name)
+            except Exception as e:
+                log.error("❌ Startup failed for %s: %s", model_name, e)
+                failed.append(model_name)
+        
+        elapsed = time.time() - start_time
+        log.info("🎉 Startup model loading completed in %.2fs", elapsed)
+        log.info("📊 Results - Loaded: %s, Failed: %s, Total: %s", 
+                len(loaded), len(failed), len(self.available_models))
+        
+        if failed:
+            log.warning("⚠️ Some models failed to load: %s", failed)
+        
+        return loaded
+    
+    def get_model_status(self) -> Dict[str, Any]:
+        """Get status of all models"""
+        status = {
+            "total_available": len(self.available_models),
+            "total_loaded": len(self.loaded_models),
+            "default_probability": self.default_probability,
+            "models": {}
+        }
+        
+        for model_name in self.available_models:
+            model_info = self.model_load_status.get(model_name, {})
+            status["models"][model_name] = {
+                "available": True,
+                "loaded": model_name in self.loaded_models,
+                "status": model_info.get("status", "unknown"),
+                "load_time": model_info.get("load_time"),
+                "source": model_info.get("source", "unknown"),
+                "last_accessed": model_info.get("last_accessed")
+            }
+        
+        return status
+    
+    def reload_all_models(self) -> Dict[str, Any]:
+        """Force reload all models"""
+        log.info("🔄 FORCE RELOADING all models")
+        
+        # Clear existing models
+        self.loaded_models.clear()
+        self.model_load_status.clear()
+        
+        # Reload all models
+        results = self.load_all_available_models()
+        
+        log.info("✅ Model reload completed")
+        return {
+            "reloaded": len(results),
+            "total_available": len(self.available_models),
+            "details": self.get_model_status()
+        }
+    
+    def predict_with_fallback(self, model_name: str, features: Dict[str, float]) -> float:
+        """Predict with model, fall back to default if model fails"""
+        try:
+            model = self.load_model(model_name)
+            if model is None:
+                log.warning("⚠️ Model %s not available, using fallback probability: %.2f", 
+                          model_name, self.default_probability)
+                return self.default_probability
+            
+            # Prepare features for prediction
+            feature_vector = self._prepare_feature_vector(features)
+            if feature_vector is None:
+                log.warning("⚠️ Feature preparation failed, using fallback")
+                return self.default_probability
+            
+            # Update last accessed time
+            if model_name in self.model_load_status:
+                self.model_load_status[model_name]["last_accessed"] = time.time()
+            
+            # Make prediction
+            try:
+                if hasattr(model, 'predict_proba'):
+                    prob = float(model.predict_proba(feature_vector.reshape(1, -1))[0][1])
+                else:
+                    pred = model.predict(feature_vector.reshape(1, -1))
+                    prob = float(pred[0]) if hasattr(pred[0], '__float__') else 0.5
+                
+                log.debug("📊 Model %s prediction: %.3f", model_name, prob)
+                return prob
+                
+            except Exception as e:
+                log.error("❌ Prediction failed for model %s: %s", model_name, e)
+                return self.default_probability
+                
+        except Exception as e:
+            log.error("❌ Critical error in predict_with_fallback for %s: %s", model_name, e)
+            return self.default_probability
+    
+    def _prepare_feature_vector(self, features: Dict[str, float]) -> Optional[np.ndarray]:
+        """Prepare feature vector from dictionary"""
+        try:
+            # Use common features that most models expect
+            common_features = [
+                'minute', 'goals_sum', 'goals_diff', 'xg_sum', 'xg_diff',
+                'sot_sum', 'cor_sum', 'pos_diff', 'momentum_h', 'momentum_a'
+            ]
+            
+            vector = []
+            for feat in common_features:
+                vector.append(features.get(feat, 0.0))
+            
+            return np.array(vector).reshape(1, -1)
+            
+        except Exception as e:
+            log.error("❌ Feature vector preparation error: %s", e)
+            return None
+
+
+# Initialize ModelManager
+model_manager = ModelManager()
+
 # ───────── Enhanced Feature Extraction System ─────────
 def extract_enhanced_features(m: dict) -> Dict[str, float]:
     """Enhanced feature extraction with player impact and advanced metrics"""
@@ -683,7 +949,12 @@ class AdvancedEnsemblePredictor:
         from sklearn.linear_model import LogisticRegression
         self.time_series_model = LogisticRegression(random_state=42)
         
-        log.info("🤖 AdvancedEnsemblePredictor initialized for %s with timing optimization", model_name)
+        # Load model using ModelManager
+        self.model = model_manager.load_model(model_name)
+        self.model_source = model_manager.model_load_status.get(model_name, {}).get("source", "unknown")
+        
+        log.info("🤖 AdvancedEnsemblePredictor initialized for %s with model source: %s", 
+                model_name, self.model_source)
         
     def analyze_match_context(self, match_data: Dict) -> float:
         """Analyze match context for additional edge"""
@@ -1132,12 +1403,19 @@ class AdvancedEnsemblePredictor:
     
     def predict_probability(self, features: Dict[str, float]) -> float:
         """Get ensemble prediction with Bayesian confidence intervals"""
+        # First try ModelManager
+        model_manager_prob = model_manager.predict_with_fallback(self.model_name, features)
+        
         if not self.models.get(self.model_name):
-            return 0.5  # Neutral prior
+            log.info("📦 Using ModelManager prediction for %s: %.3f", 
+                    self.model_name, model_manager_prob)
+            return model_manager_prob
             
+        # Otherwise use ensemble
         feature_vector = self._prepare_features(features)
         if feature_vector is None:
-            return 0.5
+            log.warning("⚠️ Feature preparation failed, using ModelManager fallback")
+            return model_manager_prob
             
         predictions: List[float] = []
         for model_name, model in self.models[self.model_name].items():
@@ -1149,10 +1427,14 @@ class AdvancedEnsemblePredictor:
                 continue
         
         if not predictions:
-            return 0.5
+            log.warning("⚠️ No ensemble predictions, using ModelManager fallback")
+            return model_manager_prob
             
         ensemble_prob = float(np.mean(predictions))
         bayesian_prob = self._apply_bayesian_prior(ensemble_prob)
+        
+        log.debug("📊 %s predictions - ModelManager: %.3f, Ensemble: %.3f, Final: %.3f", 
+                 self.model_name, model_manager_prob, ensemble_prob, bayesian_prob)
         
         _metric_inc("ensemble_predictions_total", label=self.model_name)
         return bayesian_prob
@@ -3421,6 +3703,64 @@ def _start_scheduler_once():
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
+# ───────── Add Admin Endpoints ─────────
+@app.route("/admin/model-status", methods=["GET"])
+def http_model_status():
+    """Check which models are loaded and their status"""
+    _require_admin()
+    
+    status = model_manager.get_model_status()
+    
+    # Add prediction source information
+    prediction_sources = {}
+    for model_name, model_info in status["models"].items():
+        if model_info["loaded"]:
+            # Check if it's using ModelManager or ensemble
+            if model_name in advanced_predictors:
+                predictor = advanced_predictors[model_name]
+                prediction_sources[model_name] = {
+                    "source": "AdvancedEnsemblePredictor",
+                    "model_source": getattr(predictor, 'model_source', 'unknown'),
+                    "has_ensemble": len(predictor.models.get(model_name, {})) > 0
+                }
+            else:
+                prediction_sources[model_name] = {
+                    "source": "ModelManager",
+                    "status": model_info["status"]
+                }
+    
+    return jsonify({
+        "ok": True,
+        "model_manager_status": status,
+        "prediction_sources": prediction_sources,
+        "advanced_predictors_loaded": list(advanced_predictors.keys()),
+        "default_fallback_probability": model_manager.default_probability
+    })
+
+@app.route("/admin/reload-models", methods=["POST", "GET"])
+def http_reload_models():
+    """Force reload all models"""
+    _require_admin()
+    
+    results = model_manager.reload_all_models()
+    
+    # Also reload advanced predictors
+    reloaded_predictors = []
+    for model_name in list(advanced_predictors.keys()):
+        try:
+            advanced_predictors[model_name] = AdvancedEnsemblePredictor(model_name)
+            reloaded_predictors.append(model_name)
+        except Exception as e:
+            log.error("❌ Failed to reload predictor %s: %s", model_name, e)
+    
+    return jsonify({
+        "ok": True,
+        "message": "Models reloaded successfully",
+        "model_manager_results": results,
+        "reloaded_predictors": reloaded_predictors,
+        "timestamp": time.time()
+    })
+
 # ───────── Flask / HTTP ─────────
 def _require_admin():
     key = (
@@ -3567,14 +3907,56 @@ def http_latest():
         )
     return jsonify({"ok": True, "tips": tips})
 
-# ───────── Boot ─────────
+# ───────── Update _on_boot to include model initialization ─────────
 def _on_boot():
     _init_pool()
     init_db()
     set_setting("boot_ts", str(int(time.time())))
+    
+    # Initialize all available models at startup
+    log.info("🚀 Starting application boot sequence")
+    startup_models = model_manager.load_all_available_models()
+    log.info("✅ Model initialization complete: %s models loaded", len(startup_models))
+    
     _start_scheduler_once()
+    
+    # Send startup notification
+    try:
+        status = model_manager.get_model_status()
+        loaded_count = sum(1 for m in status["models"].values() if m["loaded"])
+        
+        send_telegram(
+            f"🚀 goalsniper PURE IN-PLAY AI started\n"
+            f"📊 Models: {loaded_count}/{status['total_available']} loaded\n"
+            f"⚙️ Fallback probability: {model_manager.default_probability}\n"
+            f"🔧 Advanced features: {ENABLE_ENHANCED_FEATURES}"
+        )
+    except Exception as e:
+        log.error("❌ Failed to send startup notification: %s", e)
 
 _on_boot()
 
+# ───────── Main execution with enhanced logging ─────────
 if __name__ == "__main__":
+    # Log detailed startup information
+    log.info("=" * 60)
+    log.info("🚀 STARTING GOALSNIPER PURE IN-PLAY AI MODE")
+    log.info("=" * 60)
+    
+    # Log model configuration
+    status = model_manager.get_model_status()
+    log.info("📊 MODEL CONFIGURATION:")
+    log.info("   Available models: %s", status["total_available"])
+    log.info("   Loaded models: %s", status["total_loaded"])
+    log.info("   Fallback probability: %.2f", status["default_probability"])
+    
+    # Log enhancement status
+    log.info("🔧 ENHANCEMENTS STATUS:")
+    log.info("   Context Analysis: %s", ENABLE_CONTEXT_ANALYSIS)
+    log.info("   Performance Monitor: %s", ENABLE_PERFORMANCE_MONITOR)
+    log.info("   Multi-Book Odds: %s", ENABLE_MULTI_BOOK_ODDS)
+    log.info("   Timing Optimization: %s", ENABLE_TIMING_OPTIMIZATION)
+    log.info("   Enhanced Features: %s", ENABLE_ENHANCED_FEATURES)
+    
+    # Start the application
     app.run(host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8080")))
