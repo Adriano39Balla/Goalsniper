@@ -200,10 +200,10 @@ PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "1"))
 PER_LEAGUE_CAP        = int(os.getenv("PER_LEAGUE_CAP", "2"))
 
 # ───────── Odds/EV controls ─────────
-MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU",   "1.50"))
+MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU", "1.50"))
 MIN_ODDS_BTTS = float(os.getenv("MIN_ODDS_BTTS", "1.50"))
-MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2",  "1.50"))
-MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL",  "20.0"))
+MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2", "1.50"))
+MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL", "20.0"))
 EDGE_MIN_BPS  = int(os.getenv("EDGE_MIN_BPS", "600"))
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","0") not in ("0","false","False","no","NO")
@@ -853,7 +853,7 @@ class AdvancedEnsemblePredictor:
 
     def _get_single_book_odds(self, match_id: int, market: str, suggestion: str) -> Tuple[Optional[float], Optional[str]]:
         """Fallback to single bookmaker odds"""
-        # This would integrate with your existing odds fetching logic
+        # Fetch odds from the standard API
         odds_map = fetch_odds(match_id)
         return _get_odds_for_market(odds_map, market, suggestion)
 
@@ -2576,12 +2576,10 @@ def _process_and_rank_candidates(
     log.info("🏆 Processing and ranking %s candidates for fixture %s", len(candidates), fid)
     ranked: List[Tuple[str, str, float, Optional[float], Optional[str], Optional[float], float]] = []
     
-    # Use enhanced odds fetching if enabled
-    if ENABLE_MULTI_BOOK_ODDS:
-        log.info("💰 Using multi-book odds search")
-        # We'll fetch odds per candidate in the loop below
-    else:
-        odds_map = fetch_odds(fid) if API_KEY else {}
+    # Fetch odds once for all candidates if not using multi-book mode
+    odds_map = {}
+    if not ENABLE_MULTI_BOOK_ODDS and API_KEY:
+        odds_map = fetch_odds(fid)
         log.debug("💰 Odds map has %s markets", len(odds_map))
 
     for market, suggestion, prob in candidates:
@@ -2605,7 +2603,6 @@ def _process_and_rank_candidates(
         if ENABLE_MULTI_BOOK_ODDS:
             odds, book = ensemble_predictor.find_best_odds_across_books(fid, market, suggestion)
         else:
-            odds_map = fetch_odds(fid) if API_KEY else {}
             odds, book = _get_odds_for_market(odds_map, market, suggestion)
             
         if odds is None and not ALLOW_TIPS_WITHOUT_ODDS:
