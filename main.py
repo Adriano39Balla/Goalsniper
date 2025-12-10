@@ -513,27 +513,53 @@ class ModelManager:
             return self.default_probability
     
     def _prepare_feature_vector(self, features: Dict[str, float]) -> Optional[np.ndarray]:
-        """Prepare feature vector from dictionary"""
+        """Prepare feature vector from dictionary - CONSISTENT with training"""
         try:
-            # Use common features that most models expect
-            common_features = [
-                'minute', 'goals_sum', 'goals_diff', 'xg_sum', 'xg_diff',
-                'sot_sum', 'cor_sum', 'pos_diff', 'momentum_h', 'momentum_a'
-            ]
+            # CRITICAL: Use the EXACT SAME features your models were trained on
+            # If your models expect 5 features, use these 5 consistently
+        
+            # Option A: If your models were trained with 5 specific features
+            if hasattr(self, 'model_expected_features') and self.model_expected_features:
+                # Use predefined feature order
+                vector = []
+                for feat_name in self.model_expected_features:
+                    vector.append(features.get(feat_name, 0.0))
+            else:
+                # Option B: Use the most common basic features (5 features)
+                # This should match what your initial training script used
+                basic_features = [
+                    'minute', 
+                    'goals_sum', 
+                    'goals_diff', 
+                    'xg_sum', 
+                    'xg_diff'
+                ]
             
-            vector = []
-            for feat in common_features:
-                vector.append(features.get(feat, 0.0))
+                # Log what we're using for debugging
+                available_features = [f for f in basic_features if f in features]
+                log.info(f"🔄 Preparing features: Using {len(available_features)}/{len(basic_features)} basic features")
             
-            return np.array(vector).reshape(1, -1)
-            
+                vector = []
+                for feat_name in basic_features:
+                    vector.append(features.get(feat_name, 0.0))
+        
+            # Convert to numpy array
+            feature_array = np.array(vector).reshape(1, -1)
+        
+            # Debug logging
+            log.debug(f"📊 Feature vector shape: {feature_array.shape}, values: {vector}")
+        
+            return feature_array
+        
         except Exception as e:
-            log.error("❌ Feature vector preparation error: %s", e)
-            return None
-
-
-# Initialize ModelManager
-model_manager = ModelManager()
+            log.error(f"❌ Feature vector preparation error: {e}")
+            # Emergency fallback - create a 5-feature vector with defaults
+            try:
+                emergency_vector = [45.0, 1.0, 0.0, 1.0, 0.0]  # Default mid-game values
+                log.warning("⚠️ Using emergency fallback features")
+                return np.array(emergency_vector).reshape(1, -1)
+            except:
+                return None
 
 # ───────── Enhanced Feature Extraction System ─────────
 def extract_enhanced_features(m: dict) -> Dict[str, float]:
