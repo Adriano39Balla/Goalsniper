@@ -1,5 +1,6 @@
 # train_models.py – advanced in-play trainer matching main.py
 # Enhanced: Feature cleaning, advanced feature engineering, robust training pipeline
+# UPDATED: Now saves trained models to disk for main.py to load
 
 import argparse
 import json
@@ -8,8 +9,10 @@ import os
 import socket
 import time
 import warnings
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 import psycopg2
@@ -103,6 +106,9 @@ TARGET_PRECISION = float(os.getenv("TARGET_PRECISION", "0.60"))
 THRESH_MIN_PREDICTIONS = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
 MIN_THRESH = float(os.getenv("MIN_THRESH", "55"))
 MAX_THRESH = float(os.getenv("MAX_THRESH", "85"))
+
+# Model saving configuration
+MODELS_DIR = os.getenv("MODELS_DIR", "models")
 
 
 def _parse_market_cutoffs(s: str) -> Dict[str, int]:
@@ -591,6 +597,16 @@ class AdvancedEnsembleModel:
 
         feat_imp = self._feature_importance()
 
+        # Save the trained model to disk for main.py to load
+        self._save_to_disk()
+        
+        log.info(
+            "[%s] Model saved to disk with %d features, ensemble accuracy=%.3f",
+            self.market,
+            len(self.selected_features),
+            acc
+        )
+
         return {
             "metrics": {
                 "accuracy": float(acc),
@@ -663,6 +679,32 @@ class AdvancedEnsembleModel:
         # Final fallback: equal importance
         log.info(f"📊 Using uniform feature importance for {self.market}")
         return {f: 1.0 for f in self.selected_features}
+    
+    def _save_to_disk(self) -> None:
+        """Save the trained model to disk for main.py to load"""
+        try:
+            # Create models directory if it doesn't exist
+            Path(MODELS_DIR).mkdir(parents=True, exist_ok=True)
+            
+            # Prepare model data for saving
+            model_data = {
+                'market': self.market,
+                'models': self.models,
+                'scaler': self.scaler,
+                'selector': self.selector,
+                'selected_features': self.selected_features,
+                'training_timestamp': time.time()
+            }
+            
+            # Save using joblib with compression
+            model_path = Path(MODELS_DIR) / f"advanced_ensemble_{self.market}.joblib"
+            joblib.dump(model_data, model_path, compress=('zlib', 3))
+            
+            model_size_kb = model_path.stat().st_size / 1024
+            log.info(f"💾 Saved model to {model_path} ({len(self.selected_features)} features, {model_size_kb:.1f} KB)")
+            
+        except Exception as e:
+            log.error(f"❌ Failed to save model for {self.market}: {e}")
 
 
 # ---------- DB helpers (same style as in main.py) ----------
@@ -1000,7 +1042,6 @@ def train_advanced_market_model(
         "metrics": res["metrics"],
         "per_model": res["per_model"],
         "training_summary": res.get("training_summary", {}),
-        # Note: we do not persist sklearn weights here; main.py uses its own live ensemble.
         "version": "2.0",  # Updated version for enhanced features
     }
 
