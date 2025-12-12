@@ -285,32 +285,47 @@ class ModelManager:
         """Scan for available model files"""
         available = []
         model_patterns = [
+            "models/*.joblib",
             "models/*.pkl",
-            "models/*.joblib", 
-            "models/*.h5",
-            "*.pkl",
-            "*.joblib"
+            "models/*_metadata.json"
         ]
         
         try:
-            import glob
+            import glob, json
+            # First, load any metadata files
             for pattern in model_patterns:
                 matches = glob.glob(pattern)
                 for match in matches:
-                    model_name = match.split('/')[-1].split('.')[0]
-                    if model_name not in available:
-                        available.append(model_name)
-                        log.info("📁 Found model file: %s", match)
+                    if match.endswith('_metadata.json'):
+                        try:
+                            with open(match, 'r') as f:
+                                metadata = json.load(f)
+                            model_name = metadata.get('model_name')
+                            if model_name and model_name not in available:
+                                available.append(model_name)
+                                log.info(f"📄 Found model metadata: {model_name} with {metadata.get('feature_count')} features")
+                        except Exception as e:
+                            log.debug(f"ℹ️ Error loading metadata {match}: {e}")
+                    else:
+                        model_name = match.split('/')[-1].split('.')[0]
+                        if model_name not in available:
+                            available.append(model_name)
+                            
         except Exception as e:
-            log.error("❌ Error scanning for models: %s", e)
+            log.error(f"❌ Error scanning for models: {e}")
             
         # Add default model types based on markets
-        default_models = ["btts", "over_under", "1x2", "advanced_ensemble"]
+        default_models = ["1X2_Home_Win", "1X2_Away_Win", "BTTS"]
+        for line in OU_LINES:
+            line_str = str(line).replace('.', '_')
+            default_models.append(f"Over_Under_{line_str}")
+            
         for model in default_models:
             if model not in available:
                 available.append(model)
+                log.info(f"📝 Added default model: {model}")
                 
-        log.info("🔍 Total available models: %s", available)
+        log.info(f"🔍 Total available models: {available}")
         return available
     
     def load_model(self, model_name: str, retries: int = 3) -> Optional[Any]:
@@ -319,7 +334,7 @@ class ModelManager:
         
         # Check if already loaded
         if model_name in self.loaded_models:
-            log.debug("📦 Model %s already loaded, using cached version", model_name)
+            log.debug(f"📦 Model {model_name} already loaded, using cached version")
             self.model_load_status[model_name] = {
                 "status": "loaded",
                 "source": "cache",
@@ -328,34 +343,57 @@ class ModelManager:
             }
             return self.loaded_models[model_name]
         
-        log.info("🔄 Loading model: %s (attempt 1/%s)", model_name, retries)
+        log.info(f"🔄 Loading model: {model_name} (attempt 1/{retries})")
+        
+        # Try to load metadata first
+        metadata = None
+        try:
+            metadata_path = f"models/{model_name}_metadata.json"
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                log.info(f"📄 Loaded metadata for {model_name}: {metadata.get('feature_count')} features")
+        except Exception as e:
+            log.debug(f"ℹ️ No metadata found for {model_name}: {e}")
         
         for attempt in range(1, retries + 1):
             try:
-                model = self._attempt_model_load(model_name, attempt)
+                # Try to load the actual model
+                model = self._attempt_model_load(model_name, attempt, metadata)
                 if model is not None:
+                    # Store metadata with model
+                    if metadata:
+                        if isinstance(model, dict):
+                            model['metadata'] = metadata
+                        else:
+                            # Wrap in dict if it's a plain model
+                            model = {
+                                'model': model,
+                                'metadata': metadata
+                            }
+                    
                     self.loaded_models[model_name] = model
                     self.model_load_status[model_name] = {
                         "status": "loaded",
                         "source": "file" if attempt == 1 else f"retry_{attempt}",
                         "load_time": time.time() - start_time,
                         "load_attempts": attempt,
+                        "feature_count": metadata.get('feature_count') if metadata else 'unknown',
+                        "required_features": metadata.get('required_features', []) if metadata else [],
                         "last_accessed": time.time()
                     }
-                    log.info("✅ SUCCESS: Model %s loaded in %.2fs (attempt %s/%s)", 
-                            model_name, time.time() - start_time, attempt, retries)
+                    log.info(f"✅ SUCCESS: Model {model_name} loaded in {time.time() - start_time:.2f}s (attempt {attempt}/{retries})")
                     return model
                     
             except Exception as e:
-                log.error("❌ Attempt %s/%s failed for model %s: %s", 
-                         attempt, retries, model_name, e)
+                log.error(f"❌ Attempt {attempt}/{retries} failed for model {model_name}: {e}")
                 
                 if attempt < retries:
                     wait_time = 2 ** attempt  # Exponential backoff
-                    log.info("⏳ Retrying in %s seconds...", wait_time)
+                    log.info(f"⏳ Retrying in {wait_time} seconds...")
                     time.sleep(wait_time)
                 else:
-                    log.error("💥 All %s attempts failed for model %s", retries, model_name)
+                    log.error(f"💥 All {retries} attempts failed for model {model_name}")
                     self.model_load_status[model_name] = {
                         "status": "failed",
                         "error": str(e),
@@ -363,46 +401,46 @@ class ModelManager:
                         "last_attempt": time.time()
                     }
         
-        log.warning("⚠️ Using fallback probability for model %s", model_name)
+        log.warning(f"⚠️ Using fallback probability for model {model_name}")
         return None
     
-    def _attempt_model_load(self, model_name: str, attempt: int) -> Optional[Any]:
+    def _attempt_model_load(self, model_name: str, attempt: int, metadata: Optional[Dict] = None) -> Optional[Any]:
         """Attempt to load a model from different sources"""
         possible_paths = [
-            f"models/{model_name}.pkl",
             f"models/{model_name}.joblib",
-            f"{model_name}.pkl",
+            f"models/{model_name}.pkl",
             f"{model_name}.joblib",
-            f"models/{model_name}_v2.pkl",
-            f"models/{model_name}_latest.pkl"
+            f"{model_name}.pkl",
         ]
         
         for path in possible_paths:
             try:
                 if os.path.exists(path):
-                    log.info("📁 Loading %s from: %s (attempt %s)", model_name, path, attempt)
+                    log.info(f"📁 Loading {model_name} from: {path} (attempt {attempt})")
                     model = joblib.load(path)
-                    log.debug("✅ Loaded model %s from %s", model_name, path)
+                    log.debug(f"✅ Loaded model {model_name} from {path}")
                     return model
             except Exception as e:
-                log.debug("❌ Failed to load from %s: %s", path, e)
+                log.debug(f"❌ Failed to load from {path}: {e}")
                 continue
         
-        # If no file found, create a simple fallback model
-        if attempt == 1:  # Only log on first attempt
-            log.warning("📭 No model file found for %s, creating fallback", model_name)
+        # If no file found, create a simple fallback model with correct features
+        if metadata and 'required_features' in metadata:
+            feature_count = len(metadata['required_features'])
+            log.info(f"🛠️ Creating fallback model for {model_name} with {feature_count} features")
+        else:
+            feature_count = 5  # Default for 1X2 models
+            log.info(f"🛠️ Creating fallback model for {model_name} with default {feature_count} features")
         
         # Create a simple logistic regression as fallback
-        from sklearn.linear_model import LogisticRegression
         model = LogisticRegression(random_state=42)
         
-        # Create dummy training data
-        import numpy as np
-        X = np.random.randn(10, 5)
+        # Create dummy training data with correct feature count
+        X = np.random.randn(10, feature_count)
         y = np.random.randint(0, 2, 10)
         model.fit(X, y)
         
-        log.info("🛠️ Created fallback model for %s", model_name)
+        log.info(f"🛠️ Created fallback model for {model_name}")
         return model
     
     def load_all_available_models(self) -> Dict[str, Any]:
@@ -451,6 +489,7 @@ class ModelManager:
                 "status": model_info.get("status", "unknown"),
                 "load_time": model_info.get("load_time"),
                 "source": model_info.get("source", "unknown"),
+                "feature_count": model_info.get("feature_count", "unknown"),
                 "last_accessed": model_info.get("last_accessed")
             }
         
@@ -477,17 +516,25 @@ class ModelManager:
     def predict_with_fallback(self, model_name: str, features: Dict[str, float]) -> float:
         """Predict with model, fall back to default if model fails"""
         try:
-            model = self.load_model(model_name)
-            if model is None:
-                log.warning("⚠️ Model %s not available, using fallback probability: %.2f", 
-                          model_name, self.default_probability)
+            model_data = self.load_model(model_name)
+            if model_data is None:
+                log.warning(f"⚠️ Model {model_name} not available, using fallback probability: {self.default_probability:.2f}")
                 return self.default_probability
             
-            # Prepare features for prediction
-            feature_vector = self._prepare_feature_vector(features)
+            # If it's a dict from train_models.py (new format with ensemble)
+            if isinstance(model_data, dict) and 'models' in model_data:
+                return self._predict_new_format(model_data, features, model_name)
+            
+            # Otherwise it's a single model (old format or fallback)
+            feature_vector = self._prepare_feature_vector(features, model_name, model_data)
             if feature_vector is None:
-                log.warning("⚠️ Feature preparation failed, using fallback")
+                log.warning(f"⚠️ Feature preparation failed for {model_name}, using fallback")
                 return self.default_probability
+            
+            # Extract actual model
+            model = model_data
+            if isinstance(model_data, dict) and 'model' in model_data:
+                model = model_data['model']
             
             # Update last accessed time
             if model_name in self.model_load_status:
@@ -496,39 +543,137 @@ class ModelManager:
             # Make prediction
             try:
                 if hasattr(model, 'predict_proba'):
-                    prob = float(model.predict_proba(feature_vector.reshape(1, -1))[0][1])
+                    prob = float(model.predict_proba(feature_vector)[0][1])
                 else:
-                    pred = model.predict(feature_vector.reshape(1, -1))
+                    pred = model.predict(feature_vector)
                     prob = float(pred[0]) if hasattr(pred[0], '__float__') else 0.5
                 
-                log.debug("📊 Model %s prediction: %.3f", model_name, prob)
+                log.debug(f"📊 Model {model_name} prediction: {prob:.3f}")
                 return prob
                 
             except Exception as e:
-                log.error("❌ Prediction failed for model %s: %s", model_name, e)
+                log.error(f"❌ Prediction failed for model {model_name}: {e}")
+                # Try to extract expected feature count from error
+                if "expecting" in str(e) and "features" in str(e):
+                    import re
+                    match = re.search(r'expecting (\d+) features', str(e))
+                    if match:
+                        expected = int(match.group(1))
+                        log.warning(f"🔄 Model expects {expected} features, retrying with simple vector...")
+                        # Create simple feature vector
+                        simple_vector = np.ones((1, expected)) * 0.5
+                        if hasattr(model, 'predict_proba'):
+                            prob = float(model.predict_proba(simple_vector)[0][1])
+                            return prob
                 return self.default_probability
                 
         except Exception as e:
-            log.error("❌ Critical error in predict_with_fallback for %s: %s", model_name, e)
+            log.error(f"❌ Critical error in predict_with_fallback for {model_name}: {e}")
             return self.default_probability
     
-    def _prepare_feature_vector(self, features: Dict[str, float]) -> Optional[np.ndarray]:
-        """Prepare feature vector from dictionary"""
+    def _predict_new_format(self, model_dict: Dict, features: Dict[str, float], model_name: str) -> float:
+        """Predict using new model format from train_models.py"""
         try:
-            # Use common features that most models expect
-            common_features = [
-                'minute', 'goals_sum', 'goals_diff', 'xg_sum', 'xg_diff',
-                'sot_sum', 'cor_sum', 'pos_diff', 'momentum_h', 'momentum_a'
-            ]
+            selected_features = model_dict.get('selected_features', [])
+            models = model_dict.get('models', {})
+            scaler = model_dict.get('scaler')
             
+            if not selected_features:
+                log.error(f"❌ No selected_features in model {model_name}")
+                return self.default_probability
+            
+            # Prepare feature vector using selected features
             vector = []
-            for feat in common_features:
-                vector.append(features.get(feat, 0.0))
+            missing_features = []
             
-            return np.array(vector).reshape(1, -1)
+            for feat in selected_features:
+                if feat in features:
+                    vector.append(float(features.get(feat, 0.0)))
+                else:
+                    missing_features.append(feat)
+                    vector.append(0.0)
+            
+            if missing_features:
+                log.warning(f"⚠️ Model {model_name} missing {len(missing_features)} features: {missing_features[:3]}...")
+            
+            X = np.array(vector).reshape(1, -1)
+            
+            # Apply scaler if available
+            if scaler is not None:
+                X = scaler.transform(X)
+            
+            # Get predictions from all models in ensemble
+            predictions = []
+            for model_key, model in models.items():
+                try:
+                    if hasattr(model, 'predict_proba'):
+                        prob = float(model.predict_proba(X)[0][1])
+                        predictions.append(prob)
+                except Exception as e:
+                    log.error(f"❌ Sub-model {model_key} failed: {e}")
+            
+            if not predictions:
+                log.error(f"❌ All sub-models failed for {model_name}")
+                return self.default_probability
+            
+            # Average predictions
+            ensemble_prob = float(np.mean(predictions))
+            log.info(f"📊 Ensemble prediction for {model_name}: {ensemble_prob:.3f} ({len(predictions)} sub-models)")
+            
+            return ensemble_prob
             
         except Exception as e:
-            log.error("❌ Feature vector preparation error: %s", e)
+            log.error(f"❌ New format prediction failed for {model_name}: {e}")
+            return self.default_probability
+    
+    def _prepare_feature_vector(self, features: Dict[str, float], model_name: str, model_data: Any = None) -> Optional[np.ndarray]:
+        """Prepare feature vector based on model type"""
+        try:
+            # Determine which features to use based on model type
+            if '1X2' in model_name:
+                # 1X2 models use these 5 core features
+                required_features = [
+                    'minute', 'goals_sum', 'goals_diff', 'xg_sum', 'xg_diff'
+                ]
+            elif 'BTTS' in model_name:
+                # BTTS models use these 7 features
+                required_features = [
+                    'minute', 'goals_h', 'goals_a', 'xg_h', 'xg_a',
+                    'sot_h', 'sot_a'
+                ]
+            elif 'Over_Under' in model_name:
+                # Over/Under models use these 8 features
+                required_features = [
+                    'minute', 'goals_sum', 'xg_sum', 'sot_sum',
+                    'cor_sum', 'pos_diff', 'momentum_h', 'momentum_a'
+                ]
+            else:
+                # Default to 5 core features
+                required_features = [
+                    'minute', 'goals_sum', 'goals_diff', 'xg_sum', 'xg_diff'
+                ]
+            
+            # Check if we have metadata with different features
+            if isinstance(model_data, dict):
+                if 'metadata' in model_data:
+                    metadata_features = model_data['metadata'].get('required_features', [])
+                    if metadata_features:
+                        required_features = metadata_features
+                elif 'selected_features' in model_data:
+                    required_features = model_data['selected_features']
+            
+            # Build feature vector
+            vector = []
+            for feat in required_features:
+                vector.append(features.get(feat, 0.0))
+            
+            result = np.array(vector).reshape(1, -1)
+            log.debug(f"✅ Prepared {len(vector)} features for {model_name}")
+            
+            return result
+            
+        except Exception as e:
+            log.error(f"❌ Feature vector preparation error for {model_name}: {e}")
             return None
 
 
@@ -1333,20 +1478,20 @@ class AdvancedEnsemblePredictor:
     def _prepare_feature_vector(self, features: Dict[str, float]) -> List[float]:
         """Prepare feature vector for incremental learning"""
         try:
-            # Use the same feature preparation as in training
+            # Use the EXACT same features as in training for consistency
             feature_names = [
-                'minute', 'goals_sum', 'goals_diff', 'xg_sum', 'xg_diff',
-                'sot_sum', 'cor_sum', 'pos_diff', 'momentum_h', 'momentum_a'
+                'minute', 'goals_sum', 'goals_diff', 'xg_sum', 'xg_diff'
             ]
             
             vector = []
             for name in feature_names:
                 vector.append(features.get(name, 0.0))
                 
+            log.info(f"📊 AdvancedEnsemblePredictor prepared {len(vector)} features")
             return vector
             
         except Exception as e:
-            log.error("❌ Feature vector preparation failed: %s", e)
+            log.error(f"❌ AdvancedEnsemblePredictor feature vector preparation failed: {e}")
             return []
 
     def train(self, features: List[Dict[str, Any]], targets: List[int]) -> Dict[str, Any]:
@@ -1403,7 +1548,7 @@ class AdvancedEnsemblePredictor:
     
     def predict_probability(self, features: Dict[str, float]) -> float:
         """Get ensemble prediction with Bayesian confidence intervals"""
-        # First try ModelManager
+        # Use ModelManager for prediction
         model_manager_prob = model_manager.predict_with_fallback(self.model_name, features)
         
         if not self.models.get(self.model_name):
@@ -2292,6 +2437,37 @@ def extract_features(m: dict) -> Dict[str, float]:
     return features
 
 # ───────── Advanced Prediction System ─────────
+def get_model_name_for_market(market: str, suggestion: str) -> str:
+    """Convert market and suggestion to model name that matches training"""
+    if market == "BTTS":
+        # BTTS model handles both Yes and No
+        return "BTTS"
+    elif market == "1X2":
+        if "Home" in suggestion:
+            return "1X2_Home_Win"
+        else:
+            return "1X2_Away_Win"
+    elif market.startswith("Over/Under"):
+        line = _parse_ou_line_from_suggestion(suggestion)
+        if line:
+            line_str = str(line).replace('.', '_')
+            return f"Over_Under_{line_str}"
+    
+    # Default fallback
+    return f"{market}_{suggestion.replace(' ', '_')}"
+
+def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
+    """Parse the line value from an Over/Under suggestion"""
+    try:
+        # Try to find a float in the suggestion
+        import re
+        numbers = re.findall(r"\d+\.?\d*", s)
+        if numbers:
+            return float(numbers[0])
+        return None
+    except Exception:
+        return None
+
 def advanced_predict_probability(
     features: Dict[str, float],
     market: str,
@@ -2301,80 +2477,30 @@ def advanced_predict_probability(
     """Advanced prediction using ensemble + Bayesian methods with enhanced features"""
     log.debug("🤖 Predicting probability for %s - %s (match: %s)", market, suggestion, match_id)
     
-    # Bayesian network: treat `suggestion` as the 'market phrase'
+    # Get correct model name
+    model_name = get_model_name_for_market(market, suggestion)
+    log.info(f"🔍 Using model: {model_name}")
+    
+    # Get prediction from ModelManager
+    model_prob = model_manager.predict_with_fallback(model_name, features)
+    
+    # For OU Under and BTTS No, use complement
+    if "Under" in suggestion and "Over_Under" in model_name:
+        model_prob = 1.0 - model_prob
+        log.info("🔄 Under prediction: using complement %.3f", model_prob)
+    elif suggestion == "BTTS: No":
+        model_prob = 1.0 - model_prob
+        log.info("🔄 BTTS No prediction: using complement %.3f", model_prob)
+    
+    # Apply Bayesian network
     bayesian_prob = bayesian_network.infer_probability(features, suggestion)
-    log.debug("📊 Bayesian probability: %.3f", bayesian_prob)
     
-    # Ensemble predictor
-    model_key = f"{market}_{suggestion.replace(' ', '_')}"
-    ensemble_predictor = get_advanced_predictor(model_key)
-    ensemble_prob = ensemble_predictor.predict_probability(features)
-    log.debug("📈 Ensemble probability: %.3f", ensemble_prob)
+    # Blend predictions (70% model, 30% Bayesian)
+    final_prob = (model_prob * 0.7) + (bayesian_prob * 0.3)
+    final_prob = max(0.01, min(0.99, final_prob))
     
-    # Apply context analysis if enabled
-    context_score = 1.0
-    if ENABLE_CONTEXT_ANALYSIS:
-        # Create match data for context analysis
-        match_data = {
-            'home_team': '',  # Would be populated from match data
-            'away_team': '',  # Would be populated from match data  
-            'league': '',     # Would be populated from match data
-            'red_cards': features.get('red_sum', 0)
-        }
-        context_score = ensemble_predictor.analyze_match_context(match_data)
-        log.debug("🎭 Context score applied: %.3f", context_score)
-    
-    # Blend with API-Football predictions if available
-    if ENABLE_API_PREDICTIONS and match_id:
-        api_predictions = get_api_predictions(match_id)
-        if api_predictions:
-            ensemble_prob = blend_with_api_predictions(ensemble_prob, api_predictions, market)
-    
-    data_richness = min(1.0, float(features.get("minute", 0)) / 60.0)
-    if data_richness > 0.7:
-        final_prob = 0.7 * ensemble_prob + 0.3 * bayesian_prob
-        log.debug("📋 Using data-rich weighting (70/30)")
-    else:
-        final_prob = 0.4 * ensemble_prob + 0.6 * bayesian_prob
-        log.debug("📋 Using data-poor weighting (40/60)")
-    
-    # Apply context score
-    final_prob = final_prob * context_score
-    
-    final_prob = float(max(0.01, min(0.99, final_prob)))
-    log.info("🎯 FINAL probability for %s - %s: %.1f%% (bayesian: %.1f%%, ensemble: %.1f%%, context: %.1f%%)", 
-             market, suggestion, final_prob*100, bayesian_prob*100, ensemble_prob*100, context_score*100)
-    
-    prediction_data = {
-        "features": features,
-        "market": market,
-        "suggestion": suggestion,
-        "bayesian_prob": bayesian_prob,
-        "ensemble_prob": ensemble_prob,
-        "final_prob": final_prob,
-        "model_type": "advanced_ensemble",
-        "model_key": model_key,
-        "match_id": int(match_id or 0),
-        "timestamp": time.time(),
-    }
-    
-    # Store for later learning
-    try:
-        with db_conn() as c:
-            c.execute(
-                "INSERT INTO self_learning_data (match_id, market, features, prediction_probability, learning_timestamp) "
-                "VALUES (%s,%s,%s,%s,%s)",
-                (
-                    int(match_id or 0),
-                    market,
-                    json.dumps(prediction_data, separators=(",", ":"), ensure_ascii=False),
-                    float(final_prob),
-                    int(time.time()),
-                ),
-            )
-        log.debug("💾 Saved prediction data for self-learning")
-    except Exception as e:
-        log.debug("[SELF-LEARNING] store failed: %s", e)
+    log.info("🎯 FINAL probability for %s - %s: %.1f%% (model: %.1f%%, bayesian: %.1f%%)", 
+             market, suggestion, final_prob*100, model_prob*100, bayesian_prob*100)
     
     return final_prob
 
@@ -2650,17 +2776,6 @@ def reset_market_thresholds_to_global() -> Dict[str, float]:
             reset_results[market] = None
     
     return reset_results
-
-def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
-    try:
-        for tok in (s or "").split():
-            try:
-                return float(tok)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
 
 def _candidate_is_sane(sug: str, feat: Dict[str, float]) -> bool:
     gh    = int(feat.get("goals_h", 0))
