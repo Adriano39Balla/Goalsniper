@@ -134,7 +134,7 @@ ODDS_REQUIRE_N_BOOKS= int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))
 ODDS_FAIR_MAX_MULT  = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))
 
 # ───────── Markets allow-list (draw suppressed) ─────────
-ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
+ALLOWED_SUGGESTIONS = {"BTTS: Yes", "OVER 2.5", "UNDER 2.5" "OVER 3.5", "UNDER 3.5", "BTTS: No", "Home Win", "Away Win"}
 def _fmt_line(line: float) -> str:
     return f"{line}".rstrip("0").rstrip(".")
 
