@@ -1,6 +1,7 @@
 # train_models.py – advanced in-play trainer matching main.py
 # Enhanced: Feature cleaning, advanced feature engineering, robust training pipeline
 # UPDATED: Now saves trained models to disk for main.py to load
+# FIXED: Feature synchronization with main.py
 
 import argparse
 import json
@@ -335,7 +336,7 @@ def enhanced_data_preparation(X, y, feature_names, test_size=0.25):
         )
         return X_train, X_test, y_train, y_test, feature_names
 
-# ---------- Advanced feature engineering (aligned with main.py) ----------
+# ---------- Enhanced feature engineering (aligned with main.py) ----------
 
 
 def _calculate_momentum(features: Dict[str, float], side: str) -> float:
@@ -490,6 +491,7 @@ class AdvancedEnsembleModel:
         self.scaler: Optional[StandardScaler] = None
         self.selector: Optional[SelectKBest] = None
         self.selected_features: List[str] = []
+        self.total_samples = 0
         log.info(f"🎯 Initializing AdvancedEnsembleModel for {market}")
 
     def train(
@@ -503,6 +505,7 @@ class AdvancedEnsembleModel:
             log.warning(f"❌ Insufficient samples for {self.market}: {X.shape[0]} < {MIN_ROWS}")
             return {"error": f"insufficient samples: {X.shape[0]} < {MIN_ROWS}"}
 
+        self.total_samples = X.shape[0]
         log.info(f"🔧 Training {self.market} with {X.shape[0]} samples, {len(feature_names)} features")
 
         # Use enhanced data preparation pipeline
@@ -681,27 +684,74 @@ class AdvancedEnsembleModel:
         return {f: 1.0 for f in self.selected_features}
     
     def _save_to_disk(self) -> None:
-        """Save the trained model to disk for main.py to load"""
+        """Save the trained model to disk for main.py to load with metadata"""
         try:
             # Create models directory if it doesn't exist
             Path(MODELS_DIR).mkdir(parents=True, exist_ok=True)
             
-            # Prepare model data for saving
+            # Map training market names to main.py model names
+            model_name_map = {
+                "1X2_HOME": "1X2_Home_Win",
+                "1X2_AWAY": "1X2_Away_Win", 
+                "BTTS": "BTTS",
+            }
+            
+            # Determine output model name
+            if self.market in model_name_map:
+                output_name = model_name_map[self.market]
+            elif self.market.startswith("OU_"):
+                line = self.market.replace("OU_", "")
+                # Convert to main.py format: Over_Under_2_5
+                line_str = line.replace(".", "_")
+                output_name = f"Over_Under_{line_str}"
+            else:
+                output_name = self.market
+            
+            # Prepare comprehensive model metadata
             model_data = {
                 'market': self.market,
+                'model_name': output_name,
                 'models': self.models,
                 'scaler': self.scaler,
                 'selector': self.selector,
                 'selected_features': self.selected_features,
-                'training_timestamp': time.time()
+                'feature_count': len(self.selected_features),
+                'all_possible_features': FEATURES,  # All 30 features
+                'training_features_count': len(FEATURES),
+                'selected_features_count': len(self.selected_features),
+                'feature_importance': self._feature_importance(),
+                'training_timestamp': time.time(),
+                'training_summary': {
+                    'market': self.market,
+                    'total_samples': self.total_samples,
+                    'feature_selection_method': 'SelectKBest',
+                    'feature_count': len(self.selected_features),
+                    'features_used': self.selected_features[:10]  # First 10 for display
+                }
             }
             
             # Save using joblib with compression
-            model_path = Path(MODELS_DIR) / f"advanced_ensemble_{self.market}.joblib"
+            model_path = Path(MODELS_DIR) / f"{output_name}.joblib"
             joblib.dump(model_data, model_path, compress=('zlib', 3))
             
             model_size_kb = model_path.stat().st_size / 1024
             log.info(f"💾 Saved model to {model_path} ({len(self.selected_features)} features, {model_size_kb:.1f} KB)")
+            
+            # Also save a feature metadata file for main.py to read
+            metadata = {
+                'model_name': output_name,
+                'market': self.market,
+                'required_features': self.selected_features,
+                'feature_count': len(self.selected_features),
+                'training_timestamp': time.time(),
+                'features_example': {feature: 0.0 for feature in self.selected_features}
+            }
+            
+            metadata_path = Path(MODELS_DIR) / f"{output_name}_metadata.json"
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            log.info(f"📄 Saved feature metadata to {metadata_path}")
             
         except Exception as e:
             log.error(f"❌ Failed to save model for {self.market}: {e}")
