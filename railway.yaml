@@ -1,59 +1,20 @@
-version: 1
 build:
-  builder: nixpacks
+  builder: NIXPACKS
   buildCommand: pip install -r requirements.txt
-  startCommand: python main.py
 
 deploy:
+  startCommand: python main.py
   healthcheckPath: /health
-  healthcheckTimeout: 30
-  restartPolicyType: ON_FAILURE
-  restartPolicyMaxRetries: 3
+  healthcheckTimeout: 60
 
-services:
-  - type: web
-    name: prediction-engine
-    env:
-      PORT: 8000
-    checks:
-      http:
-        path: /health
-        timeout: 5
-
-  - type: redis
-    name: cache
-    env:
-      REDIS_MAXMEMORY: 100mb
-
-  - type: postgresql
-    name: database
-    env:
-      POSTGRESQL_DATABASE: market_engine
-      POSTGRESQL_NON_ROOT_USER: engine_user
-      POSTGRESQL_NON_ROOT_PASSWORD: ${DATABASE_PASSWORD}
-
-  - type: worker
-    name: model-trainer
-    env:
-      WORKER_TYPE: trainer
-    startCommand: python train_models.py --mode=worker
-
-variables:
-  - key: API_FOOTBALL_KEY
-    description: API Football API Key
-    generate: true
-
+env:
+  - key: PYTHON_VERSION
+    value: 3.11.0
   - key: DATABASE_URL
-    value: postgresql://engine_user:${DATABASE_PASSWORD}@database.internal:5432/market_engine
-
-  - key: REDIS_URL
-    value: redis://cache.internal:6379
-
-  - key: ENVIRONMENT
-    value: production
-
-  - key: LOG_LEVEL
-    value: INFO
-
-  - key: MODEL_UPDATE_INTERVAL
-    value: "3600"  # 1 hour
+    value: ${DATABASE_URL}
+  - key: API_KEY
+    value: ${API_KEY}
+  - key: TELEGRAM_BOT_TOKEN
+    value: ${TELEGRAM_BOT_TOKEN}
+  - key: TELEGRAM_CHAT_ID
+    value: ${TELEGRAM_CHAT_ID}
