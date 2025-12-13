@@ -1,4 +1,3 @@
-# file: train_models.py
 """
 Postgres-only training with Platt calibration + per-market auto-thresholding.
 
@@ -49,6 +48,7 @@ from sklearn.metrics import (
     f1_score,
 )
 import psycopg2
+from psycopg2 import errors as psycopg2_errors
 
 try:
     from dotenv import load_dotenv
@@ -72,18 +72,18 @@ FEATURES: List[str] = [
     "red_h", "red_a", "red_sum",
 ]
 
-# Must match main.py extract_prematch_features()
+# Must match main.py extract_prematch_features() - UPDATED to match actual implementation
 PRE_FEATURES: List[str] = [
-    "pm_gf_h","pm_ga_h","pm_win_h",
-    "pm_gf_a","pm_ga_a","pm_win_a",
-    "pm_ov25_h","pm_ov35_h","pm_btts_h",
-    "pm_ov25_a","pm_ov35_a","pm_btts_a",
-    "pm_ov25_h2h","pm_ov35_h2h","pm_btts_h2h",
+    "pm_gf_h", "pm_ga_h", "pm_win_h",
+    "pm_gf_a", "pm_ga_a", "pm_win_a",
+    "pm_ov25_h", "pm_ov35_h", "pm_btts_h",
+    "pm_ov25_a", "pm_ov35_a", "pm_btts_a",
+    "pm_ov25_h2h", "pm_ov35_h2h", "pm_btts_h2h",
     "pm_rest_diff",
     # keep live keys 0.0 for compatibility at serve time
-    "minute","goals_h","goals_a","goals_sum","goals_diff",
-    "xg_h","xg_a","xg_sum","xg_diff","sot_h","sot_a","sot_sum",
-    "cor_h","cor_a","cor_sum","pos_h","pos_a","pos_diff","red_h","red_a","red_sum",
+    "minute", "goals_h", "goals_a", "goals_sum", "goals_diff",
+    "xg_h", "xg_a", "xg_sum", "xg_diff", "sot_h", "sot_a", "sot_sum",
+    "cor_h", "cor_a", "cor_sum", "pos_h", "pos_a", "pos_diff", "red_h", "red_a", "red_sum",
 ]
 
 EPS = 1e-6
@@ -108,27 +108,33 @@ def _exec(conn, sql: str, params: Tuple = ()) -> None:
         cur.execute(sql, params)
 
 def _set_setting(conn, key: str, value: str) -> None:
-    _exec(conn,
-          "INSERT INTO settings(key,value) VALUES(%s,%s) "
-          "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-          (key, value))
+    try:
+        _exec(conn,
+              "INSERT INTO settings(key,value) VALUES(%s,%s) "
+              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+              (key, value))
+    except psycopg2.Error as e:
+        logger.error("Error setting setting %s: %s", key, e)
 
 def _ensure_training_tables(conn) -> None:
     # safety: ensure prematch_snapshots/settings exist (others are created by main.py)
-    _exec(conn, """
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-      )
-    """)
-    _exec(conn, """
-      CREATE TABLE IF NOT EXISTS prematch_snapshots (
-        match_id   BIGINT PRIMARY KEY,
-        created_ts BIGINT,
-        payload    TEXT
-      )
-    """)
-    _exec(conn, "CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
+    try:
+        _exec(conn, """
+          CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+          )
+        """)
+        _exec(conn, """
+          CREATE TABLE IF NOT EXISTS prematch_snapshots (
+            match_id   BIGINT PRIMARY KEY,
+            created_ts BIGINT,
+            payload    TEXT
+          )
+        """)
+        _exec(conn, "CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
+    except psycopg2.Error as e:
+        logger.error("Error ensuring training tables: %s", e)
 
 
 # ─────────────────────── Data load ─────────────────────── #
@@ -145,7 +151,12 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
     JOIN tip_snapshots s ON s.match_id = l.match_id AND s.created_ts = l.ts
     JOIN match_results r ON r.match_id = l.match_id
     """
-    rows = _read_sql(conn, q)
+    try:
+        rows = _read_sql(conn, q)
+    except Exception as e:
+        logger.error("Error loading inplay data: %s", e)
+        return pd.DataFrame()
+        
     if rows.empty:
         return pd.DataFrame()
 
@@ -153,7 +164,8 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
     for _, row in rows.iterrows():
         try:
             payload = json.loads(row["payload"]) or {}
-        except Exception:
+        except Exception as e:
+            logger.warning("Error parsing payload: %s", e)
             continue
         stat = (payload.get("stat") or {})
 
@@ -210,7 +222,12 @@ def load_prematch_data(conn) -> pd.DataFrame:
     FROM prematch_snapshots p
     JOIN match_results r ON r.match_id = p.match_id
     """
-    rows = _read_sql(conn, q)
+    try:
+        rows = _read_sql(conn, q)
+    except Exception as e:
+        logger.error("Error loading prematch data: %s", e)
+        return pd.DataFrame()
+        
     if rows.empty:
         return pd.DataFrame()
 
@@ -219,10 +236,14 @@ def load_prematch_data(conn) -> pd.DataFrame:
         try:
             payload = json.loads(row["payload"]) or {}
             feat = (payload.get("feat") or {})
-        except Exception:
+        except Exception as e:
+            logger.warning("Error parsing prematch payload: %s", e)
             continue
 
-        f = {k: float(feat.get(k, 0.0) or 0.0) for k in PRE_FEATURES}
+        # Ensure all PRE_FEATURES are present
+        f = {}
+        for k in PRE_FEATURES:
+            f[k] = float(feat.get(k, 0.0) or 0.0)
 
         gh_f = int(row["final_goals_h"] or 0)
         ga_f = int(row["final_goals_a"] or 0)
@@ -237,15 +258,22 @@ def load_prematch_data(conn) -> pd.DataFrame:
     if not feats:
         return pd.DataFrame()
 
-    return pd.DataFrame(feats).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df = pd.DataFrame(feats)
+    df[PRE_FEATURES] = df[PRE_FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return df
 
 
 # ─────────────────────── Model utils ─────────────────────── #
 
 def fit_lr_safe(X: np.ndarray, y: np.ndarray) -> Optional[LogisticRegression]:
     if len(np.unique(y)) < 2:
+        logger.warning("Insufficient class variety for LR")
         return None
-    return LogisticRegression(max_iter=1000, class_weight="balanced", solver="liblinear").fit(X, y)
+    try:
+        return LogisticRegression(max_iter=1000, class_weight="balanced", solver="liblinear").fit(X, y)
+    except Exception as e:
+        logger.error("Error fitting LR: %s", e)
+        return None
 
 def weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[str, float]:
     return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
@@ -257,11 +285,15 @@ def _logit_vec(p: np.ndarray) -> np.ndarray:
 def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
     z = _logit_vec(p_raw).reshape(-1, 1)
     y = y_true.astype(int)
-    lr = LogisticRegression(max_iter=1000, solver="lbfgs")
-    lr.fit(z, y)
-    a = float(lr.coef_.ravel()[0])
-    b = float(lr.intercept_.ravel()[0])
-    return a, b
+    try:
+        lr = LogisticRegression(max_iter=1000, solver="lbfgs")
+        lr.fit(z, y)
+        a = float(lr.coef_.ravel()[0])
+        b = float(lr.intercept_.ravel()[0])
+        return a, b
+    except Exception as e:
+        logger.error("Error fitting Platt: %s", e)
+        return 1.0, 0.0
 
 def build_model_blob(model: LogisticRegression, features: List[str],
                      cal: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
@@ -385,6 +417,7 @@ def _train_binary_head(
     metrics_name: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
     if len(np.unique(y_all)) < 2:
+        logger.warning("Insufficient class variety for %s", model_key)
         return False, {}, None
 
     X_tr, X_te = X_all[mask_tr], X_all[mask_te]
@@ -433,35 +466,41 @@ def train_models(
     test_size: Optional[float] = None,
     min_rows: Optional[int] = None,
 ) -> Dict[str, Any]:
-    conn = _connect(db_url or os.getenv("DATABASE_URL"))
-    _ensure_training_tables(conn)
-
-    min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
-    test_size = float(test_size if test_size is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
-    min_rows = int(min_rows if min_rows is not None else os.getenv("MIN_ROWS", 150))
-
-    ou_lines_env = os.getenv("OU_TRAIN_LINES", "2.5,3.5")
-    ou_lines: List[float] = []
-    for t in ou_lines_env.split(","):
-        t = t.strip()
-        if not t:
-            continue
-        try: ou_lines.append(float(t))
-        except Exception: pass
-    if not ou_lines:
-        ou_lines = [2.5, 3.5]
-
-    target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
-    min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
-    min_thresh = float(os.getenv("MIN_THRESH", "55"))
-    max_thresh = float(os.getenv("MAX_THRESH", "85"))
-
-    summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "thresholds": {}}
-
     try:
+        conn = _connect(db_url or os.getenv("DATABASE_URL"))
+    except Exception as e:
+        logger.error("Database connection failed: %s", e)
+        return {"ok": False, "error": f"Database connection failed: {e}"}
+        
+    try:
+        _ensure_training_tables(conn)
+
+        min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
+        test_size = float(test_size if test_size is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
+        min_rows = int(min_rows if min_rows is not None else os.getenv("MIN_ROWS", 150))
+
+        ou_lines_env = os.getenv("OU_TRAIN_LINES", "2.5,3.5")
+        ou_lines: List[float] = []
+        for t in ou_lines_env.split(","):
+            t = t.strip()
+            if not t:
+                continue
+            try: ou_lines.append(float(t))
+            except Exception: pass
+        if not ou_lines:
+            ou_lines = [2.5, 3.5]
+
+        target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
+        min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
+        min_thresh = float(os.getenv("MIN_THRESH", "55"))
+        max_thresh = float(os.getenv("MAX_THRESH", "85"))
+
+        summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "thresholds": {}}
+
         # ========== In-Play ==========
         df_ip = load_inplay_data(conn, min_minute=min_minute)
         if not df_ip.empty and len(df_ip) >= min_rows:
+            logger.info("Training in-play models with %d samples", len(df_ip))
             tr_mask, te_mask = time_order_split(df_ip, test_size=test_size)
             X_all = df_ip[FEATURES].values
 
@@ -495,10 +534,18 @@ def train_models(
                 if ok:
                     summary["metrics"][name] = mets
                     if abs(line - 2.5) < 1e-6:  # alias for serve compatibility
-                        blob = _get_setting_json(conn, f"model_latest:{name}")
+                        from io import StringIO
+                        import json as json_module
+                        blob = None
+                        try:
+                            df_setting = _read_sql(conn, "SELECT value FROM settings WHERE key=%s", (f"model_latest:{name}",))
+                            if not df_setting.empty:
+                                blob = json_module.loads(df_setting.iloc[0]["value"])
+                        except Exception as e:
+                            logger.warning("Could not read model for alias: %s", e)
                         if blob is not None:
                             for k in ("model_latest:O25", "model:O25"):
-                                _set_setting(conn, k, json.dumps(blob))
+                                _set_setting(conn, k, json_module.dumps(blob))
 
             # 1X2 (OvR heads; serving suppresses draw)
             gd = df_ip["final_goals_diff"].values.astype(int)
@@ -547,6 +594,7 @@ def train_models(
         # ========== Prematch ==========
         df_pre = load_prematch_data(conn)
         if not df_pre.empty and len(df_pre) >= min_rows:
+            logger.info("Training prematch models with %d samples", len(df_pre))
             tr_mask, te_mask = time_order_split(df_pre, test_size=test_size)
             Xp_all = df_pre[PRE_FEATURES].values
 
@@ -628,6 +676,8 @@ def train_models(
             "test_size": float(test_size),
         }
         _set_setting(conn, "model_metrics_latest", json.dumps(metrics_bundle))
+        
+        conn.close()
         return summary
 
     except Exception as e:
