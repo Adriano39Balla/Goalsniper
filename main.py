@@ -9,7 +9,6 @@ import time
 from datetime import datetime, timedelta
 from threading import Thread
 from typing import Dict, List, Optional, Tuple
-from zoneinfo import Zoneinfo
 
 from psycopg2.pool import SimpleConnectionPool
 from flask import Flask, request, jsonify
