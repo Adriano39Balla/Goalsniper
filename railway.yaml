@@ -1,20 +1,14 @@
 build:
-  builder: NIXPACKS
+  builder: nixpacks
   buildCommand: pip install -r requirements.txt
 
 deploy:
   startCommand: python main.py
-  healthcheckPath: /health
+  healthcheckPath: /manual/health
   healthcheckTimeout: 60
 
-env:
-  - key: PYTHON_VERSION
-    value: 3.11.0
-  - key: DATABASE_URL
-    value: ${DATABASE_URL}
-  - key: API_KEY
-    value: ${API_KEY}
-  - key: TELEGRAM_BOT_TOKEN
-    value: ${TELEGRAM_BOT_TOKEN}
-  - key: TELEGRAM_CHAT_ID
-    value: ${TELEGRAM_CHAT_ID}
+variables:
+  - name: PORT
+    value: 5000
+  - name: PYTHONUNBUFFERED
+    value: "true"
