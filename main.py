@@ -49,7 +49,7 @@ except Exception as e:
     log.warning("Could not create file handler: %s", e)
 
 log.info("🚀 Starting goalsniper AI mode with intensive logging...")
-
+app = Flask(__name__)
 # ───────── Core env ─────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
