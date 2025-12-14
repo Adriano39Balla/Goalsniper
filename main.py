@@ -1356,7 +1356,7 @@ def initialize_system():
 def create_tables():
     """Create necessary database tables"""
     try:
-        # First create tables without indexes
+        # First, create tables without foreign key constraints
         table_sqls = [
             """
             CREATE TABLE IF NOT EXISTS matches (
@@ -1392,8 +1392,7 @@ def create_tables():
                 btts_yes_odds DECIMAL(6,2),
                 btts_no_odds DECIMAL(6,2),
                 timestamp TIMESTAMP,
-                created_at TIMESTAMP DEFAULT NOW(),
-                FOREIGN KEY (fixture_id) REFERENCES matches(fixture_id) ON DELETE CASCADE
+                created_at TIMESTAMP DEFAULT NOW()
             )
             """,
             """
@@ -1413,14 +1412,13 @@ def create_tables():
                 edge DECIMAL(5,3),
                 confidence VARCHAR(20),
                 all_predictions JSONB,
-                created_at TIMESTAMP DEFAULT NOW(),
-                FOREIGN KEY (fixture_id) REFERENCES matches(fixture_id) ON DELETE CASCADE
+                created_at TIMESTAMP DEFAULT NOW()
             )
             """,
             """
             CREATE TABLE IF NOT EXISTS bet_results (
                 id SERIAL PRIMARY KEY,
-                value_bet_id INTEGER REFERENCES value_bets(id) ON DELETE CASCADE,
+                value_bet_id INTEGER,
                 fixture_id INTEGER,
                 market VARCHAR(50),
                 odds DECIMAL(6,2),
@@ -1506,6 +1504,44 @@ def create_tables():
             """
         ]
         
+        # Create all tables first
+        for table_sql in table_sqls:
+            try:
+                db.execute_query(table_sql, fetch=False)
+                logger.debug(f"Created table: {table_sql.split('(')[0].split()[-1]}")
+            except Exception as e:
+                logger.warning(f"Could not create table, may already exist: {e}")
+        
+        # Now add foreign key constraints separately
+        fk_sqls = [
+            """
+            ALTER TABLE odds 
+            ADD CONSTRAINT fk_odds_matches 
+            FOREIGN KEY (fixture_id) REFERENCES matches(fixture_id) 
+            ON DELETE CASCADE;
+            """,
+            """
+            ALTER TABLE value_bets 
+            ADD CONSTRAINT fk_value_bets_matches 
+            FOREIGN KEY (fixture_id) REFERENCES matches(fixture_id) 
+            ON DELETE CASCADE;
+            """,
+            """
+            ALTER TABLE bet_results 
+            ADD CONSTRAINT fk_bet_results_value_bets 
+            FOREIGN KEY (value_bet_id) REFERENCES value_bets(id) 
+            ON DELETE CASCADE;
+            """
+        ]
+        
+        # Add foreign key constraints
+        for fk_sql in fk_sqls:
+            try:
+                db.execute_query(fk_sql, fetch=False)
+                logger.debug("Added foreign key constraint")
+            except Exception as e:
+                logger.warning(f"Could not add foreign key constraint, may already exist: {e}")
+        
         # Create indexes separately
         index_sqls = [
             # Indexes for matches table
@@ -1548,11 +1584,7 @@ def create_tables():
             "CREATE INDEX IF NOT EXISTS idx_model_versions_type ON model_versions (model_type);"
         ]
         
-        # Create tables first
-        for table_sql in table_sqls:
-            db.execute_query(table_sql, fetch=False)
-        
-        # Then create indexes
+        # Create indexes
         for index_sql in index_sqls:
             try:
                 db.execute_query(index_sql, fetch=False)
