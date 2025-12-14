@@ -1,7 +1,7 @@
 # goalsniper — OU 2.5 ONLY (in-play + prematch snapshot) — Railway-ready
 # Enhanced with extensive logging and learning functions
 
-import os, json, time, logging, requests, sys, signal, atexit
+import os, json, time, logging, requests, sys, signal, atexit, math
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -155,7 +155,7 @@ API_KEY            = _require_env("API_KEY")
 DATABASE_URL       = _require_env("DATABASE_URL")
 
 # Knobs (focused on OU 2.5 only)
-CONF_THRESHOLD     = float(os.getenv("CONF_THRESHOLD", "72"))  # % threshold for sending tips
+CONF_THRESHOLD     = float(os.getenv("CONF_THRESHOLD", "65"))  # % threshold for sending tips - LOWERED FROM 72
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "20"))
 TIP_MIN_MINUTE     = int(os.getenv("TIP_MIN_MINUTE", "15"))
 SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", "240"))
@@ -166,7 +166,7 @@ RUN_SCHEDULER      = os.getenv("RUN_SCHEDULER", "1") not in ("0","false","False"
 # Odds/EV gates (only OU 2.5)
 MIN_ODDS_OU        = float(os.getenv("MIN_ODDS_OU", "1.50"))
 MAX_ODDS_ALL       = float(os.getenv("MAX_ODDS_ALL", "20.0"))
-EDGE_MIN_BPS       = int(os.getenv("EDGE_MIN_BPS", "500"))  # +5% EV by default
+EDGE_MIN_BPS       = int(os.getenv("EDGE_MIN_BPS", "300"))  # LOWERED FROM 500 (+3% EV)
 ODDS_REQUIRE_N_BOOKS = int(os.getenv("ODDS_REQUIRE_N_BOOKS", "2"))
 ODDS_AGGREGATION   = os.getenv("ODDS_AGGREGATION", "median").lower() # median|best
 ODDS_OUTLIER_MULT  = float(os.getenv("ODDS_OUTLIER_MULT", "1.8"))
@@ -174,16 +174,16 @@ ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","0") not in ("0","false","False","no","NO")
 
 # Data-quality guards
-REQUIRE_STATS_MINUTE = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
-REQUIRE_DATA_FIELDS  = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
+REQUIRE_STATS_MINUTE = int(os.getenv("REQUIRE_STATS_MINUTE", "30"))  # LOWERED FROM 35
+REQUIRE_DATA_FIELDS  = int(os.getenv("REQUIRE_DATA_FIELDS", "1"))  # LOWERED FROM 2
 STALE_GUARD_ENABLE   = os.getenv("STALE_GUARD_ENABLE","1") not in ("0","false","False","no","NO")
 STALE_STATS_MAX_SEC  = int(os.getenv("STALE_STATS_MAX_SEC","240"))
 
 # Learning system parameters
 LEARNING_ENABLED       = os.getenv("LEARNING_ENABLED", "1") not in ("0","false","False","no","NO")
 CONFIDENCE_ADJUSTMENT  = float(os.getenv("CONFIDENCE_ADJUSTMENT", "0.1"))  # % adjustment per win/loss
-MIN_LEARNING_SAMPLES   = int(os.getenv("MIN_LEARNING_SAMPLES", "50"))
-LEARNING_WINDOW_DAYS   = int(os.getenv("LEARNING_WINDOW_DAYS", "30"))
+MIN_LEARNING_SAMPLES   = int(os.getenv("MIN_LEARNING_SAMPLES", "20"))  # LOWERED FROM 50
+LEARNING_WINDOW_DAYS   = int(os.getenv("LEARNING_WINDOW_DAYS", "7"))  # SHORTER FROM 30
 EV_THRESHOLD_ADJUST    = float(os.getenv("EV_THRESHOLD_ADJUST", "0.05"))  # EV threshold adjustment
 ODDS_QUALITY_THRESHOLD = float(os.getenv("ODDS_QUALITY_THRESHOLD", "0.8"))  # Bookmaker agreement threshold
 PERFORMANCE_TRACKING   = os.getenv("PERFORMANCE_TRACKING", "1") not in ("0","false","False","no","NO")
@@ -229,7 +229,8 @@ class LearningSystem:
                 ORDER BY t.created_ts DESC
                 LIMIT 500
             """
-            rows = c.execute(query, (cutoff_ts,)).fetchall()
+            c.execute(query, (cutoff_ts,))
+            rows = c.fetchall()
         
         if len(rows) < self.min_samples:
             return {"status": "insufficient_data", "sample_size": len(rows)}
@@ -320,7 +321,7 @@ class LearningSystem:
         elif accuracy > target_accuracy + 5:  # Overperforming by 5%
             # Decrease threshold to be more aggressive
             adjustment = min(2.0, (accuracy - target_accuracy) * 0.1)
-            new_threshold = max(60.0, current_threshold - adjustment)
+            new_threshold = max(55.0, current_threshold - adjustment)  # Lowered minimum to 55%
             reason = f"Accuracy {accuracy:.1f}% above target {target_accuracy}%"
         else:
             # Adjust based on confidence bias
@@ -331,8 +332,8 @@ class LearningSystem:
                 new_threshold = current_threshold
                 reason = "Performance within acceptable range"
         
-        # Apply bounds
-        new_threshold = max(60.0, min(85.0, new_threshold))
+        # Apply bounds - widened for more flexibility
+        new_threshold = max(55.0, min(85.0, new_threshold))
         
         if abs(new_threshold - current_threshold) > 0.1:
             self._save_threshold(new_threshold)
@@ -358,14 +359,14 @@ class LearningSystem:
         current_ev_threshold = EDGE_MIN_BPS / 10000.0
         
         # Target positive EV while maintaining tip volume
-        if avg_ev < 2.0:  # Low average EV
+        if avg_ev < 1.0:  # Low average EV (lowered from 2.0)
             # Increase threshold to be more selective
             adjustment = min(0.02, (2.0 - avg_ev) * 0.01)
             new_threshold = current_ev_threshold + adjustment
             reason = f"Average EV {avg_ev:.2f}% too low"
-        elif avg_ev > 8.0:  # High average EV
+        elif avg_ev > 6.0:  # High average EV (lowered from 8.0)
             # Decrease threshold to capture more value
-            adjustment = min(0.01, (avg_ev - 8.0) * 0.005)
+            adjustment = min(0.01, (avg_ev - 6.0) * 0.005)
             new_threshold = max(0.01, current_ev_threshold - adjustment)
             reason = f"Average EV {avg_ev:.2f}% very high"
         else:
@@ -466,10 +467,11 @@ class LearningSystem:
     def _get_current_threshold(self) -> float:
         """Get current confidence threshold from settings"""
         with self.db_conn() as c:
-            row = c.execute(
+            c.execute(
                 "SELECT value FROM settings WHERE key = %s",
                 ("conf_threshold:Over/Under 2.5",)
-            ).fetchone()
+            )
+            row = c.fetchone()
             if row and row[0]:
                 try:
                     return float(row[0])
@@ -715,6 +717,12 @@ class PooledConn:
         log_enhanced.logger.debug(f"DB_EXECUTE sql={sql[:100]} params={params}")
         self.cur.execute(sql, params or ())
         return self.cur
+    
+    def fetchall(self):
+        return self.cur.fetchall()
+    
+    def fetchone(self):
+        return self.cur.fetchone()
 
 def db_conn():
     """Get database connection with initialization"""
@@ -829,8 +837,8 @@ def init_db():
 # ───────── Settings helpers ─────────
 def get_setting(key: str) -> Optional[str]:
     with db_conn() as c:
-        cur = c.execute("SELECT value FROM settings WHERE key=%s", (key,))
-        row = cur.fetchone()
+        c.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = c.fetchone()
         return (row[0] if row else None)
 
 def set_setting(key: str, value: str) -> None:
@@ -972,6 +980,7 @@ def extract_features(m: dict) -> Dict[str,float]:
         "sot_sum": float(sot_h + sot_a),
         "sh_total_h": float(sh_total_h), 
         "sh_total_a": float(sh_total_a),
+        "sh_total_sum": float(sh_total_h + sh_total_a),  # ADDED THIS MISSING FEATURE
         "cor_h": float(cor_h), 
         "cor_a": float(cor_a), 
         "cor_sum": float(cor_h + cor_a),
@@ -997,13 +1006,11 @@ def _sigmoid(x: float) -> float:
             return 1e-22
         if x>50:  
             return 1-1e-22
-        import math; 
         return 1/(1+math.exp(-x))
     except: 
         return 0.5
 
 def _logit(p: float) -> float:
-    import math; 
     p=max(EPS,min(1-EPS,float(p))); 
     return math.log(p/(1-p))
 
@@ -1021,13 +1028,17 @@ def _calibrate(p: float, cal: Dict[str,Any]) -> float:
     if method.lower()=="platt": 
         return _sigmoid(a*_logit(p)+b)
     
-    import math; 
     p=max(EPS,min(1-EPS,float(p)))
     z=math.log(p/(1-p))
     return _sigmoid(a*z+b)
 
 def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
     """Score probability with learning system adjustments"""
+    # First check if model has weights
+    if not mdl.get("weights"):
+        log_enhanced.logger.error("Model has no weights! Returning default probability.")
+        return 0.5
+    
     p=_sigmoid(_linpred(feat, mdl.get("weights",{}), float(mdl.get("intercept",0.0))))
     cal=mdl.get("calibration") or {}
     
@@ -1054,7 +1065,7 @@ def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
 def _validate_model_blob(tmp: dict) -> bool:
     return isinstance(tmp, dict) and "weights" in tmp and "intercept" in tmp and isinstance(tmp.get("weights"), dict)
 
-MODEL_KEYS_ORDER = ["model_v2:{name}", "model_latest:{name}", "model:{name}", "pre_{name}"]
+MODEL_KEYS_ORDER = ["model_latest:{name}", "model_v2:{name}", "model:{name}", "pre_{name}"]  # FIXED ORDER
 
 def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
     for pat in MODEL_KEYS_ORDER:
@@ -1072,19 +1083,59 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
                     cal.setdefault("a",1.0)
                     cal.setdefault("b",0.0)
                     tmp["calibration"]=cal
+                
+                # Log model info
+                log_enhanced.logger.info(f"Loaded model '{name}' from key '{pat.format(name=name)}'")
+                log_enhanced.logger.info(f"Model has {len(tmp.get('weights', {}))} weights, intercept: {tmp.get('intercept', 0.0)}")
+                
                 return tmp
         except Exception as e:
-            log_enhanced.log_error(f"Loading model {name}", e)
+            log_enhanced.log_error(f"Loading model {name} from key {pat.format(name=name)}", e)
             continue
+    
+    log_enhanced.logger.warning(f"No valid model found for {name}")
     return None
 
 def _load_ou25_model() -> Optional[Dict[str,Any]]:
     """Load OU 2.5 model with fallback"""
     model = load_model_from_settings("OU_2.5") or load_model_from_settings("O25")
     if model:
-        log_enhanced.logger.info("OU 2.5 model loaded successfully")
+        log_enhanced.logger.info(f"OU 2.5 model loaded successfully with {len(model.get('weights', {}))} weights")
+        
+        # Log top 5 positive and negative weights for debugging
+        weights = model.get('weights', {})
+        if weights:
+            sorted_weights = sorted(weights.items(), key=lambda x: abs(x[1]), reverse=True)
+            log_enhanced.logger.info("Top 5 most influential features:")
+            for feature, weight in sorted_weights[:5]:
+                log_enhanced.logger.info(f"  {feature}: {weight:.4f}")
     else:
-        log_enhanced.logger.warning("OU 2.5 model not found")
+        log_enhanced.logger.warning("OU 2.5 model not found in database settings")
+        # Create a simple default model if none exists
+        model = {
+            "weights": {
+                "goals_sum": 0.8,
+                "minute": 0.02,
+                "xg_sum": 0.4,
+                "sot_sum": 0.3,
+                "cor_sum": 0.15,
+                "goals_per_minute": 2.0,
+            },
+            "intercept": -2.5,
+            "calibration": {
+                "method": "platt",
+                "a": 1.0,
+                "b": 0.0
+            },
+            "feature_names": ["goals_sum", "minute", "xg_sum", "sot_sum", "cor_sum", "goals_per_minute"],
+            "training_info": {
+                "model_type": "default_emergency",
+                "timestamp": int(time.time()),
+                "notes": "Default emergency model - please train a proper model"
+            }
+        }
+        log_enhanced.logger.info("Created emergency default model")
+        
     return model
 
 def _ou25_live_odds_plausible(odds: Optional[float], minute: int, goals_sum: int) -> bool:
@@ -1694,11 +1745,12 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     updated=0
     
     with db_conn() as c:
-        rows=c.execute("""
+        c.execute("""
             WITH last AS (SELECT match_id, MAX(created_ts) last_ts FROM tips WHERE created_ts >= %s GROUP BY match_id)
             SELECT l.match_id FROM last l LEFT JOIN match_results r ON r.match_id=l.match_id
             WHERE r.match_id IS NULL ORDER BY l.last_ts DESC LIMIT %s
-        """,(cutoff, max_rows)).fetchall()
+        """,(cutoff, max_rows))
+        rows=c.fetchall()
     
     for (mid,) in rows:
         fx=_fixture_by_id(int(mid))
@@ -1731,13 +1783,14 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
         if learning_system:
             # Get the tip for this match
             with db_conn() as c3:
-                tip_row = c3.execute("""
+                c3.execute("""
                     SELECT suggestion, confidence_raw, minute, score_at_tip, learning_features
                     FROM tips 
                     WHERE match_id = %s 
                     ORDER BY created_ts DESC 
                     LIMIT 1
-                """, (int(mid),)).fetchone()
+                """, (int(mid),))
+                tip_row = c3.fetchone()
                 
                 if tip_row:
                     suggestion, confidence_raw, minute, score, features_json = tip_row
@@ -1772,13 +1825,14 @@ def daily_accuracy_digest() -> Optional[str]:
     backfill_results_for_open_matches(300)
 
     with db_conn() as c:
-        rows = c.execute("""
+        c.execute("""
             SELECT t.market, t.suggestion, t.confidence, t.confidence_raw, t.created_ts, t.odds,
                    r.final_goals_h, r.final_goals_a, r.btts_yes
             FROM tips t LEFT JOIN match_results r ON r.match_id=t.match_id
             WHERE t.created_ts >= %s AND t.market='Over/Under 2.5' AND t.sent_ok=1
             ORDER BY t.created_ts DESC
-        """, (start_ts,)).fetchall()
+        """, (start_ts,))
+        rows = c.fetchall()
 
     total = len(rows)
     graded = wins = 0
@@ -1898,10 +1952,11 @@ def health():
     """Enhanced health check with detailed system status"""
     try:
         with db_conn() as c:
-            n = c.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
-            learning_status = c.execute(
-                "SELECT COUNT(*) FROM learning_history"
-            ).fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM tips")
+            n = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM learning_history")
+            learning_status = c.fetchone()[0]
         
         api_ok = bool(_api_get(FOOTBALL_API_URL, {"live":"all"}))
         
@@ -1913,7 +1968,7 @@ def health():
             "api_connected": api_ok,
             "performance_stats": log_enhanced.performance_stats,
             "timestamp": time.time(),
-            "memory_usage_mb": round(os.sys.getsizeof({}) / 1024 / 1024, 2)
+            "memory_usage_mb": round(sys.getsizeof({}) / 1024 / 1024, 2)
         }
         
         if learning_system:
@@ -1958,14 +2013,15 @@ def http_digest():
 def http_latest():
     limit=int(request.args.get("limit","50"))
     with db_conn() as c:
-        rows=c.execute("""
+        c.execute("""
             SELECT match_id,league,home,away,market,suggestion,confidence,
                    confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct 
             FROM tips 
             WHERE market='Over/Under 2.5' 
             ORDER BY created_ts DESC 
             LIMIT %s
-        """,(max(1,min(500,limit)),)).fetchall()
+        """,(max(1,min(500,limit)),))
+        rows=c.fetchall()
     
     tips=[]
     for r in rows:
@@ -2074,12 +2130,13 @@ def http_performance():
     
     with db_conn() as c:
         # Get recent performance
-        recent_perf = c.execute("""
+        c.execute("""
             SELECT timestamp, accuracy, avg_ev, confidence_bias, confidence_threshold
             FROM performance_snapshots 
             ORDER BY timestamp DESC 
             LIMIT 10
-        """).fetchall()
+        """)
+        recent_perf = c.fetchall()
     
     return jsonify({
         "ok": True,
@@ -2161,7 +2218,8 @@ def _start_scheduler_once():
             "🚀 goalsniper OU 2.5–only mode started.\n"
             f"• Learning system: {'ENABLED' if LEARNING_ENABLED else 'DISABLED'}\n"
             f"• Scan interval: {SCAN_INTERVAL_SEC}s\n"
-            f"• Confidence threshold: {CONF_THRESHOLD}%"
+            f"• Confidence threshold: {CONF_THRESHOLD}%\n"
+            f"• Emergency fix applied: v2.1"
         )
         send_telegram(startup_message)
         
