@@ -1,782 +1,1029 @@
+#!/usr/bin/env python3
 """
-Postgres-only training with Platt calibration + per-market auto-thresholding.
-
-Trains two families of models that match main.py:
-  In-Play:
-    • BTTS_YES, BTTS_NO (binary LR) - FIXED: separate models
-    • OU_{line}_OVER, OU_{line}_UNDER (e.g., OU_2.5_OVER, OU_2.5_UNDER) - FIXED: separate models
-    • WLD_HOME, WLD_DRAW, WLD_AWAY (OvR LR heads; serving suppresses Draw)
-  Prematch:
-    • PRE_BTTS_YES, PRE_BTTS_NO - FIXED: separate models
-    • PRE_OU_{line}_OVER, PRE_OU_{line}_UNDER - FIXED: separate models
-    • PRE_WLD_HOME, PRE_WLD_AWAY  (Draw suppressed at serving)
-
-Data sources:
-  • In-Play   -> tip_snapshots  (latest snapshot per match)
-  • Prematch  -> prematch_snapshots (one snapshot per match)
-
-Models & thresholds written to `settings`:
-  • model_latest:* and model:* keys (JSON: intercept, weights, calibration)
-  • conf_threshold:* per market (percent; serving uses if present)
-
-Environment knobs:
-  DATABASE_URL
-  OU_TRAIN_LINES="2.5,3.5"
-  TRAIN_MIN_MINUTE=15
-  TRAIN_TEST_SIZE=0.25
-  TARGET_PRECISION=0.60
-  THRESH_MIN_PREDICTIONS=25
-  MIN_THRESH=55
-  MAX_THRESH=85
-  MIN_ROWS=150
+train_models.py - Train and evaluate OU 2.5 models for goalsniper
+Enhanced with cross-validation, feature engineering, and model persistence
 """
 
-import argparse
-import json
-import os
-import logging
-from typing import Any, Dict, List, Optional, Tuple
+import os, json, time, logging, sys, pickle, warnings
+from typing import Dict, Any, List, Tuple, Optional
+from datetime import datetime, timedelta
+import traceback
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    brier_score_loss,
-    accuracy_score,
-    log_loss,
-    precision_score,
-    f1_score,
-)
+from scipy import stats
 import psycopg2
-from psycopg2 import errors as psycopg2_errors
+from psycopg2.extras import RealDictCursor
 
+# ML imports
+from sklearn.linear_model import LogisticRegression, SGDClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
+from sklearn.model_selection import (
+    train_test_split, 
+    TimeSeriesSplit,
+    cross_val_score,
+    GridSearchCV,
+    RandomizedSearchCV
+)
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    log_loss,
+    brier_score_loss,
+    precision_recall_curve,
+    average_precision_score,
+    classification_report,
+    confusion_matrix
+)
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+
+# Optional imports for advanced models
+try:
+    from xgboost import XGBClassifier
+    XGB_AVAILABLE = True
+except ImportError:
+    XGB_AVAILABLE = False
+    print("XGBoost not available, skipping XGBoost models")
+
+try:
+    from lightgbm import LGBMClassifier
+    LGBM_AVAILABLE = True
+except ImportError:
+    LGBM_AVAILABLE = False
+    print("LightGBM not available, skipping LightGBM models")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("train_models")
+
+# Load environment
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    logger.error("DATABASE_URL environment variable required")
+    sys.exit(1)
 
-# ───────────────────────── Feature sets ───────────────────────── #
+# Training parameters
+MIN_SAMPLES = int(os.getenv("MIN_TRAINING_SAMPLES", "500"))
+TRAIN_TEST_SPLIT = float(os.getenv("TRAIN_TEST_SPLIT", "0.8"))
+CV_FOLDS = int(os.getenv("CV_FOLDS", "5"))
+RANDOM_STATE = int(os.getenv("RANDOM_STATE", "42"))
+N_JOBS = int(os.getenv("N_JOBS", "-1"))
 
-# Must match main.py extract_features()
-FEATURES: List[str] = [
-    "minute",
-    "goals_h", "goals_a", "goals_sum", "goals_diff",
-    "xg_h", "xg_a", "xg_sum", "xg_diff",
-    "sot_h", "sot_a", "sot_sum",
-    "cor_h", "cor_a", "cor_sum",
-    "pos_h", "pos_a", "pos_diff",
-    "red_h", "red_a", "red_sum",
-]
+# Feature engineering
+INCLUDE_DERIVED_FEATURES = os.getenv("INCLUDE_DERIVED_FEATURES", "1") == "1"
+MINUTE_BINS = json.loads(os.getenv("MINUTE_BINS", "[15, 30, 45, 60, 75]"))
+FEATURE_SELECTION_K = int(os.getenv("FEATURE_SELECTION_K", "20"))
+DROP_CORRELATION_THRESHOLD = float(os.getenv("DROP_CORRELATION_THRESHOLD", "0.95"))
 
-# Must match main.py extract_prematch_features() - FIXED: removed placeholder live features
-PRE_FEATURES: List[str] = [
-    "pm_gf_h", "pm_ga_h", "pm_win_h",
-    "pm_gf_a", "pm_ga_a", "pm_win_a",
-    "pm_ov25_h", "pm_ov35_h", "pm_btts_h",
-    "pm_ov25_a", "pm_ov35_a", "pm_btts_a",
-    "pm_ov25_h2h", "pm_ov35_h2h", "pm_btts_h2h",
-    "pm_rest_diff",
-]
+# Model training
+MODEL_TYPES = os.getenv("MODEL_TYPES", "logistic,random_forest,gradient_boosting").split(",")
+CALIBRATION_METHOD = os.getenv("CALIBRATION_METHOD", "isotonic")  # isotonic or sigmoid
+ENSEMBLE_METHOD = os.getenv("ENSEMBLE_METHOD", "voting")  # voting, stacking, or best
 
-EPS = 1e-6
+# Database connection
+def get_db_connection():
+    """Get database connection with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            return conn
+        except Exception as e:
+            logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(1)
 
+# Feature extraction from learning_features JSON
+def extract_features_from_json(learning_features: Dict) -> Dict[str, float]:
+    """Extract features from learning_features JSON column"""
+    if not learning_features:
+        return {}
+    
+    feat = learning_features.get("features", {})
+    if not feat:
+        return {}
+    
+    # Basic features
+    features = {
+        "minute": float(feat.get("minute", 0)),
+        "goals_h": float(feat.get("goals_h", 0)),
+        "goals_a": float(feat.get("goals_a", 0)),
+        "goals_sum": float(feat.get("goals_sum", 0)),
+        "xg_h": float(feat.get("xg_h", 0)),
+        "xg_a": float(feat.get("xg_a", 0)),
+        "xg_sum": float(feat.get("xg_sum", 0)),
+        "sot_h": float(feat.get("sot_h", 0)),
+        "sot_a": float(feat.get("sot_a", 0)),
+        "sot_sum": float(feat.get("sot_sum", 0)),
+        "sh_total_h": float(feat.get("sh_total_h", 0)),
+        "sh_total_a": float(feat.get("sh_total_a", 0)),
+        "cor_h": float(feat.get("cor_h", 0)),
+        "cor_a": float(feat.get("cor_a", 0)),
+        "cor_sum": float(feat.get("cor_sum", 0)),
+        "pos_h": float(feat.get("pos_h", 0)),
+        "pos_a": float(feat.get("pos_a", 0)),
+        "red_h": float(feat.get("red_h", 0)),
+        "red_a": float(feat.get("red_a", 0)),
+        "red_sum": float(feat.get("red_sum", 0)),
+    }
+    
+    # Derived features (if enabled)
+    if INCLUDE_DERIVED_FEATURES:
+        # Rate features (per minute)
+        if features["minute"] > 0:
+            features["goals_per_minute"] = features["goals_sum"] / features["minute"]
+            features["xg_per_minute"] = features["xg_sum"] / features["minute"]
+            features["sot_per_minute"] = features["sot_sum"] / features["minute"]
+            features["cor_per_minute"] = features["cor_sum"] / features["minute"]
+        
+        # Efficiency features
+        if features["sh_total_sum"] > 0:
+            features["shot_efficiency"] = features["goals_sum"] / features["sh_total_sum"]
+            features["sot_efficiency"] = features["sot_sum"] / features["sh_total_sum"]
+        
+        if features["xg_sum"] > 0:
+            features["xg_efficiency"] = features["goals_sum"] / features["xg_sum"]
+        
+        # Momentum features
+        features["goal_difference"] = abs(features["goals_h"] - features["goals_a"])
+        features["xg_difference"] = abs(features["xg_h"] - features["xg_a"])
+        
+        # Pressure features
+        features["attacking_pressure"] = (features["sot_sum"] + features["cor_sum"]) / max(1, features["minute"])
+        
+        # Match state features
+        features["is_draw"] = 1.0 if features["goals_h"] == features["goals_a"] else 0.0
+        features["home_leading"] = 1.0 if features["goals_h"] > features["goals_a"] else 0.0
+        features["away_leading"] = 1.0 if features["goals_a"] > features["goals_h"] else 0.0
+        
+        # Minute bin features
+        for i, bin_edge in enumerate(MINUTE_BINS):
+            features[f"minute_gt_{bin_edge}"] = 1.0 if features["minute"] > bin_edge else 0.0
+    
+    return features
 
-# ─────────────────────── DB helpers ─────────────────────── #
-
-def _connect(db_url: str):
-    if not db_url:
-        raise SystemExit("DATABASE_URL must be set.")
-    if "sslmode=" not in db_url:
-        db_url = db_url + ("&" if "?" in db_url else "?") + "sslmode=require"
-    conn = psycopg2.connect(db_url)
-    conn.autocommit = True
-    return conn
-
-def _read_sql(conn, sql: str, params: Tuple = ()) -> pd.DataFrame:
-    return pd.read_sql_query(sql, conn, params=params)
-
-def _exec(conn, sql: str, params: Tuple = ()) -> None:
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-
-def _set_setting(conn, key: str, value: str) -> None:
+def load_training_data(days_back: int = 180) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
+    """
+    Load training data from database
+    
+    Returns:
+        X: Features DataFrame
+        y: Target Series (1 for Over 2.5, 0 for Under 2.5)
+        feature_names: List of feature names
+    """
+    logger.info(f"Loading training data from last {days_back} days")
+    
+    cutoff_ts = int(time.time()) - (days_back * 24 * 3600)
+    
+    query = """
+        SELECT 
+            t.learning_features,
+            r.final_goals_h,
+            r.final_goals_a,
+            t.suggestion,
+            t.minute,
+            t.created_ts,
+            t.match_id
+        FROM tips t
+        JOIN match_results r ON t.match_id = r.match_id
+        WHERE t.created_ts >= %s
+          AND t.market = 'Over/Under 2.5'
+          AND t.sent_ok = 1
+          AND t.learning_features IS NOT NULL
+          AND r.final_goals_h IS NOT NULL
+          AND r.final_goals_a IS NOT NULL
+          AND t.suggestion IN ('Over 2.5 Goals', 'Under 2.5 Goals')
+        ORDER BY t.created_ts DESC
+    """
+    
     try:
-        _exec(conn,
-              "INSERT INTO settings(key,value) VALUES(%s,%s) "
-              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-              (key, value))
-    except psycopg2.Error as e:
-        logger.error("Error setting setting %s: %s", key, e)
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(query, (cutoff_ts,))
+                rows = cur.fetchall()
+        
+        logger.info(f"Retrieved {len(rows)} samples from database")
+        
+        if len(rows) < MIN_SAMPLES:
+            logger.warning(f"Insufficient samples: {len(rows)} < {MIN_SAMPLES}")
+            return pd.DataFrame(), pd.Series(), []
+        
+        # Process data
+        features_list = []
+        targets = []
+        metadata = []
+        
+        for row in rows:
+            try:
+                # Parse learning features
+                learning_features = json.loads(row['learning_features']) if isinstance(row['learning_features'], str) else row['learning_features']
+                
+                # Extract features
+                feat_dict = extract_features_from_json(learning_features)
+                if not feat_dict:
+                    continue
+                
+                # Determine target (1 for Over 2.5, 0 for Under 2.5)
+                total_goals = (row['final_goals_h'] or 0) + (row['final_goals_a'] or 0)
+                suggestion = row['suggestion']
+                
+                # For Over tips: target is 1 if total_goals > 2.5
+                if "Over" in suggestion:
+                    target = 1 if total_goals > 2.5 else 0
+                # For Under tips: target is 0 if total_goals < 2.5
+                else:
+                    target = 0 if total_goals < 2.5 else 1
+                
+                # Skip if match hasn't ended or is exactly 2.5 goals (rare)
+                if total_goals == 2.5:
+                    continue
+                
+                features_list.append(feat_dict)
+                targets.append(target)
+                metadata.append({
+                    'match_id': row['match_id'],
+                    'minute': row['minute'],
+                    'timestamp': row['created_ts'],
+                    'total_goals': total_goals,
+                    'suggestion': suggestion
+                })
+                
+            except Exception as e:
+                logger.warning(f"Error processing row: {e}")
+                continue
+        
+        # Convert to DataFrame
+        X = pd.DataFrame(features_list)
+        y = pd.Series(targets, name='target')
+        meta_df = pd.DataFrame(metadata)
+        
+        logger.info(f"Processed {len(X)} valid samples")
+        logger.info(f"Class distribution: {y.value_counts().to_dict()}")
+        logger.info(f"Features shape: {X.shape}")
+        
+        return X, y, X.columns.tolist(), meta_df
+        
+    except Exception as e:
+        logger.error(f"Error loading training data: {e}")
+        traceback.print_exc()
+        return pd.DataFrame(), pd.Series(), [], pd.DataFrame()
 
-def _ensure_training_tables(conn) -> None:
-    # safety: ensure prematch_snapshots/settings exist (others are created by main.py)
-    try:
-        _exec(conn, """
-          CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-          )
-        """)
-        _exec(conn, """
-          CREATE TABLE IF NOT EXISTS prematch_snapshots (
-            match_id   BIGINT PRIMARY KEY,
-            created_ts BIGINT,
-            payload    TEXT
-          )
-        """)
-        _exec(conn, "CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
-    except psycopg2.Error as e:
-        logger.error("Error ensuring training tables: %s", e)
+def preprocess_features(X: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Preprocess features: handle missing values, scale, select features
+    
+    Returns:
+        X_processed: Processed features
+        preprocessor: Fitted preprocessing objects
+    """
+    logger.info("Preprocessing features")
+    
+    # Store original columns
+    original_columns = X.columns.tolist()
+    
+    # Handle missing values
+    imputer = SimpleImputer(strategy='median')
+    X_imputed = imputer.fit_transform(X)
+    X_imputed = pd.DataFrame(X_imputed, columns=X.columns)
+    
+    # Remove highly correlated features
+    corr_matrix = X_imputed.corr().abs()
+    upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper_tri.columns if any(upper_tri[column] > DROP_CORRELATION_THRESHOLD)]
+    
+    if to_drop:
+        logger.info(f"Dropping {len(to_drop)} highly correlated features: {to_drop}")
+        X_imputed = X_imputed.drop(columns=to_drop)
+    
+    # Scale features
+    scaler = RobustScaler()  # Robust to outliers
+    X_scaled = scaler.fit_transform(X_imputed)
+    X_scaled = pd.DataFrame(X_scaled, columns=X_imputed.columns)
+    
+    # Feature selection
+    if len(X_scaled.columns) > FEATURE_SELECTION_K:
+        selector = SelectKBest(score_func=f_classif, k=min(FEATURE_SELECTION_K, len(X_scaled.columns)))
+        # We'll fit this later with y during training
+        logger.info(f"Will select top {FEATURE_SELECTION_K} features")
+    
+    preprocessor = {
+        'imputer': imputer,
+        'scaler': scaler,
+        'dropped_features': to_drop,
+        'original_columns': original_columns,
+        'selected_columns': X_scaled.columns.tolist()
+    }
+    
+    return X_scaled, preprocessor
 
-
-# ─────────────────────── Data load ─────────────────────── #
-
-def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
-    q = """
-    WITH latest AS (
-      SELECT match_id, MAX(created_ts) AS ts
-      FROM tip_snapshots GROUP BY match_id
+def train_logistic_regression(X_train: pd.DataFrame, y_train: pd.Series, 
+                             preprocessor: Dict) -> Tuple[Any, Dict]:
+    """Train and calibrate logistic regression model"""
+    logger.info("Training logistic regression model")
+    
+    # Feature selection
+    if len(X_train.columns) > FEATURE_SELECTION_K:
+        selector = SelectKBest(score_func=f_classif, k=min(FEATURE_SELECTION_K, len(X_train.columns)))
+        X_train_selected = selector.fit_transform(X_train, y_train)
+        selected_features = X_train.columns[selector.get_support()].tolist()
+        X_train = pd.DataFrame(X_train_selected, columns=selected_features)
+        preprocessor['selector'] = selector
+        preprocessor['selected_features'] = selected_features
+    
+    # Hyperparameter tuning
+    param_grid = {
+        'C': [0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
+        'penalty': ['l1', 'l2'],
+        'solver': ['liblinear', 'saga'],
+        'class_weight': [None, 'balanced']
+    }
+    
+    base_model = LogisticRegression(
+        random_state=RANDOM_STATE,
+        max_iter=1000,
+        n_jobs=N_JOBS
     )
-    SELECT l.match_id, s.created_ts, s.payload,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
-    FROM latest l
-    JOIN tip_snapshots s ON s.match_id = l.match_id AND s.created_ts = l.ts
-    JOIN match_results r ON r.match_id = l.match_id
-    """
-    try:
-        rows = _read_sql(conn, q)
-    except Exception as e:
-        logger.error("Error loading inplay data: %s", e)
-        return pd.DataFrame()
-        
-    if rows.empty:
-        return pd.DataFrame()
-
-    feats: List[Dict[str, Any]] = []
-    for _, row in rows.iterrows():
-        try:
-            payload = json.loads(row["payload"]) or {}
-        except Exception as e:
-            logger.warning("Error parsing payload: %s", e)
-            continue
-        stat = (payload.get("stat") or {})
-
-        f = {
-            "minute": float(payload.get("minute", 0) or 0),
-            "goals_h": float(payload.get("gh", 0) or 0),
-            "goals_a": float(payload.get("ga", 0) or 0),
-            "xg_h": float(stat.get("xg_h", 0) or 0),
-            "xg_a": float(stat.get("xg_a", 0) or 0),
-            "sot_h": float(stat.get("sot_h", 0) or 0),
-            "sot_a": float(stat.get("sot_a", 0) or 0),
-            "cor_h": float(stat.get("cor_h", 0) or 0),
-            "cor_a": float(stat.get("cor_a", 0) or 0),
-            "pos_h": float(stat.get("pos_h", 0) or 0),
-            "pos_a": float(stat.get("pos_a", 0) or 0),
-            "red_h": float(stat.get("red_h", 0) or 0),
-            "red_a": float(stat.get("red_a", 0) or 0),
-        }
-
-        # Derived
-        f["goals_sum"] = f["goals_h"] + f["goals_a"]
-        f["goals_diff"] = f["goals_h"] - f["goals_a"]
-        f["xg_sum"] = f["xg_h"] + f["xg_a"]
-        f["xg_diff"] = f["xg_h"] - f["xg_a"]
-        f["sot_sum"] = f["sot_h"] + f["sot_a"]
-        f["cor_sum"] = f["cor_h"] + f["cor_a"]
-        f["pos_diff"] = f["pos_h"] - f["pos_a"]
-        f["red_sum"] = f["red_h"] + f["red_a"]
-
-        gh_f = int(row["final_goals_h"] or 0)
-        ga_f = int(row["final_goals_a"] or 0)
-
-        f["_ts"] = int(row["created_ts"] or 0)
-        f["final_goals_sum"] = gh_f + ga_f
-        f["final_goals_diff"] = gh_f - ga_f
-        f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
-
-        feats.append(f)
-
-    if not feats:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(feats)
-    df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    df["minute"] = df["minute"].clip(0, 120)
-    df = df[df["minute"] >= float(min_minute)].copy()
-    return df
-
-
-def load_prematch_data(conn) -> pd.DataFrame:
-    q = """
-    SELECT p.match_id, p.created_ts, p.payload,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
-    FROM prematch_snapshots p
-    JOIN match_results r ON r.match_id = p.match_id
-    """
-    try:
-        rows = _read_sql(conn, q)
-    except Exception as e:
-        logger.error("Error loading prematch data: %s", e)
-        return pd.DataFrame()
-        
-    if rows.empty:
-        return pd.DataFrame()
-
-    feats: List[Dict[str, Any]] = []
-    for _, row in rows.iterrows():
-        try:
-            payload = json.loads(row["payload"]) or {}
-            feat = (payload.get("feat") or {})
-        except Exception as e:
-            logger.warning("Error parsing prematch payload: %s", e)
-            continue
-
-        # FIXED: Only include actual prematch features, no placeholders
-        f = {}
-        for k in PRE_FEATURES:
-            f[k] = float(feat.get(k, 0.0) or 0.0)
-
-        gh_f = int(row["final_goals_h"] or 0)
-        ga_f = int(row["final_goals_a"] or 0)
-
-        f["_ts"] = int(row["created_ts"] or 0)
-        f["final_goals_sum"]  = gh_f + ga_f
-        f["final_goals_diff"] = gh_f - ga_f
-        f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
-
-        feats.append(f)
-
-    if not feats:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(feats)
-    df[PRE_FEATURES] = df[PRE_FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return df
-
-
-# ─────────────────────── Model utils ─────────────────────── #
-
-def fit_lr_safe(X: np.ndarray, y: np.ndarray) -> Optional[LogisticRegression]:
-    if len(np.unique(y)) < 2:
-        logger.warning("Insufficient class variety for LR")
-        return None
-    try:
-        return LogisticRegression(max_iter=1000, class_weight="balanced", solver="liblinear").fit(X, y)
-    except Exception as e:
-        logger.error("Error fitting LR: %s", e)
-        return None
-
-def weights_dict(model: LogisticRegression, feature_names: List[str]) -> Dict[str, float]:
-    return {name: float(w) for name, w in zip(feature_names, model.coef_.ravel().tolist())}
-
-def _logit_vec(p: np.ndarray) -> np.ndarray:
-    p = np.clip(p, EPS, 1 - EPS)
-    return np.log(p / (1 - p))
-
-def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
-    z = _logit_vec(p_raw).reshape(-1, 1)
-    y = y_true.astype(int)
-    try:
-        lr = LogisticRegression(max_iter=1000, solver="lbfgs")
-        lr.fit(z, y)
-        a = float(lr.coef_.ravel()[0])
-        b = float(lr.intercept_.ravel()[0])
-        return a, b
-    except Exception as e:
-        logger.error("Error fitting Platt: %s", e)
-        return 1.0, 0.0
-
-def build_model_blob(model: LogisticRegression, features: List[str],
-                     cal: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
-    blob = {
-        "intercept": float(model.intercept_.ravel()[0]),
-        "weights": weights_dict(model, features),
-        "calibration": {"method": "sigmoid", "a": 1.0, "b": 0.0},
+    
+    # Use randomized search for speed
+    search = RandomizedSearchCV(
+        base_model,
+        param_grid,
+        n_iter=20,
+        cv=TimeSeriesSplit(n_splits=3),
+        scoring='roc_auc',
+        n_jobs=N_JOBS,
+        random_state=RANDOM_STATE,
+        verbose=0
+    )
+    
+    search.fit(X_train, y_train)
+    
+    logger.info(f"Best logistic regression params: {search.best_params_}")
+    logger.info(f"Best CV score: {search.best_score_:.4f}")
+    
+    # Calibrate the model
+    calibrated_model = CalibratedClassifierCV(
+        search.best_estimator_,
+        method=CALIBRATION_METHOD,
+        cv='prefit'  # Use the already trained model
+    )
+    
+    # For calibration, we need to fit on a holdout set
+    X_cal, X_val, y_cal, y_val = train_test_split(
+        X_train, y_train, test_size=0.3, random_state=RANDOM_STATE, stratify=y_train
+    )
+    
+    search.best_estimator_.fit(X_cal, y_cal)
+    calibrated_model.fit(X_val, y_val)
+    
+    model_info = {
+        'model_type': 'logistic_regression',
+        'best_params': search.best_params_,
+        'cv_score': float(search.best_score_),
+        'feature_importance': dict(zip(X_train.columns, search.best_estimator_.coef_[0])),
+        'intercept': float(search.best_estimator_.intercept_[0]),
+        'calibration_method': CALIBRATION_METHOD
     }
-    if cal is not None:
-        a, b = cal
-        blob["calibration"] = {"method": "platt", "a": float(a), "b": float(b)}
-    return blob
+    
+    return calibrated_model, model_info
 
-def _fmt_line(line: float) -> str:
-    return f"{line}".rstrip("0").rstrip(".")
-
-
-# ─────────────────────── Thresholding ─────────────────────── #
-
-def _percent(x: float) -> float:
-    return float(x) * 100.0
-
-def _grid_thresholds(lo=0.50, hi=0.95, step=0.005) -> np.ndarray:
-    return np.arange(lo, hi + 1e-9, step)
-
-def _pick_threshold_for_target_precision(
-    y_true: np.ndarray,
-    p_cal: np.ndarray,
-    target_precision: float,
-    min_preds: int = 25,
-    default_threshold: float = 0.65,
-) -> float:
-    """
-    Choose smallest t achieving >= target_precision and >= min_preds positives.
-    Fallback: best F1, then best accuracy, then default.
-    """
-    y = y_true.astype(int)
-    p = np.asarray(p_cal).astype(float)
-    best_t: Optional[float] = None
-    candidates = _grid_thresholds(0.50, 0.95, 0.005)
-
-    feasible: List[Tuple[float, float, int]] = []
-    for t in candidates:
-        pred = (p >= t).astype(int)
-        n_pred = int(pred.sum())
-        if n_pred < min_preds:
-            continue
-        prec = precision_score(y, pred, zero_division=0)
-        if prec >= target_precision:
-            feasible.append((t, float(prec), n_pred))
-    if feasible:
-        feasible.sort(key=lambda z: (z[0], -z[1]))
-        best_t = feasible[0][0]
-
-    if best_t is None:
-        best_f1 = -1.0
-        for t in candidates:
-            pred = (p >= t).astype(int)
-            if int(pred.sum()) < min_preds:
-                continue
-            f1 = f1_score(y, pred, zero_division=0)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_t = float(t)
-
-    if best_t is None:
-        best_acc = -1.0
-        for t in candidates:
-            pred = (p >= t).astype(int)
-            acc = accuracy_score(y, pred)
-            if acc > best_acc:
-                best_acc = acc
-                best_t = float(t)
-
-    return float(best_t if best_t is not None else default_threshold)
-
-
-# ─────────────────────── Time-based split ─────────────────────── #
-
-def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns boolean masks (train_mask, test_mask) by time order.
-    Latest `test_size` fraction goes to test. Stable across markets.
-    """
-    if "_ts" not in df.columns:
-        n = len(df)
-        idx = np.arange(n)
-        rng = np.random.default_rng(42)
-        rng.shuffle(idx)
-        cut = int((1 - test_size) * n)
-        tr = np.zeros(n, dtype=bool); te = np.zeros(n, dtype=bool)
-        tr[idx[:cut]] = True; te[idx[cut:]] = True
-        return tr, te
-
-    df_sorted = df.sort_values("_ts").reset_index(drop=True)
-    n = len(df_sorted)
-    cut = int(max(1, (1 - test_size) * n))
-    train_idx = df_sorted.index[:cut].to_numpy()
-    test_idx  = df_sorted.index[cut:].to_numpy()
-    tr = np.zeros(n, dtype=bool); te = np.zeros(n, dtype=bool)
-    tr[train_idx] = True; te[test_idx] = True
-    return tr, te
-
-
-# ─────────────────────── Core fit ─────────────────────── #
-
-def _train_binary_head(
-    conn,
-    X_all: np.ndarray,
-    y_all: np.ndarray,
-    mask_tr: np.ndarray,
-    mask_te: np.ndarray,
-    feature_names: List[str],
-    model_key: str,
-    threshold_label: Optional[str],  # if not None -> write conf_threshold:LABEL
-    target_precision: float,
-    min_preds: int,
-    min_thresh_pct: float,
-    max_thresh_pct: float,
-    default_thr_prob: float,
-    metrics_name: Optional[str] = None,
-) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
-    if len(np.unique(y_all)) < 2:
-        logger.warning("Insufficient class variety for %s", model_key)
-        return False, {}, None
-
-    X_tr, X_te = X_all[mask_tr], X_all[mask_te]
-    y_tr, y_te = y_all[mask_tr], y_all[mask_te]
-
-    m = fit_lr_safe(X_tr, y_tr)
-    if m is None:
-        return False, {}, None
-
-    p_raw = m.predict_proba(X_te)[:, 1]
-    a, b = fit_platt(y_te, p_raw)
-    z = _logit_vec(p_raw)
-    p_cal = 1.0 / (1.0 + np.exp(-(a * z + b)))
-
-    blob = build_model_blob(m, feature_names, (a, b))
-    for k in (f"model_latest:{model_key}", f"model:{model_key}"):
-        _set_setting(conn, k, json.dumps(blob))
-
-    mets = {
-        "brier": float(brier_score_loss(y_te, p_cal)),
-        "acc": float(accuracy_score(y_te, (p_cal >= 0.5).astype(int))),
-        "logloss": float(log_loss(y_te, p_cal, labels=[0, 1])),
-        "n_test": int(len(y_te)),
-        "prevalence": float(y_all.mean()),
+def train_random_forest(X_train: pd.DataFrame, y_train: pd.Series,
+                       preprocessor: Dict) -> Tuple[Any, Dict]:
+    """Train random forest model"""
+    logger.info("Training random forest model")
+    
+    # Hyperparameter tuning
+    param_grid = {
+        'n_estimators': [50, 100, 200],
+        'max_depth': [3, 5, 7, 10, None],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'max_features': ['sqrt', 'log2', None],
+        'class_weight': [None, 'balanced', 'balanced_subsample']
     }
-    if metrics_name:
-        logger.info("[METRICS] %s: %s", metrics_name, mets)
+    
+    base_model = RandomForestClassifier(
+        random_state=RANDOM_STATE,
+        n_jobs=N_JOBS,
+        verbose=0
+    )
+    
+    search = RandomizedSearchCV(
+        base_model,
+        param_grid,
+        n_iter=20,
+        cv=TimeSeriesSplit(n_splits=3),
+        scoring='roc_auc',
+        n_jobs=N_JOBS,
+        random_state=RANDOM_STATE,
+        verbose=0
+    )
+    
+    search.fit(X_train, y_train)
+    
+    logger.info(f"Best random forest params: {search.best_params_}")
+    logger.info(f"Best CV score: {search.best_score_:.4f}")
+    
+    # Calibrate
+    calibrated_model = CalibratedClassifierCV(
+        search.best_estimator_,
+        method=CALIBRATION_METHOD,
+        cv='prefit'
+    )
+    
+    X_cal, X_val, y_cal, y_val = train_test_split(
+        X_train, y_train, test_size=0.3, random_state=RANDOM_STATE, stratify=y_train
+    )
+    
+    search.best_estimator_.fit(X_cal, y_cal)
+    calibrated_model.fit(X_val, y_val)
+    
+    # Feature importance
+    feature_importance = dict(zip(X_train.columns, search.best_estimator_.feature_importances_))
+    
+    model_info = {
+        'model_type': 'random_forest',
+        'best_params': search.best_params_,
+        'cv_score': float(search.best_score_),
+        'feature_importance': feature_importance,
+        'calibration_method': CALIBRATION_METHOD
+    }
+    
+    return calibrated_model, model_info
 
-    if threshold_label:
-        thr_prob = _pick_threshold_for_target_precision(
-            y_true=y_te, p_cal=p_cal,
-            target_precision=target_precision, min_preds=min_preds,
-            default_threshold=default_thr_prob,
-        )
-        thr_pct = float(np.clip(_percent(thr_prob), min_thresh_pct, max_thresh_pct))
-        _set_setting(conn, f"conf_threshold:{threshold_label}", f"{thr_pct:.2f}")
+def train_gradient_boosting(X_train: pd.DataFrame, y_train: pd.Series,
+                           preprocessor: Dict) -> Tuple[Any, Dict]:
+    """Train gradient boosting model"""
+    logger.info("Training gradient boosting model")
+    
+    param_grid = {
+        'n_estimators': [50, 100, 200],
+        'learning_rate': [0.01, 0.05, 0.1, 0.2],
+        'max_depth': [3, 4, 5, 6],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'subsample': [0.8, 0.9, 1.0],
+        'max_features': ['sqrt', 'log2', None]
+    }
+    
+    base_model = GradientBoostingClassifier(
+        random_state=RANDOM_STATE,
+        verbose=0
+    )
+    
+    search = RandomizedSearchCV(
+        base_model,
+        param_grid,
+        n_iter=20,
+        cv=TimeSeriesSplit(n_splits=3),
+        scoring='roc_auc',
+        n_jobs=N_JOBS,
+        random_state=RANDOM_STATE,
+        verbose=0
+    )
+    
+    search.fit(X_train, y_train)
+    
+    logger.info(f"Best gradient boosting params: {search.best_params_}")
+    logger.info(f"Best CV score: {search.best_score_:.4f}")
+    
+    # Calibrate
+    calibrated_model = CalibratedClassifierCV(
+        search.best_estimator_,
+        method=CALIBRATION_METHOD,
+        cv='prefit'
+    )
+    
+    X_cal, X_val, y_cal, y_val = train_test_split(
+        X_train, y_train, test_size=0.3, random_state=RANDOM_STATE, stratify=y_train
+    )
+    
+    search.best_estimator_.fit(X_cal, y_cal)
+    calibrated_model.fit(X_val, y_val)
+    
+    feature_importance = dict(zip(X_train.columns, search.best_estimator_.feature_importances_))
+    
+    model_info = {
+        'model_type': 'gradient_boosting',
+        'best_params': search.best_params_,
+        'cv_score': float(search.best_score_),
+        'feature_importance': feature_importance,
+        'calibration_method': CALIBRATION_METHOD
+    }
+    
+    return calibrated_model, model_info
 
-    return True, mets, p_cal
+def train_xgboost_model(X_train: pd.DataFrame, y_train: pd.Series,
+                       preprocessor: Dict) -> Tuple[Any, Dict]:
+    """Train XGBoost model (if available)"""
+    if not XGB_AVAILABLE:
+        return None, {}
+    
+    logger.info("Training XGBoost model")
+    
+    param_grid = {
+        'n_estimators': [50, 100, 200],
+        'learning_rate': [0.01, 0.05, 0.1, 0.2],
+        'max_depth': [3, 4, 5, 6],
+        'min_child_weight': [1, 3, 5],
+        'subsample': [0.8, 0.9, 1.0],
+        'colsample_bytree': [0.8, 0.9, 1.0],
+        'gamma': [0, 0.1, 0.2],
+        'reg_alpha': [0, 0.1, 1.0],
+        'reg_lambda': [1.0, 1.5, 2.0]
+    }
+    
+    base_model = XGBClassifier(
+        random_state=RANDOM_STATE,
+        n_jobs=N_JOBS,
+        verbosity=0,
+        use_label_encoder=False,
+        eval_metric='logloss'
+    )
+    
+    search = RandomizedSearchCV(
+        base_model,
+        param_grid,
+        n_iter=20,
+        cv=TimeSeriesSplit(n_splits=3),
+        scoring='roc_auc',
+        n_jobs=N_JOBS,
+        random_state=RANDOM_STATE,
+        verbose=0
+    )
+    
+    search.fit(X_train, y_train)
+    
+    logger.info(f"Best XGBoost params: {search.best_params_}")
+    logger.info(f"Best CV score: {search.best_score_:.4f}")
+    
+    # Calibrate
+    calibrated_model = CalibratedClassifierCV(
+        search.best_estimator_,
+        method=CALIBRATION_METHOD,
+        cv='prefit'
+    )
+    
+    X_cal, X_val, y_cal, y_val = train_test_split(
+        X_train, y_train, test_size=0.3, random_state=RANDOM_STATE, stratify=y_train
+    )
+    
+    search.best_estimator_.fit(X_cal, y_cal)
+    calibrated_model.fit(X_val, y_val)
+    
+    feature_importance = dict(zip(X_train.columns, search.best_estimator_.feature_importances_))
+    
+    model_info = {
+        'model_type': 'xgboost',
+        'best_params': search.best_params_,
+        'cv_score': float(search.best_score_),
+        'feature_importance': feature_importance,
+        'calibration_method': CALIBRATION_METHOD
+    }
+    
+    return calibrated_model, model_info
 
+def evaluate_model(model: Any, X_test: pd.DataFrame, y_test: pd.Series, 
+                  model_info: Dict) -> Dict:
+    """Evaluate model performance"""
+    logger.info(f"Evaluating {model_info['model_type']}")
+    
+    # Predictions
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
+    y_pred = (y_pred_proba >= 0.5).astype(int)
+    
+    # Calculate metrics
+    metrics = {
+        'accuracy': float(accuracy_score(y_test, y_pred)),
+        'roc_auc': float(roc_auc_score(y_test, y_pred_proba)),
+        'log_loss': float(log_loss(y_test, y_pred_proba)),
+        'brier_score': float(brier_score_loss(y_test, y_pred_proba)),
+        'average_precision': float(average_precision_score(y_test, y_pred_proba)),
+        'positive_rate': float(y_pred.mean()),
+        'true_positive_rate': float(y_test.mean())
+    }
+    
+    # Classification report
+    report = classification_report(y_test, y_pred, output_dict=True)
+    metrics.update({
+        'precision_0': float(report['0']['precision']),
+        'recall_0': float(report['0']['recall']),
+        'f1_0': float(report['0']['f1-score']),
+        'precision_1': float(report['1']['precision']),
+        'recall_1': float(report['1']['recall']),
+        'f1_1': float(report['1']['f1-score']),
+        'macro_avg_f1': float(report['macro avg']['f1-score']),
+        'weighted_avg_f1': float(report['weighted avg']['f1-score'])
+    })
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    metrics.update({
+        'tn': int(cm[0, 0]),
+        'fp': int(cm[0, 1]),
+        'fn': int(cm[1, 0]),
+        'tp': int(cm[1, 1])
+    })
+    
+    # Calibration curve
+    prob_true, prob_pred = calibration_curve(y_test, y_pred_proba, n_bins=10)
+    metrics['calibration_curve'] = {
+        'prob_true': prob_true.tolist(),
+        'prob_pred': prob_pred.tolist()
+    }
+    
+    logger.info(f"Test accuracy: {metrics['accuracy']:.4f}")
+    logger.info(f"Test ROC AUC: {metrics['roc_auc']:.4f}")
+    logger.info(f"Test Brier score: {metrics['brier_score']:.4f}")
+    
+    return metrics
 
-# ─────────────────────── Training entry ─────────────────────── #
-
-def train_models(
-    db_url: Optional[str] = None,
-    min_minute: Optional[int] = None,
-    test_size: Optional[float] = None,
-    min_rows: Optional[int] = None,
-) -> Dict[str, Any]:
-    try:
-        conn = _connect(db_url or os.getenv("DATABASE_URL"))
-    except Exception as e:
-        logger.error("Database connection failed: %s", e)
-        return {"ok": False, "error": f"Database connection failed: {e}"}
-        
-    try:
-        _ensure_training_tables(conn)
-
-        min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
-        test_size = float(test_size if test_size is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
-        min_rows = int(min_rows if min_rows is not None else os.getenv("MIN_ROWS", 150))
-
-        ou_lines_env = os.getenv("OU_TRAIN_LINES", "2.5,3.5")
-        ou_lines: List[float] = []
-        for t in ou_lines_env.split(","):
-            t = t.strip()
-            if not t:
-                continue
-            try: ou_lines.append(float(t))
-            except Exception: pass
-        if not ou_lines:
-            ou_lines = [2.5, 3.5]
-
-        target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
-        min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
-        min_thresh = float(os.getenv("MIN_THRESH", "55"))
-        max_thresh = float(os.getenv("MAX_THRESH", "85"))
-
-        summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "thresholds": {}}
-
-        # ========== In-Play ==========
-        df_ip = load_inplay_data(conn, min_minute=min_minute)
-        if not df_ip.empty and len(df_ip) >= min_rows:
-            logger.info("Training in-play models with %d samples", len(df_ip))
-            tr_mask, te_mask = time_order_split(df_ip, test_size=test_size)
-            X_all = df_ip[FEATURES].values
-
-            # FIXED: BTTS - train separate YES and NO models
-            # BTTS YES
-            ok, mets, _ = _train_binary_head(
-                conn, X_all, df_ip["label_btts"].values.astype(int),
-                tr_mask, te_mask, FEATURES,
-                model_key="BTTS_YES",
-                threshold_label="BTTS",  # Set threshold for BTTS market
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.65, metrics_name="BTTS_YES",
-            )
-            summary["trained"]["BTTS_YES"] = ok
-            if ok: summary["metrics"]["BTTS_YES"] = mets
-            
-            # BTTS NO - train separate model
-            # Note: We need to calculate NO label as opposite of YES
-            ok, mets, _ = _train_binary_head(
-                conn, X_all, (1 - df_ip["label_btts"].values).astype(int),
-                tr_mask, te_mask, FEATURES,
-                model_key="BTTS_NO",
-                threshold_label=None,  # Don't set threshold again, already set for BTTS market
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.65, metrics_name="BTTS_NO",
-            )
-            summary["trained"]["BTTS_NO"] = ok
-            if ok: summary["metrics"]["BTTS_NO"] = mets
-
-            # FIXED: O/U - train separate OVER and UNDER models for each line
-            totals = df_ip["final_goals_sum"].values.astype(int)
-            for line in ou_lines:
-                # Over model
-                name_over = f"OU_{_fmt_line(line)}_OVER"
-                ok, mets, _ = _train_binary_head(
-                    conn, X_all, (totals > line).astype(int),
-                    tr_mask, te_mask, FEATURES,
-                    model_key=name_over,
-                    threshold_label=f"Over/Under {_fmt_line(line)}",  # Set threshold for market
-                    target_precision=target_precision, min_preds=min_preds,
-                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65, metrics_name=name_over,
-                )
-                summary["trained"][name_over] = ok
-                if ok:
-                    summary["metrics"][name_over] = mets
-                
-                # Under model
-                name_under = f"OU_{_fmt_line(line)}_UNDER"
-                ok, mets, _ = _train_binary_head(
-                    conn, X_all, (totals < line).astype(int),
-                    tr_mask, te_mask, FEATURES,
-                    model_key=name_under,
-                    threshold_label=None,  # Don't set threshold again, already set for market
-                    target_precision=target_precision, min_preds=min_preds,
-                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65, metrics_name=name_under,
-                )
-                summary["trained"][name_under] = ok
-                if ok:
-                    summary["metrics"][name_under] = mets
-                    
-                # For backward compatibility, also save old format model (deprecated)
-                if ok and abs(line - 2.5) < 1e-6:  # alias for serve compatibility
-                    from io import StringIO
-                    import json as json_module
-                    blob = None
-                    try:
-                        df_setting = _read_sql(conn, "SELECT value FROM settings WHERE key=%s", (f"model_latest:{name_over}",))
-                        if not df_setting.empty:
-                            blob = json_module.loads(df_setting.iloc[0]["value"])
-                    except Exception as e:
-                        logger.warning("Could not read model for alias: %s", e)
-                    if blob is not None:
-                        for k in ("model_latest:O25", "model:O25"):
-                            _set_setting(conn, k, json_module.dumps(blob))
-
-            # 1X2 (OvR heads; serving suppresses draw)
-            gd = df_ip["final_goals_diff"].values.astype(int)
-            y_home = (gd > 0).astype(int)
-            y_draw = (gd == 0).astype(int)
-            y_away = (gd < 0).astype(int)
-
-            ok_h, mets_h, p_h = _train_binary_head(conn, X_all, y_home, tr_mask, te_mask, FEATURES,
-                                                   "WLD_HOME", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_HOME")
-            ok_d, mets_d, p_d = _train_binary_head(conn, X_all, y_draw, tr_mask, te_mask, FEATURES,
-                                                   "WLD_DRAW", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_DRAW")
-            ok_a, mets_a, p_a = _train_binary_head(conn, X_all, y_away, tr_mask, te_mask, FEATURES,
-                                                   "WLD_AWAY", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_AWAY")
-            summary["trained"]["WLD_HOME"] = ok_h
-            summary["trained"]["WLD_DRAW"] = ok_d
-            summary["trained"]["WLD_AWAY"] = ok_a
-            if ok_h: summary["metrics"]["WLD_HOME"] = mets_h
-            if ok_d: summary["metrics"]["WLD_DRAW"] = mets_d
-            if ok_a: summary["metrics"]["WLD_AWAY"] = mets_a
-
-            if ok_h and ok_d and ok_a and (p_h is not None) and (p_d is not None) and (p_a is not None):
-                ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_d, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
-                phn, pdn, pan = p_h / ps, p_d / ps, p_a / ps
-                p_max = np.maximum.reduce([phn, pdn, pan])
-
-                gd_te = gd[te_mask]
-                y_class = np.zeros_like(gd_te, dtype=int)  # 0H/1D/2A
-                y_class[gd_te == 0] = 1
-                y_class[gd_te < 0]  = 2
-                correct = (np.argmax(np.stack([phn, pdn, pan], axis=1), axis=1) == y_class).astype(int)
-
-                thr_prob = _pick_threshold_for_target_precision(
-                    y_true=correct, p_cal=p_max,
-                    target_precision=target_precision, min_preds=min_preds, default_threshold=0.45,
-                )
-                thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
-                _set_setting(conn, "conf_threshold:1X2", f"{thr_pct:.2f}")
-                summary["thresholds"]["1X2"] = thr_pct
-        else:
-            logger.info("In-Play: not enough labeled data (have %d, need >= %d).", len(df_ip), min_rows)
-            summary["trained"]["BTTS_YES"] = False
-
-        # ========== Prematch ==========
-        df_pre = load_prematch_data(conn)
-        if not df_pre.empty and len(df_pre) >= min_rows:
-            logger.info("Training prematch models with %d samples", len(df_pre))
-            tr_mask, te_mask = time_order_split(df_pre, test_size=test_size)
-            Xp_all = df_pre[PRE_FEATURES].values
-
-            # FIXED: PRE BTTS - train separate YES and NO models
-            # PRE BTTS YES
-            ok, mets, _ = _train_binary_head(
-                conn, Xp_all, df_pre["label_btts"].values.astype(int),
-                tr_mask, te_mask, PRE_FEATURES,
-                model_key="PRE_BTTS_YES",
-                threshold_label="PRE BTTS",  # Set threshold for PRE BTTS market
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.65, metrics_name="PRE_BTTS_YES",
-            )
-            summary["trained"]["PRE_BTTS_YES"] = ok
-            if ok: summary["metrics"]["PRE_BTTS_YES"] = mets
-            
-            # PRE BTTS NO
-            ok, mets, _ = _train_binary_head(
-                conn, Xp_all, (1 - df_pre["label_btts"].values).astype(int),
-                tr_mask, te_mask, PRE_FEATURES,
-                model_key="PRE_BTTS_NO",
-                threshold_label=None,  # Don't set threshold again
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.65, metrics_name="PRE_BTTS_NO",
-            )
-            summary["trained"]["PRE_BTTS_NO"] = ok
-            if ok: summary["metrics"]["PRE_BTTS_NO"] = mets
-
-            # FIXED: PRE O/U - train separate OVER and UNDER models for each line
-            totals = df_pre["final_goals_sum"].values.astype(int)
-            for line in ou_lines:
-                # PRE Over model
-                name_over = f"PRE_OU_{_fmt_line(line)}_OVER"
-                ok, mets, _ = _train_binary_head(
-                    conn, Xp_all, (totals > line).astype(int),
-                    tr_mask, te_mask, PRE_FEATURES,
-                    model_key=name_over,
-                    threshold_label=f"PRE Over/Under {_fmt_line(line)}",  # Set threshold for market
-                    target_precision=target_precision, min_preds=min_preds,
-                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65, metrics_name=name_over,
-                )
-                summary["trained"][name_over] = ok
-                if ok: summary["metrics"][name_over] = mets
-                
-                # PRE Under model
-                name_under = f"PRE_OU_{_fmt_line(line)}_UNDER"
-                ok, mets, _ = _train_binary_head(
-                    conn, Xp_all, (totals < line).astype(int),
-                    tr_mask, te_mask, PRE_FEATURES,
-                    model_key=name_under,
-                    threshold_label=None,  # Don't set threshold again
-                    target_precision=target_precision, min_preds=min_preds,
-                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65, metrics_name=name_under,
-                )
-                summary["trained"][name_under] = ok
-                if ok: summary["metrics"][name_under] = mets
-
-            # PRE 1X2 (HOME & AWAY; draws ignored at serving)
-            gd = df_pre["final_goals_diff"].values.astype(int)
-            y_home = (gd > 0).astype(int)
-            y_away = (gd < 0).astype(int)
-
-            ok_h, mets_h, p_h = _train_binary_head(conn, Xp_all, y_home, tr_mask, te_mask, PRE_FEATURES,
-                                                   "PRE_WLD_HOME", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_HOME")
-            ok_a, mets_a, p_a = _train_binary_head(conn, Xp_all, y_away, tr_mask, te_mask, PRE_FEATURES,
-                                                   "PRE_WLD_AWAY", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_AWAY")
-            summary["trained"]["PRE_WLD_HOME"] = ok_h
-            summary["trained"]["PRE_WLD_AWAY"] = ok_a
-            if ok_h: summary["metrics"]["PRE_WLD_HOME"] = mets_h
-            if ok_a: summary["metrics"]["PRE_WLD_AWAY"] = mets_a
-
-            if ok_h and ok_a and (p_h is not None) and (p_a is not None):
-                ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
-                phn, pan = p_h / ps, p_a / ps
-                p_max = np.maximum(phn, pan)
-                gd_te = gd[te_mask]
-                y_class = np.where(gd_te > 0, 0, np.where(gd_te < 0, 1, -1))
-                mask = (y_class != -1)
-                if mask.any():
-                    correct = (np.argmax(np.stack([phn, pan], axis=1), axis=1)[mask] == y_class[mask]).astype(int)
-                    thr_prob = _pick_threshold_for_target_precision(
-                        y_true=correct, p_cal=p_max[mask],
-                        target_precision=target_precision, min_preds=min_preds, default_threshold=0.45,
-                    )
-                    thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
-                    _set_setting(conn, "conf_threshold:PRE 1X2", f"{thr_pct:.2f}")
-                    summary["thresholds"]["PRE 1X2"] = thr_pct
-        else:
-            logger.info("Prematch: not enough labeled data (have %d, need >= %d).", len(df_pre), min_rows)
-            summary["trained"]["PRE_BTTS_YES"] = False
-
-        # Bundle metrics snapshot (handy for /settings fetch)
-        metrics_bundle = {
-            "trained_at_utc": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
-            **summary["metrics"],
-            "features_inplay": FEATURES,
-            "features_prematch": PRE_FEATURES,
-            "thresholds": summary.get("thresholds", {}),
-            "target_precision": target_precision,
-            "ou_lines": [float(x) for x in ou_lines],
-            "min_rows": int(min_rows),
-            "test_size": float(test_size),
+def save_model_to_db(model: Any, model_info: Dict, metrics: Dict, 
+                    preprocessor: Dict, feature_names: List[str]):
+    """Save trained model to database settings table"""
+    logger.info(f"Saving {model_info['model_type']} model to database")
+    
+    # Prepare model blob
+    model_blob = {
+        'model_type': model_info['model_type'],
+        'weights': {},
+        'intercept': 0.0,
+        'calibration': {
+            'method': CALIBRATION_METHOD,
+            'a': 1.0,
+            'b': 0.0
+        },
+        'feature_names': feature_names,
+        'preprocessor': preprocessor,
+        'training_info': {
+            'timestamp': int(time.time()),
+            'metrics': metrics,
+            'model_info': {k: v for k, v in model_info.items() if k != 'feature_importance'},
+            'feature_importance': model_info.get('feature_importance', {}),
+            'training_samples': metrics.get('training_samples', 0)
         }
-        _set_setting(conn, "model_metrics_latest", json.dumps(metrics_bundle))
-        
-        conn.close()
-        return summary
-
-    except Exception as e:
-        logger.exception("Training failed: %s", e)
-        return {"ok": False, "error": str(e)}
-    finally:
-        try:
-            conn.close()
-        except Exception:
+    }
+    
+    # Extract weights for linear models
+    if model_info['model_type'] == 'logistic_regression':
+        # Get the base estimator from the calibrated model
+        base_estimator = model.calibrated_classifiers_[0].base_estimator
+        if hasattr(base_estimator, 'coef_'):
+            weights = base_estimator.coef_[0]
+            model_blob['weights'] = dict(zip(feature_names, weights.tolist()))
+            model_blob['intercept'] = float(base_estimator.intercept_[0])
+    
+    # For tree-based models, store feature importance as weights
+    elif 'feature_importance' in model_info:
+        model_blob['weights'] = model_info['feature_importance']
+    
+    # Store calibration parameters if available
+    if hasattr(model, 'calibrated_classifiers_'):
+        calibrated_clf = model.calibrated_classifiers_[0]
+        if hasattr(calibrated_clf, 'calibrators_'):
+            # This is simplified - actual calibration parameters depend on implementation
             pass
-
-
-# ─────────────────────── Settings read helper ─────────────────────── #
-
-def _get_setting_json(conn, key: str) -> Optional[dict]:
+    
+    # Save to database
+    model_key = f"model_latest:OU_2.5"
+    model_json = json.dumps(model_blob, indent=2)
+    
     try:
-        df = _read_sql(conn, "SELECT value FROM settings WHERE key=%s", (key,))
-        if df.empty:
-            return None
-        return json.loads(df.iloc[0]["value"])
-    except Exception:
-        return None
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Save as latest model
+                cur.execute("""
+                    INSERT INTO settings (key, value) 
+                    VALUES (%s, %s)
+                    ON CONFLICT (key) 
+                    DO UPDATE SET value = EXCLUDED.value
+                """, (model_key, model_json))
+                
+                # Also save with timestamp for versioning
+                timestamp_key = f"model_v{int(time.time())}:OU_2.5"
+                cur.execute("""
+                    INSERT INTO settings (key, value) 
+                    VALUES (%s, %s)
+                    ON CONFLICT (key) 
+                    DO UPDATE SET value = EXCLUDED.value
+                """, (timestamp_key, model_json))
+                
+                conn.commit()
+        
+        logger.info(f"Model saved to database with key: {model_key}")
+        
+        # Also save locally for backup
+        local_filename = f"models/ou25_model_{int(time.time())}.json"
+        os.makedirs("models", exist_ok=True)
+        with open(local_filename, 'w') as f:
+            json.dump(model_blob, f, indent=2)
+        logger.info(f"Model saved locally: {local_filename}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error saving model to database: {e}")
+        return False
 
+def create_ensemble_model(models: List[Tuple[Any, Dict, Dict]]) -> Tuple[Any, Dict]:
+    """Create ensemble model from multiple trained models"""
+    logger.info("Creating ensemble model")
+    
+    # Simple voting ensemble (average probabilities)
+    class VotingEnsemble:
+        def __init__(self, models):
+            self.models = models
+        
+        def predict_proba(self, X):
+            probas = []
+            for model, _, _ in self.models:
+                proba = model.predict_proba(X)[:, 1]
+                probas.append(proba)
+            
+            avg_proba = np.mean(probas, axis=0)
+            return np.column_stack([1 - avg_proba, avg_proba])
+        
+        def predict(self, X):
+            proba = self.predict_proba(X)[:, 1]
+            return (proba >= 0.5).astype(int)
+    
+    ensemble_model = VotingEnsemble(models)
+    
+    ensemble_info = {
+        'model_type': 'ensemble_voting',
+        'component_models': [info['model_type'] for _, info, _ in models],
+        'ensemble_method': 'average_probability'
+    }
+    
+    return ensemble_model, ensemble_info
 
-# ─────────────────────── CLI ─────────────────────── #
+def analyze_feature_importance(models: List[Tuple[Any, Dict, Dict]], 
+                             feature_names: List[str]) -> pd.DataFrame:
+    """Analyze and compare feature importance across models"""
+    logger.info("Analyzing feature importance")
+    
+    importance_data = []
+    
+    for model, model_info, _ in models:
+        model_type = model_info['model_type']
+        
+        if 'feature_importance' in model_info:
+            for feature, importance in model_info['feature_importance'].items():
+                importance_data.append({
+                    'model_type': model_type,
+                    'feature': feature,
+                    'importance': importance
+                })
+    
+    if importance_data:
+        df = pd.DataFrame(importance_data)
+        
+        # Create summary
+        summary = df.groupby('feature')['importance'].agg(['mean', 'std', 'count']).round(4)
+        summary = summary.sort_values('mean', ascending=False)
+        
+        logger.info("Top 10 features by average importance:")
+        for idx, row in summary.head(10).iterrows():
+            logger.info(f"  {idx}: {row['mean']:.4f} ± {row['std']:.4f}")
+        
+        return summary
+    
+    return pd.DataFrame()
 
-def _cli_main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--db-url", help="Postgres DSN (or use env DATABASE_URL)")
-    ap.add_argument("--min-minute", dest="min_minute", type=int, default=int(os.getenv("TRAIN_MIN_MINUTE", 15)))
-    ap.add_argument("--test-size", type=float, default=float(os.getenv("TRAIN_TEST_SIZE", 0.25)))
-    ap.add_argument("--min-rows", type=int, default=int(os.getenv("MIN_ROWS", 150)))
-    args = ap.parse_args()
-    res = train_models(
-        db_url=args.db_url or os.getenv("DATABASE_URL"),
-        min_minute=args.min_minute,
-        test_size=args.test_size,
-        min_rows=args.min_rows,
+def generate_training_report(models: List[Tuple[Any, Dict, Dict]], 
+                           overall_metrics: Dict) -> str:
+    """Generate comprehensive training report"""
+    report_lines = []
+    report_lines.append("=" * 80)
+    report_lines.append("MODEL TRAINING REPORT")
+    report_lines.append("=" * 80)
+    report_lines.append(f"Generated: {datetime.now().isoformat()}")
+    report_lines.append(f"Total models trained: {len(models)}")
+    report_lines.append("")
+    
+    # Overall metrics
+    report_lines.append("OVERALL PERFORMANCE:")
+    report_lines.append("-" * 40)
+    for key, value in overall_metrics.items():
+        if isinstance(value, float):
+            report_lines.append(f"{key}: {value:.4f}")
+        else:
+            report_lines.append(f"{key}: {value}")
+    report_lines.append("")
+    
+    # Individual model performance
+    report_lines.append("INDIVIDUAL MODEL PERFORMANCE:")
+    report_lines.append("-" * 40)
+    
+    for model, model_info, metrics in models:
+        report_lines.append(f"\n{model_info['model_type'].upper()}:")
+        report_lines.append(f"  ROC AUC: {metrics.get('roc_auc', 0):.4f}")
+        report_lines.append(f"  Accuracy: {metrics.get('accuracy', 0):.4f}")
+        report_lines.append(f"  Brier Score: {metrics.get('brier_score', 0):.4f}")
+        report_lines.append(f"  Log Loss: {metrics.get('log_loss', 0):.4f}")
+    
+    # Recommendations
+    report_lines.append("\nRECOMMENDATIONS:")
+    report_lines.append("-" * 40)
+    
+    # Find best model
+    best_model = max(models, key=lambda x: x[2].get('roc_auc', 0))
+    best_type = best_model[1]['model_type']
+    best_auc = best_model[2].get('roc_auc', 0)
+    
+    report_lines.append(f"Best model: {best_type} (ROC AUC: {best_auc:.4f})")
+    
+    if best_auc < 0.6:
+        report_lines.append("⚠️  Model performance is poor. Consider:")
+        report_lines.append("  - Collecting more training data")
+        report_lines.append("  - Improving feature engineering")
+        report_lines.append("  - Checking for data quality issues")
+    elif best_auc < 0.7:
+        report_lines.append("⚠️  Model performance is moderate. Consider:")
+        report_lines.append("  - Adding more features")
+        report_lines.append("  - Trying different model architectures")
+        report_lines.append("  - Increasing training data")
+    elif best_auc < 0.8:
+        report_lines.append("✅  Model performance is good.")
+    else:
+        report_lines.append("🎯  Model performance is excellent!")
+    
+    report_lines.append("\n" + "=" * 80)
+    
+    report = "\n".join(report_lines)
+    
+    # Save report to file
+    os.makedirs("reports", exist_ok=True)
+    report_file = f"reports/training_report_{int(time.time())}.txt"
+    with open(report_file, 'w') as f:
+        f.write(report)
+    
+    logger.info(f"Training report saved to: {report_file}")
+    
+    return report
+
+def main():
+    """Main training function"""
+    logger.info("Starting model training pipeline")
+    
+    # Load data
+    X, y, feature_names, meta_df = load_training_data(days_back=180)
+    
+    if len(X) == 0:
+        logger.error("No training data available")
+        return
+    
+    logger.info(f"Training on {len(X)} samples with {len(feature_names)} features")
+    
+    # Split data (time-based split for time series)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, 
+        test_size=1-TRAIN_TEST_SPLIT, 
+        random_state=RANDOM_STATE,
+        shuffle=False  # Important for time series
     )
-    print(json.dumps(res, indent=2))
-
+    
+    logger.info(f"Train set: {len(X_train)} samples")
+    logger.info(f"Test set: {len(X_test)} samples")
+    
+    # Preprocess features
+    X_train_processed, preprocessor = preprocess_features(X_train)
+    X_test_processed, _ = preprocess_features(X_test)
+    
+    # Ensure same columns in test set
+    X_test_processed = X_test_processed[preprocessor['selected_columns']]
+    
+    # Train models
+    trained_models = []
+    
+    for model_type in MODEL_TYPES:
+        model_type = model_type.strip()
+        
+        try:
+            if model_type == 'logistic':
+                model, model_info = train_logistic_regression(
+                    X_train_processed, y_train, preprocessor
+                )
+            elif model_type == 'random_forest':
+                model, model_info = train_random_forest(
+                    X_train_processed, y_train, preprocessor
+                )
+            elif model_type == 'gradient_boosting':
+                model, model_info = train_gradient_boosting(
+                    X_train_processed, y_train, preprocessor
+                )
+            elif model_type == 'xgboost' and XGB_AVAILABLE:
+                model, model_info = train_xgboost_model(
+                    X_train_processed, y_train, preprocessor
+                )
+            else:
+                logger.warning(f"Unknown model type: {model_type}")
+                continue
+            
+            if model is not None:
+                # Evaluate
+                metrics = evaluate_model(model, X_test_processed, y_test, model_info)
+                metrics['training_samples'] = len(X_train)
+                
+                trained_models.append((model, model_info, metrics))
+                
+                # Save to database
+                save_model_to_db(
+                    model, model_info, metrics, preprocessor, 
+                    X_train_processed.columns.tolist()
+                )
+                
+        except Exception as e:
+            logger.error(f"Error training {model_type}: {e}")
+            traceback.print_exc()
+    
+    if not trained_models:
+        logger.error("No models were successfully trained")
+        return
+    
+    # Create ensemble model
+    if len(trained_models) > 1 and ENSEMBLE_METHOD != 'best':
+        ensemble_model, ensemble_info = create_ensemble_model(trained_models)
+        ensemble_metrics = evaluate_model(
+            ensemble_model, X_test_processed, y_test, ensemble_info
+        )
+        ensemble_metrics['training_samples'] = len(X_train)
+        
+        # Save ensemble model
+        save_model_to_db(
+            ensemble_model, ensemble_info, ensemble_metrics, preprocessor,
+            X_train_processed.columns.tolist()
+        )
+        
+        trained_models.append((ensemble_model, ensemble_info, ensemble_metrics))
+    
+    # Feature importance analysis
+    feature_importance_df = analyze_feature_importance(trained_models, feature_names)
+    
+    # Overall metrics
+    overall_metrics = {
+        'total_samples': len(X),
+        'train_samples': len(X_train),
+        'test_samples': len(X_test),
+        'class_balance_train': {
+            'class_0': int((y_train == 0).sum()),
+            'class_1': int((y_train == 1).sum())
+        },
+        'class_balance_test': {
+            'class_0': int((y_test == 0).sum()),
+            'class_1': int((y_test == 1).sum())
+        },
+        'best_model_auc': max(m[2].get('roc_auc', 0) for m in trained_models),
+        'feature_count': len(feature_names),
+        'selected_feature_count': len(preprocessor['selected_columns'])
+    }
+    
+    # Generate report
+    report = generate_training_report(trained_models, overall_metrics)
+    logger.info("\n" + report)
+    
+    logger.info("Model training completed successfully")
 
 if __name__ == "__main__":
-    _cli_main()
+    # Parse command line arguments
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train OU 2.5 models")
+    parser.add_argument("--days-back", type=int, default=180,
+                       help="Number of days of historical data to use")
+    parser.add_argument("--model-types", type=str,
+                       default="logistic,random_forest,gradient_boosting",
+                       help="Comma-separated list of model types to train")
+    parser.add_argument("--min-samples", type=int, default=500,
+                       help="Minimum samples required for training")
+    parser.add_argument("--test-size", type=float, default=0.2,
+                       help="Test set size ratio")
+    
+    args = parser.parse_args()
+    
+    # Update parameters from command line
+    if args.days_back:
+        os.environ["DAYS_BACK"] = str(args.days_back)
+    if args.model_types:
+        os.environ["MODEL_TYPES"] = args.model_types
+    if args.min_samples:
+        os.environ["MIN_TRAINING_SAMPLES"] = str(args.min_samples)
+    if args.test_size:
+        os.environ["TRAIN_TEST_SPLIT"] = str(1 - args.test_size)
+    
+    main()
