@@ -3,12 +3,12 @@ Postgres-only training with Platt calibration + per-market auto-thresholding.
 
 Trains two families of models that match main.py:
   In-Play:
-    • BTTS_YES (binary LR)
-    • OU_{line}  (e.g., OU_2.5, OU_3.5)
+    • BTTS_YES, BTTS_NO (binary LR) - FIXED: separate models
+    • OU_{line}_OVER, OU_{line}_UNDER (e.g., OU_2.5_OVER, OU_2.5_UNDER) - FIXED: separate models
     • WLD_HOME, WLD_DRAW, WLD_AWAY (OvR LR heads; serving suppresses Draw)
   Prematch:
-    • PRE_BTTS_YES
-    • PRE_OU_{line}
+    • PRE_BTTS_YES, PRE_BTTS_NO - FIXED: separate models
+    • PRE_OU_{line}_OVER, PRE_OU_{line}_UNDER - FIXED: separate models
     • PRE_WLD_HOME, PRE_WLD_AWAY  (Draw suppressed at serving)
 
 Data sources:
@@ -72,7 +72,7 @@ FEATURES: List[str] = [
     "red_h", "red_a", "red_sum",
 ]
 
-# Must match main.py extract_prematch_features() - UPDATED to match actual implementation
+# Must match main.py extract_prematch_features() - FIXED: removed placeholder live features
 PRE_FEATURES: List[str] = [
     "pm_gf_h", "pm_ga_h", "pm_win_h",
     "pm_gf_a", "pm_ga_a", "pm_win_a",
@@ -80,10 +80,6 @@ PRE_FEATURES: List[str] = [
     "pm_ov25_a", "pm_ov35_a", "pm_btts_a",
     "pm_ov25_h2h", "pm_ov35_h2h", "pm_btts_h2h",
     "pm_rest_diff",
-    # keep live keys 0.0 for compatibility at serve time
-    "minute", "goals_h", "goals_a", "goals_sum", "goals_diff",
-    "xg_h", "xg_a", "xg_sum", "xg_diff", "sot_h", "sot_a", "sot_sum",
-    "cor_h", "cor_a", "cor_sum", "pos_h", "pos_a", "pos_diff", "red_h", "red_a", "red_sum",
 ]
 
 EPS = 1e-6
@@ -240,7 +236,7 @@ def load_prematch_data(conn) -> pd.DataFrame:
             logger.warning("Error parsing prematch payload: %s", e)
             continue
 
-        # Ensure all PRE_FEATURES are present
+        # FIXED: Only include actual prematch features, no placeholders
         f = {}
         for k in PRE_FEATURES:
             f[k] = float(feat.get(k, 0.0) or 0.0)
@@ -504,48 +500,81 @@ def train_models(
             tr_mask, te_mask = time_order_split(df_ip, test_size=test_size)
             X_all = df_ip[FEATURES].values
 
-            # BTTS
+            # FIXED: BTTS - train separate YES and NO models
+            # BTTS YES
             ok, mets, _ = _train_binary_head(
                 conn, X_all, df_ip["label_btts"].values.astype(int),
                 tr_mask, te_mask, FEATURES,
                 model_key="BTTS_YES",
-                threshold_label="BTTS",
+                threshold_label="BTTS",  # Set threshold for BTTS market
                 target_precision=target_precision, min_preds=min_preds,
                 min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
                 default_thr_prob=0.65, metrics_name="BTTS_YES",
             )
             summary["trained"]["BTTS_YES"] = ok
             if ok: summary["metrics"]["BTTS_YES"] = mets
+            
+            # BTTS NO - train separate model
+            # Note: We need to calculate NO label as opposite of YES
+            ok, mets, _ = _train_binary_head(
+                conn, X_all, (1 - df_ip["label_btts"].values).astype(int),
+                tr_mask, te_mask, FEATURES,
+                model_key="BTTS_NO",
+                threshold_label=None,  # Don't set threshold again, already set for BTTS market
+                target_precision=target_precision, min_preds=min_preds,
+                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                default_thr_prob=0.65, metrics_name="BTTS_NO",
+            )
+            summary["trained"]["BTTS_NO"] = ok
+            if ok: summary["metrics"]["BTTS_NO"] = mets
 
-            # O/U
+            # FIXED: O/U - train separate OVER and UNDER models for each line
             totals = df_ip["final_goals_sum"].values.astype(int)
             for line in ou_lines:
-                name = f"OU_{_fmt_line(line)}"
+                # Over model
+                name_over = f"OU_{_fmt_line(line)}_OVER"
                 ok, mets, _ = _train_binary_head(
                     conn, X_all, (totals > line).astype(int),
                     tr_mask, te_mask, FEATURES,
-                    model_key=name,
-                    threshold_label=f"Over/Under {_fmt_line(line)}",
+                    model_key=name_over,
+                    threshold_label=f"Over/Under {_fmt_line(line)}",  # Set threshold for market
                     target_precision=target_precision, min_preds=min_preds,
                     min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65, metrics_name=name,
+                    default_thr_prob=0.65, metrics_name=name_over,
                 )
-                summary["trained"][name] = ok
+                summary["trained"][name_over] = ok
                 if ok:
-                    summary["metrics"][name] = mets
-                    if abs(line - 2.5) < 1e-6:  # alias for serve compatibility
-                        from io import StringIO
-                        import json as json_module
-                        blob = None
-                        try:
-                            df_setting = _read_sql(conn, "SELECT value FROM settings WHERE key=%s", (f"model_latest:{name}",))
-                            if not df_setting.empty:
-                                blob = json_module.loads(df_setting.iloc[0]["value"])
-                        except Exception as e:
-                            logger.warning("Could not read model for alias: %s", e)
-                        if blob is not None:
-                            for k in ("model_latest:O25", "model:O25"):
-                                _set_setting(conn, k, json_module.dumps(blob))
+                    summary["metrics"][name_over] = mets
+                
+                # Under model
+                name_under = f"OU_{_fmt_line(line)}_UNDER"
+                ok, mets, _ = _train_binary_head(
+                    conn, X_all, (totals < line).astype(int),
+                    tr_mask, te_mask, FEATURES,
+                    model_key=name_under,
+                    threshold_label=None,  # Don't set threshold again, already set for market
+                    target_precision=target_precision, min_preds=min_preds,
+                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                    default_thr_prob=0.65, metrics_name=name_under,
+                )
+                summary["trained"][name_under] = ok
+                if ok:
+                    summary["metrics"][name_under] = mets
+                    
+                # For backward compatibility, also save old format model (deprecated)
+                if ok and abs(line - 2.5) < 1e-6:  # alias for serve compatibility
+                    from io import StringIO
+                    import json as json_module
+                    blob = None
+                    try:
+                        df_setting = _read_sql(conn, "SELECT value FROM settings WHERE key=%s", (f"model_latest:{name_over}",))
+                        if not df_setting.empty:
+                            blob = json_module.loads(df_setting.iloc[0]["value"])
+                    except Exception as e:
+                        logger.warning("Could not read model for alias: %s", e)
+                    if blob is not None:
+                        for k in ("model_latest:O25", "model:O25"):
+                            _set_setting(conn, k, json_module.dumps(blob))
 
             # 1X2 (OvR heads; serving suppresses draw)
             gd = df_ip["final_goals_diff"].values.astype(int)
@@ -598,34 +627,63 @@ def train_models(
             tr_mask, te_mask = time_order_split(df_pre, test_size=test_size)
             Xp_all = df_pre[PRE_FEATURES].values
 
-            # PRE BTTS
+            # FIXED: PRE BTTS - train separate YES and NO models
+            # PRE BTTS YES
             ok, mets, _ = _train_binary_head(
                 conn, Xp_all, df_pre["label_btts"].values.astype(int),
                 tr_mask, te_mask, PRE_FEATURES,
                 model_key="PRE_BTTS_YES",
-                threshold_label="PRE BTTS",
+                threshold_label="PRE BTTS",  # Set threshold for PRE BTTS market
                 target_precision=target_precision, min_preds=min_preds,
                 min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
                 default_thr_prob=0.65, metrics_name="PRE_BTTS_YES",
             )
             summary["trained"]["PRE_BTTS_YES"] = ok
             if ok: summary["metrics"]["PRE_BTTS_YES"] = mets
+            
+            # PRE BTTS NO
+            ok, mets, _ = _train_binary_head(
+                conn, Xp_all, (1 - df_pre["label_btts"].values).astype(int),
+                tr_mask, te_mask, PRE_FEATURES,
+                model_key="PRE_BTTS_NO",
+                threshold_label=None,  # Don't set threshold again
+                target_precision=target_precision, min_preds=min_preds,
+                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                default_thr_prob=0.65, metrics_name="PRE_BTTS_NO",
+            )
+            summary["trained"]["PRE_BTTS_NO"] = ok
+            if ok: summary["metrics"]["PRE_BTTS_NO"] = mets
 
-            # PRE O/U
+            # FIXED: PRE O/U - train separate OVER and UNDER models for each line
             totals = df_pre["final_goals_sum"].values.astype(int)
             for line in ou_lines:
-                name = f"PRE_OU_{_fmt_line(line)}"
+                # PRE Over model
+                name_over = f"PRE_OU_{_fmt_line(line)}_OVER"
                 ok, mets, _ = _train_binary_head(
                     conn, Xp_all, (totals > line).astype(int),
                     tr_mask, te_mask, PRE_FEATURES,
-                    model_key=name,
-                    threshold_label=f"PRE Over/Under {_fmt_line(line)}",
+                    model_key=name_over,
+                    threshold_label=f"PRE Over/Under {_fmt_line(line)}",  # Set threshold for market
                     target_precision=target_precision, min_preds=min_preds,
                     min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65, metrics_name=name,
+                    default_thr_prob=0.65, metrics_name=name_over,
                 )
-                summary["trained"][name] = ok
-                if ok: summary["metrics"][name] = mets
+                summary["trained"][name_over] = ok
+                if ok: summary["metrics"][name_over] = mets
+                
+                # PRE Under model
+                name_under = f"PRE_OU_{_fmt_line(line)}_UNDER"
+                ok, mets, _ = _train_binary_head(
+                    conn, Xp_all, (totals < line).astype(int),
+                    tr_mask, te_mask, PRE_FEATURES,
+                    model_key=name_under,
+                    threshold_label=None,  # Don't set threshold again
+                    target_precision=target_precision, min_preds=min_preds,
+                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
+                    default_thr_prob=0.65, metrics_name=name_under,
+                )
+                summary["trained"][name_under] = ok
+                if ok: summary["metrics"][name_under] = mets
 
             # PRE 1X2 (HOME & AWAY; draws ignored at serving)
             gd = df_pre["final_goals_diff"].values.astype(int)
