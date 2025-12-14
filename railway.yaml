@@ -1,14 +1,16 @@
 build:
-  builder: nixpacks
-  buildCommand: pip install -r requirements.txt
+  builder: "nixpacks"
+  buildCommand: "pip install -r requirements.txt"
 
 deploy:
-  startCommand: python main.py
-  healthcheckPath: /manual/health
-  healthcheckTimeout: 60
+  startCommand: "python main.py"
 
 variables:
-  - name: PORT
-    value: 5000
   - name: PYTHONUNBUFFERED
-    value: "true"
+    value: "1"
+  - name: PYTHONDONTWRITEBYTECODE
+    value: "1"
+
+hooks:
+  postDeploy:
+    - python train_models.py --initial
