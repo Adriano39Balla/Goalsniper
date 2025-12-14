@@ -1,16 +1,7 @@
-build:
-  builder: "nixpacks"
-  buildCommand: "pip install -r requirements.txt"
-
-deploy:
-  startCommand: "python main.py"
-
-variables:
-  - name: PYTHONUNBUFFERED
-    value: "1"
-  - name: PYTHONDONTWRITEBYTECODE
-    value: "1"
-
-hooks:
-  postDeploy:
-    - python train_models.py --initial
+# railway.yaml
+services:
+  api:
+    build:
+      builder: python:3.11
+      buildCommand: pip install -r requirements.txt
+      startCommand: python main.py
