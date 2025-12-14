@@ -2154,9 +2154,11 @@ def http_performance():
     })
 
 # ───────── Enhanced Scheduler ─────────
-_scheduler_started=False
+_scheduler_started = False
+_scheduler_instance = None  # ADD THIS LINE - keep reference to actual scheduler
+
 def _start_scheduler_once():
-    global _scheduler_started
+    global _scheduler_started, _scheduler_instance  # ADD _scheduler_instance here
     if _scheduler_started or not RUN_SCHEDULER: 
         return
     
@@ -2164,6 +2166,7 @@ def _start_scheduler_once():
         from apscheduler.schedulers.background import BackgroundScheduler
         
         sched = BackgroundScheduler(timezone=TZ_UTC)
+        _scheduler_instance = sched  # STORE THE REFERENCE
         
         # Main scan job
         sched.add_job(
@@ -2219,7 +2222,7 @@ def _start_scheduler_once():
             f"• Learning system: {'ENABLED' if LEARNING_ENABLED else 'DISABLED'}\n"
             f"• Scan interval: {SCAN_INTERVAL_SEC}s\n"
             f"• Confidence threshold: {CONF_THRESHOLD}%\n"
-            f"• Emergency fix applied: v2.1"
+            f"• Emergency fix applied: v2.2"
         )
         send_telegram(startup_message)
         
@@ -2260,16 +2263,24 @@ if __name__ == "__main__":
         log_enhanced.logger.info(f"Received signal {signum}, shutting down gracefully...")
         
         # Stop scheduler if running
-        global _scheduler_started
-        if _scheduler_started:
-            from apscheduler.schedulers.background import BackgroundScheduler
-            sched = BackgroundScheduler()
-            sched.shutdown()
-            _scheduler_started = False
+        global _scheduler_started, _scheduler_instance
+        if _scheduler_started and _scheduler_instance:
+            try:
+                _scheduler_instance.shutdown(wait=False)  # Use the actual instance
+                log_enhanced.logger.info("Scheduler shutdown initiated")
+            except Exception as e:
+                log_enhanced.logger.error(f"Error shutting down scheduler: {e}")
+            finally:
+                _scheduler_started = False
+                _scheduler_instance = None
         
         # Close database pool
         if POOL:
-            POOL.closeall()
+            try:
+                POOL.closeall()
+                log_enhanced.logger.info("Database pool closed")
+            except Exception as e:
+                log_enhanced.logger.error(f"Error closing database pool: {e}")
         
         log_enhanced.logger.info("Shutdown complete")
         sys.exit(0)
