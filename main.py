@@ -635,7 +635,11 @@ def _pretty_score(m: dict) -> str:
     return f"{gh}-{ga}"
 
 # ───────── Models ─────────
-MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
+MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}",
+                  "model_v2:{name}_OVER","model_latest:{name}_OVER","model:{name}_OVER",
+                  "model_v2:{name}_UNDER","model_latest:{name}_UNDER","model:{name}_UNDER",
+                  "model_v2:{name}_YES","model_latest:{name}_YES","model:{name}_YES",
+                  "model_v2:{name}_NO","model_latest:{name}_NO","model:{name}_NO"]
 EPS=1e-12
 
 def _sigmoid(x: float) -> float:
@@ -837,7 +841,10 @@ def load_model_from_settings(name: str) -> Optional[Dict[str,Any]]:
     return mdl
 
 def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
-    name=f"OU_{_fmt_line(line)}"; 
+    """Deprecated - use separate OVER/UNDER models instead"""
+    log.warning("⚠️ _load_ou_model_for_line is deprecated, use separate OVER/UNDER models")
+    # Try to load old format for backward compatibility
+    name=f"OU_{_fmt_line(line)}"
     mdl=load_model_from_settings(name)
     if not mdl and abs(line-2.5)<1e-6:
         mdl = load_model_from_settings("O25")
@@ -1440,15 +1447,25 @@ def production_scan() -> Tuple[int,int]:
                     
                     candidates: List[Tuple[str, str, float]] = []
                     
-                    # OU Markets
+                    # OU Markets - FIXED: Use separate OVER and UNDER models
                     for line in OU_LINES:
-                        mdl = _load_ou_model_for_line(line)
-                        if not mdl:
-                            log.debug("⚠️ No OU model for line %s", line)
+                        mdl_over = load_model_from_settings(f"OU_{_fmt_line(line)}_OVER")
+                        mdl_under = load_model_from_settings(f"OU_{_fmt_line(line)}_UNDER")
+                        
+                        if not mdl_over or not mdl_under:
+                            log.debug("⚠️ Missing OU models for line %s", line)
                             continue
                         
-                        p_over = _score_prob(feat, mdl)
-                        p_under = 1.0 - p_over
+                        p_over_raw = _score_prob(feat, mdl_over)
+                        p_under_raw = _score_prob(feat, mdl_under)
+                        
+                        # Normalize to ensure they sum to 1
+                        total = p_over_raw + p_under_raw
+                        if total > 0:
+                            p_over = p_over_raw / total
+                            p_under = p_under_raw / total
+                        else:
+                            p_over, p_under = 0.5, 0.5
                         
                         mk = f"Over/Under {_fmt_line(line)}"
                         thr = _get_market_threshold(mk)
@@ -1463,23 +1480,32 @@ def production_scan() -> Tuple[int,int]:
                             candidates.append((mk, f"Under {_fmt_line(line)} Goals", p_under))
                             log.debug("✅ OU Under candidate: %s (prob: %s%%)", f"Under {_fmt_line(line)} Goals", p_under*100)
                     
-                    # BTTS Market
-                    mdl_btts = load_model_from_settings("BTTS_YES")
-                    if mdl_btts:
-                        p_yes = _score_prob(feat, mdl_btts)
-                        p_no = 1.0 - p_yes
+                    # BTTS Market - FIXED: Use separate YES and NO models
+                    mdl_btts_yes = load_model_from_settings("BTTS_YES")
+                    mdl_btts_no = load_model_from_settings("BTTS_NO")
+                    if mdl_btts_yes and mdl_btts_no:
+                        p_yes_raw = _score_prob(feat, mdl_btts_yes)
+                        p_no_raw = _score_prob(feat, mdl_btts_no)
+                        
+                        # Normalize to ensure they sum to 1
+                        total = p_yes_raw + p_no_raw
+                        if total > 0:
+                            p_yes = p_yes_raw / total
+                            p_no = p_no_raw / total
+                        else:
+                            p_yes, p_no = 0.5, 0.5
                         
                         thr = _get_market_threshold("BTTS")
                         
                         if p_yes * 100.0 >= thr and _candidate_is_sane("BTTS: Yes", feat):
                             candidates.append(("BTTS", "BTTS: Yes", p_yes))
-                            log.debug("✅ BTTS Yes candidate: %s%%)", p_yes*100)
+                            log.debug("✅ BTTS Yes candidate: %s%%", p_yes*100)
                         
                         if p_no * 100.0 >= thr and _candidate_is_sane("BTTS: No", feat):
                             candidates.append(("BTTS", "BTTS: No", p_no))
-                            log.debug("✅ BTTS No candidate: %s%%)", p_no*100)
+                            log.debug("✅ BTTS No candidate: %s%%", p_no*100)
                     else:
-                        log.debug("⚠️ No BTTS model available")
+                        log.debug("⚠️ No BTTS models available (need both YES and NO)")
                     
                     # 1X2 Market (draw suppressed)
                     mh, md, ma = _load_wld_models()
@@ -1495,11 +1521,11 @@ def production_scan() -> Tuple[int,int]:
                         
                         if ph_norm * 100.0 >= thr:
                             candidates.append(("1X2", "Home Win", ph_norm))
-                            log.debug("✅ Home Win candidate: %s%%)", ph_norm*100)
+                            log.debug("✅ Home Win candidate: %s%%", ph_norm*100)
                         
                         if pa_norm * 100.0 >= thr:
                             candidates.append(("1X2", "Away Win", pa_norm))
-                            log.debug("✅ Away Win candidate: %s%%)", pa_norm*100)
+                            log.debug("✅ Away Win candidate: %s%%", pa_norm*100)
                     else:
                         log.debug("⚠️ Incomplete 1X2 models: H=%s, D=%s, A=%s", mh is not None, md is not None, ma is not None)
                     
@@ -1660,6 +1686,7 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
             pm_ga_a = ga_a / valid_games
             pm_win_a = win_a / valid_games
     
+    # FIXED: Remove placeholder live features, only include actual prematch features
     features = {
         # Main features matching train_models.py
         "pm_gf_h": pm_gf_h, "pm_ga_h": pm_ga_h, "pm_win_h": pm_win_h,
@@ -1667,14 +1694,7 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
         "pm_ov25_h": ov25_h, "pm_ov35_h": ov35_h, "pm_btts_h": btts_h,
         "pm_ov25_a": ov25_a, "pm_ov35_a": ov35_a, "pm_btts_a": btts_a,
         "pm_ov25_h2h": ov25_h2h, "pm_ov35_h2h": ov35_h2h, "pm_btts_h2h": btts_h2h,
-        "pm_rest_diff": pm_rest_diff,
-        # Live features (zeroed for compatibility)
-        "minute": 0.0, "goals_h": 0.0, "goals_a": 0.0, "goals_sum": 0.0, "goals_diff": 0.0,
-        "xg_h": 0.0, "xg_a": 0.0, "xg_sum": 0.0, "xg_diff": 0.0,
-        "sot_h": 0.0, "sot_a": 0.0, "sot_sum": 0.0,
-        "cor_h": 0.0, "cor_a": 0.0, "cor_sum": 0.0,
-        "pos_h": 0.0, "pos_a": 0.0, "pos_diff": 0.0,
-        "red_h": 0.0, "red_a": 0.0, "red_sum": 0.0
+        "pm_rest_diff": pm_rest_diff
     }
     
     log.debug("📊 Extracted prematch features: %s", {k: round(v, 2) for k, v in features.items() if v != 0})
@@ -1737,39 +1757,61 @@ def prematch_scan_save() -> int:
         
         candidates: List[Tuple[str,str,float]]=[]
         
-        # PRE OU via PRE_OU_* models
+        # PRE OU via PRE_OU_* models - FIXED: Use separate OVER and UNDER models
         for line in OU_LINES:
-            mdl=load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-            if not mdl: 
-                log.debug("⚠️ No PRE OU model for line %s", line)
+            mdl_over=load_model_from_settings(f"PRE_OU_{_fmt_line(line)}_OVER")
+            mdl_under=load_model_from_settings(f"PRE_OU_{_fmt_line(line)}_UNDER")
+            
+            if not mdl_over or not mdl_under:
+                log.debug("⚠️ Missing PRE OU models for line %s", line)
                 continue
             
-            p=_score_prob(feat, mdl); 
-            mk=f"Over/Under {_fmt_line(line)}"; 
+            p_over_raw=_score_prob(feat, mdl_over)
+            p_under_raw=_score_prob(feat, mdl_under)
+            
+            # Normalize to ensure they sum to 1
+            total = p_over_raw + p_under_raw
+            if total > 0:
+                p_over = p_over_raw / total
+                p_under = p_under_raw / total
+            else:
+                p_over, p_under = 0.5, 0.5
+            
+            mk=f"Over/Under {_fmt_line(line)}"
             thr=_get_market_threshold_pre(mk)
             
-            if p*100.0>=thr:   
-                candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p))
-                log.debug("✅ PRE OU Over candidate: %s (prob: %s%%)", f"Over {_fmt_line(line)} Goals", p*100)
+            if p_over*100.0>=thr:   
+                candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p_over))
+                log.debug("✅ PRE OU Over candidate: %s (prob: %s%%)", f"Over {_fmt_line(line)} Goals", p_over*100)
             
-            q=1.0-p
-            if q*100.0>=thr:   
-                candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", q))
-                log.debug("✅ PRE OU Under candidate: %s (prob: %s%%)", f"Under {_fmt_line(line)} Goals", q*100)
+            if p_under*100.0>=thr:   
+                candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", p_under))
+                log.debug("✅ PRE OU Under candidate: %s (prob: %s%%)", f"Under {_fmt_line(line)} Goals", p_under*100)
         
-        # PRE BTTS
-        mdl=load_model_from_settings("PRE_BTTS_YES")
-        if mdl:
-            p=_score_prob(feat, mdl); thr=_get_market_threshold_pre("BTTS")
-            if p*100.0>=thr: 
-                candidates.append(("PRE BTTS","BTTS: Yes",p))
-                log.debug("✅ PRE BTTS Yes candidate: %s%%)", p*100)
-            q=1.0-p
-            if q*100.0>=thr: 
-                candidates.append(("PRE BTTS","BTTS: No",q))
-                log.debug("✅ PRE BTTS No candidate: %s%%)", q*100)
+        # PRE BTTS - FIXED: Use separate YES and NO models
+        mdl_yes=load_model_from_settings("PRE_BTTS_YES")
+        mdl_no=load_model_from_settings("PRE_BTTS_NO")
+        if mdl_yes and mdl_no:
+            p_yes_raw=_score_prob(feat, mdl_yes)
+            p_no_raw=_score_prob(feat, mdl_no)
+            
+            # Normalize to ensure they sum to 1
+            total = p_yes_raw + p_no_raw
+            if total > 0:
+                p_yes = p_yes_raw / total
+                p_no = p_no_raw / total
+            else:
+                p_yes, p_no = 0.5, 0.5
+            
+            thr=_get_market_threshold_pre("BTTS")
+            if p_yes*100.0>=thr: 
+                candidates.append(("PRE BTTS","BTTS: Yes",p_yes))
+                log.debug("✅ PRE BTTS Yes candidate: %s%%", p_yes*100)
+            if p_no*100.0>=thr: 
+                candidates.append(("PRE BTTS","BTTS: No",p_no))
+                log.debug("✅ PRE BTTS No candidate: %s%%", p_no*100)
         else:
-            log.debug("⚠️ No PRE BTTS model available")
+            log.debug("⚠️ No PRE BTTS models available (need both YES and NO)")
         
         # PRE 1X2 (draw suppressed)
         mh,ma=load_model_from_settings("PRE_WLD_HOME"), load_model_from_settings("PRE_WLD_AWAY")
@@ -1781,10 +1823,10 @@ def prematch_scan_save() -> int:
             thr=_get_market_threshold_pre("1X2")
             if ph*100.0>=thr: 
                 candidates.append(("PRE 1X2","Home Win",ph))
-                log.debug("✅ PRE Home Win candidate: %s%%)", ph*100)
+                log.debug("✅ PRE Home Win candidate: %s%%", ph*100)
             if pa*100.0>=thr: 
                 candidates.append(("PRE 1X2","Away Win",pa))
-                log.debug("✅ PRE Away Win candidate: %s%%)", pa*100)
+                log.debug("✅ PRE Away Win candidate: %s%%", pa*100)
         else:
             log.debug("⚠️ Incomplete PRE 1X2 models: H=%s, A=%s", mh is not None, ma is not None)
         
@@ -1891,31 +1933,72 @@ def send_match_of_the_day() -> bool:
         # Collect PRE candidates (same thresholds as prematch_scan_save)
         candidates: List[Tuple[str,str,float]] = []
 
+        # PRE OU - FIXED: Use separate OVER and UNDER models
         for line in OU_LINES:
-            mdl = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
-            if not mdl: continue
-            p = _score_prob(feat, mdl)
+            mdl_over = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}_OVER")
+            mdl_under = load_model_from_settings(f"PRE_OU_{_fmt_line(line)}_UNDER")
+            
+            if not mdl_over or not mdl_under:
+                continue
+            
+            p_over_raw = _score_prob(feat, mdl_over)
+            p_under_raw = _score_prob(feat, mdl_under)
+            
+            # Normalize to ensure they sum to 1
+            total = p_over_raw + p_under_raw
+            if total > 0:
+                p_over = p_over_raw / total
+                p_under = p_under_raw / total
+            else:
+                p_over, p_under = 0.5, 0.5
+            
             mk = f"Over/Under {_fmt_line(line)}"
             thr = _get_market_threshold_pre(mk)
-            if p*100.0 >= thr:   candidates.append((mk, f"Over {_fmt_line(line)} Goals", p))
-            q = 1.0 - p
-            if q*100.0 >= thr:   candidates.append((mk, f"Under {_fmt_line(line)} Goals", q))
+            
+            if p_over*100.0 >= thr:
+                candidates.append((mk, f"Over {_fmt_line(line)} Goals", p_over))
+            
+            if p_under*100.0 >= thr:
+                candidates.append((mk, f"Under {_fmt_line(line)} Goals", p_under))
 
-        mdl = load_model_from_settings("PRE_BTTS_YES")
-        if mdl:
-            p = _score_prob(feat, mdl); thr = _get_market_threshold_pre("BTTS")
-            if p*100.0 >= thr: candidates.append(("BTTS","BTTS: Yes", p))
-            q = 1.0 - p
-            if q*100.0 >= thr: candidates.append(("BTTS","BTTS: No",  q))
+        # PRE BTTS - FIXED: Use separate YES and NO models
+        mdl_yes = load_model_from_settings("PRE_BTTS_YES")
+        mdl_no = load_model_from_settings("PRE_BTTS_NO")
+        if mdl_yes and mdl_no:
+            p_yes_raw = _score_prob(feat, mdl_yes)
+            p_no_raw = _score_prob(feat, mdl_no)
+            
+            # Normalize to ensure they sum to 1
+            total = p_yes_raw + p_no_raw
+            if total > 0:
+                p_yes = p_yes_raw / total
+                p_no = p_no_raw / total
+            else:
+                p_yes, p_no = 0.5, 0.5
+            
+            thr = _get_market_threshold_pre("BTTS")
+            if p_yes*100.0 >= thr:
+                candidates.append(("BTTS","BTTS: Yes", p_yes))
+            
+            if p_no*100.0 >= thr:
+                candidates.append(("BTTS","BTTS: No", p_no))
 
+        # PRE 1X2
         mh = load_model_from_settings("PRE_WLD_HOME")
         ma = load_model_from_settings("PRE_WLD_AWAY")
         if mh and ma:
-            ph = _score_prob(feat, mh); pa = _score_prob(feat, ma)
-            s = max(EPS, ph+pa); ph, pa = ph/s, pa/s  # Normalize only home and away
+            ph = _score_prob(feat, mh)
+            pa = _score_prob(feat, ma)
+            s = max(EPS, ph+pa)
+            if s > 0:
+                ph, pa = ph/s, pa/s  # Normalize only home and away
+            
             thr = _get_market_threshold_pre("1X2")
-            if ph*100.0 >= thr: candidates.append(("1X2","Home Win", ph))
-            if pa*100.0 >= thr: candidates.append(("1X2","Away Win", pa))
+            if ph*100.0 >= thr:
+                candidates.append(("1X2","Home Win", ph))
+            
+            if pa*100.0 >= thr:
+                candidates.append(("1X2","Away Win", pa))
 
         if not candidates:
             log.debug("⚠️ No candidates for MOTD fixture %s", fid)
@@ -2189,7 +2272,7 @@ def calibration_check_job():
                 log.warning("⚠️ High calibration errors detected: %s", 
                           {k: v for k, v in calibration_errors.items() if v > 0.1})
             
-            send_telegram("\n".join(lines))
+            send_telegram("\n".lines())
             log.info("✅ Calibration check completed")
         else:
             log.info("ℹ️ No calibration data available")
