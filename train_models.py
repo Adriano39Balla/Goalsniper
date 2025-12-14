@@ -1,260 +1,311 @@
-import psycopg2
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import json
+from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score, log_loss
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import joblib
-import logging
-from dotenv import load_dotenv
+import warnings
+warnings.filterwarnings('ignore')
 import os
+from dotenv import load_dotenv
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
-
 def get_db_connection():
-    """Get database connection"""
-    return psycopg2.connect(os.getenv('DATABASE_URL'))
-
-def fetch_training_data(conn, days: int = 90):
-    """Fetch historical data for training"""
-    query = """
-    WITH match_data AS (
-        SELECT 
-            ep.fixture_id,
-            ep.league_id,
-            ep.minute,
-            ep.predictions,
-            ms.market_type,
-            ms.probability as predicted_probability,
-            ms.confidence_score,
-            mr.outcome,
-            mr.actual_probability,
-            mr.match_state,
-            mr.analyzed_at
-        FROM event_predictions ep
-        LEFT JOIN market_suggestions ms ON ep.fixture_id = ms.fixture_id 
-            AND ABS(ep.minute - EXTRACT(MINUTE FROM ms.created_at)) < 5
-        LEFT JOIN market_results mr ON ms.id = mr.market_suggestion_id
-        WHERE ep.created_at >= NOW() - INTERVAL '%s days'
-            AND mr.outcome IS NOT NULL
+    """Establish database connection"""
+    conn = psycopg2.connect(
+        host=os.getenv("SUPABASE_URL"),
+        database="postgres",
+        user="postgres",
+        password=os.getenv("SUPABASE_KEY"),
+        port=5432
     )
-    SELECT * FROM match_data
+    return conn
+
+def fetch_training_data(years=3):
+    """Fetch historical match data for training"""
+    conn = get_db_connection()
+    
+    query = f"""
+    SELECT 
+        -- Match details
+        f.id, f.date, f.home_team, f.away_team, f.home_score, f.away_score,
+        
+        -- Derived outcomes
+        CASE WHEN f.home_score > f.away_score THEN 1 ELSE 0 END as home_win,
+        CASE WHEN f.home_score = f.away_score THEN 1 ELSE 0 END as draw,
+        CASE WHEN f.home_score < f.away_score THEN 1 ELSE 0 END as away_win,
+        CASE WHEN (f.home_score + f.away_score) > 2.5 THEN 1 ELSE 0 END as over_25,
+        CASE WHEN (f.home_score + f.away_score) < 2.5 THEN 1 ELSE 0 END as under_25,
+        CASE WHEN f.home_score > 0 AND f.away_score > 0 THEN 1 ELSE 0 END as btts_yes,
+        
+        -- Historical features (simplified - you'd expand these)
+        -- Team form last 5 games
+        -- Head-to-head history
+        -- Injury data
+        -- etc.
+        
+        -- Placeholder features for now
+        RANDOM() as form_home_last5,
+        RANDOM() as form_away_last5,
+        RANDOM() as h2h_home_wins
+        
+    FROM fixtures f
+    WHERE f.date >= NOW() - INTERVAL '{years} years'
+    AND f.status = 'FT'  # Only finished matches
+    AND f.home_score IS NOT NULL
+    ORDER BY f.date DESC
     """
     
-    df = pd.read_sql_query(query, conn, params=(days,))
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    
+    print(f"Fetched {len(df)} historical matches for training")
     return df
 
-def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Prepare features for training"""
-    features = []
+def engineer_features(df):
+    """Create advanced features for prediction models"""
     
-    for _, row in df.iterrows():
-        try:
-            predictions = row['predictions']
-            if isinstance(predictions, str):
-                predictions = json.loads(predictions)
-            
-            match_state = row['match_state']
-            if isinstance(match_state, str):
-                match_state = json.loads(match_state)
-            
-            # Extract base features
-            feature = {
-                'league_id': row['league_id'],
-                'minute': row['minute'],
-                'market_type': row['market_type'],
-                'predicted_probability': row['predicted_probability'],
-                'confidence_score': row['confidence_score'],
-                
-                # Event probabilities
-                'goal_next_10min': predictions.get('goal_next_10min', 0),
-                'home_goal_probability': predictions.get('home_goal_probability', 0),
-                'away_goal_probability': predictions.get('away_goal_probability', 0),
-                'expected_final_goals': predictions.get('expected_final_goals', 0),
-                'corner_next_10min': predictions.get('corner_next_10min', 0),
-                'yellow_card_next_10min': predictions.get('yellow_card_next_10min', 0),
-                
-                # Match state
-                'score_delta': match_state.get('score_delta', 0),
-                'home_possession': match_state.get('home_possession', 0.5),
-                'shot_pressure': match_state.get('shot_pressure', 0),
-                'corner_rate': match_state.get('corner_rate', 0),
-                
-                # Target
-                'outcome': 1 if row['outcome'] == 'win' else 0
-            }
-            
-            features.append(feature)
-        except Exception as e:
-            logger.warning(f"Error processing row: {e}")
-            continue
+    # This is a simplified feature engineering process
+    # In production, you would create much more sophisticated features:
+    # - Rolling averages of team performance
+    # - Weighted recent form
+    # - Head-to-head statistics
+    # - Injury impact metrics
+    # - Rest days between matches
+    # - Travel distance
+    # - Manager statistics
     
-    return pd.DataFrame(features)
+    features = pd.DataFrame()
+    
+    # Basic features (expand these significantly)
+    features['home_win_rate'] = df.groupby('home_team')['home_win'].transform('mean').fillna(0.5)
+    features['away_win_rate'] = df.groupby('away_team')['away_win'].transform('mean').fillna(0.5)
+    
+    # Form features (placeholder - you'd implement actual form calculation)
+    features['home_form'] = np.random.rand(len(df)) * 0.5 + 0.25
+    features['away_form'] = np.random.rand(len(df)) * 0.5 + 0.25
+    
+    # Goal scoring/conceding averages
+    features['home_goals_scored_avg'] = df.groupby('home_team')['home_score'].transform('mean').fillna(1.2)
+    features['away_goals_conceded_avg'] = df.groupby('away_team')['away_score'].transform('mean').fillna(1.2)
+    
+    # Additional placeholder features
+    features['feature_1'] = np.random.randn(len(df))
+    features['feature_2'] = np.random.randn(len(df))
+    features['feature_3'] = np.random.randn(len(df))
+    
+    return features
 
-def train_market_model(market_type: str, df: pd.DataFrame):
-    """Train model for specific market type"""
-    market_df = df[df['market_type'] == market_type].copy()
-    
-    if len(market_df) < 50:
-        logger.warning(f"Insufficient data for {market_type}: {len(market_df)} samples")
-        return None
-    
-    # Prepare features and target
-    feature_cols = [
-        'minute', 'predicted_probability', 'confidence_score',
-        'goal_next_10min', 'home_goal_probability', 'away_goal_probability',
-        'expected_final_goals', 'corner_next_10min', 'yellow_card_next_10min',
-        'score_delta', 'home_possession', 'shot_pressure', 'corner_rate'
-    ]
-    
-    X = market_df[feature_cols]
-    y = market_df['outcome']
-    
-    # Encode league_id if needed
-    if 'league_id' in X.columns:
-        X = pd.get_dummies(X, columns=['league_id'], drop_first=True)
+def train_winner_model(X, y):
+    """Train model to predict match winner (1X2)"""
+    print("Training winner prediction model...")
     
     # Split data
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
     
-    # Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    # Model selection and training
+    models = {
+        'random_forest': RandomForestClassifier(n_estimators=100, random_state=42),
+        'gradient_boosting': GradientBoostingClassifier(n_estimators=100, random_state=42),
+        'logistic_regression': LogisticRegression(random_state=42, max_iter=1000)
+    }
     
-    # Train model
+    best_model = None
+    best_score = 0
+    
+    for name, model in models.items():
+        model.fit(X_train, y_train)
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+        score = roc_auc_score(y_test, y_pred_proba)
+        
+        print(f"  {name}: ROC-AUC = {score:.3f}")
+        
+        if score > best_score:
+            best_score = score
+            best_model = model
+    
+    # Evaluate best model
+    y_pred = best_model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    
+    print(f"Best model: {type(best_model).__name__}")
+    print(f"Accuracy: {accuracy:.3f}, ROC-AUC: {best_score:.3f}")
+    
+    return best_model
+
+def train_over_under_model(X, y):
+    """Train model to predict over/under 2.5 goals"""
+    print("Training over/under 2.5 goals model...")
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
     model = GradientBoostingClassifier(
-        n_estimators=100,
-        learning_rate=0.1,
-        max_depth=3,
+        n_estimators=150,
+        learning_rate=0.05,
+        max_depth=5,
         random_state=42
     )
     
-    model.fit(X_train_scaled, y_train)
+    model.fit(X_train, y_train)
     
-    # Evaluate
-    y_pred = model.predict(X_test_scaled)
-    y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+    y_pred = model.predict(X_test)
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
     
-    metrics = {
-        'accuracy': accuracy_score(y_test, y_pred),
-        'precision': precision_score(y_test, y_pred, zero_division=0),
-        'recall': recall_score(y_test, y_pred, zero_division=0),
-        'roc_auc': roc_auc_score(y_test, y_pred_proba),
-        'train_samples': len(X_train),
-        'test_samples': len(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    
+    print(f"Accuracy: {accuracy:.3f}, ROC-AUC: {roc_auc:.3f}")
+    
+    return model
+
+def train_btts_model(X, y):
+    """Train model to predict Both Teams To Score"""
+    print("Training Both Teams To Score model...")
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=7,
+        min_samples_split=10,
+        random_state=42,
+        class_weight='balanced'  # Important for imbalanced datasets
+    )
+    
+    model.fit(X_train, y_train)
+    
+    y_pred = model.predict(X_test)
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
+    
+    accuracy = accuracy_score(y_test, y_pred)
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    
+    print(f"Accuracy: {accuracy:.3f}, ROC-AUC: {roc_auc:.3f}")
+    
+    return model
+
+def auto_tune_models():
+    """Automatic hyperparameter tuning for all models"""
+    print("Starting auto-tuning process...")
+    
+    # Fetch data
+    df = fetch_training_data(years=2)
+    features = engineer_features(df)
+    
+    # Prepare targets
+    y_winner = df['home_win']
+    y_over_under = df['over_25']
+    y_btts = df['btts_yes']
+    
+    # Hyperparameter grids (simplified)
+    param_grid_rf = {
+        'n_estimators': [100, 200],
+        'max_depth': [5, 10, None],
+        'min_samples_split': [2, 5, 10]
     }
     
-    logger.info(f"{market_type} model performance: {metrics}")
+    # Example tuning for one model
+    base_model = RandomForestClassifier(random_state=42)
     
-    # Save model and scaler
-    joblib.dump(model, f'models/{market_type}_model.joblib')
-    joblib.dump(scaler, f'models/{market_type}_scaler.joblib')
+    X_train, X_test, y_train, y_test = train_test_split(
+        features, y_winner, test_size=0.2, random_state=42
+    )
     
-    return metrics
+    grid_search = GridSearchCV(
+        base_model,
+        param_grid_rf,
+        cv=3,
+        scoring='roc_auc',
+        n_jobs=-1,
+        verbose=1
+    )
+    
+    grid_search.fit(X_train, y_train)
+    
+    print(f"Best parameters: {grid_search.best_params_}")
+    print(f"Best cross-validation score: {grid_search.best_score_:.3f}")
+    
+    return grid_search.best_params_
 
-def train_event_prediction_model(df: pd.DataFrame):
-    """Train model for event predictions"""
-    # This would train models to predict events (goals, corners, cards)
-    # For now, return placeholder
-    logger.info("Event prediction model training placeholder")
-    return {}
-
-def update_league_stats(conn):
-    """Update league statistics based on recent performance"""
-    cur = conn.cursor()
+def run_training_pipeline():
+    """Complete training pipeline for all models"""
+    print("=" * 50)
+    print("STARTING MODEL TRAINING PIPELINE")
+    print("=" * 50)
     
-    # Update reliability scores
-    cur.execute("""
-        UPDATE league_stats ls
-        SET 
-            reliability_score = COALESCE(
-                (SELECT 
-                    CASE 
-                        WHEN COUNT(*) > 20 
-                        THEN SUM(CASE WHEN mr.outcome = 'win' THEN 1 ELSE 0 END)::float / COUNT(*)
-                        ELSE ls.reliability_score
-                    END
-                 FROM market_suggestions ms
-                 JOIN market_results mr ON ms.id = mr.market_suggestion_id
-                 WHERE ms.league_id = ls.league_id
-                    AND mr.analyzed_at >= NOW() - INTERVAL '30 days'
-                ), 
-                ls.reliability_score
-            ),
-            last_updated = NOW()
-        WHERE EXISTS (
-            SELECT 1 FROM market_suggestions ms
-            JOIN market_results mr ON ms.id = mr.market_suggestion_id
-            WHERE ms.league_id = ls.league_id
-                AND mr.analyzed_at >= NOW() - INTERVAL '30 days'
-        )
-    """)
+    # Step 1: Fetch data
+    df = fetch_training_data(years=3)
     
-    conn.commit()
-    cur.close()
-    logger.info("League stats updated")
-
-def train_all_models(conn):
-    """Train all models"""
-    logger.info("Starting model training...")
+    if len(df) < 100:
+        print(f"Warning: Only {len(df)} matches available. Need more data for reliable training.")
+        return {"status": "warning", "message": "Insufficient data"}
     
-    try:
-        # Fetch training data
-        df_raw = fetch_training_data(conn, days=90)
-        
-        if df_raw.empty:
-            logger.warning("No training data available")
-            return {"status": "no_data"}
-        
-        # Prepare features
-        df = prepare_features(df_raw)
-        
-        if df.empty:
-            logger.warning("No valid features extracted")
-            return {"status": "no_features"}
-        
-        # Train models for each market type
-        market_types = df['market_type'].unique()
-        results = {}
-        
-        for market_type in market_types:
-            logger.info(f"Training model for {market_type}")
-            metrics = train_market_model(market_type, df)
-            if metrics:
-                results[market_type] = metrics
-        
-        # Train event prediction models
-        event_results = train_event_prediction_model(df)
-        results['event_models'] = event_results
-        
-        # Update league statistics
-        update_league_stats(conn)
-        
-        logger.info(f"Model training completed: {len(results)} models trained")
-        return {
-            "status": "success",
-            "results": results,
-            "total_samples": len(df)
+    # Step 2: Engineer features
+    features = engineer_features(df)
+    
+    # Step 3: Train individual models
+    print("\n--- Training Individual Models ---")
+    
+    # Winner model
+    winner_model = train_winner_model(features, df['home_win'])
+    joblib.dump(winner_model, 'models/winner_model.pkl')
+    
+    # Over/Under model
+    over_under_model = train_over_under_model(features, df['over_25'])
+    joblib.dump(over_under_model, 'models/over_under_model.pkl')
+    
+    # BTTS model
+    btts_model = train_btts_model(features, df['btts_yes'])
+    joblib.dump(btts_model, 'models/btts_model.pkl')
+    
+    # Step 4: Create ensemble metadata
+    ensemble_info = {
+        'training_date': pd.Timestamp.now().isoformat(),
+        'training_samples': len(df),
+        'feature_count': features.shape[1],
+        'model_versions': {
+            'winner_model': '1.0',
+            'over_under_model': '1.0',
+            'btts_model': '1.0'
         }
-        
-    except Exception as e:
-        logger.error(f"Error in model training: {e}")
-        return {"status": "error", "error": str(e)}
+    }
+    
+    joblib.dump(ensemble_info, 'models/ensemble_info.pkl')
+    
+    print("\n" + "=" * 50)
+    print("TRAINING PIPELINE COMPLETED SUCCESSFULLY")
+    print("=" * 50)
+    
+    return {
+        "status": "success",
+        "models_trained": 3,
+        "training_samples": len(df),
+        "model_saved": True
+    }
+
+def backfill_historical_data(days=365):
+    """Backfill historical data from API-Football"""
+    print(f"Backfilling {days} days of historical data...")
+    
+    # This would connect to API-Football and fetch historical matches
+    # Implement based on your API-Football subscription limits
+    
+    return {"status": "placeholder", "days": days, "message": "Implement API-Football historical endpoint"}
 
 if __name__ == "__main__":
-    # Standalone training script
-    logging.basicConfig(level=logging.INFO)
+    # Create models directory if it doesn't exist
+    os.makedirs('models', exist_ok=True)
     
-    conn = get_db_connection()
-    results = train_all_models(conn)
-    conn.close()
-    
-    print(f"Training results: {results}")
+    # Run the training pipeline
+    result = run_training_pipeline()
+    print(f"\nTraining result: {result}")
