@@ -1356,7 +1356,8 @@ def initialize_system():
 def create_tables():
     """Create necessary database tables"""
     try:
-        tables = [
+        # First create tables without indexes
+        table_sqls = [
             """
             CREATE TABLE IF NOT EXISTS matches (
                 id SERIAL PRIMARY KEY,
@@ -1376,10 +1377,7 @@ def create_tables():
                 venue VARCHAR(200),
                 referee VARCHAR(100),
                 created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                INDEX idx_matches_fixture_id (fixture_id),
-                INDEX idx_matches_league (league_id, season),
-                INDEX idx_matches_teams (home_team_id, away_team_id)
+                updated_at TIMESTAMP DEFAULT NOW()
             )
             """,
             """
@@ -1395,8 +1393,7 @@ def create_tables():
                 btts_no_odds DECIMAL(6,2),
                 timestamp TIMESTAMP,
                 created_at TIMESTAMP DEFAULT NOW(),
-                FOREIGN KEY (fixture_id) REFERENCES matches(fixture_id) ON DELETE CASCADE,
-                INDEX idx_odds_fixture (fixture_id)
+                FOREIGN KEY (fixture_id) REFERENCES matches(fixture_id) ON DELETE CASCADE
             )
             """,
             """
@@ -1417,9 +1414,7 @@ def create_tables():
                 confidence VARCHAR(20),
                 all_predictions JSONB,
                 created_at TIMESTAMP DEFAULT NOW(),
-                FOREIGN KEY (fixture_id) REFERENCES matches(fixture_id) ON DELETE CASCADE,
-                INDEX idx_value_bets_fixture (fixture_id),
-                INDEX idx_value_bets_created (created_at)
+                FOREIGN KEY (fixture_id) REFERENCES matches(fixture_id) ON DELETE CASCADE
             )
             """,
             """
@@ -1434,9 +1429,7 @@ def create_tables():
                 profit_loss DECIMAL(8,2),
                 bet_date TIMESTAMP,
                 settled_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT NOW(),
-                INDEX idx_bet_results_date (bet_date),
-                INDEX idx_bet_results_fixture (fixture_id)
+                created_at TIMESTAMP DEFAULT NOW()
             )
             """,
             """
@@ -1450,8 +1443,7 @@ def create_tables():
                 avg_ev DECIMAL(5,3) DEFAULT 0,
                 total_pnl DECIMAL(10,2) DEFAULT 0,
                 roi DECIMAL(5,2) DEFAULT 0,
-                created_at TIMESTAMP DEFAULT NOW(),
-                INDEX idx_daily_digests_date (date)
+                created_at TIMESTAMP DEFAULT NOW()
             )
             """,
             """
@@ -1471,9 +1463,7 @@ def create_tables():
                 away_att_strength DECIMAL(4,2) DEFAULT 0,
                 away_def_strength DECIMAL(4,2) DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT NOW(),
-                UNIQUE(team_id, league_id, season),
-                INDEX idx_team_stats_team (team_id),
-                INDEX idx_team_stats_league (league_id, season)
+                UNIQUE(team_id, league_id, season)
             )
             """,
             """
@@ -1486,8 +1476,7 @@ def create_tables():
                 away_wins INTEGER DEFAULT 0,
                 draws INTEGER DEFAULT 0,
                 last_updated TIMESTAMP DEFAULT NOW(),
-                UNIQUE(home_team_id, away_team_id),
-                INDEX idx_h2h_teams (home_team_id, away_team_id)
+                UNIQUE(home_team_id, away_team_id)
             )
             """,
             """
@@ -1497,9 +1486,7 @@ def create_tables():
                 message TEXT,
                 module VARCHAR(100),
                 function VARCHAR(100),
-                created_at TIMESTAMP DEFAULT NOW(),
-                INDEX idx_system_logs_created (created_at),
-                INDEX idx_system_logs_level (level)
+                created_at TIMESTAMP DEFAULT NOW()
             )
             """,
             """
@@ -1519,10 +1506,60 @@ def create_tables():
             """
         ]
         
-        for table_sql in tables:
+        # Create indexes separately
+        index_sqls = [
+            # Indexes for matches table
+            "CREATE INDEX IF NOT EXISTS idx_matches_fixture_id ON matches (fixture_id);",
+            "CREATE INDEX IF NOT EXISTS idx_matches_league ON matches (league_id, season);",
+            "CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches (home_team_id, away_team_id);",
+            "CREATE INDEX IF NOT EXISTS idx_matches_timestamp ON matches (timestamp);",
+            
+            # Indexes for odds table
+            "CREATE INDEX IF NOT EXISTS idx_odds_fixture ON odds (fixture_id);",
+            "CREATE INDEX IF NOT EXISTS idx_odds_timestamp ON odds (timestamp);",
+            
+            # Indexes for value_bets table
+            "CREATE INDEX IF NOT EXISTS idx_value_bets_fixture ON value_bets (fixture_id);",
+            "CREATE INDEX IF NOT EXISTS idx_value_bets_created ON value_bets (created_at);",
+            "CREATE INDEX IF NOT EXISTS idx_value_bets_match_time ON value_bets (match_time);",
+            "CREATE INDEX IF NOT EXISTS idx_value_bets_league ON value_bets (league);",
+            
+            # Indexes for bet_results table
+            "CREATE INDEX IF NOT EXISTS idx_bet_results_date ON bet_results (bet_date);",
+            "CREATE INDEX IF NOT EXISTS idx_bet_results_fixture ON bet_results (fixture_id);",
+            "CREATE INDEX IF NOT EXISTS idx_bet_results_result ON bet_results (result);",
+            
+            # Indexes for daily_digests table
+            "CREATE INDEX IF NOT EXISTS idx_daily_digests_date ON daily_digests (date);",
+            
+            # Indexes for team_stats table
+            "CREATE INDEX IF NOT EXISTS idx_team_stats_team ON team_stats (team_id);",
+            "CREATE INDEX IF NOT EXISTS idx_team_stats_league ON team_stats (league_id, season);",
+            
+            # Indexes for head_to_head table
+            "CREATE INDEX IF NOT EXISTS idx_h2h_teams ON head_to_head (home_team_id, away_team_id);",
+            
+            # Indexes for system_logs table
+            "CREATE INDEX IF NOT EXISTS idx_system_logs_created ON system_logs (created_at);",
+            "CREATE INDEX IF NOT EXISTS idx_system_logs_level ON system_logs (level);",
+            
+            # Indexes for model_versions table
+            "CREATE INDEX IF NOT EXISTS idx_model_versions_date ON model_versions (training_date);",
+            "CREATE INDEX IF NOT EXISTS idx_model_versions_type ON model_versions (model_type);"
+        ]
+        
+        # Create tables first
+        for table_sql in table_sqls:
             db.execute_query(table_sql, fetch=False)
         
-        logger.success("Database tables created/verified")
+        # Then create indexes
+        for index_sql in index_sqls:
+            try:
+                db.execute_query(index_sql, fetch=False)
+            except Exception as e:
+                logger.warning(f"Could not create index, may already exist: {e}")
+        
+        logger.success("Database tables and indexes created/verified")
         
     except Exception as e:
         logger.error(f"Error creating tables: {e}")
