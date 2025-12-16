@@ -1,4 +1,3 @@
-# file: train_models.py
 """
 Postgres-only training with Platt calibration + per-market auto-thresholding.
 
@@ -72,18 +71,18 @@ FEATURES: List[str] = [
     "red_h", "red_a", "red_sum",
 ]
 
-# Must match main.py extract_prematch_features()
+# FIXED: Updated to match main.py's extract_prematch_features()
 PRE_FEATURES: List[str] = [
-    "pm_gf_h","pm_ga_h","pm_win_h",
-    "pm_gf_a","pm_ga_a","pm_win_a",
-    "pm_ov25_h","pm_ov35_h","pm_btts_h",
-    "pm_ov25_a","pm_ov35_a","pm_btts_a",
-    "pm_ov25_h2h","pm_ov35_h2h","pm_btts_h2h",
+    "pm_gf_h", "pm_ga_h", "pm_win_h",
+    "pm_gf_a", "pm_ga_a", "pm_win_a",
+    "pm_ov25_h", "pm_ov35_h", "pm_btts_h",
+    "pm_ov25_a", "pm_ov35_a", "pm_btts_a",
+    "pm_ov25_h2h", "pm_ov35_h2h", "pm_btts_h2h",
     "pm_rest_diff",
     # keep live keys 0.0 for compatibility at serve time
-    "minute","goals_h","goals_a","goals_sum","goals_diff",
-    "xg_h","xg_a","xg_sum","xg_diff","sot_h","sot_a","sot_sum",
-    "cor_h","cor_a","cor_sum","pos_h","pos_a","pos_diff","red_h","red_a","red_sum",
+    "minute", "goals_h", "goals_a", "goals_sum", "goals_diff",
+    "xg_h", "xg_a", "xg_sum", "xg_diff", "sot_h", "sot_a", "sot_sum",
+    "cor_h", "cor_a", "cor_sum", "pos_h", "pos_a", "pos_diff", "red_h", "red_a", "red_sum",
 ]
 
 EPS = 1e-6
@@ -237,7 +236,14 @@ def load_prematch_data(conn) -> pd.DataFrame:
     if not feats:
         return pd.DataFrame()
 
-    return pd.DataFrame(feats).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df = pd.DataFrame(feats)
+    # Ensure all PRE_FEATURES are present
+    for col in PRE_FEATURES:
+        if col not in df.columns:
+            df[col] = 0.0
+    
+    df[PRE_FEATURES] = df[PRE_FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return df
 
 
 # ─────────────────────── Model utils ─────────────────────── #
@@ -523,8 +529,16 @@ def train_models(
             if ok_a: summary["metrics"]["WLD_AWAY"] = mets_a
 
             if ok_h and ok_d and ok_a and (p_h is not None) and (p_d is not None) and (p_a is not None):
-                ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_d, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
-                phn, pdn, pan = p_h / ps, p_d / ps, p_a / ps
+                # FIXED: Safe probability normalization
+                p_h_safe = np.clip(p_h, EPS, 1 - EPS)
+                p_d_safe = np.clip(p_d, EPS, 1 - EPS)
+                p_a_safe = np.clip(p_a, EPS, 1 - EPS)
+                ps = p_h_safe + p_d_safe + p_a_safe
+                
+                # Avoid division by zero
+                ps[ps < EPS] = EPS
+                
+                phn, pdn, pan = p_h_safe / ps, p_d_safe / ps, p_a_safe / ps
                 p_max = np.maximum.reduce([phn, pdn, pan])
 
                 gd_te = gd[te_mask]
@@ -596,8 +610,15 @@ def train_models(
             if ok_a: summary["metrics"]["PRE_WLD_AWAY"] = mets_a
 
             if ok_h and ok_a and (p_h is not None) and (p_a is not None):
-                ps = np.clip(p_h, EPS, 1 - EPS) + np.clip(p_a, EPS, 1 - EPS)
-                phn, pan = p_h / ps, p_a / ps
+                # FIXED: Safe probability normalization for prematch
+                p_h_safe = np.clip(p_h, EPS, 1 - EPS)
+                p_a_safe = np.clip(p_a, EPS, 1 - EPS)
+                ps = p_h_safe + p_a_safe
+                
+                # Avoid division by zero
+                ps[ps < EPS] = EPS
+                
+                phn, pan = p_h_safe / ps, p_a_safe / ps
                 p_max = np.maximum(phn, pan)
                 gd_te = gd[te_mask]
                 y_class = np.where(gd_te > 0, 0, np.where(gd_te < 0, 1, -1))
