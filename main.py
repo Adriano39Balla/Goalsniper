@@ -1,4 +1,3 @@
-# file: main.py
 """
 goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate.
 
@@ -200,6 +199,8 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS tip_snapshots (
             match_id BIGINT, created_ts BIGINT, payload TEXT,
             PRIMARY KEY (match_id, created_ts))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
+            match_id BIGINT PRIMARY KEY, created_ts BIGINT, payload TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS feedback (
             id SERIAL PRIMARY KEY, match_id BIGINT UNIQUE, verdict INTEGER, created_ts BIGINT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
@@ -218,6 +219,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_sent ON tips (sent_ok, created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_snap_by_match ON tip_snapshots (match_id, created_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_prematch_by_match ON prematch_snapshots (match_id, created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_updated ON match_results (updated_ts DESC)")
 
 # ───────── Telegram ─────────
@@ -281,7 +283,7 @@ def fetch_live_matches() -> List[dict]:
         out.append(m)
     return out
 
-# ───────── Prematch helpers (short) ─────────
+# ───────── Prematch helpers ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
     js=_api_get(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
     return js.get("response",[]) if isinstance(js,dict) else []
@@ -303,6 +305,67 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
                 fixtures.append(r)
     fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
     return fixtures
+
+def _team_stats_from_fixtures(fixtures: List[dict]) -> Dict[str, float]:
+    """Calculate comprehensive team stats from recent fixtures"""
+    if not fixtures:
+        return {
+            "gf": 0.0, "ga": 0.0, "win": 0.0,
+            "ov25": 0.0, "ov35": 0.0, "btts": 0.0,
+            "goals_scored": 0.0, "goals_conceded": 0.0
+        }
+    
+    total_games = 0
+    wins = 0
+    total_goals_for = 0
+    total_goals_against = 0
+    ov25 = 0
+    ov35 = 0
+    btts = 0
+    
+    for match in fixtures:
+        st = (((match.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st not in {"FT", "AET", "PEN"}:
+            continue
+            
+        goals = match.get("goals") or {}
+        gh = int(goals.get("home") or 0)
+        ga = int(goals.get("away") or 0)
+        teams = match.get("teams") or {}
+        
+        # Determine if this team is home or away and calculate accordingly
+        # This function will be called separately for home and away teams
+        total_games += 1
+        total_goals_for += gh + ga  # We'll recalc properly in calling function
+        total_goals_against += ga + gh  # We'll recalc properly in calling function
+        
+        if gh > ga:
+            wins += 1
+        total = gh + ga
+        if total > 2:
+            ov25 += 1
+        if total > 3:
+            ov35 += 1
+        if gh > 0 and ga > 0:
+            btts += 1
+    
+    if total_games == 0:
+        return {
+            "gf": 0.0, "ga": 0.0, "win": 0.0,
+            "ov25": 0.0, "ov35": 0.0, "btts": 0.0,
+            "goals_scored": 0.0, "goals_conceded": 0.0
+        }
+    
+    return {
+        "gf": total_goals_for / total_games,
+        "ga": total_goals_against / total_games,
+        "win": wins / total_games,
+        "ov25": ov25 / total_games,
+        "ov35": ov35 / total_games,
+        "btts": btts / total_games,
+        "goals_scored": total_goals_for / total_games,
+        "goals_conceded": total_goals_against / total_games
+    }
 
 # ───────── Feature extraction (live) ─────────
 def _num(v) -> float:
@@ -343,6 +406,142 @@ def extract_features(m: dict) -> Dict[str,float]:
             "cor_h":float(cor_h),"cor_a":float(cor_a),"cor_sum":float(cor_h+cor_a),
             "pos_h":float(pos_h),"pos_a":float(pos_a),"pos_diff":float(pos_h-pos_a),
             "red_h":float(red_h),"red_a":float(red_a),"red_sum":float(red_h+red_a)}
+
+# FIXED: Match training features exactly
+def extract_prematch_features(fx: dict) -> Dict[str,float]:
+    """Extract prematch features that match train_models.py expectations"""
+    teams=fx.get("teams") or {}
+    home_team=teams.get("home") or {}; away_team=teams.get("away") or {}
+    home_id=home_team.get("id"); away_id=away_team.get("id")
+    
+    if not home_id or not away_id:
+        return {}
+    
+    # Fetch recent form
+    last_h=_api_last_fixtures(home_id,5) if home_id else []
+    last_a=_api_last_fixtures(away_id,5) if away_id else []
+    h2h=_api_h2h(home_id, away_id,5) if home_id and away_id else []
+    
+    # Calculate stats for home team (as home team in their matches)
+    home_stats = {"gf": 0.0, "ga": 0.0, "win": 0.0, "ov25": 0.0, "ov35": 0.0, "btts": 0.0}
+    home_games = 0
+    for match in last_h:
+        st = (((match.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st not in {"FT", "AET", "PEN"}:
+            continue
+            
+        goals = match.get("goals") or {}
+        gh = int(goals.get("home") or 0)
+        ga = int(goals.get("away") or 0)
+        
+        home_stats["gf"] += gh
+        home_stats["ga"] += ga
+        home_stats["win"] += 1 if gh > ga else 0
+        total = gh + ga
+        home_stats["ov25"] += 1 if total > 2 else 0
+        home_stats["ov35"] += 1 if total > 3 else 0
+        home_stats["btts"] += 1 if gh > 0 and ga > 0 else 0
+        home_games += 1
+    
+    # Calculate stats for away team (as away team in their matches)
+    away_stats = {"gf": 0.0, "ga": 0.0, "win": 0.0, "ov25": 0.0, "ov35": 0.0, "btts": 0.0}
+    away_games = 0
+    for match in last_a:
+        st = (((match.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st not in {"FT", "AET", "PEN"}:
+            continue
+            
+        goals = match.get("goals") or {}
+        gh = int(goals.get("home") or 0)
+        ga = int(goals.get("away") or 0)
+        
+        # Away team perspective
+        away_stats["gf"] += ga  # Away goals scored
+        away_stats["ga"] += gh  # Away goals conceded
+        away_stats["win"] += 1 if ga > gh else 0
+        total = gh + ga
+        away_stats["ov25"] += 1 if total > 2 else 0
+        away_stats["ov35"] += 1 if total > 3 else 0
+        away_stats["btts"] += 1 if gh > 0 and ga > 0 else 0
+        away_games += 1
+    
+    # Calculate H2H stats
+    h2h_stats = {"ov25": 0.0, "ov35": 0.0, "btts": 0.0}
+    h2h_games = 0
+    for match in h2h:
+        st = (((match.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st not in {"FT", "AET", "PEN"}:
+            continue
+            
+        goals = match.get("goals") or {}
+        gh = int(goals.get("home") or 0)
+        ga = int(goals.get("away") or 0)
+        total = gh + ga
+        
+        h2h_stats["ov25"] += 1 if total > 2 else 0
+        h2h_stats["ov35"] += 1 if total > 3 else 0
+        h2h_stats["btts"] += 1 if gh > 0 and ga > 0 else 0
+        h2h_games += 1
+    
+    # Calculate averages
+    home_gf_avg = home_stats["gf"] / home_games if home_games > 0 else 0.0
+    home_ga_avg = home_stats["ga"] / home_games if home_games > 0 else 0.0
+    home_win_avg = home_stats["win"] / home_games if home_games > 0 else 0.0
+    home_ov25_avg = home_stats["ov25"] / home_games if home_games > 0 else 0.0
+    home_ov35_avg = home_stats["ov35"] / home_games if home_games > 0 else 0.0
+    home_btts_avg = home_stats["btts"] / home_games if home_games > 0 else 0.0
+    
+    away_gf_avg = away_stats["gf"] / away_games if away_games > 0 else 0.0
+    away_ga_avg = away_stats["ga"] / away_games if away_games > 0 else 0.0
+    away_win_avg = away_stats["win"] / away_games if away_games > 0 else 0.0
+    away_ov25_avg = away_stats["ov25"] / away_games if away_games > 0 else 0.0
+    away_ov35_avg = away_stats["ov35"] / away_games if away_games > 0 else 0.0
+    away_btts_avg = away_stats["btts"] / away_games if away_games > 0 else 0.0
+    
+    h2h_ov25_avg = h2h_stats["ov25"] / h2h_games if h2h_games > 0 else 0.0
+    h2h_ov35_avg = h2h_stats["ov35"] / h2h_games if h2h_games > 0 else 0.0
+    h2h_btts_avg = h2h_stats["btts"] / h2h_games if h2h_games > 0 else 0.0
+    
+    # Get rest days (simplified - would need fixture dates)
+    rest_diff = 0.0  # Placeholder
+    
+    # Build feature dictionary matching train_models.py
+    features = {
+        # Team form features
+        "pm_gf_h": home_gf_avg,
+        "pm_ga_h": home_ga_avg,
+        "pm_win_h": home_win_avg,
+        "pm_gf_a": away_gf_avg,
+        "pm_ga_a": away_ga_avg,
+        "pm_win_a": away_win_avg,
+        
+        # Over/Under features
+        "pm_ov25_h": home_ov25_avg,
+        "pm_ov35_h": home_ov35_avg,
+        "pm_btts_h": home_btts_avg,
+        "pm_ov25_a": away_ov25_avg,
+        "pm_ov35_a": away_ov35_avg,
+        "pm_btts_a": away_btts_avg,
+        
+        # H2H features
+        "pm_ov25_h2h": h2h_ov25_avg,
+        "pm_ov35_h2h": h2h_ov35_avg,
+        "pm_btts_h2h": h2h_btts_avg,
+        
+        # Rest days
+        "pm_rest_diff": rest_diff,
+        
+        # Live features (set to 0 for prematch)
+        "minute": 0.0,
+        "goals_h": 0.0, "goals_a": 0.0, "goals_sum": 0.0, "goals_diff": 0.0,
+        "xg_h": 0.0, "xg_a": 0.0, "xg_sum": 0.0, "xg_diff": 0.0,
+        "sot_h": 0.0, "sot_a": 0.0, "sot_sum": 0.0,
+        "cor_h": 0.0, "cor_a": 0.0, "cor_sum": 0.0,
+        "pos_h": 0.0, "pos_a": 0.0, "pos_diff": 0.0,
+        "red_h": 0.0, "red_a": 0.0, "red_sum": 0.0,
+    }
+    
+    return features
 
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
     require_stats_minute=int(os.getenv("REQUIRE_STATS_MINUTE","35"))
@@ -497,7 +696,7 @@ def fetch_odds(fid: int) -> dict:
         out={}
     return out
 
-def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
+def _price_gate(market_text: str, suggestion: str, fid: int, probability: float) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
     """
     Return (pass, odds, book, ev_pct). If odds missing:
       - pass if ALLOW_TIPS_WITHOUT_ODDS else block.
@@ -525,8 +724,11 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
     min_odds=_min_odds_for_market(market_text)
     if not (min_odds <= odds <= MAX_ODDS_ALL):
         return (False, odds, book, None)
+    
+    # Calculate EV
+    ev_pct = (_ev(probability, odds) * 100.0) if probability > 0 else None
 
-    return (True, odds, book, None)
+    return (True, odds, book, ev_pct)
 
 # ───────── Snapshots ─────────
 def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
@@ -550,7 +752,18 @@ def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
                   "VALUES (%s,%s,%s,%s,%s,'HARVEST','HARVEST',0.0,0.0,%s,%s,%s,1)",
                   (fid, league_id, league, home, away, f"{gh}-{ga}", minute, now))
 
-# ───────── Outcomes/backfill/digest (short) ─────────
+def save_prematch_snapshot(fid: int, feat: Dict[str, float]) -> None:
+    """Save prematch features for training"""
+    now = int(time.time())
+    snapshot = {"feat": feat}
+    with db_conn() as c:
+        c.execute(
+            "INSERT INTO prematch_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
+            "ON CONFLICT (match_id) DO UPDATE SET created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload",
+            (fid, now, json.dumps(snapshot)[:200000])
+        )
+
+# ───────── Outcomes/backfill/digest ─────────
 def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     try:
         for tok in (s or "").split():
@@ -677,12 +890,12 @@ def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
     if sug.startswith("Over"):
         ln=_parse_ou_line_from_suggestion(sug)
         if ln is None: return False
-        if total > ln - 1e-9: return False
+        if total > ln - 1e-9: return False  # Already over the line
     if sug.startswith("Under"):
         ln=_parse_ou_line_from_suggestion(sug)
         if ln is None: return False
-        if total >= ln - 1e-9: return False
-    if sug.startswith("BTTS") and (gh>0 and ga>0): return False
+        if total >= ln - 1e-9: return False  # Already at or over the line
+    if sug.startswith("BTTS") and (gh>0 and ga>0): return False  # BTTS already happened
     return True
 
 def production_scan() -> Tuple[int,int]:
@@ -743,21 +956,18 @@ def production_scan() -> Tuple[int,int]:
                     if suggestion not in ALLOWED_SUGGESTIONS: continue
                     if per_match >= max(1,PREDICTIONS_PER_MATCH): break
 
-                    # Odds/EV gate
-                    pass_odds, odds, book, _ = _price_gate(market_txt, suggestion, fid)
+                    # Odds/EV gate - FIXED: pass probability to calculate EV
+                    pass_odds, odds, book, ev_pct = _price_gate(market_txt, suggestion, fid, prob)
                     if not pass_odds: 
                         continue
-                    ev_pct=None
+                    
                     if odds is not None:
-                        edge=_ev(prob, odds)  # decimal (e.g. 0.05)
-                        ev_pct=round(edge*100.0,1)
-                        if int(round(edge*10000)) < EDGE_MIN_BPS:  # basis points compare
+                        if ev_pct is not None and int(round(ev_pct * 10)) < (EDGE_MIN_BPS / 10):
                             continue
 
                     created_ts=base_now+idx
                     raw=float(prob); prob_pct=round(raw*100.0,1)
 
-                    # PATCH: reuse the existing connection `c`
                     c.execute(
                         "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
                         "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
@@ -779,30 +989,6 @@ def production_scan() -> Tuple[int,int]:
     return saved, live_seen
 
 # ───────── Prematch (compact: save-only, thresholds respected) ─────────
-def extract_prematch_features(fx: dict) -> Dict[str,float]:
-    teams=fx.get("teams") or {}; th=(teams.get("home") or {}).get("id"); ta=(teams.get("away") or {}).get("id")
-    if not th or not ta: return {}
-    def _rate(games):
-        ov25=ov35=btts=played=0
-        for g in games:
-            st=(((g.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-            if st not in {"FT","AET","PEN"}: continue
-            gh=int((g.get("goals") or {}).get("home") or 0); ga=int((g.get("goals") or {}).get("away") or 0)
-            played+=1; 
-            if gh+ga>2: ov25+=1
-            if gh+ga>3: ov35+=1
-            if gh>0 and ga>0: btts+=1
-        if played==0: return 0,0,0
-        return ov25/played, ov35/played, btts/played
-    last_h=_api_last_fixtures(th,5); last_a=_api_last_fixtures(ta,5); h2h=_api_h2h(th,ta,5)
-    ov25_h,ov35_h,btts_h=_rate(last_h); ov25_a,ov35_a,btts_a=_rate(last_a); ov25_h2h,ov35_h2h,btts_h2h=_rate(h2h)
-    return {"pm_ov25_h":ov25_h,"pm_ov35_h":ov35_h,"pm_btts_h":btts_h,
-            "pm_ov25_a":ov25_a,"pm_ov35_a":ov35_a,"pm_btts_a":btts_a,
-            "pm_ov25_h2h":ov25_h2h,"pm_ov35_h2h":ov35_h2h,"pm_btts_h2h":btts_h2h,
-            "minute":0.0,"goals_h":0.0,"goals_a":0.0,"goals_sum":0.0,"goals_diff":0.0,
-            "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
-            "cor_h":0.0,"cor_a":0.0,"cor_sum":0.0,"pos_h":0.0,"pos_a":0.0,"pos_diff":0.0,"red_h":0.0,"red_a":0.0,"red_sum":0.0}
-
 def _kickoff_berlin(utc_iso: str|None) -> str:
     try:
         if not utc_iso: return "TBD"
@@ -839,6 +1025,13 @@ def prematch_scan_save() -> int:
         league_id=int((lg.get("id") or 0)); league=f"{lg.get('country','')} - {lg.get('name','')}".strip(" -"); fid=int((fixture.get("id") or 0))
         feat=extract_prematch_features(fx); 
         if not fid or not feat: continue
+        
+        # Save prematch snapshot for training
+        try:
+            save_prematch_snapshot(fid, feat)
+        except Exception as e:
+            log.warning("[PREMATCH] Failed to save snapshot for %s: %s", fid, e)
+        
         candidates: List[Tuple[str,str,float]]=[]
         # PRE OU via PRE_OU_* models
         for line in OU_LINES:
@@ -868,13 +1061,13 @@ def prematch_scan_save() -> int:
         for idx,(mk,sug,prob) in enumerate(candidates):
             if sug not in ALLOWED_SUGGESTIONS: continue
             if per_match>=max(1,PREDICTIONS_PER_MATCH): break
-            # Odds/EV gate
-            pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ",""), sug, fid)
+            # Odds/EV gate - FIXED: pass probability
+            pass_odds, odds, book, ev_pct = _price_gate(mk.replace("PRE ",""), sug, fid, prob)
             if not pass_odds: continue
-            ev_pct=None
-            if odds is not None:
-                edge=_ev(prob, odds); ev_pct=round(edge*100.0,1)
-                if int(round(edge*10000)) < EDGE_MIN_BPS: continue
+            
+            if odds is not None and ev_pct is not None:
+                if int(round(ev_pct * 10)) < (EDGE_MIN_BPS / 10):
+                    continue
             created_ts=base_now+idx; raw=float(prob); pct=round(raw*100.0,1)
             with db_conn() as c2:
                 c2.execute("INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
@@ -884,7 +1077,7 @@ def prematch_scan_save() -> int:
             saved+=1; per_match+=1
     log.info("[PREMATCH] saved=%d", saved); return saved
 
-# ───────── Auto-train / tune / retry (unchanged signatures) ─────────
+# ───────── Auto-train / tune / retry ─────────
 def auto_train_job():
     if not TRAIN_ENABLE: send_telegram("🤖 Training skipped: TRAIN_ENABLE=0"); return
     send_telegram("🤖 Training started.")
@@ -988,16 +1181,12 @@ def send_match_of_the_day() -> bool:
             continue
 
         # Odds/EV (reuse in-play price gate; market text must be without "PRE ")
-        pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
+        pass_odds, odds, book, ev_pct = _price_gate(mk, sug, fid, prob)
         if not pass_odds:
             continue
 
-        ev_pct = None
-        if odds is not None:
-            edge = _ev(prob, odds)            # decimal (e.g. 0.05)
-            ev_bps = int(round(edge * 10000)) # basis points
-            ev_pct = round(edge * 100.0, 1)
-            if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
+        if odds is not None and ev_pct is not None:
+            if MOTD_MIN_EV_BPS > 0 and int(round(ev_pct * 10)) < (MOTD_MIN_EV_BPS / 10):
                 continue
 
         item = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
