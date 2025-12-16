@@ -1,15 +1,15 @@
 """
-goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate.
+goalsniper — FULL AI mode (in-play + prematch) with advanced features.
 
-- Pure ML (calibrated) loaded from Postgres settings (train_models.py).
-- Markets: OU(2.5,3.5), BTTS (Yes/No), 1X2 (Draw suppressed).
-- Adds bookmaker odds filtering + EV check.
-- Scheduler: scan, results backfill, nightly train, daily digest, MOTD.
-
-Safe to run on Railway/Render. Requires DATABASE_URL and API keys.
+Enhanced with sophisticated features:
+- Game state and momentum metrics
+- Team strength ratings (ELO-inspired)
+- Advanced form metrics with exponential decay
+- Shot quality and efficiency metrics
 """
 
 import os, json, time, logging, requests, psycopg2
+import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
@@ -125,6 +125,10 @@ SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
 
+# ───────── Team ELO Ratings Cache ─────────
+TEAM_RATINGS_CACHE: Dict[int, Dict[str, float]] = {}  # team_id -> {rating, home_rating, away_rating, last_updated}
+TEAM_RATINGS_TTL = 3600  # 1 hour
+
 # ───────── Optional import: trainer ─────────
 try:
     from train_models import train_models
@@ -206,6 +210,9 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS match_results (
             match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS team_ratings (
+            team_id BIGINT PRIMARY KEY, rating DOUBLE PRECISION, home_rating DOUBLE PRECISION,
+            away_rating DOUBLE PRECISION, matches_played INTEGER, last_updated BIGINT)""")
         # Evolutive columns (idempotent)
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
         except: pass
@@ -221,6 +228,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_snap_by_match ON tip_snapshots (match_id, created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_prematch_by_match ON prematch_snapshots (match_id, created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_updated ON match_results (updated_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_team_ratings_updated ON team_ratings (last_updated DESC)")
 
 # ───────── Telegram ─────────
 def send_telegram(text: str) -> bool:
@@ -283,6 +291,133 @@ def fetch_live_matches() -> List[dict]:
         out.append(m)
     return out
 
+# ───────── Team Rating System (ELO-inspired) ─────────
+def calculate_elo_update(winner_rating: float, loser_rating: float, home_advantage: float = 0.0, k_factor: float = 32.0) -> Tuple[float, float]:
+    """Calculate ELO rating changes for two teams"""
+    # Expected score for team A
+    expected_a = 1 / (1 + 10 ** ((loser_rating - winner_rating + home_advantage) / 400))
+    # Actual score (1 for win, 0 for loss)
+    actual_a = 1.0
+    # Rating change
+    change = k_factor * (actual_a - expected_a)
+    return change, -change
+
+def update_team_rating(team_id: int, opponent_rating: float, result: int, is_home: bool, k_factor: float = 32.0):
+    """Update team rating after a match (result: 1=win, 0.5=draw, 0=loss)"""
+    with db_conn() as c:
+        # Get current rating
+        row = c.execute("SELECT rating, home_rating, away_rating, matches_played FROM team_ratings WHERE team_id=%s", (team_id,)).fetchone()
+        
+        if row:
+            rating, home_rating, away_rating, matches = row[0], row[1], row[2], row[3]
+        else:
+            # Initialize with base rating
+            rating = 1500.0
+            home_rating = 1500.0
+            away_rating = 1500.0
+            matches = 0
+        
+        # Adjust K-factor based on matches played (higher for new teams)
+        effective_k = k_factor * (40.0 / max(matches, 1)) if matches < 40 else k_factor
+        
+        # Calculate expected score
+        expected = 1 / (1 + 10 ** ((opponent_rating - rating) / 400))
+        
+        # Calculate rating change
+        change = effective_k * (result - expected)
+        new_rating = rating + change
+        
+        # Update home/away rating
+        if is_home:
+            home_rating = home_rating + change * 0.5  # Less impact on specialized rating
+        else:
+            away_rating = away_rating + change * 0.5
+        
+        # Save to database
+        c.execute("""
+            INSERT INTO team_ratings (team_id, rating, home_rating, away_rating, matches_played, last_updated)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (team_id) DO UPDATE SET
+                rating = EXCLUDED.rating,
+                home_rating = EXCLUDED.home_rating,
+                away_rating = EXCLUDED.away_rating,
+                matches_played = EXCLUDED.matches_played,
+                last_updated = EXCLUDED.last_updated
+        """, (team_id, new_rating, home_rating, away_rating, matches + 1, int(time.time())))
+        
+        return new_rating
+
+def get_team_rating(team_id: int) -> Dict[str, float]:
+    """Get team rating from cache or database"""
+    now = time.time()
+    
+    # Check cache
+    if team_id in TEAM_RATINGS_CACHE:
+        cached = TEAM_RATINGS_CACHE[team_id]
+        if now - cached.get("last_updated", 0) < TEAM_RATINGS_TTL:
+            return cached
+    
+    # Fetch from database
+    with db_conn() as c:
+        row = c.execute("SELECT rating, home_rating, away_rating, matches_played FROM team_ratings WHERE team_id=%s", (team_id,)).fetchone()
+    
+    if row:
+        rating_data = {
+            "rating": float(row[0] or 1500.0),
+            "home_rating": float(row[1] or 1500.0),
+            "away_rating": float(row[2] or 1500.0),
+            "matches_played": int(row[3] or 0),
+            "last_updated": now
+        }
+    else:
+        rating_data = {
+            "rating": 1500.0,
+            "home_rating": 1500.0,
+            "away_rating": 1500.0,
+            "matches_played": 0,
+            "last_updated": now
+        }
+    
+    # Update cache
+    TEAM_RATINGS_CACHE[team_id] = rating_data
+    return rating_data
+
+def update_ratings_from_finished_match(match_data: dict):
+    """Update ELO ratings for both teams after a finished match"""
+    fixture = match_data.get("fixture") or {}
+    teams = match_data.get("teams") or {}
+    goals = match_data.get("goals") or {}
+    
+    home_id = (teams.get("home") or {}).get("id")
+    away_id = (teams.get("away") or {}).get("id")
+    home_goals = int(goals.get("home") or 0)
+    away_goals = int(goals.get("away") or 0)
+    
+    if not home_id or not away_id:
+        return
+    
+    # Get current ratings
+    home_rating_data = get_team_rating(home_id)
+    away_rating_data = get_team_rating(away_id)
+    
+    home_rating = home_rating_data["rating"]
+    away_rating = away_rating_data["rating"]
+    
+    # Determine result
+    if home_goals > away_goals:
+        home_result = 1.0
+        away_result = 0.0
+    elif home_goals < away_goals:
+        home_result = 0.0
+        away_result = 1.0
+    else:
+        home_result = 0.5
+        away_result = 0.5
+    
+    # Update ratings
+    update_team_rating(home_id, away_rating, home_result, is_home=True)
+    update_team_rating(away_id, home_rating, away_result, is_home=False)
+
 # ───────── Prematch helpers ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
     js=_api_get(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
@@ -306,68 +441,7 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
     fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
     return fixtures
 
-def _team_stats_from_fixtures(fixtures: List[dict]) -> Dict[str, float]:
-    """Calculate comprehensive team stats from recent fixtures"""
-    if not fixtures:
-        return {
-            "gf": 0.0, "ga": 0.0, "win": 0.0,
-            "ov25": 0.0, "ov35": 0.0, "btts": 0.0,
-            "goals_scored": 0.0, "goals_conceded": 0.0
-        }
-    
-    total_games = 0
-    wins = 0
-    total_goals_for = 0
-    total_goals_against = 0
-    ov25 = 0
-    ov35 = 0
-    btts = 0
-    
-    for match in fixtures:
-        st = (((match.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-        if st not in {"FT", "AET", "PEN"}:
-            continue
-            
-        goals = match.get("goals") or {}
-        gh = int(goals.get("home") or 0)
-        ga = int(goals.get("away") or 0)
-        teams = match.get("teams") or {}
-        
-        # Determine if this team is home or away and calculate accordingly
-        # This function will be called separately for home and away teams
-        total_games += 1
-        total_goals_for += gh + ga  # We'll recalc properly in calling function
-        total_goals_against += ga + gh  # We'll recalc properly in calling function
-        
-        if gh > ga:
-            wins += 1
-        total = gh + ga
-        if total > 2:
-            ov25 += 1
-        if total > 3:
-            ov35 += 1
-        if gh > 0 and ga > 0:
-            btts += 1
-    
-    if total_games == 0:
-        return {
-            "gf": 0.0, "ga": 0.0, "win": 0.0,
-            "ov25": 0.0, "ov35": 0.0, "btts": 0.0,
-            "goals_scored": 0.0, "goals_conceded": 0.0
-        }
-    
-    return {
-        "gf": total_goals_for / total_games,
-        "ga": total_goals_against / total_games,
-        "win": wins / total_games,
-        "ov25": ov25 / total_games,
-        "ov35": ov35 / total_games,
-        "btts": btts / total_games,
-        "goals_scored": total_goals_for / total_games,
-        "goals_conceded": total_goals_against / total_games
-    }
-
-# ───────── Feature extraction (live) ─────────
+# ───────── Feature extraction with Advanced Features ─────────
 def _num(v) -> float:
     try:
         if isinstance(v,str) and v.endswith("%"): return float(v[:-1])
@@ -379,18 +453,32 @@ def _pos_pct(v) -> float:
     except: return 0.0
 
 def extract_features(m: dict) -> Dict[str,float]:
+    """Extract live match features including advanced metrics"""
     home=m["teams"]["home"]["name"]; away=m["teams"]["away"]["name"]
     gh=m["goals"]["home"] or 0; ga=m["goals"]["away"] or 0
     minute=int(((m.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
+    
     stats={}; 
     for s in (m.get("statistics") or []):
         t=(s.get("team") or {}).get("name"); 
         if t: stats[t]={ (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
+    
     sh=stats.get(home,{}) or {}; sa=stats.get(away,{}) or {}
+    
+    # Basic stats
     xg_h=_num(sh.get("Expected Goals",0)); xg_a=_num(sa.get("Expected Goals",0))
     sot_h=_num(sh.get("Shots on Target",0)); sot_a=_num(sa.get("Shots on Target",0))
     cor_h=_num(sh.get("Corner Kicks",0)); cor_a=_num(sa.get("Corner Kicks",0))
     pos_h=_pos_pct(sh.get("Ball Possession",0)); pos_a=_pos_pct(sa.get("Ball Possession",0))
+    
+    # Additional stats for advanced features
+    total_shots_h = _num(sh.get("Total Shots", 0))
+    total_shots_a = _num(sa.get("Total Shots", 0))
+    shots_inside_box_h = _num(sh.get("Shots insidebox", 0))
+    shots_inside_box_a = _num(sa.get("Shots insidebox", 0))
+    fouls_h = _num(sh.get("Fouls", 0))
+    fouls_a = _num(sa.get("Fouls", 0))
+    
     red_h=red_a=0
     for ev in (m.get("events") or []):
         if (ev.get("type","").lower()=="card"):
@@ -399,17 +487,111 @@ def extract_features(m: dict) -> Dict[str,float]:
                 t=(ev.get("team") or {}).get("name") or ""
                 if t==home: red_h+=1
                 elif t==away: red_a+=1
-    return {"minute":float(minute),
-            "goals_h":float(gh),"goals_a":float(ga),"goals_sum":float(gh+ga),"goals_diff":float(gh-ga),
-            "xg_h":float(xg_h),"xg_a":float(xg_a),"xg_sum":float(xg_h+xg_a),"xg_diff":float(xg_h-xg_a),
-            "sot_h":float(sot_h),"sot_a":float(sot_a),"sot_sum":float(sot_h+sot_a),
-            "cor_h":float(cor_h),"cor_a":float(cor_a),"cor_sum":float(cor_h+cor_a),
-            "pos_h":float(pos_h),"pos_a":float(pos_a),"pos_diff":float(pos_h-pos_a),
-            "red_h":float(red_h),"red_a":float(red_a),"red_sum":float(red_h+red_a)}
+    
+    # Basic features
+    features = {
+        "minute": float(minute),
+        "goals_h": float(gh), "goals_a": float(ga), 
+        "goals_sum": float(gh+ga), "goals_diff": float(gh-ga),
+        "xg_h": float(xg_h), "xg_a": float(xg_a), 
+        "xg_sum": float(xg_h+xg_a), "xg_diff": float(xg_h-xg_a),
+        "sot_h": float(sot_h), "sot_a": float(sot_a), 
+        "sot_sum": float(sot_h+sot_a),
+        "cor_h": float(cor_h), "cor_a": float(cor_a), 
+        "cor_sum": float(cor_h+cor_a),
+        "pos_h": float(pos_h), "pos_a": float(pos_a), 
+        "pos_diff": float(pos_h-pos_a),
+        "red_h": float(red_h), "red_a": float(red_a), 
+        "red_sum": float(red_h+red_a),
+        
+        # Additional basic stats
+        "total_shots_h": float(total_shots_h), "total_shots_a": float(total_shots_a),
+        "shots_inside_h": float(shots_inside_box_h), "shots_inside_a": float(shots_inside_box_a),
+        "fouls_h": float(fouls_h), "fouls_a": float(fouls_a),
+    }
+    
+    # ───────── ADVANCED FEATURES ─────────
+    
+    # 1. Game State & Momentum Features
+    if minute > 0:
+        # Rate of events per minute
+        features["goals_per_minute"] = features["goals_sum"] / minute
+        features["xg_per_minute"] = features["xg_sum"] / minute
+        features["sot_per_minute"] = features["sot_sum"] / minute
+        features["shots_per_minute"] = (total_shots_h + total_shots_a) / minute
+        
+        # Recent momentum (last 15 minutes proxy)
+        # Note: This is simplified - ideally would track event timestamps
+        features["momentum_score"] = (features["xg_per_minute"] * 0.5 + 
+                                      features["sot_per_minute"] * 0.3 + 
+                                      features["shots_per_minute"] * 0.2)
+    else:
+        features["goals_per_minute"] = 0.0
+        features["xg_per_minute"] = 0.0
+        features["sot_per_minute"] = 0.0
+        features["shots_per_minute"] = 0.0
+        features["momentum_score"] = 0.0
+    
+    # 2. Shot Quality & Efficiency Features
+    # Shot accuracy
+    features["shot_accuracy_h"] = sot_h / max(total_shots_h, 1)
+    features["shot_accuracy_a"] = sot_a / max(total_shots_a, 1)
+    
+    # Shot quality (proportion of shots inside box)
+    features["shot_quality_h"] = shots_inside_box_h / max(total_shots_h, 1)
+    features["shot_quality_a"] = shots_inside_box_a / max(total_shots_a, 1)
+    
+    # Conversion rates
+    features["conversion_rate_h"] = gh / max(sot_h, 1)
+    features["conversion_rate_a"] = ga / max(sot_a, 1)
+    
+    # xG efficiency (over/underperformance)
+    features["xg_efficiency_h"] = gh - xg_h
+    features["xg_efficiency_a"] = ga - xg_a
+    
+    # 3. Pressure & Game Control Features
+    # Attack pressure score
+    features["attack_pressure_h"] = (sot_h * 0.4 + xg_h * 0.4 + cor_h * 0.2)
+    features["attack_pressure_a"] = (sot_a * 0.4 + xg_a * 0.4 + cor_a * 0.2)
+    features["attack_pressure_diff"] = features["attack_pressure_h"] - features["attack_pressure_a"]
+    
+    # Game control score (possession-adjusted)
+    features["game_control_h"] = (pos_h / 100) * features["attack_pressure_h"]
+    features["game_control_a"] = (pos_a / 100) * features["attack_pressure_a"]
+    
+    # 4. Game Phase Features
+    features["is_first_half"] = 1.0 if minute <= 45 else 0.0
+    features["is_second_half"] = 1.0 if minute > 45 else 0.0
+    features["is_final_15"] = 1.0 if minute > 75 else 0.0
+    
+    # 5. Score State Features
+    features["score_margin"] = abs(gh - ga)
+    features["is_leading_h"] = 1.0 if gh > ga else 0.0
+    features["is_leading_a"] = 1.0 if ga > gh else 0.0
+    features["is_draw"] = 1.0 if gh == ga else 0.0
+    features["is_goalfest"] = 1.0 if gh + ga >= 3 else 0.0
+    
+    # 6. Discipline & Foul Features
+    features["fouls_per_minute"] = (fouls_h + fouls_a) / max(minute, 1)
+    features["discipline_score_h"] = 1.0 / max(fouls_h + red_h * 10, 1)
+    features["discipline_score_a"] = 1.0 / max(fouls_a + red_a * 10, 1)
+    
+    # 7. Cross-Feature Interactions
+    # These are often predictive as they capture non-linear relationships
+    features["possession_xg_interaction_h"] = (pos_h / 100) * xg_h
+    features["possession_xg_interaction_a"] = (pos_a / 100) * xg_a
+    features["sot_xg_ratio_h"] = sot_h / max(xg_h, 0.1)
+    features["sot_xg_ratio_a"] = sot_a / max(xg_a, 0.1)
+    
+    # 8. Match Context Features
+    features["match_minute_normalized"] = minute / 90.0
+    features["time_weighted_xg_h"] = xg_h * (minute / 90.0)
+    features["time_weighted_xg_a"] = xg_a * (minute / 90.0)
+    
+    return features
 
-# FIXED: Match training features exactly
 def extract_prematch_features(fx: dict) -> Dict[str,float]:
-    """Extract prematch features that match train_models.py expectations"""
+    """Extract prematch features with advanced metrics"""
     teams=fx.get("teams") or {}
     home_team=teams.get("home") or {}; away_team=teams.get("away") or {}
     home_id=home_team.get("id"); away_id=away_team.get("id")
@@ -417,56 +599,93 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
     if not home_id or not away_id:
         return {}
     
-    # Fetch recent form
+    # Fetch recent form with exponential decay weighting
     last_h=_api_last_fixtures(home_id,5) if home_id else []
     last_a=_api_last_fixtures(away_id,5) if away_id else []
     h2h=_api_h2h(home_id, away_id,5) if home_id and away_id else []
     
-    # Calculate stats for home team (as home team in their matches)
-    home_stats = {"gf": 0.0, "ga": 0.0, "win": 0.0, "ov25": 0.0, "ov35": 0.0, "btts": 0.0}
-    home_games = 0
-    for match in last_h:
-        st = (((match.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-        if st not in {"FT", "AET", "PEN"}:
-            continue
-            
-        goals = match.get("goals") or {}
-        gh = int(goals.get("home") or 0)
-        ga = int(goals.get("away") or 0)
+    # ───────── ADVANCED FORM CALCULATION WITH EXPONENTIAL DECAY ─────────
+    def calculate_weighted_form(matches: List[dict], is_home_for_team: bool = True) -> Dict[str, float]:
+        """Calculate form metrics with exponential decay weighting (recent matches more important)"""
+        if not matches:
+            return {
+                "gf": 0.0, "ga": 0.0, "win": 0.0, "draw": 0.0, "loss": 0.0,
+                "ov25": 0.0, "ov35": 0.0, "btts": 0.0,
+                "points": 0.0, "xg_for": 0.0, "xg_against": 0.0
+            }
         
-        home_stats["gf"] += gh
-        home_stats["ga"] += ga
-        home_stats["win"] += 1 if gh > ga else 0
-        total = gh + ga
-        home_stats["ov25"] += 1 if total > 2 else 0
-        home_stats["ov35"] += 1 if total > 3 else 0
-        home_stats["btts"] += 1 if gh > 0 and ga > 0 else 0
-        home_games += 1
+        # Exponential decay weights: most recent gets weight 1.0, then 0.8, 0.64, 0.512, 0.41
+        weights = [0.8 ** i for i in range(len(matches))]  # [1.0, 0.8, 0.64, 0.512, 0.41]
+        total_weight = sum(weights)
+        
+        gf = ga = wins = draws = losses = 0.0
+        ov25 = ov35 = btts = 0.0
+        points = 0.0
+        
+        for i, match in enumerate(reversed(matches)):  # Reverse to get chronological order
+            st = (((match.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+            if st not in {"FT", "AET", "PEN"}:
+                continue
+                
+            goals = match.get("goals") or {}
+            gh = int(goals.get("home") or 0)
+            ga_match = int(goals.get("away") or 0)
+            
+            # Determine if this team is home or away in this match
+            teams_match = match.get("teams") or {}
+            home_team_match = (teams_match.get("home") or {}).get("id")
+            
+            if is_home_for_team:
+                # Team is home in these matches
+                gf += gh * weights[i]
+                ga += ga_match * weights[i]
+                if gh > ga_match:
+                    wins += weights[i]
+                    points += 3 * weights[i]
+                elif gh == ga_match:
+                    draws += weights[i]
+                    points += 1 * weights[i]
+                else:
+                    losses += weights[i]
+            else:
+                # Team is away in these matches
+                gf += ga_match * weights[i]
+                ga += gh * weights[i]
+                if ga_match > gh:
+                    wins += weights[i]
+                    points += 3 * weights[i]
+                elif ga_match == gh:
+                    draws += weights[i]
+                    points += 1 * weights[i]
+                else:
+                    losses += weights[i]
+            
+            total = gh + ga_match
+            if total > 2:
+                ov25 += weights[i]
+            if total > 3:
+                ov35 += weights[i]
+            if gh > 0 and ga_match > 0:
+                btts += weights[i]
+        
+        return {
+            "gf": gf / total_weight if total_weight > 0 else 0.0,
+            "ga": ga / total_weight if total_weight > 0 else 0.0,
+            "win": wins / total_weight if total_weight > 0 else 0.0,
+            "draw": draws / total_weight if total_weight > 0 else 0.0,
+            "loss": losses / total_weight if total_weight > 0 else 0.0,
+            "ov25": ov25 / total_weight if total_weight > 0 else 0.0,
+            "ov35": ov35 / total_weight if total_weight > 0 else 0.0,
+            "btts": btts / total_weight if total_weight > 0 else 0.0,
+            "points": points / total_weight if total_weight > 0 else 0.0
+        }
     
-    # Calculate stats for away team (as away team in their matches)
-    away_stats = {"gf": 0.0, "ga": 0.0, "win": 0.0, "ov25": 0.0, "ov35": 0.0, "btts": 0.0}
-    away_games = 0
-    for match in last_a:
-        st = (((match.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-        if st not in {"FT", "AET", "PEN"}:
-            continue
-            
-        goals = match.get("goals") or {}
-        gh = int(goals.get("home") or 0)
-        ga = int(goals.get("away") or 0)
-        
-        # Away team perspective
-        away_stats["gf"] += ga  # Away goals scored
-        away_stats["ga"] += gh  # Away goals conceded
-        away_stats["win"] += 1 if ga > gh else 0
-        total = gh + ga
-        away_stats["ov25"] += 1 if total > 2 else 0
-        away_stats["ov35"] += 1 if total > 3 else 0
-        away_stats["btts"] += 1 if gh > 0 and ga > 0 else 0
-        away_games += 1
+    # Calculate weighted form
+    home_form = calculate_weighted_form(last_h, is_home_for_team=True)
+    away_form = calculate_weighted_form(last_a, is_home_for_team=False)
     
     # Calculate H2H stats
-    h2h_stats = {"ov25": 0.0, "ov35": 0.0, "btts": 0.0}
+    h2h_stats = {"ov25": 0.0, "ov35": 0.0, "btts": 0.0, "home_wins": 0.0, "away_wins": 0.0, "draws": 0.0}
     h2h_games = 0
     for match in h2h:
         st = (((match.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
@@ -481,55 +700,69 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
         h2h_stats["ov25"] += 1 if total > 2 else 0
         h2h_stats["ov35"] += 1 if total > 3 else 0
         h2h_stats["btts"] += 1 if gh > 0 and ga > 0 else 0
+        
+        if gh > ga:
+            h2h_stats["home_wins"] += 1
+        elif ga > gh:
+            h2h_stats["away_wins"] += 1
+        else:
+            h2h_stats["draws"] += 1
         h2h_games += 1
     
-    # Calculate averages
-    home_gf_avg = home_stats["gf"] / home_games if home_games > 0 else 0.0
-    home_ga_avg = home_stats["ga"] / home_games if home_games > 0 else 0.0
-    home_win_avg = home_stats["win"] / home_games if home_games > 0 else 0.0
-    home_ov25_avg = home_stats["ov25"] / home_games if home_games > 0 else 0.0
-    home_ov35_avg = home_stats["ov35"] / home_games if home_games > 0 else 0.0
-    home_btts_avg = home_stats["btts"] / home_games if home_games > 0 else 0.0
+    if h2h_games > 0:
+        h2h_stats = {k: v / h2h_games for k, v in h2h_stats.items()}
     
-    away_gf_avg = away_stats["gf"] / away_games if away_games > 0 else 0.0
-    away_ga_avg = away_stats["ga"] / away_games if away_games > 0 else 0.0
-    away_win_avg = away_stats["win"] / away_games if away_games > 0 else 0.0
-    away_ov25_avg = away_stats["ov25"] / away_games if away_games > 0 else 0.0
-    away_ov35_avg = away_stats["ov35"] / away_games if away_games > 0 else 0.0
-    away_btts_avg = away_stats["btts"] / away_games if away_games > 0 else 0.0
+    # Get team ratings
+    home_rating_data = get_team_rating(home_id)
+    away_rating_data = get_team_rating(away_id)
     
-    h2h_ov25_avg = h2h_stats["ov25"] / h2h_games if h2h_games > 0 else 0.0
-    h2h_ov35_avg = h2h_stats["ov35"] / h2h_games if h2h_games > 0 else 0.0
-    h2h_btts_avg = h2h_stats["btts"] / h2h_games if h2h_games > 0 else 0.0
+    # Calculate advanced features
+    home_rating = home_rating_data["rating"]
+    away_rating = away_rating_data["rating"]
+    home_home_rating = home_rating_data["home_rating"]
+    away_away_rating = away_rating_data["away_rating"]
     
-    # Get rest days (simplified - would need fixture dates)
-    rest_diff = 0.0  # Placeholder
-    
-    # Build feature dictionary matching train_models.py
+    # ───────── BUILD ADVANCED FEATURE DICTIONARY ─────────
     features = {
-        # Team form features
-        "pm_gf_h": home_gf_avg,
-        "pm_ga_h": home_ga_avg,
-        "pm_win_h": home_win_avg,
-        "pm_gf_a": away_gf_avg,
-        "pm_ga_a": away_ga_avg,
-        "pm_win_a": away_win_avg,
+        # Team form features (weighted)
+        "pm_gf_h": home_form["gf"], "pm_ga_h": home_form["ga"],
+        "pm_win_h": home_form["win"], "pm_draw_h": home_form["draw"], "pm_loss_h": home_form["loss"],
+        "pm_gf_a": away_form["gf"], "pm_ga_a": away_form["ga"],
+        "pm_win_a": away_form["win"], "pm_draw_a": away_form["draw"], "pm_loss_a": away_form["loss"],
         
-        # Over/Under features
-        "pm_ov25_h": home_ov25_avg,
-        "pm_ov35_h": home_ov35_avg,
-        "pm_btts_h": home_btts_avg,
-        "pm_ov25_a": away_ov25_avg,
-        "pm_ov35_a": away_ov35_avg,
-        "pm_btts_a": away_btts_avg,
+        # Over/Under features (weighted)
+        "pm_ov25_h": home_form["ov25"], "pm_ov35_h": home_form["ov35"], "pm_btts_h": home_form["btts"],
+        "pm_ov25_a": away_form["ov25"], "pm_ov35_a": away_form["ov35"], "pm_btts_a": away_form["btts"],
         
         # H2H features
-        "pm_ov25_h2h": h2h_ov25_avg,
-        "pm_ov35_h2h": h2h_ov35_avg,
-        "pm_btts_h2h": h2h_btts_avg,
+        "pm_ov25_h2h": h2h_stats.get("ov25", 0.0), "pm_ov35_h2h": h2h_stats.get("ov35", 0.0),
+        "pm_btts_h2h": h2h_stats.get("btts", 0.0), "pm_home_wins_h2h": h2h_stats.get("home_wins", 0.0),
+        "pm_away_wins_h2h": h2h_stats.get("away_wins", 0.0), "pm_draws_h2h": h2h_stats.get("draws", 0.0),
         
-        # Rest days
-        "pm_rest_diff": rest_diff,
+        # Team Strength Features (ELO-based)
+        "pm_rating_h": home_rating, "pm_rating_a": away_rating,
+        "pm_rating_diff": home_rating - away_rating,
+        "pm_home_adv_rating": home_home_rating - home_rating,  # Home advantage
+        "pm_away_adv_rating": away_away_rating - away_rating,  # Away performance
+        
+        # Advanced Form Metrics
+        "pm_form_points_h": home_form["points"], "pm_form_points_a": away_form["points"],
+        "pm_form_points_diff": home_form["points"] - away_form["points"],
+        "pm_goal_difference_h": home_form["gf"] - home_form["ga"],
+        "pm_goal_difference_a": away_form["gf"] - away_form["ga"],
+        
+        # Attack vs Defense Strength
+        "pm_attack_strength_h": home_form["gf"] / max(home_form["ga"], 0.1),
+        "pm_attack_strength_a": away_form["gf"] / max(away_form["ga"], 0.1),
+        "pm_defense_strength_h": 1.0 / max(home_form["ga"], 0.1),
+        "pm_defense_strength_a": 1.0 / max(away_form["ga"], 0.1),
+        
+        # Expected Goals Proxy
+        "pm_expected_total": (home_form["gf"] + away_form["gf"]) / 2,
+        "pm_expected_total_diff": home_form["gf"] - away_form["gf"],
+        
+        # Rest days (placeholder - would need fixture dates)
+        "pm_rest_diff": 0.0,
         
         # Live features (set to 0 for prematch)
         "minute": 0.0,
@@ -539,7 +772,32 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
         "cor_h": 0.0, "cor_a": 0.0, "cor_sum": 0.0,
         "pos_h": 0.0, "pos_a": 0.0, "pos_diff": 0.0,
         "red_h": 0.0, "red_a": 0.0, "red_sum": 0.0,
+        
+        # Advanced live features (set to 0 for prematch)
+        "total_shots_h": 0.0, "total_shots_a": 0.0,
+        "shots_inside_h": 0.0, "shots_inside_a": 0.0,
+        "fouls_h": 0.0, "fouls_a": 0.0,
+        "goals_per_minute": 0.0, "xg_per_minute": 0.0, "sot_per_minute": 0.0,
+        "shots_per_minute": 0.0, "momentum_score": 0.0,
+        "shot_accuracy_h": 0.0, "shot_accuracy_a": 0.0,
+        "shot_quality_h": 0.0, "shot_quality_a": 0.0,
+        "conversion_rate_h": 0.0, "conversion_rate_a": 0.0,
+        "xg_efficiency_h": 0.0, "xg_efficiency_a": 0.0,
+        "attack_pressure_h": 0.0, "attack_pressure_a": 0.0,
+        "attack_pressure_diff": 0.0,
+        "game_control_h": 0.0, "game_control_a": 0.0,
+        "is_first_half": 0.0, "is_second_half": 0.0, "is_final_15": 0.0,
+        "score_margin": 0.0, "is_leading_h": 0.0, "is_leading_a": 0.0,
+        "is_draw": 0.0, "is_goalfest": 0.0,
+        "fouls_per_minute": 0.0, "discipline_score_h": 0.0, "discipline_score_a": 0.0,
+        "possession_xg_interaction_h": 0.0, "possession_xg_interaction_a": 0.0,
+        "sot_xg_ratio_h": 0.0, "sot_xg_ratio_a": 0.0,
+        "match_minute_normalized": 0.0, "time_weighted_xg_h": 0.0, "time_weighted_xg_a": 0.0,
     }
+    
+    # Calculate interaction features
+    features["pm_rating_form_interaction"] = features["pm_rating_diff"] * features["pm_form_points_diff"]
+    features["pm_attack_defense_ratio"] = features["pm_attack_strength_h"] / max(features["pm_defense_strength_a"], 0.1)
     
     return features
 
@@ -739,10 +997,36 @@ def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
     away=(m.get("teams") or {}).get("away",{}).get("name","")
     gh=(m.get("goals") or {}).get("home") or 0; ga=(m.get("goals") or {}).get("away") or 0
     minute=int(feat.get("minute",0))
-    snapshot={"minute":minute,"gh":gh,"ga":ga,"league_id":league_id,"market":"HARVEST","suggestion":"HARVEST","confidence":0,
-              "stat":{"xg_h":feat.get("xg_h",0),"xg_a":feat.get("xg_a",0),"sot_h":feat.get("sot_h",0),"sot_a":feat.get("sot_a",0),
-                      "cor_h":feat.get("cor_h",0),"cor_a":feat.get("cor_a",0),"pos_h":feat.get("pos_h",0),"pos_a":feat.get("pos_a",0),
-                      "red_h":feat.get("red_h",0),"red_a":feat.get("red_a",0)}}
+    
+    # Include advanced features in snapshot
+    snapshot={
+        "minute": minute,
+        "gh": gh, "ga": ga,
+        "league_id": league_id,
+        "market": "HARVEST",
+        "suggestion": "HARVEST",
+        "confidence": 0,
+        "stat": {
+            "xg_h": feat.get("xg_h",0), "xg_a": feat.get("xg_a",0),
+            "sot_h": feat.get("sot_h",0), "sot_a": feat.get("sot_a",0),
+            "cor_h": feat.get("cor_h",0), "cor_a": feat.get("cor_a",0),
+            "pos_h": feat.get("pos_h",0), "pos_a": feat.get("pos_a",0),
+            "red_h": feat.get("red_h",0), "red_a": feat.get("red_a",0),
+            "total_shots_h": feat.get("total_shots_h",0), "total_shots_a": feat.get("total_shots_a",0),
+            "shots_inside_h": feat.get("shots_inside_h",0), "shots_inside_a": feat.get("shots_inside_a",0),
+            "fouls_h": feat.get("fouls_h",0), "fouls_a": feat.get("fouls_a",0),
+        },
+        "advanced": {
+            "goals_per_minute": feat.get("goals_per_minute",0),
+            "xg_per_minute": feat.get("xg_per_minute",0),
+            "sot_per_minute": feat.get("sot_per_minute",0),
+            "shot_accuracy_h": feat.get("shot_accuracy_h",0),
+            "shot_accuracy_a": feat.get("shot_accuracy_a",0),
+            "attack_pressure_h": feat.get("attack_pressure_h",0),
+            "attack_pressure_a": feat.get("attack_pressure_a",0),
+        }
+    }
+    
     now=int(time.time())
     with db_conn() as c:
         c.execute("INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
@@ -819,6 +1103,13 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
                        "VALUES(%s,%s,%s,%s,%s) ON CONFLICT(match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
                        "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
                        (int(mid), gh, ga, btts, int(time.time())))
+        
+        # Update team ratings from finished match
+        try:
+            update_ratings_from_finished_match(fx)
+        except Exception as e:
+            log.warning("Failed to update ratings for match %s: %s", mid, e)
+        
         updated+=1
     if updated: log.info("[RESULTS] backfilled %d", updated)
     return updated
@@ -863,26 +1154,28 @@ def _get_market_threshold(m: str) -> float:
 def _get_market_threshold_pre(m: str) -> float: return _get_market_threshold(f"PRE {m}")
 
 def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct, feat, odds=None, book=None, ev_pct=None):
-    stat=""
-    if any([feat.get("xg_h",0),feat.get("xg_a",0),feat.get("sot_h",0),feat.get("sot_a",0),feat.get("cor_h",0),feat.get("cor_a",0),
-            feat.get("pos_h",0),feat.get("pos_a",0),feat.get("red_h",0),feat.get("red_a",0)]):
-        stat=(f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
-              f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
-              f" • CK {int(feat.get('cor_h',0))}-{int(feat.get('cor_a',0))}")
-        if feat.get("pos_h",0) or feat.get("pos_a",0): stat += f" • POS {int(feat.get('pos_h',0))}%–{int(feat.get('pos_a',0))}%"
-        if feat.get("red_h",0) or feat.get("red_a",0): stat += f" • RED {int(feat.get('red_h',0))}-{int(feat.get('red_a',0))}"
+    # Include advanced stats if available
+    advanced_stats = ""
+    if any([feat.get("xg_h",0), feat.get("xg_a",0), feat.get("attack_pressure_h",0), feat.get("attack_pressure_a",0)]):
+        advanced_stats = (f"\n📊 xG {feat.get('xg_h',0):.2f}-{feat.get('xg_a',0):.2f}"
+                         f" • SOT {int(feat.get('sot_h',0))}-{int(feat.get('sot_a',0))}"
+                         f" • Attack Pressure: {feat.get('attack_pressure_h',0):.1f}-{feat.get('attack_pressure_a',0):.1f}")
+        if feat.get("shot_accuracy_h",0) or feat.get("shot_accuracy_a",0):
+            advanced_stats += f"\n🎯 Shot Accuracy: {feat.get('shot_accuracy_h',0)*100:.0f}%-{feat.get('shot_accuracy_a',0)*100:.0f}%"
+    
     money = ""
     if odds:
         if ev_pct is not None:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
         else:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
-    return ("⚽️ <b>New Tip!</b>\n"
+    
+    return ("⚽️ <b>New Tip!</b> [ADVANCED]\n"
             f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
             f"🕒 <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score)}\n"
             f"<b>Tip:</b> {escape(suggestion)}\n"
             f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}\n"
-            f"🏆 <b>League:</b> {escape(league)}{stat}")
+            f"🏆 <b>League:</b> {escape(league)}{advanced_stats}")
 
 # ───────── Scan (in-play) ─────────
 def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
@@ -956,7 +1249,7 @@ def production_scan() -> Tuple[int,int]:
                     if suggestion not in ALLOWED_SUGGESTIONS: continue
                     if per_match >= max(1,PREDICTIONS_PER_MATCH): break
 
-                    # Odds/EV gate - FIXED: pass probability to calculate EV
+                    # Odds/EV gate
                     pass_odds, odds, book, ev_pct = _price_gate(market_txt, suggestion, fid, prob)
                     if not pass_odds: 
                         continue
@@ -1004,7 +1297,7 @@ def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, 
         else:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
     return (
-        "🏅 <b>Match of the Day</b>\n"
+        "🏅 <b>Match of the Day</b> [ADVANCED]\n"
         f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
         f"🏆 <b>League:</b> {escape(league)}\n"
         f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
@@ -1061,7 +1354,7 @@ def prematch_scan_save() -> int:
         for idx,(mk,sug,prob) in enumerate(candidates):
             if sug not in ALLOWED_SUGGESTIONS: continue
             if per_match>=max(1,PREDICTIONS_PER_MATCH): break
-            # Odds/EV gate - FIXED: pass probability
+            # Odds/EV gate
             pass_odds, odds, book, ev_pct = _price_gate(mk.replace("PRE ",""), sug, fid, prob)
             if not pass_odds: continue
             
@@ -1100,7 +1393,7 @@ def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
     y=np.asarray(y_true,dtype=int); p=np.asarray(y_prob,dtype=float)
     best=default_pct/100.0
     for t in np.arange(MIN_THRESH,MAX_THRESH+1e-9,1.0)/100.0:
-        pred=(p>=t).astype(int); n=int(pred.sum())
+        pred=(p>=t).ast(int); n=int(pred.sum())
         if n<min_preds: continue
         tp=int(((pred==1)&(y==1)).sum()); prec=tp/max(1,n)
         if prec>=target_precision: best=float(t); break
@@ -1279,7 +1572,7 @@ def _start_scheduler_once():
                           id="auto_tune", max_instances=1, coalesce=True)
         sched.add_job(lambda:_run_with_pg_lock(1007,retry_unsent_tips,30,200),"interval",minutes=10,id="retry",max_instances=1,coalesce=True)
         sched.start(); _scheduler_started=True
-        send_telegram("🚀 goalsniper AI mode (in-play + prematch) started.")
+        send_telegram("🚀 goalsniper ADVANCED mode (in-play + prematch) started with ELO ratings.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
@@ -1293,14 +1586,15 @@ def _require_admin():
 
 # ───────── HTTP endpoints ─────────
 @app.route("/")
-def root(): return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI", "scheduler": RUN_SCHEDULER})
+def root(): return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI_ADVANCED", "scheduler": RUN_SCHEDULER})
 
 @app.route("/health")
 def health():
     try:
         with db_conn() as c:
             n=c.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
-        return jsonify({"ok": True, "db": "ok", "tips_count": int(n)})
+            r=c.execute("SELECT COUNT(*) FROM team_ratings").fetchone()[0]
+        return jsonify({"ok": True, "db": "ok", "tips_count": int(n), "team_ratings": int(r)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -1340,6 +1634,37 @@ def http_prematch_scan(): _require_admin(); saved=prematch_scan_save(); return j
 def http_motd():
     _require_admin(); ok = send_match_of_the_day(); return jsonify({"ok": bool(ok)})
 
+@app.route("/admin/update-ratings", methods=["POST","GET"])
+def http_update_ratings():
+    """Manually trigger rating updates from recent matches"""
+    _require_admin()
+    cutoff = int(time.time()) - 30*24*3600  # Last 30 days
+    updated = 0
+    
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT match_id FROM match_results 
+            WHERE updated_ts >= %s 
+            ORDER BY updated_ts DESC LIMIT 1000
+        """, (cutoff,)).fetchall()
+    
+    for (match_id,) in rows:
+        fx = _fixture_by_id(int(match_id))
+        if fx:
+            try:
+                update_ratings_from_finished_match(fx)
+                updated += 1
+            except Exception as e:
+                log.warning("Failed to update ratings for match %s: %s", match_id, e)
+    
+    return jsonify({"ok": True, "updated": updated})
+
+@app.route("/team-rating/<int:team_id>")
+def http_team_rating(team_id: int):
+    """Get team rating"""
+    rating_data = get_team_rating(team_id)
+    return jsonify({"ok": True, "team_id": team_id, "rating": rating_data})
+
 @app.route("/settings/<key>", methods=["GET","POST"])
 def http_settings(key: str):
     _require_admin()
@@ -1370,7 +1695,7 @@ def telegram_webhook(secret: str):
     update=request.get_json(silent=True) or {}
     try:
         msg=(update.get("message") or {}).get("text") or ""
-        if msg.startswith("/start"): send_telegram("👋 goalsniper bot (FULL AI mode) is online.")
+        if msg.startswith("/start"): send_telegram("👋 goalsniper ADVANCED bot (FULL AI mode with ELO ratings) is online.")
         elif msg.startswith("/digest"): daily_accuracy_digest()
         elif msg.startswith("/motd"): send_match_of_the_day()
         elif msg.startswith("/scan"):
@@ -1385,6 +1710,7 @@ def telegram_webhook(secret: str):
 # ───────── Boot ─────────
 def _on_boot():
     _init_pool(); init_db(); set_setting("boot_ts", str(int(time.time())))
+    log.info("✅ Advanced features enabled: ELO ratings, weighted form, shot quality metrics")
 
 _on_boot()
 
