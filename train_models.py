@@ -1,34 +1,9 @@
 """
-Postgres-only training with Platt calibration + per-market auto-thresholding.
-
-Trains two families of models that match main.py:
-  In-Play:
-    • BTTS_YES (binary LR)
-    • OU_{line}  (e.g., OU_2.5, OU_3.5)
-    • WLD_HOME, WLD_DRAW, WLD_AWAY (OvR LR heads; serving suppresses Draw)
-  Prematch:
-    • PRE_BTTS_YES
-    • PRE_OU_{line}
-    • PRE_WLD_HOME, PRE_WLD_AWAY  (Draw suppressed at serving)
-
-Data sources:
-  • In-Play   -> tip_snapshots  (latest snapshot per match)
-  • Prematch  -> prematch_snapshots (one snapshot per match)
-
-Models & thresholds written to `settings`:
-  • model_latest:* and model:* keys (JSON: intercept, weights, calibration)
-  • conf_threshold:* per market (percent; serving uses if present)
-
-Environment knobs:
-  DATABASE_URL
-  OU_TRAIN_LINES="2.5,3.5"
-  TRAIN_MIN_MINUTE=15
-  TRAIN_TEST_SIZE=0.25
-  TARGET_PRECISION=0.60
-  THRESH_MIN_PREDICTIONS=25
-  MIN_THRESH=55
-  MAX_THRESH=85
-  MIN_ROWS=150
+Postgres-only training with advanced features:
+- ELO team ratings
+- Exponential decay weighted form
+- Shot quality and efficiency metrics
+- Game state and momentum features
 """
 
 import argparse
@@ -60,8 +35,9 @@ logger = logging.getLogger(__name__)
 
 # ───────────────────────── Feature sets ───────────────────────── #
 
-# Must match main.py extract_features()
+# Advanced in-play features (matches main.py)
 FEATURES: List[str] = [
+    # Basic features
     "minute",
     "goals_h", "goals_a", "goals_sum", "goals_diff",
     "xg_h", "xg_a", "xg_sum", "xg_diff",
@@ -69,20 +45,88 @@ FEATURES: List[str] = [
     "cor_h", "cor_a", "cor_sum",
     "pos_h", "pos_a", "pos_diff",
     "red_h", "red_a", "red_sum",
+    
+    # Additional basic stats
+    "total_shots_h", "total_shots_a",
+    "shots_inside_h", "shots_inside_a",
+    "fouls_h", "fouls_a",
+    
+    # Advanced features
+    "goals_per_minute", "xg_per_minute", "sot_per_minute", "shots_per_minute",
+    "momentum_score",
+    "shot_accuracy_h", "shot_accuracy_a",
+    "shot_quality_h", "shot_quality_a",
+    "conversion_rate_h", "conversion_rate_a",
+    "xg_efficiency_h", "xg_efficiency_a",
+    "attack_pressure_h", "attack_pressure_a", "attack_pressure_diff",
+    "game_control_h", "game_control_a",
+    "is_first_half", "is_second_half", "is_final_15",
+    "score_margin", "is_leading_h", "is_leading_a", "is_draw", "is_goalfest",
+    "fouls_per_minute", "discipline_score_h", "discipline_score_a",
+    "possession_xg_interaction_h", "possession_xg_interaction_a",
+    "sot_xg_ratio_h", "sot_xg_ratio_a",
+    "match_minute_normalized", "time_weighted_xg_h", "time_weighted_xg_a",
 ]
 
-# FIXED: Updated to match main.py's extract_prematch_features()
+# Advanced prematch features (matches main.py)
 PRE_FEATURES: List[str] = [
-    "pm_gf_h", "pm_ga_h", "pm_win_h",
-    "pm_gf_a", "pm_ga_a", "pm_win_a",
+    # Team form features (weighted)
+    "pm_gf_h", "pm_ga_h", "pm_win_h", "pm_draw_h", "pm_loss_h",
+    "pm_gf_a", "pm_ga_a", "pm_win_a", "pm_draw_a", "pm_loss_a",
+    
+    # Over/Under features (weighted)
     "pm_ov25_h", "pm_ov35_h", "pm_btts_h",
     "pm_ov25_a", "pm_ov35_a", "pm_btts_a",
+    
+    # H2H features
     "pm_ov25_h2h", "pm_ov35_h2h", "pm_btts_h2h",
+    "pm_home_wins_h2h", "pm_away_wins_h2h", "pm_draws_h2h",
+    
+    # Team Strength Features (ELO-based)
+    "pm_rating_h", "pm_rating_a", "pm_rating_diff",
+    "pm_home_adv_rating", "pm_away_adv_rating",
+    
+    # Advanced Form Metrics
+    "pm_form_points_h", "pm_form_points_a", "pm_form_points_diff",
+    "pm_goal_difference_h", "pm_goal_difference_a",
+    
+    # Attack vs Defense Strength
+    "pm_attack_strength_h", "pm_attack_strength_a",
+    "pm_defense_strength_h", "pm_defense_strength_a",
+    
+    # Expected Goals Proxy
+    "pm_expected_total", "pm_expected_total_diff",
+    
+    # Rest days
     "pm_rest_diff",
-    # keep live keys 0.0 for compatibility at serve time
+    
+    # Interaction features
+    "pm_rating_form_interaction", "pm_attack_defense_ratio",
+    
+    # Live features (set to 0 for prematch) - must include ALL in-play features
     "minute", "goals_h", "goals_a", "goals_sum", "goals_diff",
-    "xg_h", "xg_a", "xg_sum", "xg_diff", "sot_h", "sot_a", "sot_sum",
-    "cor_h", "cor_a", "cor_sum", "pos_h", "pos_a", "pos_diff", "red_h", "red_a", "red_sum",
+    "xg_h", "xg_a", "xg_sum", "xg_diff",
+    "sot_h", "sot_a", "sot_sum",
+    "cor_h", "cor_a", "cor_sum",
+    "pos_h", "pos_a", "pos_diff",
+    "red_h", "red_a", "red_sum",
+    "total_shots_h", "total_shots_a",
+    "shots_inside_h", "shots_inside_a",
+    "fouls_h", "fouls_a",
+    "goals_per_minute", "xg_per_minute", "sot_per_minute", "shots_per_minute",
+    "momentum_score",
+    "shot_accuracy_h", "shot_accuracy_a",
+    "shot_quality_h", "shot_quality_a",
+    "conversion_rate_h", "conversion_rate_a",
+    "xg_efficiency_h", "xg_efficiency_a",
+    "attack_pressure_h", "attack_pressure_a", "attack_pressure_diff",
+    "game_control_h", "game_control_a",
+    "is_first_half", "is_second_half", "is_final_15",
+    "score_margin", "is_leading_h", "is_leading_a", "is_draw", "is_goalfest",
+    "fouls_per_minute", "discipline_score_h", "discipline_score_a",
+    "possession_xg_interaction_h", "possession_xg_interaction_a",
+    "sot_xg_ratio_h", "sot_xg_ratio_a",
+    "match_minute_normalized", "time_weighted_xg_h", "time_weighted_xg_a",
 ]
 
 EPS = 1e-6
@@ -130,7 +174,7 @@ def _ensure_training_tables(conn) -> None:
     _exec(conn, "CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
 
 
-# ─────────────────────── Data load ─────────────────────── #
+# ─────────────────────── Data load with Advanced Features ─────────────────────── #
 
 def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
     q = """
@@ -154,8 +198,11 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
             payload = json.loads(row["payload"]) or {}
         except Exception:
             continue
+        
         stat = (payload.get("stat") or {})
-
+        advanced = (payload.get("advanced") or {})
+        
+        # Basic stats
         f = {
             "minute": float(payload.get("minute", 0) or 0),
             "goals_h": float(payload.get("gh", 0) or 0),
@@ -170,9 +217,15 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
             "pos_a": float(stat.get("pos_a", 0) or 0),
             "red_h": float(stat.get("red_h", 0) or 0),
             "red_a": float(stat.get("red_a", 0) or 0),
+            "total_shots_h": float(stat.get("total_shots_h", 0) or 0),
+            "total_shots_a": float(stat.get("total_shots_a", 0) or 0),
+            "shots_inside_h": float(stat.get("shots_inside_h", 0) or 0),
+            "shots_inside_a": float(stat.get("shots_inside_a", 0) or 0),
+            "fouls_h": float(stat.get("fouls_h", 0) or 0),
+            "fouls_a": float(stat.get("fouls_a", 0) or 0),
         }
-
-        # Derived
+        
+        # Derived features (same as in main.py)
         f["goals_sum"] = f["goals_h"] + f["goals_a"]
         f["goals_diff"] = f["goals_h"] - f["goals_a"]
         f["xg_sum"] = f["xg_h"] + f["xg_a"]
@@ -181,10 +234,81 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
         f["cor_sum"] = f["cor_h"] + f["cor_a"]
         f["pos_diff"] = f["pos_h"] - f["pos_a"]
         f["red_sum"] = f["red_h"] + f["red_a"]
-
+        
+        # Advanced features from snapshot or calculate them
+        minute = f["minute"]
+        goals_sum = f["goals_sum"]
+        xg_sum = f["xg_sum"]
+        sot_sum = f["sot_sum"]
+        total_shots_sum = f["total_shots_h"] + f["total_shots_a"]
+        
+        # Rate features
+        if minute > 0:
+            f["goals_per_minute"] = goals_sum / minute
+            f["xg_per_minute"] = xg_sum / minute
+            f["sot_per_minute"] = sot_sum / minute
+            f["shots_per_minute"] = total_shots_sum / minute
+        else:
+            f["goals_per_minute"] = 0.0
+            f["xg_per_minute"] = 0.0
+            f["sot_per_minute"] = 0.0
+            f["shots_per_minute"] = 0.0
+        
+        # Momentum score (simplified)
+        f["momentum_score"] = (f.get("xg_per_minute", 0) * 0.5 + 
+                               f.get("sot_per_minute", 0) * 0.3 + 
+                               f.get("shots_per_minute", 0) * 0.2)
+        
+        # Shot quality and efficiency
+        f["shot_accuracy_h"] = f["sot_h"] / max(f["total_shots_h"], 1)
+        f["shot_accuracy_a"] = f["sot_a"] / max(f["total_shots_a"], 1)
+        f["shot_quality_h"] = f["shots_inside_h"] / max(f["total_shots_h"], 1)
+        f["shot_quality_a"] = f["shots_inside_a"] / max(f["total_shots_a"], 1)
+        f["conversion_rate_h"] = f["goals_h"] / max(f["sot_h"], 1)
+        f["conversion_rate_a"] = f["goals_a"] / max(f["sot_a"], 1)
+        f["xg_efficiency_h"] = f["goals_h"] - f["xg_h"]
+        f["xg_efficiency_a"] = f["goals_a"] - f["xg_a"]
+        
+        # Pressure and game control
+        f["attack_pressure_h"] = (f["sot_h"] * 0.4 + f["xg_h"] * 0.4 + f["cor_h"] * 0.2)
+        f["attack_pressure_a"] = (f["sot_a"] * 0.4 + f["xg_a"] * 0.4 + f["cor_a"] * 0.2)
+        f["attack_pressure_diff"] = f["attack_pressure_h"] - f["attack_pressure_a"]
+        f["game_control_h"] = (f["pos_h"] / 100) * f["attack_pressure_h"]
+        f["game_control_a"] = (f["pos_a"] / 100) * f["attack_pressure_a"]
+        
+        # Game phase
+        f["is_first_half"] = 1.0 if minute <= 45 else 0.0
+        f["is_second_half"] = 1.0 if minute > 45 else 0.0
+        f["is_final_15"] = 1.0 if minute > 75 else 0.0
+        
+        # Score state
+        f["score_margin"] = abs(f["goals_h"] - f["goals_a"])
+        f["is_leading_h"] = 1.0 if f["goals_h"] > f["goals_a"] else 0.0
+        f["is_leading_a"] = 1.0 if f["goals_a"] > f["goals_h"] else 0.0
+        f["is_draw"] = 1.0 if f["goals_h"] == f["goals_a"] else 0.0
+        f["is_goalfest"] = 1.0 if f["goals_sum"] >= 3 else 0.0
+        
+        # Discipline
+        fouls_sum = f["fouls_h"] + f["fouls_a"]
+        f["fouls_per_minute"] = fouls_sum / max(minute, 1)
+        f["discipline_score_h"] = 1.0 / max(f["fouls_h"] + f["red_h"] * 10, 1)
+        f["discipline_score_a"] = 1.0 / max(f["fouls_a"] + f["red_a"] * 10, 1)
+        
+        # Cross-feature interactions
+        f["possession_xg_interaction_h"] = (f["pos_h"] / 100) * f["xg_h"]
+        f["possession_xg_interaction_a"] = (f["pos_a"] / 100) * f["xg_a"]
+        f["sot_xg_ratio_h"] = f["sot_h"] / max(f["xg_h"], 0.1)
+        f["sot_xg_ratio_a"] = f["sot_a"] / max(f["xg_a"], 0.1)
+        
+        # Match context
+        f["match_minute_normalized"] = minute / 90.0
+        f["time_weighted_xg_h"] = f["xg_h"] * (minute / 90.0)
+        f["time_weighted_xg_a"] = f["xg_a"] * (minute / 90.0)
+        
+        # Final result
         gh_f = int(row["final_goals_h"] or 0)
         ga_f = int(row["final_goals_a"] or 0)
-
+        
         f["_ts"] = int(row["created_ts"] or 0)
         f["final_goals_sum"] = gh_f + ga_f
         f["final_goals_diff"] = gh_f - ga_f
@@ -196,6 +320,12 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(feats)
+    
+    # Ensure all FEATURES are present
+    for col in FEATURES:
+        if col not in df.columns:
+            df[col] = 0.0
+    
     df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     df["minute"] = df["minute"].clip(0, 120)
     df = df[df["minute"] >= float(min_minute)].copy()
@@ -221,7 +351,13 @@ def load_prematch_data(conn) -> pd.DataFrame:
         except Exception:
             continue
 
-        f = {k: float(feat.get(k, 0.0) or 0.0) for k in PRE_FEATURES}
+        # Create feature dict with all PRE_FEATURES
+        f = {k: float(feat.get(k, 0.0) or 0.0) for k in PRE_FEATURES if k in feat}
+        
+        # Fill missing features with 0.0
+        for k in PRE_FEATURES:
+            if k not in f:
+                f[k] = 0.0
 
         gh_f = int(row["final_goals_h"] or 0)
         ga_f = int(row["final_goals_a"] or 0)
@@ -415,9 +551,16 @@ def _train_binary_head(
         "logloss": float(log_loss(y_te, p_cal, labels=[0, 1])),
         "n_test": int(len(y_te)),
         "prevalence": float(y_all.mean()),
+        "n_features": len(feature_names),
+        "feature_importance": dict(sorted(
+            zip(feature_names, m.coef_.ravel().tolist()),
+            key=lambda x: abs(x[1]),
+            reverse=True
+        )[:10])  # Top 10 features
     }
     if metrics_name:
-        logger.info("[METRICS] %s: %s", metrics_name, mets)
+        logger.info("[METRICS] %s: %s", metrics_name, {k: v for k, v in mets.items() if k != 'feature_importance'})
+        logger.info("[FEATURES] %s top features: %s", metrics_name, mets['feature_importance'])
 
     if threshold_label:
         thr_prob = _pick_threshold_for_target_precision(
@@ -462,14 +605,16 @@ def train_models(
     min_thresh = float(os.getenv("MIN_THRESH", "55"))
     max_thresh = float(os.getenv("MAX_THRESH", "85"))
 
-    summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "thresholds": {}}
+    summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "thresholds": {}, "feature_counts": {}}
 
     try:
         # ========== In-Play ==========
         df_ip = load_inplay_data(conn, min_minute=min_minute)
         if not df_ip.empty and len(df_ip) >= min_rows:
+            logger.info("In-Play data loaded: %d rows, %d features", len(df_ip), len(FEATURES))
             tr_mask, te_mask = time_order_split(df_ip, test_size=test_size)
             X_all = df_ip[FEATURES].values
+            summary["feature_counts"]["inplay"] = len(FEATURES)
 
             # BTTS
             ok, mets, _ = _train_binary_head(
@@ -561,8 +706,10 @@ def train_models(
         # ========== Prematch ==========
         df_pre = load_prematch_data(conn)
         if not df_pre.empty and len(df_pre) >= min_rows:
+            logger.info("Prematch data loaded: %d rows, %d features", len(df_pre), len(PRE_FEATURES))
             tr_mask, te_mask = time_order_split(df_pre, test_size=test_size)
             Xp_all = df_pre[PRE_FEATURES].values
+            summary["feature_counts"]["prematch"] = len(PRE_FEATURES)
 
             # PRE BTTS
             ok, mets, _ = _train_binary_head(
@@ -647,8 +794,13 @@ def train_models(
             "ou_lines": [float(x) for x in ou_lines],
             "min_rows": int(min_rows),
             "test_size": float(test_size),
+            "feature_counts": summary.get("feature_counts", {}),
         }
         _set_setting(conn, "model_metrics_latest", json.dumps(metrics_bundle))
+        
+        # Log feature importance summary
+        logger.info("Training completed with %d in-play features, %d prematch features", 
+                   len(FEATURES), len(PRE_FEATURES))
         return summary
 
     except Exception as e:
