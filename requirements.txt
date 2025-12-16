@@ -1,12 +1,23 @@
-Flask==3.0.3
-gunicorn==22.0.0
-requests==2.32.3
-urllib3==2.2.2
-python-dotenv==1.0.1
+# Core (essential)
+Flask==3.0.0
 psycopg2-binary==2.9.9
-apscheduler==3.10.4
-pytz==2024.1
-numpy==1.26.4
-scipy==1.12.0
-pandas==2.2.2
-scikit-learn==1.4.2
+requests==2.31.0
+
+# ML Core (minimal)
+numpy==1.26.3
+scikit-learn==1.4.0
+
+# Data processing
+pandas==2.2.0
+
+# Scheduling & time
+APScheduler==3.10.4
+python-dateutil==2.8.2
+pytz==2023.3.post1
+
+# Environment & HTTP
+python-dotenv==1.0.0
+urllib3==2.1.0
+
+# Server (for Railway/Render)
+gunicorn==21.2.0
