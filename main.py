@@ -14,7 +14,6 @@ import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
-from scipy.stats import norm, binom_test
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
