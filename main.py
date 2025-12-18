@@ -9,11 +9,12 @@ Enhanced with sophisticated features:
 - Learning system to adapt from mistakes
 """
 
-import os, json, time, logging, requests, psycopg2
+import os, json, time, math, logging, requests, psycopg2
 import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
+from scipy.stats import norm, binom_test
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify, request, abort
@@ -369,6 +370,30 @@ def calculate_elo_update(winner_rating: float, loser_rating: float, home_advanta
     # Rating change
     change = k_factor * (actual_a - expected_a)
     return change, -change
+
+def calculate_confidence_interval(successes: int, trials: int, confidence: float = 0.95) -> tuple:
+    """Calculate Wilson score interval for binomial proportion"""
+    if trials == 0:
+        return (0, 0)
+    
+    p = successes / trials
+    z = norm.ppf(1 - (1 - confidence) / 2)
+    
+    denominator = 1 + z**2 / trials
+    centre_adjusted_probability = p + z**2 / (2 * trials)
+    adjusted_standard_deviation = math.sqrt(
+        (p * (1 - p) + z**2 / (4 * trials)) / trials
+    )
+    
+    lower_bound = (
+        centre_adjusted_probability - z * adjusted_standard_deviation
+    ) / denominator
+    
+    upper_bound = (
+        centre_adjusted_probability + z * adjusted_standard_deviation
+    ) / denominator
+    
+    return (max(0, lower_bound), min(1, upper_bound))
 
 def update_team_rating(team_id: int, opponent_rating: float, result: int, is_home: bool, k_factor: float = 32.0):
     """Update team rating after a match (result: 1=win, 0.5=draw, 0=loss)"""
@@ -2067,6 +2092,612 @@ def http_settings(key: str):
     set_setting(key, str(val)); _SETTINGS_CACHE.invalidate(key); invalidate_model_caches_for_key(key)
     return jsonify({"ok": True})
 
+@app.route("/admin/diagnostics/edge-analysis", methods=["GET"])
+def edge_analysis():
+    """Comprehensive edge analysis - THE TRUTH TELLER"""
+    
+    days = int(request.args.get("days", "60"))
+    min_tips_per_scenario = int(request.args.get("min_samples", "20"))
+    
+    cutoff_ts = int(time.time()) - days * 24 * 3600
+    
+    with db_conn() as c:
+        # Get ALL tips with outcomes and odds
+        tips_data = c.execute("""
+            SELECT 
+                t.match_id,
+                t.league,
+                t.market,
+                t.suggestion,
+                t.confidence,
+                t.confidence_raw,
+                t.score_at_tip,
+                t.minute,
+                t.odds,
+                t.book,
+                t.ev_pct,
+                r.final_goals_h,
+                r.final_goals_a,
+                r.btts_yes,
+                t.created_ts
+            FROM tips t
+            LEFT JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts >= %s
+            AND t.suggestion <> 'HARVEST'
+            AND t.sent_ok = 1
+            ORDER BY t.created_ts DESC
+        """, (cutoff_ts,)).fetchall()
+    
+    if not tips_data:
+        return jsonify({"error": "No tips found in the specified period"})
+    
+    # Calculate outcomes and profits
+    analyzed_tips = []
+    total_staked = 0
+    total_return = 0
+    
+    for tip in tips_data:
+        (match_id, league, market, suggestion, confidence, confidence_raw, 
+         score_at_tip, minute, odds, book, ev_pct, final_gh, final_ga, btts, created_ts) = tip
+        
+        # Skip if no result yet
+        if final_gh is None:
+            continue
+        
+        # Determine outcome
+        result = {
+            "final_goals_h": final_gh,
+            "final_goals_a": final_ga,
+            "btts_yes": btts
+        }
+        outcome = _tip_outcome_for_result(suggestion, result)
+        
+        # Calculate profit (assuming 1 unit stake)
+        profit = 0
+        if outcome == 1 and odds:
+            profit = odds - 1  # Win: odds - stake
+        elif outcome == 0 and odds:
+            profit = -1  # Loss: lose stake
+        
+        analyzed_tips.append({
+            "match_id": match_id,
+            "league": league,
+            "market": market,
+            "suggestion": suggestion,
+            "confidence": float(confidence) if confidence else None,
+            "odds": float(odds) if odds else None,
+            "minute": minute,
+            "score_at_tip": score_at_tip,
+            "outcome": outcome,  # 1=win, 0=loss, None=push
+            "profit": profit,
+            "ev_pct": float(ev_pct) if ev_pct else None,
+            "expected_value": _ev(confidence/100.0, odds) if confidence and odds else None
+        })
+        
+        if odds:
+            total_staked += 1
+            total_return += profit
+    
+    # Calculate overall metrics
+    total_tips = len(analyzed_tips)
+    winning_tips = sum(1 for t in analyzed_tips if t["outcome"] == 1)
+    losing_tips = sum(1 for t in analyzed_tips if t["outcome"] == 0)
+    pushes = sum(1 for t in analyzed_tips if t["outcome"] is None)
+    
+    overall_roi = (total_return / total_staked * 100) if total_staked > 0 else 0
+    win_rate = (winning_tips / (winning_tips + losing_tips) * 100) if (winning_tips + losing_tips) > 0 else 0
+    
+    # 1. Analyze by MARKET
+    market_analysis = {}
+    for tip in analyzed_tips:
+        market = tip["market"]
+        if market not in market_analysis:
+            market_analysis[market] = {
+                "tips": 0, "wins": 0, "losses": 0, "pushes": 0,
+                "total_staked": 0, "total_return": 0,
+                "avg_odds": [], "avg_confidence": []
+            }
+        
+        ma = market_analysis[market]
+        ma["tips"] += 1
+        if tip["outcome"] == 1:
+            ma["wins"] += 1
+        elif tip["outcome"] == 0:
+            ma["losses"] += 1
+        else:
+            ma["pushes"] += 1
+        
+        if tip["odds"]:
+            ma["total_staked"] += 1
+            ma["total_return"] += tip["profit"]
+            ma["avg_odds"].append(tip["odds"])
+        
+        if tip["confidence"]:
+            ma["avg_confidence"].append(tip["confidence"])
+    
+    # Calculate market metrics
+    for market, data in market_analysis.items():
+        if data["total_staked"] > 0:
+            data["roi"] = (data["total_return"] / data["total_staked"] * 100)
+        else:
+            data["roi"] = 0
+        
+        if data["wins"] + data["losses"] > 0:
+            data["win_rate"] = (data["wins"] / (data["wins"] + data["losses"]) * 100)
+        else:
+            data["win_rate"] = 0
+        
+        data["avg_odds"] = sum(data["avg_odds"]) / len(data["avg_odds"]) if data["avg_odds"] else 0
+        data["avg_confidence"] = sum(data["avg_confidence"]) / len(data["avg_confidence"]) if data["avg_confidence"] else 0
+        
+        # Expected vs Actual
+        if data["tips"] >= min_tips_per_scenario:
+            implied_win_rate = (1 / data["avg_odds"]) * 100 if data["avg_odds"] else 0
+            data["edge_over_market"] = data["win_rate"] - implied_win_rate
+        else:
+            data["edge_over_market"] = None
+    
+    # 2. Analyze by SUGGESTION TYPE
+    suggestion_analysis = {}
+    for tip in analyzed_tips:
+        suggestion = tip["suggestion"]
+        if suggestion not in suggestion_analysis:
+            suggestion_analysis[suggestion] = {
+                "tips": 0, "wins": 0, "losses": 0,
+                "total_staked": 0, "total_return": 0,
+                "avg_odds": [], "avg_confidence": []
+            }
+        
+        sa = suggestion_analysis[suggestion]
+        sa["tips"] += 1
+        if tip["outcome"] == 1:
+            sa["wins"] += 1
+        elif tip["outcome"] == 0:
+            sa["losses"] += 1
+        
+        if tip["odds"]:
+            sa["total_staked"] += 1
+            sa["total_return"] += tip["profit"]
+            sa["avg_odds"].append(tip["odds"])
+        
+        if tip["confidence"]:
+            sa["avg_confidence"].append(tip["confidence"])
+    
+    # Calculate suggestion metrics
+    for suggestion, data in suggestion_analysis.items():
+        if data["total_staked"] > 0:
+            data["roi"] = (data["total_return"] / data["total_staked"] * 100)
+            data["avg_odds"] = sum(data["avg_odds"]) / len(data["avg_odds"])
+        else:
+            data["roi"] = 0
+            data["avg_odds"] = 0
+        
+        if data["wins"] + data["losses"] > 0:
+            data["win_rate"] = (data["wins"] / (data["wins"] + data["losses"]) * 100)
+        else:
+            data["win_rate"] = 0
+        
+        data["avg_confidence"] = sum(data["avg_confidence"]) / len(data["avg_confidence"]) if data["avg_confidence"] else 0
+        
+        # Statistical significance test
+        if data["tips"] >= min_tips_per_scenario:
+            # Z-test for binomial proportion
+            implied_prob = 1 / data["avg_odds"] if data["avg_odds"] > 0 else 0
+            actual_prob = data["wins"] / data["tips"]
+            n = data["tips"]
+            
+            if implied_prob > 0 and implied_prob < 1:
+                se = math.sqrt(implied_prob * (1 - implied_prob) / n)
+                z_score = (actual_prob - implied_prob) / se if se > 0 else 0
+                data["z_score"] = z_score
+                data["p_value"] = 2 * (1 - norm.cdf(abs(z_score)))  # Two-tailed test
+                data["significant"] = abs(z_score) > 1.96  # 95% confidence
+            else:
+                data["z_score"] = None
+                data["p_value"] = None
+                data["significant"] = False
+        else:
+            data["z_score"] = None
+            data["p_value"] = None
+            data["significant"] = False
+    
+    # 3. Analyze by MINUTE BUCKET
+    minute_buckets = {
+        "0-20": (0, 20),
+        "20-40": (20, 40),
+        "40-60": (40, 60),
+        "60-75": (60, 75),
+        "75+": (75, 200)
+    }
+    
+    minute_analysis = {}
+    for bucket_name, (min_start, min_end) in minute_buckets.items():
+        bucket_tips = [t for t in analyzed_tips if min_start <= t["minute"] < min_end]
+        
+        if not bucket_tips:
+            continue
+        
+        wins = sum(1 for t in bucket_tips if t["outcome"] == 1)
+        losses = sum(1 for t in bucket_tips if t["outcome"] == 0)
+        stakes = sum(1 for t in bucket_tips if t["odds"])
+        returns = sum(t["profit"] for t in bucket_tips if t["odds"])
+        
+        minute_analysis[bucket_name] = {
+            "tips": len(bucket_tips),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0,
+            "roi": (returns / stakes * 100) if stakes > 0 else 0,
+            "avg_minute": sum(t["minute"] for t in bucket_tips) / len(bucket_tips)
+        }
+    
+    # 4. Analyze by SCORE AT TIP
+    score_analysis = {}
+    for tip in analyzed_tips:
+        score = tip["score_at_tip"]
+        if score not in score_analysis:
+            score_analysis[score] = {
+                "tips": 0, "wins": 0, "losses": 0,
+                "total_staked": 0, "total_return": 0
+            }
+        
+        sa = score_analysis[score]
+        sa["tips"] += 1
+        if tip["outcome"] == 1:
+            sa["wins"] += 1
+        elif tip["outcome"] == 0:
+            sa["losses"] += 1
+        
+        if tip["odds"]:
+            sa["total_staked"] += 1
+            sa["total_return"] += tip["profit"]
+    
+    # Calculate score metrics
+    for score, data in score_analysis.items():
+        if data["total_staked"] > 0:
+            data["roi"] = (data["total_return"] / data["total_staked"] * 100)
+        else:
+            data["roi"] = 0
+        
+        if data["wins"] + data["losses"] > 0:
+            data["win_rate"] = (data["wins"] / (data["wins"] + data["losses"]) * 100)
+        else:
+            data["win_rate"] = 0
+    
+    # 5. CONFIDENCE CALIBRATION
+    confidence_buckets = {
+        "50-55": (50, 55),
+        "55-60": (55, 60),
+        "60-65": (60, 65),
+        "65-70": (65, 70),
+        "70-75": (70, 75),
+        "75-80": (75, 80),
+        "80-85": (80, 85),
+        "85-90": (85, 90),
+        "90-95": (90, 95),
+        "95-100": (95, 100)
+    }
+    
+    calibration_analysis = {}
+    for bucket_name, (conf_low, conf_high) in confidence_buckets.items():
+        bucket_tips = [t for t in analyzed_tips 
+                      if t["confidence"] and conf_low <= t["confidence"] < conf_high]
+        
+        if len(bucket_tips) < 5:  # Too few samples
+            continue
+        
+        wins = sum(1 for t in bucket_tips if t["outcome"] == 1)
+        total = len(bucket_tips)
+        
+        calibration_analysis[bucket_name] = {
+            "tips": total,
+            "expected_win_rate": (conf_low + conf_high) / 2,
+            "actual_win_rate": (wins / total * 100) if total > 0 else 0,
+            "calibration_error": ((wins / total * 100) - (conf_low + conf_high) / 2) if total > 0 else 0
+        }
+    
+    # 6. Find TOP PROFITABLE SCENARIOS (combination analysis)
+    profitable_scenarios = []
+    
+    # Define scenario combinations to analyze
+    scenarios_to_check = []
+    
+    for tip in analyzed_tips:
+        if tip["odds"] and tip["confidence"]:
+            # Create scenario key
+            scenario_key = f"{tip['market']}|{tip['suggestion']}|{tip['score_at_tip']}|{tip['minute']//10*10}"
+            scenarios_to_check.append((scenario_key, tip))
+    
+    # Group and analyze scenarios
+    scenario_groups = {}
+    for scenario_key, tip in scenarios_to_check:
+        if scenario_key not in scenario_groups:
+            scenario_groups[scenario_key] = []
+        scenario_groups[scenario_key].append(tip)
+    
+    # Calculate metrics for each scenario
+    for scenario_key, tips in scenario_groups.items():
+        if len(tips) < min_tips_per_scenario:
+            continue
+        
+        wins = sum(1 for t in tips if t["outcome"] == 1)
+        losses = sum(1 for t in tips if t["outcome"] == 0)
+        total_return = sum(t["profit"] for t in tips if t["odds"])
+        total_staked = sum(1 for t in tips if t["odds"])
+        
+        if total_staked == 0:
+            continue
+        
+        win_rate = wins / (wins + losses) * 100 if (wins + losses) > 0 else 0
+        roi = total_return / total_staked * 100
+        avg_odds = sum(t["odds"] for t in tips if t["odds"]) / total_staked
+        
+        # Calculate expected value based on average confidence
+        avg_confidence = sum(t["confidence"] for t in tips if t["confidence"]) / len(tips)
+        expected_roi = _ev(avg_confidence/100.0, avg_odds) * 100
+        
+        profitable_scenarios.append({
+            "scenario": scenario_key,
+            "market": tips[0]["market"],
+            "suggestion": tips[0]["suggestion"],
+            "score": tips[0]["score_at_tip"],
+            "minute_range": f"{tips[0]['minute']//10*10}-{tips[0]['minute']//10*10+10}",
+            "samples": len(tips),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 1),
+            "roi": round(roi, 1),
+            "avg_odds": round(avg_odds, 2),
+            "avg_confidence": round(avg_confidence, 1),
+            "expected_roi": round(expected_roi, 1),
+            "edge_actual_vs_expected": round(roi - expected_roi, 1)
+        })
+    
+    # Sort scenarios by ROI
+    profitable_scenarios.sort(key=lambda x: x["roi"], reverse=True)
+    top_scenarios = profitable_scenarios[:10]
+    worst_scenarios = profitable_scenarios[-10:] if len(profitable_scenarios) >= 10 else []
+    
+    # 7. Statistical Significance Tests
+    overall_significance = {
+        "total_tips": total_tips,
+        "winning_tips": winning_tips,
+        "losing_tips": losing_tips,
+        "win_rate": round(win_rate, 1),
+        "overall_roi": round(overall_roi, 1)
+    }
+    
+    # Test if overall ROI is statistically significant
+    if total_staked > 0:
+        # Standard error of ROI
+        roi_std = math.sqrt(abs(overall_roi/100) * (1 - abs(overall_roi/100)) / total_staked)
+        roi_z = (overall_roi/100) / roi_std if roi_std > 0 else 0
+        overall_significance["roi_z_score"] = round(roi_z, 2)
+        overall_significance["roi_p_value"] = round(2 * (1 - norm.cdf(abs(roi_z))), 4)
+        overall_significance["roi_significant"] = abs(roi_z) > 1.96
+    else:
+        overall_significance["roi_z_score"] = None
+        overall_significance["roi_p_value"] = None
+        overall_significance["roi_significant"] = False
+    
+    # Compile final report
+    report = {
+        "period_days": days,
+        "total_tips_analyzed": total_tips,
+        "overall_metrics": {
+            "win_rate": round(win_rate, 1),
+            "roi": round(overall_roi, 1),
+            "total_staked": total_staked,
+            "total_return": round(total_return, 2),
+            "profit_per_tip": round(total_return / total_staked, 3) if total_staked > 0 else 0,
+            "push_rate": round(pushes / total_tips * 100, 1) if total_tips > 0 else 0
+        },
+        "significance": overall_significance,
+        "by_market": market_analysis,
+        "by_suggestion": suggestion_analysis,
+        "by_minute": minute_analysis,
+        "by_score": score_analysis,
+        "calibration": calibration_analysis,
+        "top_profitable_scenarios": top_scenarios,
+        "worst_scenarios": worst_scenarios,
+        "diagnostic_conclusion": _generate_diagnostic_conclusion(
+            overall_roi, win_rate, total_tips, market_analysis
+        )
+    }
+    
+    return jsonify(report)
+
+def _generate_diagnostic_conclusion(roi, win_rate, total_tips, market_analysis):
+    """Generate a plain English conclusion about edge"""
+    
+    conclusions = []
+    
+    # ROI conclusion
+    if roi > 5:
+        conclusions.append(f"✅ STRONG EDGE: {roi:.1f}% ROI suggests significant profitability")
+    elif roi > 2:
+        conclusions.append(f"⚠️ MODEST EDGE: {roi:.1f}% ROI is positive but small - needs more data")
+    elif roi > 0:
+        conclusions.append(f"📊 MARGINAL EDGE: {roi:.1f}% ROI might not survive variance")
+    elif roi > -2:
+        conclusions.append(f"⚠️ NO CLEAR EDGE: {roi:.1f}% ROI suggests model is roughly break-even")
+    else:
+        conclusions.append(f"❌ NEGATIVE EDGE: {roi:.1f}% ROI suggests model is losing money")
+    
+    # Sample size warning
+    if total_tips < 100:
+        conclusions.append(f"📉 WARNING: Only {total_tips} tips analyzed - need minimum 500 for statistical confidence")
+    elif total_tips < 500:
+        conclusions.append(f"⚠️ CAUTION: {total_tips} tips analyzed - borderline for statistical significance")
+    else:
+        conclusions.append(f"📈 GOOD SAMPLE SIZE: {total_tips} tips provides reasonable confidence")
+    
+    # Market-specific insights
+    profitable_markets = [m for m, data in market_analysis.items() 
+                         if data.get("roi", 0) > 3 and data.get("tips", 0) >= 20]
+    
+    if profitable_markets:
+        conclusions.append(f"🎯 PROFITABLE MARKETS: {', '.join(profitable_markets)}")
+    
+    losing_markets = [m for m, data in market_analysis.items() 
+                     if data.get("roi", 0) < -5 and data.get("tips", 0) >= 10]
+    
+    if losing_markets:
+        conclusions.append(f"💣 LOSING MARKETS: {', '.join(losing_markets)} - consider disabling")
+    
+    # Final recommendation
+    if roi > 2 and total_tips >= 200:
+        conclusions.append("🎉 RECOMMENDATION: System shows real edge - continue with bankroll management")
+    elif roi > 0 and total_tips >= 200:
+        conclusions.append("🤔 RECOMMENDATION: Edge is marginal - optimize top scenarios, cut losers")
+    else:
+        conclusions.append("🚫 RECOMMENDATION: No clear edge found - need model improvements before real money")
+    
+    return "\n".join(conclusions)
+
+@app.route("/admin/diagnostics/monte-carlo", methods=["GET"])
+def monte_carlo_simulation():
+    """Run Monte Carlo simulations to assess bankroll risk"""
+    
+    days = int(request.args.get("days", "60"))
+    initial_bankroll = float(request.args.get("bankroll", "1000.0"))
+    stake_percent = float(request.args.get("stake_percent", "2.0"))
+    simulations = int(request.args.get("simulations", "10000"))
+    
+    cutoff_ts = int(time.time()) - days * 24 * 3600
+    
+    with db_conn() as c:
+        # Get all tips with outcomes
+        tips = c.execute("""
+            SELECT t.odds, 
+                   CASE WHEN _tip_outcome_for_result(t.suggestion, 
+                         json_build_object('final_goals_h', r.final_goals_h,
+                                          'final_goals_a', r.final_goals_a,
+                                          'btts_yes', r.btts_yes)) = 1 
+                        THEN 1 ELSE 0 END as outcome
+            FROM tips t
+            JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts >= %s
+            AND t.suggestion <> 'HARVEST'
+            AND t.odds IS NOT NULL
+            AND t.sent_ok = 1
+        """, (cutoff_ts,)).fetchall()
+    
+    if not tips:
+        return jsonify({"error": "No tips found for simulation"})
+    
+    # Extract win probabilities from historical data
+    tip_outcomes = []
+    for odds, outcome in tips:
+        if odds:
+            tip_outcomes.append({
+                "odds": float(odds),
+                "outcome": outcome,
+                "profit_if_win": float(odds) - 1,
+                "profit_if_lose": -1
+            })
+    
+    # Run Monte Carlo simulations
+    simulation_results = []
+    
+    for sim in range(simulations):
+        bankroll = initial_bankroll
+        bankroll_history = [bankroll]
+        
+        # Shuffle tip outcomes randomly
+        import random
+        shuffled_outcomes = random.sample(tip_outcomes, len(tip_outcomes))
+        
+        for tip in shuffled_outcomes:
+            # Calculate stake (percentage of current bankroll)
+            stake = bankroll * (stake_percent / 100)
+            
+            # Apply outcome
+            if tip["outcome"] == 1:
+                bankroll += stake * tip["profit_if_win"]
+            else:
+                bankroll -= stake
+            
+            bankroll_history.append(bankroll)
+            
+            # Stop if bankrupt
+            if bankroll <= 0:
+                bankroll = 0
+                break
+        
+        simulation_results.append({
+            "final_bankroll": bankroll,
+            "max_drawdown": min(bankroll_history) / initial_bankroll * 100 if bankroll_history else 0,
+            "peak": max(bankroll_history) if bankroll_history else 0,
+            "trough": min(bankroll_history) if bankroll_history else 0
+        })
+    
+    # Analyze simulation results
+    final_values = [r["final_bankroll"] for r in simulation_results]
+    max_drawdowns = [r["max_drawdown"] for r in simulation_results]
+    
+    # Calculate statistics
+    analysis = {
+        "initial_bankroll": initial_bankroll,
+        "stake_percent": stake_percent,
+        "simulations": simulations,
+        "historical_tips_used": len(tip_outcomes),
+        
+        "final_bankroll_stats": {
+            "mean": sum(final_values) / len(final_values),
+            "median": sorted(final_values)[len(final_values) // 2],
+            "std_dev": math.sqrt(sum((x - sum(final_values)/len(final_values))**2 for x in final_values) / len(final_values)),
+            "min": min(final_values),
+            "max": max(final_values),
+            "q10": sorted(final_values)[int(len(final_values) * 0.1)],
+            "q90": sorted(final_values)[int(len(final_values) * 0.9)]
+        },
+        
+        "risk_metrics": {
+            "probability_of_ruin": sum(1 for v in final_values if v <= 0) / len(final_values) * 100,
+            "probability_of_doubling": sum(1 for v in final_values if v >= initial_bankroll * 2) / len(final_values) * 100,
+            "avg_max_drawdown": sum(max_drawdowns) / len(max_drawdowns),
+            "worst_drawdown": min(max_drawdowns),
+            "sharpe_ratio": (sum(final_values)/len(final_values) - initial_bankroll) / max(0.001, math.sqrt(sum((x - sum(final_values)/len(final_values))**2 for x in final_values) / len(final_values)))
+        },
+        
+        "recommendations": _generate_risk_recommendations(
+            initial_bankroll, stake_percent, simulation_results
+        )
+    }
+    
+    return jsonify(analysis)
+
+def _generate_risk_recommendations(initial_bankroll, stake_percent, results):
+    """Generate risk management recommendations"""
+    final_values = [r["final_bankroll"] for r in results]
+    ruin_prob = sum(1 for v in final_values if v <= 0) / len(final_values) * 100
+    
+    recommendations = []
+    
+    if ruin_prob > 20:
+        recommendations.append(f"🚨 EXTREME RISK: {ruin_prob:.1f}% chance of ruin - REDUCE STAKE SIZE IMMEDIATELY")
+        recommendations.append(f"   Suggested max stake: {stake_percent/2:.1f}% (currently {stake_percent:.1f}%)")
+    elif ruin_prob > 10:
+        recommendations.append(f"⚠️ HIGH RISK: {ruin_prob:.1f}% chance of ruin - consider reducing stake size")
+    elif ruin_prob > 5:
+        recommendations.append(f"📊 MODERATE RISK: {ruin_prob:.1f}% chance of ruin - acceptable for aggressive bankroll")
+    elif ruin_prob > 1:
+        recommendations.append(f"✅ ACCEPTABLE RISK: {ruin_prob:.1f}% chance of ruin - standard for professional betting")
+    else:
+        recommendations.append(f"🎯 LOW RISK: {ruin_prob:.1f}% chance of ruin - very safe bankroll management")
+    
+    # Kelly criterion check
+    avg_return = sum(final_values) / len(final_values)
+    expected_growth = avg_return / initial_bankroll - 1
+    
+    if stake_percent > expected_growth * 100 * 2:  # More than half-Kelly
+        recommendations.append(f"📉 OVER-BETTING: Stake {stake_percent:.1f}% may be too high for expected edge")
+        optimal_stake = max(0.5, min(5.0, expected_growth * 100 * 0.5))  # Quarter-Kelly
+        recommendations.append(f"   Recommended stake: {optimal_stake:.1f}% (quarter-Kelly)")
+    
+    return recommendations
+
 @app.route("/tips/latest")
 def http_latest():
     limit=int(request.args.get("limit","50"))
@@ -2080,6 +2711,326 @@ def http_latest():
                      "score_at_tip":r[8],"minute":int(r[9]),"created_ts":int(r[10]),
                      "odds": (float(r[11]) if r[11] is not None else None), "book": r[12], "ev_pct": (float(r[13]) if r[13] is not None else None)})
     return jsonify({"ok": True, "tips": tips})
+
+@app.route("/admin/diagnostics/edge-detector", methods=["GET"])
+def real_time_edge_detector():
+    """Real-time edge detection for current matches"""
+    
+    # Get current live matches
+    live_matches = fetch_live_matches()
+    
+    edge_detections = []
+    
+    for match in live_matches:
+        fid = int((match.get("fixture", {}) or {}).get("id") or 0)
+        league_id, league = _league_name(match)
+        home, away = _teams(match)
+        score = _pretty_score(match)
+        minute = int(((match.get("fixture") or {}).get("status") or {}).get("elapsed") or 0)
+        
+        # Extract features
+        feat = extract_features(match)
+        
+        # Get market odds
+        odds_data = fetch_odds(fid)
+        
+        # Analyze each market for edge
+        market_edges = []
+        
+        # Over/Under markets
+        for line in OU_LINES:
+            mdl = _load_ou_model_for_line(line)
+            if not mdl or f"OU_{_fmt_line(line)}" not in odds_data:
+                continue
+            
+            # Our probability
+            our_prob = _score_prob(feat, mdl)
+            
+            # Market implied probability
+            market_over = odds_data[f"OU_{_fmt_line(line)}"].get("Over", {}).get("odds")
+            market_under = odds_data[f"OU_{_fmt_line(line)}"].get("Under", {}).get("odds")
+            
+            if market_over:
+                market_implied = 1 / market_over
+                edge_over = our_prob - market_implied
+                ev_over = _ev(our_prob, market_over) * 100
+                
+                if abs(edge_over) > 0.05:  # 5% edge
+                    market_edges.append({
+                        "market": f"Over {_fmt_line(line)}",
+                        "our_prob": round(our_prob * 100, 1),
+                        "market_implied": round(market_implied * 100, 1),
+                        "edge": round(edge_over * 100, 1),
+                        "ev": round(ev_over, 1),
+                        "odds": market_over,
+                        "book": odds_data[f"OU_{_fmt_line(line)}"]["Over"].get("book")
+                    })
+        
+        # 1X2 market
+        mh, md, ma = _load_wld_models()
+        if mh and ma and "1X2" in odds_data:
+            ph = _score_prob(feat, mh)
+            pa = _score_prob(feat, ma)
+            
+            # Normalize (ignore draw)
+            s = max(EPS, ph + pa)
+            ph, pa = ph/s, pa/s
+            
+            market_home = odds_data["1X2"].get("Home", {}).get("odds")
+            market_away = odds_data["1X2"].get("Away", {}).get("odds")
+            
+            if market_home:
+                market_implied_h = 1 / market_home
+                edge_h = ph - market_implied_h
+                ev_h = _ev(ph, market_home) * 100
+                
+                if abs(edge_h) > 0.05:
+                    market_edges.append({
+                        "market": "Home Win",
+                        "our_prob": round(ph * 100, 1),
+                        "market_implied": round(market_implied_h * 100, 1),
+                        "edge": round(edge_h * 100, 1),
+                        "ev": round(ev_h, 1),
+                        "odds": market_home,
+                        "book": odds_data["1X2"]["Home"].get("book")
+                    })
+        
+        # Sort by absolute edge
+        market_edges.sort(key=lambda x: abs(x["edge"]), reverse=True)
+        
+        if market_edges:
+            edge_detections.append({
+                "match": f"{home} vs {away}",
+                "league": league,
+                "minute": minute,
+                "score": score,
+                "edges": market_edges[:3]  # Top 3 edges
+            })
+    
+    return jsonify({
+        "timestamp": int(time.time()),
+        "matches_analyzed": len(live_matches),
+        "edges_found": len(edge_detections),
+        "detections": edge_detections
+    })
+
+@app.route("/admin/diagnostics/dashboard")
+def diagnostics_dashboard():
+    """HTML dashboard for visual diagnostics"""
+    
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Edge Diagnostic Dashboard</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            body { font-family: Arial; margin: 20px; }
+            .card { border: 1px solid #ddd; padding: 15px; margin: 10px; border-radius: 5px; }
+            .positive { color: green; }
+            .negative { color: red; }
+            .warning { color: orange; }
+            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 20px; }
+            button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+            .summary { background: #f5f5f5; padding: 15px; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <h1>⚡ Edge Diagnostic Dashboard</h1>
+        
+        <div class="summary">
+            <h3>Quick Actions</h3>
+            <button onclick="runEdgeAnalysis()">Run Edge Analysis</button>
+            <button onclick="runMonteCarlo()">Run Risk Simulation</button>
+            <button onclick="runRealTimeEdge()">Scan Live Edges</button>
+            <button onclick="exportData()">Export All Data</button>
+        </div>
+        
+        <div class="grid">
+            <div class="card">
+                <h3>Overall Performance</h3>
+                <div id="overall-stats">Click "Run Edge Analysis"</div>
+                <canvas id="roi-chart" width="400" height="200"></canvas>
+            </div>
+            
+            <div class="card">
+                <h3>Market Breakdown</h3>
+                <div id="market-breakdown"></div>
+                <canvas id="market-chart" width="400" height="200"></canvas>
+            </div>
+            
+            <div class="card">
+                <h3>Calibration Check</h3>
+                <div id="calibration-data"></div>
+                <canvas id="calibration-chart" width="400" height="200"></canvas>
+            </div>
+            
+            <div class="card">
+                <h3>Risk Analysis</h3>
+                <div id="risk-stats">Click "Run Risk Simulation"</div>
+                <canvas id="risk-chart" width="400" height="200"></canvas>
+            </div>
+            
+            <div class="card" style="grid-column: span 2;">
+                <h3>Top & Worst Scenarios</h3>
+                <div style="display: flex; gap: 20px;">
+                    <div style="flex: 1;">
+                        <h4>Top 5 Profitable</h4>
+                        <div id="top-scenarios"></div>
+                    </div>
+                    <div style="flex: 1;">
+                        <h4>Top 5 Losing</h4>
+                        <div id="worst-scenarios"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card" style="grid-column: span 2;">
+                <h3>Real-Time Edge Detection</h3>
+                <div id="live-edges"></div>
+                <button onclick="runRealTimeEdge()">Refresh Live Edges</button>
+            </div>
+        </div>
+        
+        <script>
+            async function runEdgeAnalysis() {
+                const response = await fetch('/admin/diagnostics/edge-analysis?days=90');
+                const data = await response.json();
+                
+                // Update overall stats
+                document.getElementById('overall-stats').innerHTML = `
+                    <p><b>Win Rate:</b> <span class="${data.overall_metrics.win_rate > 50 ? 'positive' : 'negative'}">${data.overall_metrics.win_rate}%</span></p>
+                    <p><b>ROI:</b> <span class="${data.overall_metrics.roi > 0 ? 'positive' : 'negative'}">${data.overall_metrics.roi}%</span></p>
+                    <p><b>Tips Analyzed:</b> ${data.total_tips_analyzed}</p>
+                    <p><b>Conclusion:</b> ${data.diagnostic_conclusion.split('\\n').join('<br>')}</p>
+                `;
+                
+                // Update market breakdown
+                let marketHTML = '';
+                for (const [market, stats] of Object.entries(data.by_market)) {
+                    marketHTML += `
+                        <p><b>${market}:</b> ${stats.tips} tips, 
+                        ROI: <span class="${stats.roi > 0 ? 'positive' : 'negative'}">${stats.roi?.toFixed(1) || 0}%</span>,
+                        Win Rate: ${stats.win_rate?.toFixed(1) || 0}%</p>
+                    `;
+                }
+                document.getElementById('market-breakdown').innerHTML = marketHTML;
+                
+                // Update calibration
+                let calHTML = '';
+                for (const [bucket, stats] of Object.entries(data.calibration)) {
+                    const diff = stats.calibration_error;
+                    calHTML += `
+                        <p><b>${bucket}%:</b> Expected ${stats.expected_win_rate}%, Actual ${stats.actual_win_rate}%
+                        <span class="${Math.abs(diff) < 5 ? 'positive' : 'warning'}"> (${diff > 0 ? '+' : ''}${diff.toFixed(1)}%)</span></p>
+                    `;
+                }
+                document.getElementById('calibration-data').innerHTML = calHTML;
+                
+                // Update scenarios
+                let topHTML = '';
+                data.top_profitable_scenarios.forEach(scenario => {
+                    topHTML += `<p>${scenario.scenario}: ${scenario.roi}% ROI (${scenario.samples} samples)</p>`;
+                });
+                document.getElementById('top-scenarios').innerHTML = topHTML;
+                
+                let worstHTML = '';
+                data.worst_scenarios.forEach(scenario => {
+                    worstHTML += `<p>${scenario.scenario}: ${scenario.roi}% ROI (${scenario.samples} samples)</p>`;
+                });
+                document.getElementById('worst-scenarios').innerHTML = worstHTML;
+                
+                // Create charts
+                createCharts(data);
+            }
+            
+            async function runMonteCarlo() {
+                const response = await fetch('/admin/diagnostics/monte-carlo?bankroll=1000&stake_percent=2&simulations=10000');
+                const data = await response.json();
+                
+                document.getElementById('risk-stats').innerHTML = `
+                    <p><b>Ruin Probability:</b> <span class="${data.risk_metrics.probability_of_ruin < 5 ? 'positive' : 'warning'}">${data.risk_metrics.probability_of_ruin.toFixed(1)}%</span></p>
+                    <p><b>Expected Final Bankroll:</b> $${data.final_bankroll_stats.mean.toFixed(2)}</p>
+                    <p><b>Worst Case:</b> $${data.final_bankroll_stats.min.toFixed(2)}</p>
+                    <p><b>Best Case:</b> $${data.final_bankroll_stats.max.toFixed(2)}</p>
+                    <p><b>Recommendations:</b> ${data.recommendations.join('<br>')}</p>
+                `;
+            }
+            
+            async function runRealTimeEdge() {
+                const response = await fetch('/admin/diagnostics/edge-detector');
+                const data = await response.json();
+                
+                let edgesHTML = '';
+                data.detections.forEach(detection => {
+                    edgesHTML += `<div style="border: 1px solid #ccc; padding: 10px; margin: 10px 0;">
+                        <b>${detection.match}</b> (${detection.minute}', ${detection.score})<br>`;
+                    
+                    detection.edges.forEach(edge => {
+                        edgesHTML += `
+                            ${edge.market}: Our ${edge.our_prob}% vs Market ${edge.market_implied}% 
+                            <span class="${edge.edge > 0 ? 'positive' : 'negative'}">(${edge.edge > 0 ? '+' : ''}${edge.edge}% edge)</span><br>
+                        `;
+                    });
+                    
+                    edgesHTML += '</div>';
+                });
+                
+                document.getElementById('live-edges').innerHTML = edgesHTML || 'No significant edges detected in live matches.';
+            }
+            
+            function createCharts(data) {
+                // ROI over time chart
+                const roiCtx = document.getElementById('roi-chart').getContext('2d');
+                new Chart(roiCtx, {
+                    type: 'line',
+                    data: {
+                        labels: Object.keys(data.by_market),
+                        datasets: [{
+                            label: 'ROI by Market',
+                            data: Object.values(data.by_market).map(m => m.roi || 0),
+                            borderColor: 'rgb(75, 192, 192)',
+                            backgroundColor: 'rgba(75, 192, 192, 0.2)'
+                        }]
+                    }
+                });
+                
+                // Calibration chart
+                const calCtx = document.getElementById('calibration-chart').getContext('2d');
+                const calData = Object.entries(data.calibration || {});
+                new Chart(calCtx, {
+                    type: 'scatter',
+                    data: {
+                        datasets: [{
+                            label: 'Calibration',
+                            data: calData.map(([bucket, stats]) => ({
+                                x: stats.expected_win_rate,
+                                y: stats.actual_win_rate
+                            })),
+                            borderColor: 'rgb(255, 99, 132)',
+                            backgroundColor: 'rgba(255, 99, 132, 0.5)'
+                        }]
+                    },
+                    options: {
+                        scales: {
+                            x: { title: { display: true, text: 'Expected Win Rate (%)' }},
+                            y: { title: { display: true, text: 'Actual Win Rate (%)' }}
+                        }
+                    }
+                });
+            }
+            
+            function exportData() {
+                // Implement CSV export
+                alert('Export functionality would be implemented here');
+            }
+            
+            // Run analysis on page load
+            window.onload = runEdgeAnalysis;
+        </script>
+    </body>
+    </html>
+    """
 
 @app.route("/telegram/webhook/<secret>", methods=["POST"])
 def telegram_webhook(secret: str):
