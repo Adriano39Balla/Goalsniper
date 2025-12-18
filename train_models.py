@@ -4,6 +4,7 @@ Postgres-only training with advanced features:
 - Exponential decay weighted form
 - Shot quality and efficiency metrics
 - Game state and momentum features
+- Learning system integration
 """
 
 import argparse
@@ -21,8 +22,11 @@ from sklearn.metrics import (
     log_loss,
     precision_score,
     f1_score,
+    confusion_matrix,
+    classification_report
 )
 import psycopg2
+from datetime import datetime, timedelta
 
 try:
     from dotenv import load_dotenv
@@ -421,7 +425,7 @@ def _fmt_line(line: float) -> str:
     return f"{line}".rstrip("0").rstrip(".")
 
 
-# ─────────────────────── Thresholding ─────────────────────── #
+# ─────────────────────── Thresholding with Learning Integration ─────────────────────── #
 
 def _percent(x: float) -> float:
     return float(x) * 100.0
@@ -508,7 +512,7 @@ def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray, np
     return tr, te
 
 
-# ─────────────────────── Core fit ─────────────────────── #
+# ─────────────────────── Core fit with Enhanced Metrics ─────────────────────── #
 
 def _train_binary_head(
     conn,
@@ -545,22 +549,34 @@ def _train_binary_head(
     for k in (f"model_latest:{model_key}", f"model:{model_key}"):
         _set_setting(conn, k, json.dumps(blob))
 
+    # Enhanced metrics
+    pred_binary = (p_cal >= 0.5).astype(int)
+    cm = confusion_matrix(y_te, pred_binary)
+    tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+    
     mets = {
         "brier": float(brier_score_loss(y_te, p_cal)),
-        "acc": float(accuracy_score(y_te, (p_cal >= 0.5).astype(int))),
+        "acc": float(accuracy_score(y_te, pred_binary)),
         "logloss": float(log_loss(y_te, p_cal, labels=[0, 1])),
+        "precision": float(precision_score(y_te, pred_binary, zero_division=0)),
+        "recall": float(recall_score(y_te, pred_binary, zero_division=0)),
+        "f1": float(f1_score(y_te, pred_binary, zero_division=0)),
         "n_test": int(len(y_te)),
+        "n_train": int(len(y_tr)),
         "prevalence": float(y_all.mean()),
         "n_features": len(feature_names),
+        "confusion_matrix": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
         "feature_importance": dict(sorted(
             zip(feature_names, m.coef_.ravel().tolist()),
             key=lambda x: abs(x[1]),
             reverse=True
         )[:10])  # Top 10 features
     }
+    
     if metrics_name:
-        logger.info("[METRICS] %s: %s", metrics_name, {k: v for k, v in mets.items() if k != 'feature_importance'})
-        logger.info("[FEATURES] %s top features: %s", metrics_name, mets['feature_importance'])
+        logger.info("[METRICS] %s: Accuracy=%.3f, Precision=%.3f, F1=%.3f", 
+                   metrics_name, mets["acc"], mets["precision"], mets["f1"])
+        logger.info("[FEATURES] %s top features: %s", metrics_name, list(mets['feature_importance'].keys())[:5])
 
     if threshold_label:
         thr_prob = _pick_threshold_for_target_precision(
@@ -574,7 +590,7 @@ def _train_binary_head(
     return True, mets, p_cal
 
 
-# ─────────────────────── Training entry ─────────────────────── #
+# ─────────────────────── Training entry with Learning Integration ─────────────────────── #
 
 def train_models(
     db_url: Optional[str] = None,
@@ -798,6 +814,9 @@ def train_models(
         }
         _set_setting(conn, "model_metrics_latest", json.dumps(metrics_bundle))
         
+        # Log learning system insights
+        _log_learning_insights(conn, df_ip, df_pre)
+        
         # Log feature importance summary
         logger.info("Training completed with %d in-play features, %d prematch features", 
                    len(FEATURES), len(PRE_FEATURES))
@@ -811,6 +830,47 @@ def train_models(
             conn.close()
         except Exception:
             pass
+
+
+def _log_learning_insights(conn, df_ip: pd.DataFrame, df_pre: pd.DataFrame):
+    """Log insights for the learning system"""
+    insights = []
+    
+    # Check data quality
+    if not df_ip.empty:
+        ip_features_present = sum(1 for col in FEATURES if col in df_ip.columns and df_ip[col].notna().any())
+        insights.append(f"In-play: {ip_features_present}/{len(FEATURES)} features available")
+    
+    if not df_pre.empty:
+        pre_features_present = sum(1 for col in PRE_FEATURES if col in df_pre.columns and df_pre[col].notna().any())
+        insights.append(f"Prematch: {pre_features_present}/{len(PRE_FEATURES)} features available")
+    
+    # Check feature correlations with outcomes
+    if not df_ip.empty and "label_btts" in df_ip.columns:
+        # Simple correlation check
+        numeric_cols = df_ip.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            correlations = df_ip[numeric_cols].corrwith(df_ip["label_btts"]).abs().sort_values(ascending=False)
+            top_correlated = correlations.head(5)
+            insights.append(f"Top BTTS correlations: {', '.join([f'{k}: {v:.3f}' for k, v in top_correlated.items()])}")
+    
+    # Save insights
+    if insights:
+        insight_text = "\n".join(insights)
+        logger.info("[LEARNING INSIGHTS] %s", insight_text)
+        
+        # Could save to database for the learning system
+        try:
+            _exec(conn, """
+                INSERT INTO settings(key, value) 
+                VALUES('learning_insights_latest', %s)
+                ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
+            """, (json.dumps({
+                "timestamp": datetime.utcnow().isoformat(),
+                "insights": insights
+            }),))
+        except Exception as e:
+            logger.warning("Failed to save learning insights: %s", e)
 
 
 # ─────────────────────── Settings read helper ─────────────────────── #
@@ -833,6 +893,7 @@ def _cli_main() -> None:
     ap.add_argument("--min-minute", dest="min_minute", type=int, default=int(os.getenv("TRAIN_MIN_MINUTE", 15)))
     ap.add_argument("--test-size", type=float, default=float(os.getenv("TRAIN_TEST_SIZE", 0.25)))
     ap.add_argument("--min-rows", type=int, default=int(os.getenv("MIN_ROWS", 150)))
+    ap.add_argument("--learning", action="store_true", help="Enable learning system insights")
     args = ap.parse_args()
     res = train_models(
         db_url=args.db_url or os.getenv("DATABASE_URL"),
