@@ -213,6 +213,19 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS team_ratings (
             team_id BIGINT PRIMARY KEY, rating DOUBLE PRECISION, home_rating DOUBLE PRECISION,
             away_rating DOUBLE PRECISION, matches_played INTEGER, last_updated BIGINT)""")
+        # Add table for tip outcomes (learning system)
+        c.execute("""CREATE TABLE IF NOT EXISTS tip_outcomes (
+            id SERIAL PRIMARY KEY,
+            match_id BIGINT,
+            created_ts BIGINT,
+            suggestion TEXT,
+            confidence DOUBLE PRECISION,
+            actual_result JSONB,
+            was_correct BOOLEAN,
+            recorded_ts BIGINT,
+            INDEX idx_tip_outcomes_match (match_id),
+            INDEX idx_tip_outcomes_correct (was_correct, recorded_ts)
+        )""")
         # Evolutive columns (idempotent)
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
         except: pass
@@ -251,16 +264,46 @@ def _api_get(url: str, params: dict, timeout: int = 15):
 
 # ───────── League filter ─────────
 _BLOCK_PATTERNS = ["u17","u18","u19","u20","u21","u23","youth","junior","reserve","res.","friendlies","friendly"]
+_BLOCK_TYPES = ["Youth", "Cup", "Friendlies"]  # Add league types to block
+
 def _blocked_league(league_obj: dict) -> bool:
-    name=str((league_obj or {}).get("name","")).lower()
-    country=str((league_obj or {}).get("country","")).lower()
-    typ=str((league_obj or {}).get("type","")).lower()
-    txt=f"{country} {name} {typ}"
-    if any(p in txt for p in _BLOCK_PATTERNS): return True
-    allow=[x.strip() for x in os.getenv("MOTD_LEAGUE_IDS","").split(",") if x.strip()]  # not used for live
-    deny=[x.strip() for x in os.getenv("LEAGUE_DENY_IDS","").split(",") if x.strip()]
-    lid=str((league_obj or {}).get("id") or "")
-    if lid in deny: return True
+    if not league_obj:
+        return False
+    
+    name = str(league_obj.get("name", "")).lower()
+    country = str(league_obj.get("country", "")).lower()
+    typ = str(league_obj.get("type", "")).lower()
+    
+    # Combine all text for pattern matching
+    combined_text = f"{country} {name} {typ}"
+    
+    # Check for youth/reserve patterns
+    for pattern in _BLOCK_PATTERNS:
+        if pattern in combined_text:
+            return True
+    
+    # Check league type
+    if typ in [t.lower() for t in _BLOCK_TYPES]:
+        return True
+    
+    # Check league ID in deny list
+    deny_ids = [x.strip() for x in os.getenv("LEAGUE_DENY_IDS", "").split(",") if x.strip()]
+    league_id = str(league_obj.get("id", ""))
+    if league_id in deny_ids:
+        return True
+    
+    # Additional checks for common youth league naming conventions
+    youth_indicators = [
+        ("u", 17, 23),  # u17 to u23
+        ("under", 17, 23),  # under 17 to under 23
+        ("u-", 17, 23),  # u-17 to u-23
+    ]
+    
+    for prefix, start, end in youth_indicators:
+        for age in range(start, end + 1):
+            if f"{prefix}{age}" in combined_text or f"{prefix}-{age}" in combined_text:
+                return True
+    
     return False
 
 # ───────── Live fetches ─────────
@@ -417,6 +460,157 @@ def update_ratings_from_finished_match(match_data: dict):
     # Update ratings
     update_team_rating(home_id, away_rating, home_result, is_home=True)
     update_team_rating(away_id, home_rating, away_result, is_home=False)
+
+# ───────── Learning System Functions ─────────
+
+def record_tip_outcome(match_id: int, created_ts: int, suggestion: str, confidence: float, 
+                       actual_result: dict, was_correct: bool) -> None:
+    """Record the outcome of a tip for learning purposes"""
+    with db_conn() as c:
+        c.execute("""
+            INSERT INTO tip_outcomes 
+            (match_id, created_ts, suggestion, confidence, actual_result, was_correct, recorded_ts)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (match_id, created_ts) DO UPDATE SET
+                actual_result = EXCLUDED.actual_result,
+                was_correct = EXCLUDED.was_correct,
+                recorded_ts = EXCLUDED.recorded_ts
+        """, (match_id, created_ts, suggestion, confidence, 
+              json.dumps(actual_result), was_correct, int(time.time())))
+
+def analyze_recent_mistakes(days: int = 7) -> Dict[str, Any]:
+    """Analyze recent mistakes to identify patterns"""
+    cutoff = int(time.time()) - days * 24 * 3600
+    
+    with db_conn() as c:
+        # Get mistake patterns by market
+        mistakes_by_market = c.execute("""
+            SELECT t.market, COUNT(*) as mistake_count,
+                   AVG(t.confidence) as avg_confidence,
+                   COUNT(DISTINCT t.league) as leagues_affected
+            FROM tips t
+            JOIN tip_outcomes o ON t.match_id = o.match_id AND t.created_ts = o.created_ts
+            WHERE o.was_correct = FALSE 
+                AND t.created_ts >= %s
+                AND t.suggestion != 'HARVEST'
+            GROUP BY t.market
+            HAVING COUNT(*) >= 3
+            ORDER BY mistake_count DESC
+        """, (cutoff,)).fetchall()
+        
+        # Get mistake patterns by league
+        mistakes_by_league = c.execute("""
+            SELECT t.league, t.league_id, COUNT(*) as mistake_count,
+                   AVG(t.confidence) as avg_confidence
+            FROM tips t
+            JOIN tip_outcomes o ON t.match_id = o.match_id AND t.created_ts = o.created_ts
+            WHERE o.was_correct = FALSE 
+                AND t.created_ts >= %s
+                AND t.suggestion != 'HARVEST'
+            GROUP BY t.league, t.league_id
+            HAVING COUNT(*) >= 2
+            ORDER BY mistake_count DESC
+        """, (cutoff,)).fetchall()
+        
+        # Get time-based patterns
+        time_patterns = c.execute("""
+            SELECT 
+                EXTRACT(HOUR FROM TO_TIMESTAMP(t.created_ts)) as hour,
+                COUNT(*) as mistake_count,
+                AVG(t.confidence) as avg_confidence
+            FROM tips t
+            JOIN tip_outcomes o ON t.match_id = o.match_id AND t.created_ts = o.created_ts
+            WHERE o.was_correct = FALSE 
+                AND t.created_ts >= %s
+                AND t.suggestion != 'HARVEST'
+            GROUP BY EXTRACT(HOUR FROM TO_TIMESTAMP(t.created_ts))
+            HAVING COUNT(*) >= 2
+            ORDER BY mistake_count DESC
+        """, (cutoff,)).fetchall()
+    
+    return {
+        "by_market": [
+            {
+                "market": row[0],
+                "mistake_count": row[1],
+                "avg_confidence": float(row[2]),
+                "leagues_affected": row[3]
+            }
+            for row in mistakes_by_market
+        ],
+        "by_league": [
+            {
+                "league": row[0],
+                "league_id": row[1],
+                "mistake_count": row[2],
+                "avg_confidence": float(row[3])
+            }
+            for row in mistakes_by_league
+        ],
+        "by_time": [
+            {
+                "hour": int(row[0]),
+                "mistake_count": row[1],
+                "avg_confidence": float(row[2])
+            }
+            for row in time_patterns
+        ]
+    }
+
+def adjust_thresholds_based_on_mistakes(mistake_analysis: Dict[str, Any]) -> Dict[str, float]:
+    """Adjust confidence thresholds based on mistake patterns"""
+    adjustments = {}
+    
+    # Adjust market thresholds
+    for market_data in mistake_analysis.get("by_market", []):
+        market = market_data["market"]
+        mistake_count = market_data["mistake_count"]
+        
+        if mistake_count >= 5:
+            # Increase threshold by 5-10% for problematic markets
+            increase = min(10, mistake_count * 2)
+            current_threshold = _get_market_threshold(market)
+            new_threshold = min(95, current_threshold + increase)
+            adjustments[f"conf_threshold:{market}"] = new_threshold
+    
+    # Adjust league-specific penalties
+    for league_data in mistake_analysis.get("by_league", []):
+        league_id = league_data["league_id"]
+        mistake_count = league_data["mistake_count"]
+        
+        if mistake_count >= 3:
+            # Create league-specific penalty
+            key = f"league_{league_id}_penalty"
+            penalty = min(15, mistake_count * 3)  # 3-15% penalty
+            adjustments[key] = penalty
+    
+    return adjustments
+
+def apply_mistake_learnings() -> None:
+    """Apply learned adjustments to avoid repeating mistakes"""
+    # Analyze recent mistakes
+    mistake_analysis = analyze_recent_mistakes(7)
+    
+    # Get adjustments
+    adjustments = adjust_thresholds_based_on_mistakes(mistake_analysis)
+    
+    # Apply adjustments
+    for key, value in adjustments.items():
+        set_setting(key, str(value))
+        _SETTINGS_CACHE.invalidate(key)
+    
+    # Log the adjustments
+    if adjustments:
+        log.info(f"[LEARNING] Applied adjustments: {adjustments}")
+        
+        # Send notification if significant adjustments
+        total_adjustments = len(adjustments)
+        if total_adjustments >= 2:
+            send_telegram(
+                f"📊 Learning System Update\n"
+                f"Applied {total_adjustments} adjustments based on recent patterns.\n"
+                f"Markets adjusted: {[k for k in adjustments if 'conf_threshold:' in k]}"
+            )
 
 # ───────── Prematch helpers ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
@@ -1104,6 +1298,28 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
                        "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
                        (int(mid), gh, ga, btts, int(time.time())))
         
+        # Record outcomes for tips of this match
+        with db_conn() as c3:
+            tips = c3.execute("""
+                SELECT match_id, created_ts, suggestion, confidence
+                FROM tips 
+                WHERE match_id = %s AND suggestion != 'HARVEST'
+            """, (int(mid),)).fetchall()
+            
+            for tip in tips:
+                match_id, created_ts, suggestion, confidence = tip
+                result = {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts}
+                outcome = _tip_outcome_for_result(suggestion, result)
+                if outcome is not None:
+                    record_tip_outcome(
+                        match_id=match_id,
+                        created_ts=created_ts,
+                        suggestion=suggestion,
+                        confidence=confidence,
+                        actual_result=result,
+                        was_correct=(outcome == 1)
+                    )
+        
         # Update team ratings from finished match
         try:
             update_ratings_from_finished_match(fx)
@@ -1193,8 +1409,26 @@ def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
 
 def production_scan() -> Tuple[int,int]:
     matches=fetch_live_matches(); live_seen=len(matches)
+    
+    # Apply learning adjustments before scanning
+    apply_mistake_learnings()
+    
     if live_seen==0: log.info("[PROD] no live"); return 0,0
     saved=0; now_ts=int(time.time())
+    
+    # Get league penalties
+    league_penalties = {}
+    with db_conn() as c:
+        penalty_rows = c.execute(
+            "SELECT key, value FROM settings WHERE key LIKE 'league_%_penalty'"
+        ).fetchall()
+        for key, value in penalty_rows:
+            try:
+                league_id = int(key.split('_')[1])
+                league_penalties[league_id] = float(value)
+            except:
+                pass
+    
     with db_conn() as c:
         for m in matches:
             try:
@@ -1212,6 +1446,10 @@ def production_scan() -> Tuple[int,int]:
                     except: pass
 
                 league_id, league=_league_name(m); home,away=_teams(m); score=_pretty_score(m)
+                
+                # Apply league penalty if exists
+                league_penalty = league_penalties.get(league_id, 0)
+                
                 candidates: List[Tuple[str,str,float]]=[]
 
                 # OU
@@ -1220,19 +1458,21 @@ def production_scan() -> Tuple[int,int]:
                     if not mdl: continue
                     p_over=_score_prob(feat, mdl)
                     mk=f"Over/Under {_fmt_line(line)}"; thr=_get_market_threshold(mk)
-                    if p_over*100.0 >= thr and _candidate_is_sane(f"Over {_fmt_line(line)} Goals", feat):
+                    adjusted_thr = thr + league_penalty  # Apply penalty to threshold
+                    if p_over*100.0 >= adjusted_thr and _candidate_is_sane(f"Over {_fmt_line(line)} Goals", feat):
                         candidates.append((mk, f"Over {_fmt_line(line)} Goals", p_over))
                     p_under=1.0-p_over
-                    if p_under*100.0 >= thr and _candidate_is_sane(f"Under {_fmt_line(line)} Goals", feat):
+                    if p_under*100.0 >= adjusted_thr and _candidate_is_sane(f"Under {_fmt_line(line)} Goals", feat):
                         candidates.append((mk, f"Under {_fmt_line(line)} Goals", p_under))
 
                 # BTTS
                 mdl_btts=load_model_from_settings("BTTS_YES")
                 if mdl_btts:
                     p=_score_prob(feat, mdl_btts); thr=_get_market_threshold("BTTS")
-                    if p*100.0>=thr and _candidate_is_sane("BTTS: Yes", feat): candidates.append(("BTTS","BTTS: Yes",p))
+                    adjusted_thr = thr + league_penalty  # Apply penalty to threshold
+                    if p*100.0>=adjusted_thr and _candidate_is_sane("BTTS: Yes", feat): candidates.append(("BTTS","BTTS: Yes",p))
                     q=1.0-p
-                    if q*100.0>=thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
+                    if q*100.0>=adjusted_thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
 
                 # 1X2 (no draw)
                 mh,md,ma=_load_wld_models()
@@ -1240,8 +1480,9 @@ def production_scan() -> Tuple[int,int]:
                     ph=_score_prob(feat,mh); pd=_score_prob(feat,md); pa=_score_prob(feat,ma)
                     s=max(EPS,ph+pd+pa); ph,pa=ph/s,pa/s
                     thr=_get_market_threshold("1X2")
-                    if ph*100.0>=thr: candidates.append(("1X2","Home Win",ph))
-                    if pa*100.0>=thr: candidates.append(("1X2","Away Win",pa))
+                    adjusted_thr = thr + league_penalty  # Apply penalty to threshold
+                    if ph*100.0>=adjusted_thr: candidates.append(("1X2","Home Win",ph))
+                    if pa*100.0>=adjusted_thr: candidates.append(("1X2","Away Win",pa))
 
                 candidates.sort(key=lambda x:x[2], reverse=True)
                 per_match=0; base_now=int(time.time())
@@ -1571,8 +1812,15 @@ def _start_scheduler_once():
                           CronTrigger(hour=4, minute=7, timezone=TZ_UTC),
                           id="auto_tune", max_instances=1, coalesce=True)
         sched.add_job(lambda:_run_with_pg_lock(1007,retry_unsent_tips,30,200),"interval",minutes=10,id="retry",max_instances=1,coalesce=True)
+        
+        # Add learning system job (run every 6 hours)
+        sched.add_job(
+            lambda:_run_with_pg_lock(1010, apply_mistake_learnings),
+            "interval", hours=6, id="learning", max_instances=1, coalesce=True
+        )
+        
         sched.start(); _scheduler_started=True
-        send_telegram("🚀 goalsniper ADVANCED mode (in-play + prematch) started with ELO ratings.")
+        send_telegram("🚀 goalsniper ADVANCED mode (in-play + prematch) started with ELO ratings and learning system.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
@@ -1665,6 +1913,19 @@ def http_team_rating(team_id: int):
     rating_data = get_team_rating(team_id)
     return jsonify({"ok": True, "team_id": team_id, "rating": rating_data})
 
+@app.route("/admin/learning-analysis", methods=["GET"])
+def http_learning_analysis():
+    _require_admin()
+    days = int(request.args.get("days", "7"))
+    analysis = analyze_recent_mistakes(days)
+    return jsonify({"ok": True, "analysis": analysis})
+
+@app.route("/admin/apply-learning", methods=["POST"])
+def http_apply_learning():
+    _require_admin()
+    apply_mistake_learnings()
+    return jsonify({"ok": True, "message": "Learning adjustments applied"})
+
 @app.route("/settings/<key>", methods=["GET","POST"])
 def http_settings(key: str):
     _require_admin()
@@ -1710,7 +1971,7 @@ def telegram_webhook(secret: str):
 # ───────── Boot ─────────
 def _on_boot():
     _init_pool(); init_db(); set_setting("boot_ts", str(int(time.time())))
-    log.info("✅ Advanced features enabled: ELO ratings, weighted form, shot quality metrics")
+    log.info("✅ Advanced features enabled: ELO ratings, weighted form, shot quality metrics, learning system")
 
 _on_boot()
 
