@@ -7,9 +7,10 @@ Enhanced with sophisticated features:
 - Advanced form metrics with exponential decay
 - Shot quality and efficiency metrics
 - Learning system to adapt from mistakes
+- Comprehensive edge diagnostic tools
 """
 
-import os, json, time, math, logging, requests, psycopg2
+import os, json, time, math, logging, requests, psycopg2, random
 import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
@@ -149,6 +150,98 @@ except Exception as e:
     def train_models(*args, **kwargs):  # type: ignore
         log.warning("train_models not available: %s", _IMPORT_ERR)
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
+
+# ───────── Statistical helper functions ─────────
+def norm_cdf(x: float) -> float:
+    """Normal CDF approximation using error function (no scipy dependency)"""
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+def norm_ppf(p: float) -> float:
+    """Inverse normal CDF approximation (simplified)"""
+    # Common z-scores for confidence intervals
+    if p <= 0.5:
+        return -1.96  # 2.5% tail
+    elif p >= 0.975:
+        return 1.96   # 97.5% percentile
+    elif p >= 0.95:
+        return 1.645  # 95% percentile
+    elif p >= 0.90:
+        return 1.282  # 90% percentile
+    else:
+        return 0.0
+
+def calculate_confidence_interval(successes: int, trials: int, confidence: float = 0.95) -> tuple:
+    """Calculate Wilson score interval for binomial proportion"""
+    if trials == 0:
+        return (0, 0)
+    
+    p = successes / trials
+    z = norm_ppf(1 - (1 - confidence) / 2)
+    
+    denominator = 1 + z**2 / trials
+    centre_adjusted_probability = p + z**2 / (2 * trials)
+    adjusted_standard_deviation = math.sqrt(
+        (p * (1 - p) + z**2 / (4 * trials)) / trials
+    )
+    
+    lower_bound = (
+        centre_adjusted_probability - z * adjusted_standard_deviation
+    ) / denominator
+    
+    upper_bound = (
+        centre_adjusted_probability + z * adjusted_standard_deviation
+    ) / denominator
+    
+    return (max(0, lower_bound), min(1, upper_bound))
+
+def truth_test_on_new_tip(feat: dict, suggestion: str, probability: float) -> bool:
+    """Only send tips that pass the truth test - skip historically bad scenarios"""
+    
+    minute = feat.get("minute", 0)
+    goals_sum = feat.get("goals_sum", 0)
+    
+    # Rule 1: Never bet on scenarios with historical ROI < -10%
+    scenario_key = f"{suggestion}|{goals_sum}|{minute//10*10}"
+    
+    # Check against historical performance
+    with db_conn() as c:
+        historical = c.execute("""
+            SELECT COUNT(*) as samples,
+                   SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) as wins,
+                   AVG(profit) as avg_profit
+            FROM (
+                SELECT t.suggestion,
+                       t.score_at_tip,
+                       t.minute,
+                       CASE WHEN _tip_outcome_for_result(t.suggestion, 
+                             json_build_object('final_goals_h', r.final_goals_h,
+                                              'final_goals_a', r.final_goals_a,
+                                              'btts_yes', r.btts_yes)) = 1 
+                            THEN 1 ELSE 0 END as outcome,
+                       CASE WHEN _tip_outcome_for_result(t.suggestion, 
+                             json_build_object('final_goals_h', r.final_goals_h,
+                                              'final_goals_a', r.final_goals_a,
+                                              'btts_yes', r.btts_yes)) = 1 
+                            THEN t.odds - 1 ELSE -1 END as profit
+                FROM tips t
+                JOIN match_results r ON r.match_id = t.match_id
+                WHERE t.created_ts >= %s
+                AND t.suggestion = %s
+                AND t.score_at_tip LIKE %s
+                AND ABS(t.minute - %s) <= 5
+            ) hist
+        """, (int(time.time()) - 60*24*3600, suggestion, f"{feat.get('goals_h', 0)}-{feat.get('goals_a', 0)}", minute)).fetchone()
+    
+    if historical and historical[0] >= 10:  # At least 10 samples
+        samples, wins, avg_profit = historical
+        win_rate = wins / samples * 100
+        roi = avg_profit * 100
+        
+        if roi < -15 or win_rate < 40:
+            log.warning(f"[TRUTH TEST] Skipping historically bad scenario: {scenario_key}, ROI: {roi:.1f}%")
+            return False
+    
+    return True
 
 # ───────── DB pool & helpers ─────────
 POOL: Optional[SimpleConnectionPool] = None
@@ -370,30 +463,6 @@ def calculate_elo_update(winner_rating: float, loser_rating: float, home_advanta
     change = k_factor * (actual_a - expected_a)
     return change, -change
 
-def calculate_confidence_interval(successes: int, trials: int, confidence: float = 0.95) -> tuple:
-    """Calculate Wilson score interval for binomial proportion"""
-    if trials == 0:
-        return (0, 0)
-    
-    p = successes / trials
-    z = norm.ppf(1 - (1 - confidence) / 2)
-    
-    denominator = 1 + z**2 / trials
-    centre_adjusted_probability = p + z**2 / (2 * trials)
-    adjusted_standard_deviation = math.sqrt(
-        (p * (1 - p) + z**2 / (4 * trials)) / trials
-    )
-    
-    lower_bound = (
-        centre_adjusted_probability - z * adjusted_standard_deviation
-    ) / denominator
-    
-    upper_bound = (
-        centre_adjusted_probability + z * adjusted_standard_deviation
-    ) / denominator
-    
-    return (max(0, lower_bound), min(1, upper_bound))
-
 def update_team_rating(team_id: int, opponent_rating: float, result: int, is_home: bool, k_factor: float = 32.0):
     """Update team rating after a match (result: 1=win, 0.5=draw, 0=loss)"""
     with db_conn() as c:
@@ -473,55 +542,6 @@ def get_team_rating(team_id: int) -> Dict[str, float]:
     # Update cache
     TEAM_RATINGS_CACHE[team_id] = rating_data
     return rating_data
-
-def truth_test_on_new_tip(feat: dict, suggestion: str, probability: float) -> bool:
-    """Only send tips that pass the truth test"""
-    
-    minute = feat.get("minute", 0)
-    goals_sum = feat.get("goals_sum", 0)
-    
-    # Rule 1: Never bet on scenarios with historical ROI < -10%
-    scenario_key = f"{suggestion}|{goals_sum}|{minute//10*10}"
-    
-    # Check against historical performance
-    with db_conn() as c:
-        historical = c.execute("""
-            SELECT COUNT(*) as samples,
-                   SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) as wins,
-                   AVG(profit) as avg_profit
-            FROM (
-                SELECT t.suggestion,
-                       t.score_at_tip,
-                       t.minute,
-                       CASE WHEN _tip_outcome_for_result(t.suggestion, 
-                             json_build_object('final_goals_h', r.final_goals_h,
-                                              'final_goals_a', r.final_goals_a,
-                                              'btts_yes', r.btts_yes)) = 1 
-                            THEN 1 ELSE 0 END as outcome,
-                       CASE WHEN _tip_outcome_for_result(t.suggestion, 
-                             json_build_object('final_goals_h', r.final_goals_h,
-                                              'final_goals_a', r.final_goals_a,
-                                              'btts_yes', r.btts_yes)) = 1 
-                            THEN t.odds - 1 ELSE -1 END as profit
-                FROM tips t
-                JOIN match_results r ON r.match_id = t.match_id
-                WHERE t.created_ts >= %s
-                AND t.suggestion = %s
-                AND t.score_at_tip LIKE %s
-                AND ABS(t.minute - %s) <= 5
-            ) hist
-        """, (int(time.time()) - 60*24*3600, suggestion, f"{feat.get('goals_h', 0)}-{feat.get('goals_a', 0)}", minute)).fetchone()
-    
-    if historical and historical[0] >= 10:  # At least 10 samples
-        samples, wins, avg_profit = historical
-        win_rate = wins / samples * 100
-        roi = avg_profit * 100
-        
-        if roi < -15 or win_rate < 40:
-            log.warning(f"[TRUTH TEST] Skipping historically bad scenario: {scenario_key}, ROI: {roi:.1f}%")
-            return False
-    
-    return True
 
 def update_ratings_from_finished_match(match_data: dict):
     """Update ELO ratings for both teams after a finished match"""
@@ -1390,6 +1410,11 @@ def production_scan() -> Tuple[int,int]:
                     if suggestion not in ALLOWED_SUGGESTIONS: continue
                     if per_match >= max(1,PREDICTIONS_PER_MATCH): break
 
+                    # Truth Test: Skip historically bad scenarios
+                    if not truth_test_on_new_tip(feat, suggestion, prob):
+                        log.debug(f"[TRUTH TEST] Skipping {suggestion} at {minute}' with prob {prob:.3f}")
+                        continue
+
                     # Odds/EV gate
                     pass_odds, odds, book, ev_pct = _price_gate(market_txt, suggestion, fid, prob)
                     if not pass_odds: 
@@ -1993,8 +2018,13 @@ def _start_scheduler_once():
             sched.add_job(lambda:_run_with_pg_lock(1009,detect_error_patterns,LEARNING_HISTORY_DAYS),
                           CronTrigger(hour=LEARNING_UPDATE_HOUR+1, minute=LEARNING_UPDATE_MINUTE, timezone=TZ_UTC),
                           id="error_patterns", max_instances=1, coalesce=True)
+        # Diagnostic jobs
+        sched.add_job(lambda:_run_with_pg_lock(1010,backfill_results_for_open_matches,400),
+                      CronTrigger(hour=0, minute=30, timezone=TZ_UTC),
+                      id="daily_backfill", max_instances=1, coalesce=True)
+        
         sched.start(); _scheduler_started=True
-        send_telegram("🚀 goalsniper ADVANCED mode (in-play + prematch) started with ELO ratings and Learning System.")
+        send_telegram("🚀 goalsniper ADVANCED mode (in-play + prematch) started with ELO ratings, Learning System, and Diagnostic Tools.")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
@@ -2008,7 +2038,7 @@ def _require_admin():
 
 # ───────── HTTP endpoints ─────────
 @app.route("/")
-def root(): return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI_ADVANCED", "scheduler": RUN_SCHEDULER})
+def root(): return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI_ADVANCED", "scheduler": RUN_SCHEDULER, "version": "2.0-diagnostics"})
 
 @app.route("/health")
 def health():
