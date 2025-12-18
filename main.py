@@ -222,9 +222,7 @@ def init_db():
             confidence DOUBLE PRECISION,
             actual_result JSONB,
             was_correct BOOLEAN,
-            recorded_ts BIGINT,
-            INDEX idx_tip_outcomes_match (match_id),
-            INDEX idx_tip_outcomes_correct (was_correct, recorded_ts)
+            recorded_ts BIGINT
         )""")
         # Evolutive columns (idempotent)
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
@@ -242,6 +240,9 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_prematch_by_match ON prematch_snapshots (match_id, created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_updated ON match_results (updated_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_team_ratings_updated ON team_ratings (last_updated DESC)")
+        # Create indexes for tip_outcomes table
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tip_outcomes_match ON tip_outcomes (match_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tip_outcomes_correct ON tip_outcomes (was_correct, recorded_ts)")
 
 # ───────── Telegram ─────────
 def send_telegram(text: str) -> bool:
