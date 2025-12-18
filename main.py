@@ -474,6 +474,55 @@ def get_team_rating(team_id: int) -> Dict[str, float]:
     TEAM_RATINGS_CACHE[team_id] = rating_data
     return rating_data
 
+def truth_test_on_new_tip(feat: dict, suggestion: str, probability: float) -> bool:
+    """Only send tips that pass the truth test"""
+    
+    minute = feat.get("minute", 0)
+    goals_sum = feat.get("goals_sum", 0)
+    
+    # Rule 1: Never bet on scenarios with historical ROI < -10%
+    scenario_key = f"{suggestion}|{goals_sum}|{minute//10*10}"
+    
+    # Check against historical performance
+    with db_conn() as c:
+        historical = c.execute("""
+            SELECT COUNT(*) as samples,
+                   SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) as wins,
+                   AVG(profit) as avg_profit
+            FROM (
+                SELECT t.suggestion,
+                       t.score_at_tip,
+                       t.minute,
+                       CASE WHEN _tip_outcome_for_result(t.suggestion, 
+                             json_build_object('final_goals_h', r.final_goals_h,
+                                              'final_goals_a', r.final_goals_a,
+                                              'btts_yes', r.btts_yes)) = 1 
+                            THEN 1 ELSE 0 END as outcome,
+                       CASE WHEN _tip_outcome_for_result(t.suggestion, 
+                             json_build_object('final_goals_h', r.final_goals_h,
+                                              'final_goals_a', r.final_goals_a,
+                                              'btts_yes', r.btts_yes)) = 1 
+                            THEN t.odds - 1 ELSE -1 END as profit
+                FROM tips t
+                JOIN match_results r ON r.match_id = t.match_id
+                WHERE t.created_ts >= %s
+                AND t.suggestion = %s
+                AND t.score_at_tip LIKE %s
+                AND ABS(t.minute - %s) <= 5
+            ) hist
+        """, (int(time.time()) - 60*24*3600, suggestion, f"{feat.get('goals_h', 0)}-{feat.get('goals_a', 0)}", minute)).fetchone()
+    
+    if historical and historical[0] >= 10:  # At least 10 samples
+        samples, wins, avg_profit = historical
+        win_rate = wins / samples * 100
+        roi = avg_profit * 100
+        
+        if roi < -15 or win_rate < 40:
+            log.warning(f"[TRUTH TEST] Skipping historically bad scenario: {scenario_key}, ROI: {roi:.1f}%")
+            return False
+    
+    return True
+
 def update_ratings_from_finished_match(match_data: dict):
     """Update ELO ratings for both teams after a finished match"""
     fixture = match_data.get("fixture") or {}
