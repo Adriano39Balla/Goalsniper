@@ -10,7 +10,7 @@ Enhanced with sophisticated features:
 - Comprehensive edge diagnostic tools
 """
 
-import os, json, time, math, logging, requests, psycopg2, random
+import os, json, time, math, logging, requests, psycopg2, sys
 import numpy as np
 from psycopg2.pool import SimpleConnectionPool
 from html import escape
@@ -143,12 +143,13 @@ LEARNING_PATTERNS_CACHE: Dict[str, Dict[str, Any]] = {}  # pattern_key -> patter
 LEARNING_CACHE_TTL = 3600  # 1 hour
 
 # ───────── Optional import: trainer ─────────
+TRAIN_MODELS_AVAILABLE = False
 try:
     from train_models import train_models
-    _IMPORT_ERR = None
+    TRAIN_MODELS_AVAILABLE = True
 except Exception as e:
     _IMPORT_ERR = repr(e)
-    def train_models(*args, **kwargs):  # type: ignore
+    def train_models(*args, **kwargs):
         log.warning("train_models not available: %s", _IMPORT_ERR)
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
@@ -204,7 +205,7 @@ def truth_test_on_new_tip(feat: dict, suggestion: str, probability: float) -> bo
     # Rule 1: Never bet on scenarios with historical ROI < -10%
     scenario_key = f"{suggestion}|{goals_sum}|{minute//10*10}"
     
-    # Check against historical performance - FIXED: Process outcomes in Python, not SQL
+    # Check against historical performance
     with db_conn() as c:
         # Fetch raw data and process in Python
         rows = c.execute("""
@@ -274,7 +275,7 @@ def _init_pool():
 
 def db_conn(): 
     if not POOL: _init_pool()
-    return PooledConn(POOL)  # type: ignore
+    return PooledConn(POOL)
 
 # ───────── Settings cache ─────────
 class _TTLCache:
@@ -695,7 +696,6 @@ def extract_features(m: dict) -> Dict[str,float]:
         features["shots_per_minute"] = (total_shots_h + total_shots_a) / minute
         
         # Recent momentum (last 15 minutes proxy)
-        # Note: This is simplified - ideally would track event timestamps
         features["momentum_score"] = (features["xg_per_minute"] * 0.5 + 
                                       features["sot_per_minute"] * 0.3 + 
                                       features["shots_per_minute"] * 0.2)
@@ -751,7 +751,6 @@ def extract_features(m: dict) -> Dict[str,float]:
     features["discipline_score_a"] = 1.0 / max(fouls_a + red_a * 10, 1)
     
     # 7. Cross-Feature Interactions
-    # These are often predictive as they capture non-linear relationships
     features["possession_xg_interaction_h"] = (pos_h / 100) * xg_h
     features["possession_xg_interaction_a"] = (pos_a / 100) * xg_a
     features["sot_xg_ratio_h"] = sot_h / max(xg_h, 0.1)
@@ -1231,23 +1230,55 @@ def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     return None
 
 def _tip_outcome_for_result(suggestion: str, res: Dict[str,Any]) -> Optional[int]:
-    gh=int(res.get("final_goals_h") or 0); ga=int(res.get("final_goals_a") or 0)
-    total=gh+ga; btts=int(res.get("btts_yes") or 0); s=(suggestion or "").strip()
-    if s.startswith("Over") or s.startswith("Under"):
-        line=_parse_ou_line_from_suggestion(s); 
-        if line is None: return None
-        if s.startswith("Over"):
-            if total>line: return 1
-            if abs(total-line)<1e-9: return None
-            return 0
-        else:
-            if total<line: return 1
-            if abs(total-line)<1e-9: return None
-            return 0
-    if s=="BTTS: Yes": return 1 if btts==1 else 0
-    if s=="BTTS: No":  return 1 if btts==0 else 0
-    if s=="Home Win":  return 1 if gh>ga else 0
-    if s=="Away Win":  return 1 if ga>gh else 0
+    gh=int(res.get("final_goals_h") or 0)
+    ga=int(res.get("final_goals_a") or 0)
+    total=gh+ga
+    btts=int(res.get("btts_yes") or 0)
+    s_str=(suggestion or "").strip()
+    
+    # Over/Under markets
+    if s_str.startswith("Over") or s_str.startswith("Under"):
+        # Extract line from suggestion
+        line_str = None
+        for token in s_str.split():
+            try:
+                line_str = float(token)
+                break
+            except ValueError:
+                continue
+        
+        if line_str is None:
+            return None
+        
+        line = float(line_str)
+        
+        if s_str.startswith("Over"):
+            if total > line:
+                return 1
+            elif total < line:
+                return 0
+            else:
+                return None  # Push
+        else:  # Under
+            if total < line:
+                return 1
+            elif total > line:
+                return 0
+            else:
+                return None  # Push
+    
+    # BTTS markets
+    if s_str == "BTTS: Yes":
+        return 1 if btts == 1 else 0
+    if s_str == "BTTS: No":
+        return 1 if btts == 0 else 0
+    
+    # 1X2 markets
+    if s_str == "Home Win":
+        return 1 if gh > ga else 0
+    if s_str == "Away Win":
+        return 1 if ga > gh else 0
+    
     return None
 
 def _fixture_by_id(mid: int) -> Optional[dict]:
@@ -1366,99 +1397,118 @@ def _candidate_is_sane(sug: str, feat: Dict[str,float]) -> bool:
     return True
 
 def production_scan() -> Tuple[int,int]:
-    matches=fetch_live_matches(); live_seen=len(matches)
-    if live_seen==0: log.info("[PROD] no live"); return 0,0
-    saved=0; now_ts=int(time.time())
-    with db_conn() as c:
-        for m in matches:
-            try:
-                fid=int((m.get("fixture",{}) or {}).get("id") or 0)
-                if not fid: continue
-                if DUP_COOLDOWN_MIN>0:
-                    cutoff=now_ts - DUP_COOLDOWN_MIN*60
-                    if c.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",(fid,cutoff)).fetchone(): 
-                        continue
-                feat=extract_features(m); minute=int(feat.get("minute",0))
-                if not stats_coverage_ok(feat, minute): continue
-                if minute < TIP_MIN_MINUTE: continue
-                if HARVEST_MODE and minute>=TRAIN_MIN_MINUTE and minute%3==0:
-                    try: save_snapshot_from_match(m, feat)
-                    except: pass
-
-                league_id, league=_league_name(m); home,away=_teams(m); score=_pretty_score(m)
-                candidates: List[Tuple[str,str,float]]=[]
-
-                # OU
-                for line in OU_LINES:
-                    mdl=_load_ou_model_for_line(line)
-                    if not mdl: continue
-                    p_over=_score_prob(feat, mdl)
-                    mk=f"Over/Under {_fmt_line(line)}"; thr=_get_market_threshold(mk)
-                    if p_over*100.0 >= thr and _candidate_is_sane(f"Over {_fmt_line(line)} Goals", feat):
-                        candidates.append((mk, f"Over {_fmt_line(line)} Goals", p_over))
-                    p_under=1.0-p_over
-                    if p_under*100.0 >= thr and _candidate_is_sane(f"Under {_fmt_line(line)} Goals", feat):
-                        candidates.append((mk, f"Under {_fmt_line(line)} Goals", p_under))
-
-                # BTTS
-                mdl_btts=load_model_from_settings("BTTS_YES")
-    if mdl_btts:
-        p=_score_prob(feat, mdl_btts); thr=_get_market_threshold("BTTS")
-        if p*100.0>=thr and _candidate_is_sane("BTTS: Yes", feat): candidates.append(("BTTS","BTTS: Yes",p))
-        q=1.0-p
-        if q*100.0>=thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
-
-                # 1X2 (no draw)
-                mh,md,ma=_load_wld_models()
-                if mh and md and ma:
-                    ph=_score_prob(feat,mh); pd=_score_prob(feat,md); pa=_score_prob(feat,ma)
-                    s=max(EPS,ph+pd+pa); ph,pa=ph/s,pa/s
-                    thr=_get_market_threshold("1X2")
-                    if ph*100.0>=thr: candidates.append(("1X2","Home Win",ph))
-                    if pa*100.0>=thr: candidates.append(("1X2","Away Win",pa))
-
-                candidates.sort(key=lambda x:x[2], reverse=True)
-                per_match=0; base_now=int(time.time())
-                for idx,(market_txt,suggestion,prob) in enumerate(candidates):
-                    if suggestion not in ALLOWED_SUGGESTIONS: continue
-                    if per_match >= max(1,PREDICTIONS_PER_MATCH): break
-
-                    # Truth Test: Skip historically bad scenarios
-                    if not truth_test_on_new_tip(feat, suggestion, prob):
-                        log.debug(f"[TRUTH TEST] Skipping {suggestion} at {minute}' with prob {prob:.3f}")
-                        continue
-
-                    # Odds/EV gate
-                    pass_odds, odds, book, ev_pct = _price_gate(market_txt, suggestion, fid, prob)
-                    if not pass_odds: 
-                        continue
+    try:
+        matches=fetch_live_matches()
+        live_seen=len(matches)
+        
+        if live_seen==0: 
+            log.info("[PROD] no live matches found")
+            return 0,0
+            
+        saved=0
+        now_ts=int(time.time())
+        
+        with db_conn() as c:
+            for idx, m in enumerate(matches):
+                try:
+                    # Add progress logging for large scans
+                    if idx % 10 == 0:
+                        log.info(f"[PROD] Processing match {idx+1}/{live_seen}")
                     
-                    if odds is not None:
-                        if ev_pct is not None and int(round(ev_pct * 10)) < (EDGE_MIN_BPS / 10):
+                    fid=int((m.get("fixture",{}) or {}).get("id") or 0)
+                    if not fid: continue
+                    if DUP_COOLDOWN_MIN>0:
+                        cutoff=now_ts - DUP_COOLDOWN_MIN*60
+                        if c.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s LIMIT 1",(fid,cutoff)).fetchone(): 
+                            continue
+                    feat=extract_features(m); minute=int(feat.get("minute",0))
+                    if not stats_coverage_ok(feat, minute): continue
+                    if minute < TIP_MIN_MINUTE: continue
+                    if HARVEST_MODE and minute>=TRAIN_MIN_MINUTE and minute%3==0:
+                        try: save_snapshot_from_match(m, feat)
+                        except: pass
+
+                    league_id, league=_league_name(m); home,away=_teams(m); score=_pretty_score(m)
+                    candidates: List[Tuple[str,str,float]]=[]
+
+                    # OU
+                    for line in OU_LINES:
+                        mdl=_load_ou_model_for_line(line)
+                        if not mdl: continue
+                        p_over=_score_prob(feat, mdl)
+                        mk=f"Over/Under {_fmt_line(line)}"; thr=_get_market_threshold(mk)
+                        if p_over*100.0 >= thr and _candidate_is_sane(f"Over {_fmt_line(line)} Goals", feat):
+                            candidates.append((mk, f"Over {_fmt_line(line)} Goals", p_over))
+                        p_under=1.0-p_over
+                        if p_under*100.0 >= thr and _candidate_is_sane(f"Under {_fmt_line(line)} Goals", feat):
+                            candidates.append((mk, f"Under {_fmt_line(line)} Goals", p_under))
+
+                    # BTTS
+                    mdl_btts=load_model_from_settings("BTTS_YES")
+                    if mdl_btts:
+                        p=_score_prob(feat, mdl_btts); thr=_get_market_threshold("BTTS")
+                        if p*100.0>=thr and _candidate_is_sane("BTTS: Yes", feat): 
+                            candidates.append(("BTTS","BTTS: Yes",p))
+                        q=1.0-p
+                        if q*100.0>=thr and _candidate_is_sane("BTTS: No", feat):  
+                            candidates.append(("BTTS","BTTS: No",q))
+
+                    # 1X2 (no draw)
+                    mh,md,ma=_load_wld_models()
+                    if mh and md and ma:
+                        ph=_score_prob(feat,mh); pd=_score_prob(feat,md); pa=_score_prob(feat,ma)
+                        s=max(EPS,ph+pd+pa); ph,pa=ph/s,pa/s
+                        thr=_get_market_threshold("1X2")
+                        if ph*100.0>=thr: candidates.append(("1X2","Home Win",ph))
+                        if pa*100.0>=thr: candidates.append(("1X2","Away Win",pa))
+
+                    candidates.sort(key=lambda x:x[2], reverse=True)
+                    per_match=0; base_now=int(time.time())
+                    for idx2,(market_txt,suggestion,prob) in enumerate(candidates):
+                        if suggestion not in ALLOWED_SUGGESTIONS: continue
+                        if per_match >= max(1,PREDICTIONS_PER_MATCH): break
+
+                        # Truth Test: Skip historically bad scenarios
+                        if not truth_test_on_new_tip(feat, suggestion, prob):
+                            log.debug(f"[TRUTH TEST] Skipping {suggestion} at {minute}' with prob {prob:.3f}")
                             continue
 
-                    created_ts=base_now+idx
-                    raw=float(prob); prob_pct=round(raw*100.0,1)
+                        # Odds/EV gate
+                        pass_odds, odds, book, ev_pct = _price_gate(market_txt, suggestion, fid, prob)
+                        if not pass_odds: 
+                            continue
+                        
+                        if odds is not None:
+                            if ev_pct is not None and int(round(ev_pct * 10)) < (EDGE_MIN_BPS / 10):
+                                continue
 
-                    c.execute(
-                        "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
-                        (fid,league_id,league,home,away,market_txt,suggestion,float(prob_pct),raw,score,minute,created_ts,
-                         (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None))
-                    )
+                        created_ts=base_now+idx2
+                        raw=float(prob); prob_pct=round(raw*100.0,1)
 
-                    sent=_send_tip(home,away,league,minute,score,suggestion,float(prob_pct),feat,odds,book,ev_pct)
-                    if sent:
-                        c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(fid,created_ts))
+                        c.execute(
+                            "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
+                            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                            (fid,league_id,league,home,away,market_txt,suggestion,float(prob_pct),raw,score,minute,created_ts,
+                             (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None))
+                        )
 
-                    saved+=1; per_match+=1
+                        sent=_send_tip(home,away,league,minute,score,suggestion,float(prob_pct),feat,odds,book,ev_pct)
+                        if sent:
+                            c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(fid,created_ts))
+
+                        saved+=1; per_match+=1
+                        if MAX_TIPS_PER_SCAN and saved>=MAX_TIPS_PER_SCAN: break
                     if MAX_TIPS_PER_SCAN and saved>=MAX_TIPS_PER_SCAN: break
-                if MAX_TIPS_PER_SCAN and saved>=MAX_TIPS_PER_SCAN: break
-            except Exception as e:
-                log.exception("[PROD] failure: %s", e)
-                continue
-    log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
-    return saved, live_seen
+                except Exception as e:
+                    log.exception(f"[PROD] Error processing match: {e}")
+                    continue
+                    
+        log.info(f"[PROD] completed: saved={saved}, live_seen={live_seen}")
+        return saved, live_seen
+        
+    except Exception as e:
+        log.exception(f"[PROD] Fatal error in scan: {e}")
+        return 0, 0
 
 # ───────── Prematch (compact: save-only, thresholds respected) ─────────
 def _kickoff_berlin(utc_iso: str|None) -> str:
@@ -1824,7 +1874,14 @@ def learning_system_update():
 
 # ───────── Auto-train / tune / retry ─────────
 def auto_train_job():
-    if not TRAIN_ENABLE: send_telegram("🤖 Training skipped: TRAIN_ENABLE=0"); return
+    if not TRAIN_ENABLE: 
+        send_telegram("🤖 Training skipped: TRAIN_ENABLE=0"); 
+        return
+    
+    if not TRAIN_MODELS_AVAILABLE:
+        send_telegram("⚠️ Training skipped: train_models module not available"); 
+        return
+    
     send_telegram("🤖 Training started.")
     try:
         res=train_models() or {}; ok=bool(res.get("ok"))
@@ -2051,7 +2108,15 @@ def _require_admin():
 
 # ───────── HTTP endpoints ─────────
 @app.route("/")
-def root(): return jsonify({"ok": True, "name": "goalsniper", "mode": "FULL_AI_ADVANCED", "scheduler": RUN_SCHEDULER, "version": "2.0-diagnostics"})
+def root(): 
+    return jsonify({
+        "ok": True, 
+        "name": "goalsniper", 
+        "mode": "FULL_AI_ADVANCED", 
+        "scheduler": RUN_SCHEDULER, 
+        "version": "2.0-enhanced",
+        "train_models_available": TRAIN_MODELS_AVAILABLE
+    })
 
 @app.route("/health")
 def health():
@@ -2060,45 +2125,82 @@ def health():
             n=c.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
             r=c.execute("SELECT COUNT(*) FROM team_ratings").fetchone()[0]
             p=c.execute("SELECT COUNT(*) FROM error_patterns").fetchone()[0]
-        return jsonify({"ok": True, "db": "ok", "tips_count": int(n), "team_ratings": int(r), "error_patterns": int(p)})
+        return jsonify({
+            "ok": True, 
+            "db": "ok", 
+            "tips_count": int(n), 
+            "team_ratings": int(r), 
+            "error_patterns": int(p),
+            "timestamp": int(time.time())
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/init-db", methods=["POST"])
-def http_init_db(): _require_admin(); init_db(); return jsonify({"ok": True})
+def http_init_db(): 
+    _require_admin(); 
+    init_db(); 
+    return jsonify({"ok": True})
 
 @app.route("/admin/scan", methods=["POST","GET"])
-def http_scan(): _require_admin(); s,l=production_scan(); return jsonify({"ok": True, "saved": s, "live_seen": l})
+def http_scan(): 
+    _require_admin(); 
+    s,l=production_scan(); 
+    return jsonify({"ok": True, "saved": s, "live_seen": l})
 
 @app.route("/admin/backfill-results", methods=["POST","GET"])
-def http_backfill(): _require_admin(); n=backfill_results_for_open_matches(400); return jsonify({"ok": True, "updated": n})
+def http_backfill(): 
+    _require_admin(); 
+    n=backfill_results_for_open_matches(400); 
+    return jsonify({"ok": True, "updated": n})
 
 @app.route("/admin/train", methods=["POST","GET"])
 def http_train():
     _require_admin()
-    if not TRAIN_ENABLE: return jsonify({"ok": False, "reason": "training disabled"}), 400
-    try: out=train_models(); return jsonify({"ok": True, "result": out})
+    if not TRAIN_ENABLE: 
+        return jsonify({"ok": False, "reason": "training disabled"}), 400
+    try: 
+        out=train_models(); 
+        return jsonify({"ok": True, "result": out})
     except Exception as e:
-        log.exception("train_models failed: %s", e); return jsonify({"ok": False, "error": str(e)}), 500
+        log.exception("train_models failed: %s", e); 
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/admin/train-notify", methods=["POST","GET"])
-def http_train_notify(): _require_admin(); auto_train_job(); return jsonify({"ok": True})
+def http_train_notify(): 
+    _require_admin(); 
+    auto_train_job(); 
+    return jsonify({"ok": True})
 
 @app.route("/admin/digest", methods=["POST","GET"])
-def http_digest(): _require_admin(); msg=daily_accuracy_digest(); return jsonify({"ok": True, "sent": bool(msg)})
+def http_digest(): 
+    _require_admin(); 
+    msg=daily_accuracy_digest(); 
+    return jsonify({"ok": True, "sent": bool(msg)})
 
 @app.route("/admin/auto-tune", methods=["POST","GET"])
-def http_auto_tune(): _require_admin(); tuned=auto_tune_thresholds(14); return jsonify({"ok": True, "tuned": tuned})
+def http_auto_tune(): 
+    _require_admin(); 
+    tuned=auto_tune_thresholds(14); 
+    return jsonify({"ok": True, "tuned": tuned})
 
 @app.route("/admin/retry-unsent", methods=["POST","GET"])
-def http_retry_unsent(): _require_admin(); n=retry_unsent_tips(30,200); return jsonify({"ok": True, "resent": n})
+def http_retry_unsent(): 
+    _require_admin(); 
+    n=retry_unsent_tips(30,200); 
+    return jsonify({"ok": True, "resent": n})
 
 @app.route("/admin/prematch-scan", methods=["POST","GET"])
-def http_prematch_scan(): _require_admin(); saved=prematch_scan_save(); return jsonify({"ok": True, "saved": int(saved)})
+def http_prematch_scan(): 
+    _require_admin(); 
+    saved=prematch_scan_save(); 
+    return jsonify({"ok": True, "saved": int(saved)})
 
 @app.route("/admin/motd", methods=["POST","GET"])
 def http_motd():
-    _require_admin(); ok = send_match_of_the_day(); return jsonify({"ok": bool(ok)})
+    _require_admin(); 
+    ok = send_match_of_the_day(); 
+    return jsonify({"ok": bool(ok)})
 
 @app.route("/admin/update-ratings", methods=["POST","GET"])
 def http_update_ratings():
@@ -2177,11 +2279,61 @@ def http_learning_performance():
 def http_settings(key: str):
     _require_admin()
     if request.method=="GET":
-        val=get_setting_cached(key); return jsonify({"ok": True, "key": key, "value": val})
+        val=get_setting_cached(key); 
+        return jsonify({"ok": True, "key": key, "value": val})
     val=(request.get_json(silent=True) or {}).get("value")
     if val is None: abort(400)
     set_setting(key, str(val)); _SETTINGS_CACHE.invalidate(key); invalidate_model_caches_for_key(key)
     return jsonify({"ok": True})
+
+@app.route("/admin/diagnostics/system-stats")
+def system_stats():
+    """Comprehensive system diagnostics"""
+    _require_admin()
+    
+    stats = {
+        "timestamp": int(time.time()),
+        "caches": {
+            "stats_cache_size": len(STATS_CACHE),
+            "events_cache_size": len(EVENTS_CACHE),
+            "odds_cache_size": len(ODDS_CACHE),
+            "settings_cache_size": len(_SETTINGS_CACHE.data),
+            "models_cache_size": len(_MODELS_CACHE.data),
+            "team_ratings_cache_size": len(TEAM_RATINGS_CACHE),
+        },
+        "performance": {
+            "live_matches_last_hour": 0,
+            "tips_sent_today": 0,
+        }
+    }
+    
+    # Add database stats
+    with db_conn() as c:
+        try:
+            tips_today = c.execute("""
+                SELECT COUNT(*) FROM tips 
+                WHERE created_ts >= %s AND suggestion != 'HARVEST'
+            """, (int(time.time()) - 24*3600,)).fetchone()[0]
+            stats["performance"]["tips_sent_today"] = tips_today
+            
+            db_stats = c.execute("""
+                SELECT 
+                    (SELECT COUNT(*) FROM tips) as total_tips,
+                    (SELECT COUNT(*) FROM match_results) as total_results,
+                    (SELECT COUNT(*) FROM team_ratings) as team_ratings,
+                    (SELECT COUNT(*) FROM error_patterns) as error_patterns
+            """).fetchone()
+            
+            stats["database"] = {
+                "total_tips": db_stats[0],
+                "total_results": db_stats[1],
+                "team_ratings": db_stats[2],
+                "error_patterns": db_stats[3]
+            }
+        except Exception as e:
+            stats["database_error"] = str(e)
+    
+    return jsonify({"ok": True, "stats": stats})
 
 @app.route("/admin/diagnostics/edge-analysis", methods=["GET"])
 def edge_analysis():
@@ -3156,7 +3308,9 @@ def telegram_webhook(secret: str):
 
 # ───────── Boot ─────────
 def _on_boot():
-    _init_pool(); init_db(); set_setting("boot_ts", str(int(time.time())))
+    _init_pool(); 
+    init_db(); 
+    set_setting("boot_ts", str(int(time.time())))
     log.info("✅ Advanced features enabled: ELO ratings, weighted form, shot quality metrics, Learning System")
 
 _on_boot()
