@@ -24,14 +24,8 @@ class Settings(BaseSettings):
     
     # Supabase Configuration
     SUPABASE_URL: str = Field(..., description="Supabase project URL")
-    SUPABASE_KEY: str = Field(..., description="Supabase anon key")
-    DB_HOST: str = Field(..., description="Database host")
-    DB_PORT: int = Field(default=5432, description="Database port")
-    DB_NAME: str = Field(default="postgres", description="Database name")
-    DB_USER: str = Field(default="postgres", description="Database user")
-    DB_PASSWORD: str = Field(..., description="Database password")
     
-    # Telegram Configuration
+     # Telegram Configuration
     TELEGRAM_BOT_TOKEN: str = Field(..., description="Telegram bot token")
     TELEGRAM_CHAT_ID: str = Field(..., description="Telegram chat ID")
     
@@ -63,12 +57,7 @@ class Settings(BaseSettings):
         description="Days of historical data to backfill"
     )
     
-    # API Control Configuration
-    API_HOST: str = Field(default="0.0.0.0", description="API host")
-    API_PORT: int = Field(default=8000, description="API port")
-    API_SECRET_KEY: str = Field(..., description="API authentication secret key")
-    
-    # Railway Configuration
+     # Railway Configuration
     PORT: Optional[int] = Field(default=None, description="Railway port (auto-assigned)")
     
     @validator('PORT', pre=True, always=True)
