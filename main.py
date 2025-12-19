@@ -145,6 +145,7 @@ LEARNING_CACHE_TTL = 3600  # 1 hour
 # ───────── Optional import: trainer ─────────
 try:
     from train_models import train_models
+    _IMPORT_ERR = None
 except Exception as e:
     _IMPORT_ERR = repr(e)
     def train_models(*args, **kwargs):  # type: ignore
@@ -203,38 +204,50 @@ def truth_test_on_new_tip(feat: dict, suggestion: str, probability: float) -> bo
     # Rule 1: Never bet on scenarios with historical ROI < -10%
     scenario_key = f"{suggestion}|{goals_sum}|{minute//10*10}"
     
-    # Check against historical performance
+    # Check against historical performance - FIXED: Process outcomes in Python, not SQL
     with db_conn() as c:
-        historical = c.execute("""
-            SELECT COUNT(*) as samples,
-                   SUM(CASE WHEN outcome = 1 THEN 1 ELSE 0 END) as wins,
-                   AVG(profit) as avg_profit
-            FROM (
-                SELECT t.suggestion,
-                       t.score_at_tip,
-                       t.minute,
-                       CASE WHEN _tip_outcome_for_result(t.suggestion, 
-                             json_build_object('final_goals_h', r.final_goals_h,
-                                              'final_goals_a', r.final_goals_a,
-                                              'btts_yes', r.btts_yes)) = 1 
-                            THEN 1 ELSE 0 END as outcome,
-                       CASE WHEN _tip_outcome_for_result(t.suggestion, 
-                             json_build_object('final_goals_h', r.final_goals_h,
-                                              'final_goals_a', r.final_goals_a,
-                                              'btts_yes', r.btts_yes)) = 1 
-                            THEN t.odds - 1 ELSE -1 END as profit
-                FROM tips t
-                JOIN match_results r ON r.match_id = t.match_id
-                WHERE t.created_ts >= %s
-                AND t.suggestion = %s
-                AND t.score_at_tip LIKE %s
-                AND ABS(t.minute - %s) <= 5
-            ) hist
-        """, (int(time.time()) - 60*24*3600, suggestion, f"{feat.get('goals_h', 0)}-{feat.get('goals_a', 0)}", minute)).fetchone()
+        # Fetch raw data and process in Python
+        rows = c.execute("""
+            SELECT t.suggestion, t.odds, t.score_at_tip, t.minute,
+                   r.final_goals_h, r.final_goals_a, r.btts_yes
+            FROM tips t
+            JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.created_ts >= %s
+            AND t.suggestion = %s
+            AND t.score_at_tip = %s
+            AND ABS(t.minute - %s) <= 5
+        """, (int(time.time()) - 60*24*3600, suggestion, 
+              f"{feat.get('goals_h', 0)}-{feat.get('goals_a', 0)}", minute)).fetchall()
     
-    if historical and historical[0] >= 10:  # At least 10 samples
-        samples, wins, avg_profit = historical
-        win_rate = wins / samples * 100
+    if rows and len(rows) >= 10:  # At least 10 samples
+        wins = 0
+        total_profit = 0.0
+        profit_samples = 0
+        
+        for row in rows:
+            suggestion_db, odds, score_at_tip, minute_db, final_gh, final_ga, btts = row
+            
+            # Determine outcome using Python function
+            result = {
+                "final_goals_h": final_gh,
+                "final_goals_a": final_ga,
+                "btts_yes": btts
+            }
+            outcome = _tip_outcome_for_result(suggestion_db, result)
+            
+            if outcome == 1:
+                wins += 1
+                if odds is not None:
+                    total_profit += (float(odds) - 1)
+                    profit_samples += 1
+                # If odds is None, we still count the win but can't calculate profit
+            elif outcome == 0:
+                total_profit -= 1
+                profit_samples += 1
+            # outcome is None for pushes - ignore in ROI calculation
+        
+        win_rate = wins / len(rows) * 100
+        avg_profit = total_profit / profit_samples if profit_samples > 0 else 0
         roi = avg_profit * 100
         
         if roi < -15 or win_rate < 40:
@@ -1389,11 +1402,11 @@ def production_scan() -> Tuple[int,int]:
 
                 # BTTS
                 mdl_btts=load_model_from_settings("BTTS_YES")
-                if mdl_btts:
-                    p=_score_prob(feat, mdl_btts); thr=_get_market_threshold("BTTS")
-                    if p*100.0>=thr and _candidate_is_sane("BTTS: Yes", feat): candidates.append(("BTTS","BTTS: Yes",p))
-                    q=1.0-p
-                    if q*100.0>=thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
+    if mdl_btts:
+        p=_score_prob(feat, mdl_btts); thr=_get_market_threshold("BTTS")
+        if p*100.0>=thr and _candidate_is_sane("BTTS: Yes", feat): candidates.append(("BTTS","BTTS: Yes",p))
+        q=1.0-p
+        if q*100.0>=thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
 
                 # 1X2 (no draw)
                 mh,md,ma=_load_wld_models()
@@ -2368,7 +2381,7 @@ def edge_analysis():
                 se = math.sqrt(implied_prob * (1 - implied_prob) / n)
                 z_score = (actual_prob - implied_prob) / se if se > 0 else 0
                 data["z_score"] = z_score
-                data["p_value"] = 2 * (1 - norm.cdf(abs(z_score)))  # Two-tailed test
+                data["p_value"] = 2 * (1 - norm_cdf(abs(z_score)))  # Two-tailed test
                 data["significant"] = abs(z_score) > 1.96  # 95% confidence
             else:
                 data["z_score"] = None
@@ -2551,7 +2564,7 @@ def edge_analysis():
         roi_std = math.sqrt(abs(overall_roi/100) * (1 - abs(overall_roi/100)) / total_staked)
         roi_z = (overall_roi/100) / roi_std if roi_std > 0 else 0
         overall_significance["roi_z_score"] = round(roi_z, 2)
-        overall_significance["roi_p_value"] = round(2 * (1 - norm.cdf(abs(roi_z))), 4)
+        overall_significance["roi_p_value"] = round(2 * (1 - norm_cdf(abs(roi_z))), 4)
         overall_significance["roi_significant"] = abs(roi_z) > 1.96
     else:
         overall_significance["roi_z_score"] = None
