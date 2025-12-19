@@ -11,6 +11,7 @@ fastapi
 
 # Data processing
 pandas==2.2.0
+loguru
 
 # Scheduling & time
 APScheduler==3.10.4
