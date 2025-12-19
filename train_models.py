@@ -21,10 +21,12 @@ from sklearn.metrics import (
     accuracy_score,
     log_loss,
     precision_score,
+    recall_score,
     f1_score,
     confusion_matrix,
     classification_report
 )
+from sklearn.preprocessing import StandardScaler
 import psycopg2
 from datetime import datetime, timedelta
 
@@ -611,8 +613,10 @@ def train_models(
         t = t.strip()
         if not t:
             continue
-        try: ou_lines.append(float(t))
-        except Exception: pass
+        try: 
+            ou_lines.append(float(t))
+        except Exception: 
+            pass
     if not ou_lines:
         ou_lines = [2.5, 3.5]
 
@@ -621,46 +625,82 @@ def train_models(
     min_thresh = float(os.getenv("MIN_THRESH", "55"))
     max_thresh = float(os.getenv("MAX_THRESH", "85"))
 
-    summary: Dict[str, Any] = {"ok": True, "trained": {}, "metrics": {}, "thresholds": {}, "feature_counts": {}}
+    summary: Dict[str, Any] = {
+        "ok": True, 
+        "trained": {}, 
+        "metrics": {}, 
+        "thresholds": {}, 
+        "feature_counts": {},
+        "data_stats": {}
+    }
 
     try:
         # ========== In-Play ==========
         df_ip = load_inplay_data(conn, min_minute=min_minute)
+        summary["data_stats"]["inplay_rows"] = len(df_ip)
+        summary["data_stats"]["inplay_minute_avg"] = float(df_ip["minute"].mean()) if not df_ip.empty else 0
+        
         if not df_ip.empty and len(df_ip) >= min_rows:
             logger.info("In-Play data loaded: %d rows, %d features", len(df_ip), len(FEATURES))
+            
+            # Check data quality
+            missing_features = [f for f in FEATURES if f not in df_ip.columns]
+            if missing_features:
+                logger.warning("Missing in-play features: %s", missing_features[:10])
+                for f in missing_features:
+                    df_ip[f] = 0.0
+            
             tr_mask, te_mask = time_order_split(df_ip, test_size=test_size)
-            X_all = df_ip[FEATURES].values
+            
+            # Prepare features with standardization
+            scaler = StandardScaler()
+            X_all_raw = df_ip[FEATURES].values
+            X_all_scaled = scaler.fit_transform(X_all_raw)
             summary["feature_counts"]["inplay"] = len(FEATURES)
+            summary["data_stats"]["inplay_features_non_zero"] = int((X_all_raw != 0).sum())
 
             # BTTS
+            y_btts = df_ip["label_btts"].values.astype(int)
             ok, mets, _ = _train_binary_head(
-                conn, X_all, df_ip["label_btts"].values.astype(int),
+                conn, X_all_scaled, y_btts,
                 tr_mask, te_mask, FEATURES,
                 model_key="BTTS_YES",
                 threshold_label="BTTS",
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.65, metrics_name="BTTS_YES",
+                target_precision=target_precision, 
+                min_preds=min_preds,
+                min_thresh_pct=min_thresh, 
+                max_thresh_pct=max_thresh,
+                default_thr_prob=0.65, 
+                metrics_name="BTTS_YES",
             )
             summary["trained"]["BTTS_YES"] = ok
-            if ok: summary["metrics"]["BTTS_YES"] = mets
+            if ok: 
+                summary["metrics"]["BTTS_YES"] = mets
+                summary["data_stats"]["btts_prevalence"] = float(y_btts.mean())
 
             # O/U
             totals = df_ip["final_goals_sum"].values.astype(int)
             for line in ou_lines:
                 name = f"OU_{_fmt_line(line)}"
+                y_ou = (totals > line).astype(int)
+                
                 ok, mets, _ = _train_binary_head(
-                    conn, X_all, (totals > line).astype(int),
+                    conn, X_all_scaled, y_ou,
                     tr_mask, te_mask, FEATURES,
                     model_key=name,
                     threshold_label=f"Over/Under {_fmt_line(line)}",
-                    target_precision=target_precision, min_preds=min_preds,
-                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65, metrics_name=name,
+                    target_precision=target_precision, 
+                    min_preds=min_preds,
+                    min_thresh_pct=min_thresh, 
+                    max_thresh_pct=max_thresh,
+                    default_thr_prob=0.65, 
+                    metrics_name=name,
                 )
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
+                    summary["data_stats"][f"ou_{line}_prevalence"] = float(y_ou.mean())
+                    
                     if abs(line - 2.5) < 1e-6:  # alias for serve compatibility
                         blob = _get_setting_json(conn, f"model_latest:{name}")
                         if blob is not None:
@@ -673,18 +713,26 @@ def train_models(
             y_draw = (gd == 0).astype(int)
             y_away = (gd < 0).astype(int)
 
-            ok_h, mets_h, p_h = _train_binary_head(conn, X_all, y_home, tr_mask, te_mask, FEATURES,
-                                                   "WLD_HOME", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_HOME")
-            ok_d, mets_d, p_d = _train_binary_head(conn, X_all, y_draw, tr_mask, te_mask, FEATURES,
-                                                   "WLD_DRAW", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_DRAW")
-            ok_a, mets_a, p_a = _train_binary_head(conn, X_all, y_away, tr_mask, te_mask, FEATURES,
-                                                   "WLD_AWAY", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "WLD_AWAY")
+            ok_h, mets_h, p_h = _train_binary_head(
+                conn, X_all_scaled, y_home, tr_mask, te_mask, FEATURES,
+                "WLD_HOME", None, target_precision, min_preds,
+                min_thresh, max_thresh, 0.45, "WLD_HOME"
+            )
+            ok_d, mets_d, p_d = _train_binary_head(
+                conn, X_all_scaled, y_draw, tr_mask, te_mask, FEATURES,
+                "WLD_DRAW", None, target_precision, min_preds,
+                min_thresh, max_thresh, 0.45, "WLD_DRAW"
+            )
+            ok_a, mets_a, p_a = _train_binary_head(
+                conn, X_all_scaled, y_away, tr_mask, te_mask, FEATURES,
+                "WLD_AWAY", None, target_precision, min_preds,
+                min_thresh, max_thresh, 0.45, "WLD_AWAY"
+            )
+            
             summary["trained"]["WLD_HOME"] = ok_h
             summary["trained"]["WLD_DRAW"] = ok_d
             summary["trained"]["WLD_AWAY"] = ok_a
+            
             if ok_h: summary["metrics"]["WLD_HOME"] = mets_h
             if ok_d: summary["metrics"]["WLD_DRAW"] = mets_d
             if ok_a: summary["metrics"]["WLD_AWAY"] = mets_a
@@ -706,11 +754,14 @@ def train_models(
                 y_class = np.zeros_like(gd_te, dtype=int)  # 0H/1D/2A
                 y_class[gd_te == 0] = 1
                 y_class[gd_te < 0]  = 2
+                
                 correct = (np.argmax(np.stack([phn, pdn, pan], axis=1), axis=1) == y_class).astype(int)
 
                 thr_prob = _pick_threshold_for_target_precision(
                     y_true=correct, p_cal=p_max,
-                    target_precision=target_precision, min_preds=min_preds, default_threshold=0.45,
+                    target_precision=target_precision, 
+                    min_preds=min_preds, 
+                    default_threshold=0.45,
                 )
                 thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
                 _set_setting(conn, "conf_threshold:1X2", f"{thr_pct:.2f}")
@@ -721,54 +772,84 @@ def train_models(
 
         # ========== Prematch ==========
         df_pre = load_prematch_data(conn)
+        summary["data_stats"]["prematch_rows"] = len(df_pre)
+        
         if not df_pre.empty and len(df_pre) >= min_rows:
             logger.info("Prematch data loaded: %d rows, %d features", len(df_pre), len(PRE_FEATURES))
+            
+            # Check data quality
+            missing_features = [f for f in PRE_FEATURES if f not in df_pre.columns]
+            if missing_features:
+                logger.warning("Missing prematch features: %s", missing_features[:10])
+                for f in missing_features:
+                    df_pre[f] = 0.0
+            
             tr_mask, te_mask = time_order_split(df_pre, test_size=test_size)
-            Xp_all = df_pre[PRE_FEATURES].values
+            
+            # Prepare features with standardization
+            Xp_all_raw = df_pre[PRE_FEATURES].values
+            Xp_all_scaled = scaler.fit_transform(Xp_all_raw)
             summary["feature_counts"]["prematch"] = len(PRE_FEATURES)
+            summary["data_stats"]["prematch_features_non_zero"] = int((Xp_all_raw != 0).sum())
 
             # PRE BTTS
             ok, mets, _ = _train_binary_head(
-                conn, Xp_all, df_pre["label_btts"].values.astype(int),
+                conn, Xp_all_scaled, df_pre["label_btts"].values.astype(int),
                 tr_mask, te_mask, PRE_FEATURES,
                 model_key="PRE_BTTS_YES",
                 threshold_label="PRE BTTS",
-                target_precision=target_precision, min_preds=min_preds,
-                min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                default_thr_prob=0.65, metrics_name="PRE_BTTS_YES",
+                target_precision=target_precision, 
+                min_preds=min_preds,
+                min_thresh_pct=min_thresh, 
+                max_thresh_pct=max_thresh,
+                default_thr_prob=0.65, 
+                metrics_name="PRE_BTTS_YES",
             )
             summary["trained"]["PRE_BTTS_YES"] = ok
-            if ok: summary["metrics"]["PRE_BTTS_YES"] = mets
+            if ok: 
+                summary["metrics"]["PRE_BTTS_YES"] = mets
 
             # PRE O/U
             totals = df_pre["final_goals_sum"].values.astype(int)
             for line in ou_lines:
                 name = f"PRE_OU_{_fmt_line(line)}"
+                y_ou = (totals > line).astype(int)
+                
                 ok, mets, _ = _train_binary_head(
-                    conn, Xp_all, (totals > line).astype(int),
+                    conn, Xp_all_scaled, y_ou,
                     tr_mask, te_mask, PRE_FEATURES,
                     model_key=name,
                     threshold_label=f"PRE Over/Under {_fmt_line(line)}",
-                    target_precision=target_precision, min_preds=min_preds,
-                    min_thresh_pct=min_thresh, max_thresh_pct=max_thresh,
-                    default_thr_prob=0.65, metrics_name=name,
+                    target_precision=target_precision, 
+                    min_preds=min_preds,
+                    min_thresh_pct=min_thresh, 
+                    max_thresh_pct=max_thresh,
+                    default_thr_prob=0.65, 
+                    metrics_name=name,
                 )
                 summary["trained"][name] = ok
-                if ok: summary["metrics"][name] = mets
+                if ok: 
+                    summary["metrics"][name] = mets
 
             # PRE 1X2 (HOME & AWAY; draws ignored at serving)
             gd = df_pre["final_goals_diff"].values.astype(int)
             y_home = (gd > 0).astype(int)
             y_away = (gd < 0).astype(int)
 
-            ok_h, mets_h, p_h = _train_binary_head(conn, Xp_all, y_home, tr_mask, te_mask, PRE_FEATURES,
-                                                   "PRE_WLD_HOME", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_HOME")
-            ok_a, mets_a, p_a = _train_binary_head(conn, Xp_all, y_away, tr_mask, te_mask, PRE_FEATURES,
-                                                   "PRE_WLD_AWAY", None, target_precision, min_preds,
-                                                   min_thresh, max_thresh, 0.45, "PRE_WLD_AWAY")
+            ok_h, mets_h, p_h = _train_binary_head(
+                conn, Xp_all_scaled, y_home, tr_mask, te_mask, PRE_FEATURES,
+                "PRE_WLD_HOME", None, target_precision, min_preds,
+                min_thresh, max_thresh, 0.45, "PRE_WLD_HOME"
+            )
+            ok_a, mets_a, p_a = _train_binary_head(
+                conn, Xp_all_scaled, y_away, tr_mask, te_mask, PRE_FEATURES,
+                "PRE_WLD_AWAY", None, target_precision, min_preds,
+                min_thresh, max_thresh, 0.45, "PRE_WLD_AWAY"
+            )
+            
             summary["trained"]["PRE_WLD_HOME"] = ok_h
             summary["trained"]["PRE_WLD_AWAY"] = ok_a
+            
             if ok_h: summary["metrics"]["PRE_WLD_HOME"] = mets_h
             if ok_a: summary["metrics"]["PRE_WLD_AWAY"] = mets_a
 
@@ -784,13 +865,17 @@ def train_models(
                 phn, pan = p_h_safe / ps, p_a_safe / ps
                 p_max = np.maximum(phn, pan)
                 gd_te = gd[te_mask]
+                
                 y_class = np.where(gd_te > 0, 0, np.where(gd_te < 0, 1, -1))
                 mask = (y_class != -1)
+                
                 if mask.any():
                     correct = (np.argmax(np.stack([phn, pan], axis=1), axis=1)[mask] == y_class[mask]).astype(int)
                     thr_prob = _pick_threshold_for_target_precision(
                         y_true=correct, p_cal=p_max[mask],
-                        target_precision=target_precision, min_preds=min_preds, default_threshold=0.45,
+                        target_precision=target_precision, 
+                        min_preds=min_preds, 
+                        default_threshold=0.45,
                     )
                     thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
                     _set_setting(conn, "conf_threshold:PRE 1X2", f"{thr_pct:.2f}")
@@ -811,6 +896,7 @@ def train_models(
             "min_rows": int(min_rows),
             "test_size": float(test_size),
             "feature_counts": summary.get("feature_counts", {}),
+            "data_stats": summary.get("data_stats", {}),
         }
         _set_setting(conn, "model_metrics_latest", json.dumps(metrics_bundle))
         
@@ -820,6 +906,11 @@ def train_models(
         # Log feature importance summary
         logger.info("Training completed with %d in-play features, %d prematch features", 
                    len(FEATURES), len(PRE_FEATURES))
+        
+        # Log summary
+        logger.info("Trained models: %s", [k for k, v in summary["trained"].items() if v])
+        logger.info("Data stats: %s", summary["data_stats"])
+        
         return summary
 
     except Exception as e:
