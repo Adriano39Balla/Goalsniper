@@ -2,16 +2,27 @@
 Flask==3.0.0
 psycopg2-binary==2.9.9
 requests==2.31.0
+jsonschema
+numba
 
 # ML Core (minimal)
 numpy==1.26.3
 scikit-learn==1.4.0
 fastapi 
+xgboost
+lightgbm
+catboost
+scipy
+statsmodels
 
 
 # Data processing
 pandas==2.2.0
 loguru
+pydantic
+pydantic-settings
+httpx
+aiohttp
 
 # Scheduling & time
 APScheduler==3.10.4
