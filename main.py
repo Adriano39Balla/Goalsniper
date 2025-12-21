@@ -197,65 +197,97 @@ def calculate_confidence_interval(successes: int, trials: int, confidence: float
     return (max(0, lower_bound), min(1, upper_bound))
 
 def truth_test_on_new_tip(feat: dict, suggestion: str, probability: float) -> bool:
-    """Only send tips that pass the truth test - skip historically bad scenarios"""
+    """STRICT truth test using learned patterns - blocks known bad scenarios"""
     
     minute = feat.get("minute", 0)
     goals_sum = feat.get("goals_sum", 0)
+    goals_h = feat.get("goals_h", 0)
+    goals_a = feat.get("goals_a", 0)
     
-    # Rule 1: Never bet on scenarios with historical ROI < -10%
-    scenario_key = f"{suggestion}|{goals_sum}|{minute//10*10}"
+    # Create scenario keys at different granularities
+    scenario_keys = [
+        f"{suggestion}|{goals_h}-{goals_a}|{minute//5*5}",      # Every 5 minutes
+        f"{suggestion}|{goals_sum}|{minute//15*15}",            # Every 15 minutes  
+        f"{suggestion}|{goals_sum}",                            # Just score total
+        f"{suggestion}",                                         # Just suggestion type
+    ]
     
-    # Check against historical performance
     with db_conn() as c:
-        # Fetch raw data and process in Python
-        rows = c.execute("""
-            SELECT t.suggestion, t.odds, t.score_at_tip, t.minute,
-                   r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM tips t
-            JOIN match_results r ON r.match_id = t.match_id
-            WHERE t.created_ts >= %s
-            AND t.suggestion = %s
-            AND t.score_at_tip = %s
-            AND ABS(t.minute - %s) <= 5
-        """, (int(time.time()) - 60*24*3600, suggestion, 
-              f"{feat.get('goals_h', 0)}-{feat.get('goals_a', 0)}", minute)).fetchall()
+        # Check against learned error patterns (FAST - uses pre-computed table)
+        for key in scenario_keys:
+            pattern = c.execute("""
+                SELECT error_rate, samples_count, corrective_action 
+                FROM error_patterns 
+                WHERE pattern_key = %s 
+                AND samples_count >= 10 
+                AND last_detected_ts >= %s
+                LIMIT 1
+            """, (key, int(time.time()) - 7*24*3600)).fetchone()
+            
+            if pattern:
+                error_rate, samples, action = pattern
+                accuracy = (1 - error_rate) * 100
+                
+                # BLOCK if accuracy < 55% with decent sample size
+                if accuracy < 55 and samples >= 15:
+                    log.warning(f"[LEARNING] Blocking {suggestion}: {key} accuracy={accuracy:.1f}% ({samples} samples)")
+                    return False
+                
+                # WARN but allow if accuracy < 60%
+                if accuracy < 60 and samples >= 20:
+                    log.info(f"[LEARNING] Warning: {suggestion}: {key} accuracy={accuracy:.1f}%")
     
-    if rows and len(rows) >= 10:  # At least 10 samples
-        wins = 0
-        total_profit = 0.0
-        profit_samples = 0
+    # Additional smart filters based on game state
+    if suggestion.startswith("Over"):
+        line = float(suggestion.split()[1])
         
-        for row in rows:
-            suggestion_db, odds, score_at_tip, minute_db, final_gh, final_ga, btts = row
-            
-            # Determine outcome using Python function
-            result = {
-                "final_goals_h": final_gh,
-                "final_goals_a": final_ga,
-                "btts_yes": btts
-            }
-            outcome = _tip_outcome_for_result(suggestion_db, result)
-            
-            if outcome == 1:
-                wins += 1
-                if odds is not None:
-                    total_profit += (float(odds) - 1)
-                    profit_samples += 1
-                # If odds is None, we still count the win but can't calculate profit
-            elif outcome == 0:
-                total_profit -= 1
-                profit_samples += 1
-            # outcome is None for pushes - ignore in ROI calculation
+        # BLOCK: Over 2.5 when it's 0-0 after 60' and xG is low
+        if minute > 60 and goals_sum == 0 and feat.get("xg_sum", 0) < 1.0:
+            if line >= 2.5:
+                log.debug(f"[LEARNING] Block Over {line}: 0-0 after 60', low xG")
+                return False
         
-        win_rate = wins / len(rows) * 100
-        avg_profit = total_profit / profit_samples if profit_samples > 0 else 0
-        roi = avg_profit * 100
+        # BLOCK: Over 3.5 when score is 1-0 after 75'
+        if minute > 75 and goals_sum == 1 and line >= 3.5:
+            log.debug(f"[LEARNING] Block Over {line}: only 1 goal after 75'")
+            return False
+    
+    elif suggestion.startswith("Under"):
+        line = float(suggestion.split()[1])
         
-        if roi < -15 or win_rate < 40:
-            log.warning(f"[TRUTH TEST] Skipping historically bad scenario: {scenario_key}, ROI: {roi:.1f}%")
+        # BLOCK: Under 2.5 when it's 2-0 before 30'
+        if minute < 30 and goals_sum >= 2 and line <= 2.5:
+            log.debug(f"[LEARNING] Block Under {line}: {goals_h}-{goals_a} before 30'")
+            return False
+        
+        # BLOCK: Under 1.5 when it's already 1-0
+        if goals_sum >= 1 and line <= 1.5:
+            log.debug(f"[LEARNING] Block Under {line}: already {goals_h}-{goals_a}")
+            return False
+    
+    elif "BTTS: Yes" in suggestion:
+        # BLOCK: BTTS Yes when it's 0-0 after 70'
+        if minute > 70 and goals_sum == 0:
+            log.debug(f"[LEARNING] Block BTTS Yes: 0-0 after 70'")
+            return False
+    
+    elif "BTTS: No" in suggestion:
+        # BLOCK: BTTS No when it's already 1-1
+        if goals_h >= 1 and goals_a >= 1:
+            log.debug(f"[LEARNING] Block BTTS No: already {goals_h}-{goals_a}")
             return False
     
     return True
+
+def _min_odds_for_suggestion(suggestion: str) -> float:
+    """Get minimum odds for a specific suggestion type"""
+    if suggestion.startswith("Over") or suggestion.startswith("Under"):
+        return MIN_ODDS_OU
+    elif "BTTS" in suggestion:
+        return MIN_ODDS_BTTS
+    elif "Win" in suggestion:
+        return MIN_ODDS_1X2
+    return 1.30
 
 # ───────── DB pool & helpers ─────────
 POOL: Optional[SimpleConnectionPool] = None
@@ -1601,7 +1633,7 @@ def prematch_scan_save() -> int:
 
 # ───────── Learning System to Adapt from Mistakes ─────────
 def detect_error_patterns(days: int = LEARNING_HISTORY_DAYS) -> Dict[str, Any]:
-    """Analyze past mistakes to detect patterns and suggest corrections"""
+    """AGGRESSIVE pattern detection - finds more actionable insights"""
     if not LEARNING_ENABLE:
         return {"enabled": False, "patterns": []}
     
@@ -1609,198 +1641,306 @@ def detect_error_patterns(days: int = LEARNING_HISTORY_DAYS) -> Dict[str, Any]:
     patterns = []
     
     with db_conn() as c:
-        # Analyze by market type
+        # Get ALL tips with outcomes
         rows = c.execute("""
-            SELECT t.market, t.suggestion, t.confidence, t.confidence_raw, 
+            SELECT t.match_id, t.market, t.suggestion, t.confidence, t.confidence_raw,
+                   t.score_at_tip, t.minute, t.odds, t.created_ts,
                    r.final_goals_h, r.final_goals_a, r.btts_yes,
-                   t.created_ts, t.league_id, t.league
+                   t.league, t.league_id
             FROM tips t 
             JOIN match_results r ON r.match_id = t.match_id
-            WHERE t.created_ts >= %s AND t.suggestion <> 'HARVEST' 
+            WHERE t.created_ts >= %s 
+            AND t.suggestion <> 'HARVEST'
+            AND t.sent_ok = 1
             ORDER BY t.created_ts DESC
-            LIMIT 1000
         """, (cutoff,)).fetchall()
     
     if not rows:
         return {"patterns": [], "total_samples": 0}
     
-    # Group by market and analyze
-    by_market = {}
-    for row in rows:
-        market = row[0] or "Unknown"
-        if market not in by_market:
-            by_market[market] = {"total": 0, "correct": 0, "samples": []}
-        
-        suggestion = row[1]
-        outcome = _tip_outcome_for_result(suggestion, {
-            "final_goals_h": row[4],
-            "final_goals_a": row[5],
-            "btts_yes": row[6]
-        })
-        
-        by_market[market]["total"] += 1
-        if outcome == 1:
-            by_market[market]["correct"] += 1
-        by_market[market]["samples"].append({
-            "suggestion": suggestion,
-            "confidence": row[2],
-            "outcome": outcome,
-            "league": row[9]
-        })
+    # Group by SCENARIO (not just market)
+    scenarios = {}
     
-    # Detect patterns
-    for market, data in by_market.items():
-        if data["total"] < LEARNING_MIN_SAMPLES:
+    for row in rows:
+        match_id, market, suggestion, confidence, conf_raw, score, minute, odds, created_ts, gh, ga, btts, league, league_id = row
+        
+        # Create scenario key at different levels
+        base_key = f"{suggestion}"
+        detailed_key = f"{suggestion}|{score}|{minute//10*10}"  # Every 10 minutes
+        league_key = f"{suggestion}|{league_id}"
+        
+        # Calculate outcome
+        outcome = _tip_outcome_for_result(suggestion, {
+            "final_goals_h": gh,
+            "final_goals_a": ga,
+            "btts_yes": btts
+        })
+        
+        if outcome is None:  # Push
             continue
         
-        accuracy = data["correct"] / data["total"]
-        avg_confidence = sum(s["confidence"] for s in data["samples"]) / data["total"]
+        # Track all scenario levels
+        for key in [base_key, detailed_key, league_key]:
+            if key not in scenarios:
+                scenarios[key] = {
+                    "wins": 0, "losses": 0, "pushes": 0,
+                    "total_odds": 0.0, "odds_count": 0,
+                    "total_confidence": 0.0, "confidence_count": 0,
+                    "samples": []
+                }
+            
+            s = scenarios[key]
+            if outcome == 1:
+                s["wins"] += 1
+            else:
+                s["losses"] += 1
+            
+            if odds:
+                s["total_odds"] += float(odds)
+                s["odds_count"] += 1
+            
+            if confidence:
+                s["total_confidence"] += float(confidence)
+                s["confidence_count"] += 1
+            
+            s["samples"].append({
+                "match_id": match_id,
+                "outcome": outcome,
+                "odds": float(odds) if odds else None,
+                "confidence": float(confidence) if confidence else None,
+                "minute": minute,
+                "score": score,
+                "league": league
+            })
+    
+    # Analyze each scenario
+    for scenario_key, data in scenarios.items():
+        total = data["wins"] + data["losses"]
+        if total < LEARNING_MIN_SAMPLES:
+            continue
         
-        # Pattern 1: Overconfidence in certain markets
-        if avg_confidence > 75 and accuracy < 0.5:
+        win_rate = data["wins"] / total * 100
+        avg_odds = data["total_odds"] / data["odds_count"] if data["odds_count"] > 0 else 0
+        avg_confidence = data["total_confidence"] / data["confidence_count"] if data["confidence_count"] > 0 else 0
+        
+        # Calculate ROI
+        total_profit = 0.0
+        profitable_samples = 0
+        for sample in data["samples"]:
+            if sample["odds"]:
+                if sample["outcome"] == 1:
+                    total_profit += sample["odds"] - 1
+                else:
+                    total_profit -= 1
+                profitable_samples += 1
+        
+        roi = (total_profit / profitable_samples * 100) if profitable_samples > 0 else 0
+        
+        # PATTERN 1: High confidence but low accuracy (OVERCONFIDENCE)
+        if avg_confidence > 70 and win_rate < 60:
             patterns.append({
                 "type": "overconfidence",
-                "market": market,
+                "key": scenario_key,
+                "win_rate": win_rate,
                 "avg_confidence": avg_confidence,
-                "accuracy": accuracy,
-                "samples": data["total"],
-                "suggestion": f"Consider lowering confidence threshold for {market} from current {_get_market_threshold(market):.1f}%"
+                "samples": total,
+                "roi": roi,
+                "action": f"Increase threshold or avoid {scenario_key}"
             })
         
-        # Pattern 2: League-specific issues
-        league_stats = {}
-        for sample in data["samples"]:
-            league = sample["league"]
-            if league not in league_stats:
-                league_stats[league] = {"total": 0, "correct": 0}
-            league_stats[league]["total"] += 1
-            if sample["outcome"] == 1:
-                league_stats[league]["correct"] += 1
+        # PATTERN 2: Consistently losing ROI (MONEY BURNER)
+        if roi < -10 and total >= 20:
+            patterns.append({
+                "type": "money_burner",
+                "key": scenario_key,
+                "win_rate": win_rate,
+                "roi": roi,
+                "samples": total,
+                "action": f"BLOCK {scenario_key} (ROI: {roi:.1f}%)"
+            })
         
-        for league, stats in league_stats.items():
-            if stats["total"] >= 10:
-                league_acc = stats["correct"] / stats["total"]
-                if league_acc < 0.4:  # Poor performance in this league
-                    patterns.append({
-                        "type": "league_specific",
-                        "market": market,
-                        "league": league,
-                        "accuracy": league_acc,
-                        "samples": stats["total"],
-                        "suggestion": f"Avoid {market} tips in {league} (accuracy: {league_acc:.1%})"
-                    })
-        
-        # Pattern 3: Suggestion type issues
-        suggestion_stats = {}
-        for sample in data["samples"]:
-            sugg = sample["suggestion"]
-            if sugg not in suggestion_stats:
-                suggestion_stats[sugg] = {"total": 0, "correct": 0}
-            suggestion_stats[sugg]["total"] += 1
-            if sample["outcome"] == 1:
-                suggestion_stats[sugg]["correct"] += 1
-        
-        for sugg, stats in suggestion_stats.items():
-            if stats["total"] >= 5:
-                sugg_acc = stats["correct"] / stats["total"]
-                if sugg_acc < 0.4:
-                    patterns.append({
-                        "type": "suggestion_specific",
-                        "market": market,
-                        "suggestion": sugg,
-                        "accuracy": sugg_acc,
-                        "samples": stats["total"],
-                        "suggestion_text": f"Avoid {sugg} in {market} market (accuracy: {sugg_acc:.1%})"
-                    })
+        # PATTERN 3: High variance (unreliable)
+        outcomes = [s["outcome"] for s in data["samples"]]
+        if len(outcomes) >= 10:
+            win_streak = max_streak = current = 0
+            for o in outcomes:
+                if o == 1:
+                    current += 1
+                    win_streak = max(win_streak, current)
+                else:
+                    current = 0
+            
+            loss_streak = max_streak_loss = current = 0
+            for o in outcomes:
+                if o == 0:
+                    current += 1
+                    loss_streak = max(loss_streak, current)
+                else:
+                    current = 0
+            
+            if win_streak >= 5 or loss_streak >= 5:
+                patterns.append({
+                    "type": "high_variance",
+                    "key": scenario_key,
+                    "win_streak": win_streak,
+                    "loss_streak": loss_streak,
+                    "win_rate": win_rate,
+                    "samples": total,
+                    "action": f"High variance in {scenario_key} - use with caution"
+                })
     
-    # Save detected patterns to database
+    # Save patterns to database with CLEAR corrective actions
     now = int(time.time())
     for pattern in patterns:
+        error_rate = 1 - (pattern["win_rate"] / 100)
+        
         with db_conn() as c:
             c.execute("""
                 INSERT INTO error_patterns 
-                (pattern_type, pattern_key, error_rate, samples_count, last_detected_ts, corrective_action, created_ts)
+                (pattern_type, pattern_key, error_rate, samples_count, 
+                 last_detected_ts, corrective_action, created_ts)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (pattern_type, pattern_key) 
                 DO UPDATE SET 
                     error_rate = EXCLUDED.error_rate,
                     samples_count = EXCLUDED.samples_count,
                     last_detected_ts = EXCLUDED.last_detected_ts,
-                    corrective_action = EXCLUDED.corrective_action
+                    corrective_action = EXCLUDED.corrective_action,
+                    created_ts = EXCLUDED.created_ts
             """, (
                 pattern["type"],
-                f"{pattern.get('market')}_{pattern.get('league', '')}_{pattern.get('suggestion', '')}",
-                1.0 - pattern.get("accuracy", 0.5),
+                pattern["key"],
+                error_rate,
                 pattern["samples"],
                 now,
-                pattern.get("suggestion") or pattern.get("suggestion_text", ""),
+                pattern["action"],
                 now
             ))
     
+    # Send Telegram alert for critical patterns
+    critical_patterns = [p for p in patterns if p.get("roi", 0) < -15 or p["win_rate"] < 50]
+    if critical_patterns:
+        message = "🚨 <b>CRITICAL PATTERNS DETECTED</b>\n"
+        for p in critical_patterns[:5]:  # Limit to top 5
+            message += f"• {p['key']}: {p['win_rate']:.1f}% win rate, ROI: {p.get('roi', 0):.1f}%\n"
+        message += f"\nTotal patterns: {len(patterns)}"
+        send_telegram(message)
+    
     return {
         "patterns": patterns,
-        "total_samples": sum(data["total"] for data in by_market.values()),
-        "avg_accuracy": sum(data["correct"] for data in by_market.values()) / sum(data["total"] for data in by_market.values()) if by_market else 0
+        "total_samples": len(rows),
+        "scenarios_analyzed": len(scenarios)
     }
 
 def apply_learning_corrections() -> Dict[str, Any]:
-    """Apply learned corrections to improve future predictions"""
+    """AGGRESSIVE corrections - actually blocks bad tips"""
     if not LEARNING_ENABLE:
         return {"applied": 0, "corrections": []}
     
     corrections_applied = 0
     corrections = []
+    now = int(time.time())
     
     with db_conn() as c:
-        # Get recent error patterns
+        # Get the WORST performing patterns
         rows = c.execute("""
             SELECT pattern_type, pattern_key, error_rate, samples_count, corrective_action
             FROM error_patterns 
             WHERE last_detected_ts >= %s 
             AND samples_count >= %s
             ORDER BY error_rate DESC
-            LIMIT 20
-        """, (int(time.time()) - 7*24*3600, LEARNING_MIN_SAMPLES)).fetchall()
+            LIMIT 50
+        """, (now - 14*24*3600, 10)).fetchall()
     
     for row in rows:
         pattern_type, pattern_key, error_rate, samples_count, corrective_action = row
         
-        # Apply corrections based on pattern type
-        if pattern_type == "overconfidence" and "market" in pattern_key:
-            market = pattern_key.split("_")[0]
-            current_threshold = _get_market_threshold(market)
+        # Convert error_rate to accuracy
+        accuracy = (1 - error_rate) * 100
+        
+        # ACTION 1: AUTOMATIC BLOCKING for terrible scenarios
+        if accuracy < 50 and samples_count >= 15:
+            # Add to block list in settings
+            current_blocks = get_setting_cached("blocked_patterns") or "[]"
+            blocks = json.loads(current_blocks)
             
-            # Increase threshold if overconfidence detected
-            if error_rate > 0.6 and samples_count >= 20:
-                new_threshold = min(current_threshold + 5.0, MAX_THRESH)
-                set_setting(f"conf_threshold:{market}", f"{new_threshold:.1f}")
-                _SETTINGS_CACHE.invalidate(f"conf_threshold:{market}")
+            if pattern_key not in blocks:
+                blocks.append(pattern_key)
+                set_setting("blocked_patterns", json.dumps(blocks))
                 
                 corrections.append({
-                    "type": "threshold_adjustment",
-                    "market": market,
-                    "old_threshold": current_threshold,
-                    "new_threshold": new_threshold,
-                    "reason": f"High error rate ({error_rate:.1%}) with {samples_count} samples"
+                    "type": "automatic_block",
+                    "pattern": pattern_key,
+                    "accuracy": accuracy,
+                    "samples": samples_count,
+                    "action": "Added to blocked patterns list"
                 })
                 corrections_applied += 1
         
-        elif pattern_type == "league_specific":
-            # Could implement league-specific filters here
-            corrections.append({
-                "type": "league_warning",
-                "action": corrective_action,
-                "error_rate": error_rate,
-                "samples": samples_count
-            })
+        # ACTION 2: THRESHOLD INCREASES for poor performers
+        elif accuracy < 60 and samples_count >= 20:
+            # Extract market from pattern key
+            if "|" in pattern_key:
+                market = pattern_key.split("|")[0]
+                
+                # Increase threshold for this market
+                current_threshold = _get_market_threshold(market)
+                if current_threshold < 85:  # Cap at 85%
+                    new_threshold = min(current_threshold + 3.0, 85.0)
+                    set_setting(f"conf_threshold:{market}", f"{new_threshold:.1f}")
+                    _SETTINGS_CACHE.invalidate(f"conf_threshold:{market}")
+                    
+                    corrections.append({
+                        "type": "threshold_increase",
+                        "market": market,
+                        "old": current_threshold,
+                        "new": new_threshold,
+                        "reason": f"{accuracy:.1f}% accuracy over {samples_count} samples"
+                    })
+                    corrections_applied += 1
+        
+        # ACTION 3: ODDS FILTER for losing scenarios
+        if pattern_type == "money_burner" and samples_count >= 15:
+            # Extract suggestion type
+            if "|" in pattern_key:
+                suggestion = pattern_key.split("|")[0]
+                
+                # Increase minimum odds for this suggestion
+                current_min = _min_odds_for_suggestion(suggestion)
+                new_min = current_min * 1.2  # Increase by 20%
+                
+                # Store in settings
+                set_setting(f"min_odds:{suggestion}", f"{new_min:.2f}")
+                
+                corrections.append({
+                    "type": "odds_filter",
+                    "suggestion": suggestion,
+                    "old_min": current_min,
+                    "new_min": new_min,
+                    "reason": f"ROI: {error_rate*100:.1f}% loss rate"
+                })
+                corrections_applied += 1
     
-    # Log performance metrics
+    # Log performance
     log_performance_metrics()
+    
+    # Send summary
+    if corrections_applied > 0:
+        message = "🔧 <b>Learning Corrections Applied</b>\n"
+        message += f"Applied {corrections_applied} corrections\n\n"
+        
+        for corr in corrections[:3]:  # Top 3
+            if corr["type"] == "automatic_block":
+                message += f"• Blocked: {corr['pattern'][:30]}...\n"
+            elif corr["type"] == "threshold_increase":
+                message += f"• {corr['market']}: {corr['old']:.1f}% → {corr['new']:.1f}%\n"
+        
+        send_telegram(message)
     
     return {
         "applied": corrections_applied,
         "corrections": corrections,
-        "total_patterns_analyzed": len(rows)
+        "total_patterns": len(rows)
     }
 
 def log_performance_metrics():
