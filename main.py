@@ -1,12 +1,11 @@
 # goalsniper — OU 2.5 ONLY (in-play + prematch snapshot) — Railway-ready
 # Lean build: predicts ONLY Over/Under 2.5 with robust odds/EV gating and data-quality guards.
 
-import os, json, time, logging, requests, sys, signal, atexit
+import os, json, time, logging, requests, atexit
 from typing import Dict, Any, Optional, Tuple, List
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from flask import Flask, jsonify, request, abort
@@ -48,7 +47,6 @@ CONF_THRESHOLD     = float(os.getenv("CONF_THRESHOLD", "72"))  # % threshold for
 MAX_TIPS_PER_SCAN  = int(os.getenv("MAX_TIPS_PER_SCAN", "20"))
 TIP_MIN_MINUTE     = int(os.getenv("TIP_MIN_MINUTE", "15"))
 SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", "240"))
-TOTAL_MATCH_MINUTES= int(os.getenv("TOTAL_MATCH_MINUTES", "95"))
 PER_LEAGUE_CAP     = int(os.getenv("PER_LEAGUE_CAP", "3"))
 RUN_SCHEDULER      = os.getenv("RUN_SCHEDULER", "1") not in ("0","false","False","no","NO")
 
@@ -61,12 +59,22 @@ ODDS_AGGREGATION   = os.getenv("ODDS_AGGREGATION", "median").lower() # median|be
 ODDS_OUTLIER_MULT  = float(os.getenv("ODDS_OUTLIER_MULT", "1.8"))
 ODDS_FAIR_MAX_MULT = float(os.getenv("ODDS_FAIR_MAX_MULT", "2.5"))
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","0") not in ("0","false","False","no","NO")
+# When live odds are unavailable and we fall back to pre-match odds, require a tighter cap
+# since pre-match prices can be stale relative to the current in-play state.
+PREMATCH_FALLBACK_FAIR_MAX_MULT = float(os.getenv("PREMATCH_FALLBACK_FAIR_MAX_MULT", "1.5"))
+REQUIRE_LIVE_ODDS_ONLY = os.getenv("REQUIRE_LIVE_ODDS_ONLY", "0") not in ("0","false","False","no","NO")
 
 # Data-quality guards
 REQUIRE_STATS_MINUTE = int(os.getenv("REQUIRE_STATS_MINUTE", "35"))
 REQUIRE_DATA_FIELDS  = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
 STALE_GUARD_ENABLE   = os.getenv("STALE_GUARD_ENABLE","1") not in ("0","false","False","no","NO")
 STALE_STATS_MAX_SEC  = int(os.getenv("STALE_STATS_MAX_SEC","240"))
+
+# Feature logging (for offline training) — logs the exact feature dict extract_features()
+# produces for every scanned live match, not just ones that became tips. This avoids
+# training only on matches the current model already liked (selection bias / feedback loop).
+FEATURE_LOG_ENABLE     = os.getenv("FEATURE_LOG_ENABLE","1") not in ("0","false","False","no","NO")
+FEATURE_LOG_MIN_MINUTE = int(os.getenv("FEATURE_LOG_MIN_MINUTE", str(TIP_MIN_MINUTE)))
 
 # Timezones
 TZ_UTC = ZoneInfo("UTC")
@@ -92,8 +100,11 @@ def send_telegram(text: str) -> bool:
             data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=REQ_TIMEOUT_SEC
         )
+        if not r.ok:
+            log.warning("[TELEGRAM] send failed: status=%s body=%s", r.status_code, r.text[:200])
         return bool(r.ok)
-    except Exception:
+    except Exception as e:
+        log.warning("[TELEGRAM] send exception: %s", e)
         return False
 
 # ───────── DB Pool ─────────
@@ -117,6 +128,17 @@ def _init_pool():
         application_name="goalsniper_ou25"
     )
     log.info("[DB] pool initialized.")
+
+def _close_pool():
+    global POOL
+    if POOL:
+        try:
+            POOL.closeall()
+            log.info("[DB] pool closed.")
+        except Exception as e:
+            log.warning("[DB] pool close failed: %s", e)
+
+atexit.register(_close_pool)
 
 class PooledConn:
     def __enter__(self):
@@ -148,6 +170,8 @@ def init_db():
             sent_ok INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts))""")
         c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
+        # Trainer stamps updated_at on every model save; older deployments won't have this column yet.
+        c.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
         c.execute("""CREATE TABLE IF NOT EXISTS match_results (
             match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS odds_history (
@@ -159,10 +183,35 @@ def init_db():
             book TEXT,
             PRIMARY KEY (match_id, market, selection, captured_ts)
         )""")
+        # Raw feature snapshots for every scanned live match (not just sent tips) — this is
+        # what train_models.py trains on, so its columns must always match extract_features().
+        c.execute("""CREATE TABLE IF NOT EXISTS feature_log (
+            match_id BIGINT,
+            captured_ts BIGINT,
+            minute INTEGER,
+            league_id BIGINT,
+            league TEXT,
+            features_json TEXT,
+            goals_sum INTEGER,
+            stats_ok BOOLEAN,
+            PRIMARY KEY (match_id, captured_ts)
+        )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_odds_hist_match ON odds_history (match_id, captured_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_feature_log_captured ON feature_log (captured_ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_feature_log_match ON feature_log (match_id)")
     log.info("[DB] schema ensured.")
+
+def log_features(c: "PooledConn", fid: int, league_id: int, league: str, minute: int,
+                  feat: Dict[str, float], stats_ok: bool, captured_ts: int) -> None:
+    """Persist the exact feature dict used for scoring, so train_models.py can train on
+    identical feature names/values to what production actually sees at inference time."""
+    c.execute(
+        "INSERT INTO feature_log(match_id,captured_ts,minute,league_id,league,features_json,goals_sum,stats_ok) "
+        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (match_id,captured_ts) DO NOTHING",
+        (fid, captured_ts, minute, league_id, league, json.dumps(feat), int(feat.get("goals_sum", 0)), bool(stats_ok))
+    )
 
 # ───────── Settings helpers ─────────
 def get_setting(key: str) -> Optional[str]:
@@ -179,8 +228,12 @@ def set_setting(key: str, value: str) -> None:
 def _api_get(url: str, params: dict, timeout: int = 12) -> Optional[dict]:
     try:
         r = session.get(url, headers=HEADERS, params=params, timeout=min(timeout, REQ_TIMEOUT_SEC))
-        return r.json() if r.ok else None
-    except Exception:
+        if not r.ok:
+            log.warning("[API] GET %s params=%s failed: status=%s body=%s", url, params, r.status_code, r.text[:200])
+            return None
+        return r.json()
+    except Exception as e:
+        log.warning("[API] GET %s params=%s exception: %s", url, params, e)
         return None
 
 def fetch_match_stats(fid: int) -> list:
@@ -302,7 +355,8 @@ def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
     cal=mdl.get("calibration") or {}
     try: 
         if cal: p=_calibrate(p, cal)
-    except: pass
+    except Exception as e:
+        log.debug("[MODEL] calibration failed, using raw sigmoid: %s", e)
     return max(0.0, min(1.0, float(p)))
 
 def _validate_model_blob(tmp: dict) -> bool:
@@ -323,15 +377,16 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
                     cal.setdefault("method","sigmoid"); cal.setdefault("a",1.0); cal.setdefault("b",0.0)
                     tmp["calibration"]=cal
                 return tmp
-        except Exception:
+        except Exception as e:
+            log.warning("[MODEL] failed to parse settings key %s: %s", pat.format(name=name), e)
             continue
     return None
 
 def _load_ou25_model() -> Optional[Dict[str,Any]]:
     return load_model_from_settings("OU_2.5") or load_model_from_settings("O25")
 
-def _ou25_live_odds_plausible(odds: Optional[float], minute: int, goals_sum: int) -> bool:
-    """Quick plausibility guard for Over 2.5 prices in-play."""
+def _ou25_live_odds_plausible(odds: Optional[float], minute: int, goals_sum: int, side: str = "Over") -> bool:
+    """Quick plausibility guard for OU 2.5 prices in-play (both sides)."""
     if odds is None:
         return False
     try:
@@ -339,15 +394,25 @@ def _ou25_live_odds_plausible(odds: Optional[float], minute: int, goals_sum: int
     except Exception:
         return True  # don't block if we can't parse
 
-    # Very early 2–0 → price must be very short
-    if g >= 2 and m <= 30:
-        return odds <= 1.30
-    # Late first half 2–0 → even shorter
-    if g >= 2 and m <= 45:
-        return odds <= 1.20
-    # Early 1–0 → still fairly short on O2.5 in many leagues
-    if g == 1 and m <= 20:
-        return odds <= 1.80
+    if side == "Over":
+        # Very early 2–0 → price must be very short
+        if g >= 2 and m <= 30:
+            return odds <= 1.30
+        # Late first half 2–0 → even shorter
+        if g >= 2 and m <= 45:
+            return odds <= 1.20
+        # Early 1–0 → still fairly short on O2.5 in many leagues
+        if g == 1 and m <= 20:
+            return odds <= 1.80
+    else:  # Under
+        # Goalless deep into the match → Under price must be short
+        if g == 0 and m >= 75:
+            return odds <= 1.30
+        if g == 0 and m >= 60:
+            return odds <= 1.50
+        # 1-goal game very late → still fairly short on U2.5
+        if g == 1 and m >= 85:
+            return odds <= 1.60
 
     return True
 
@@ -357,7 +422,7 @@ def _market_name_normalize(s: str) -> str:
     if "over/under" in s or "total" in s or "goals" in s: return "OU"
     return s
 
-def _aggregate_price(vals: List[tuple[float,str]], prob_hint: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+def _aggregate_price(vals: List[tuple[float,str]], prob_hint: Optional[float], fair_max_mult: float) -> tuple[Optional[float], Optional[str]]:
     if not vals: return None, None
     xs = sorted([o for (o,_) in vals if (o or 0) > 0])
     if not xs: return None, None
@@ -368,7 +433,7 @@ def _aggregate_price(vals: List[tuple[float,str]], prob_hint: Optional[float]) -
     med2 = statistics.median(xs2)
     if prob_hint is not None and prob_hint > 0:
         fair = 1.0 / max(1e-6, float(prob_hint))
-        cap = fair * max(1.0, ODDS_FAIR_MAX_MULT)
+        cap = fair * max(1.0, fair_max_mult)
         filtered = [(o,b) for (o,b) in filtered if o <= cap] or filtered
     if ODDS_AGGREGATION == "best":
         best = max(filtered, key=lambda t: t[0])
@@ -378,10 +443,15 @@ def _aggregate_price(vals: List[tuple[float,str]], prob_hint: Optional[float]) -
     return float(pick[0]), f"{pick[1]} (median of {len(xs)})"
 
 def fetch_odds_ou25(fid: int, prob_hint_over: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
-    """Return {'Over': {'odds':x,'book':y}, 'Under': {...}} for OU 2.5"""
+    """Return {'Over': {'odds':x,'book':y,'source':'live'|'prematch'}, 'Under': {...}} for OU 2.5"""
     js = _api_get(f"{BASE_URL}/odds/live", {"fixture": fid}) or {}
+    source = "live"
     if not (js.get("response") or []):
+        if REQUIRE_LIVE_ODDS_ONLY:
+            return {}
         js = _api_get(f"{BASE_URL}/odds", {"fixture": fid}) or {}
+        source = "prematch"
+
     by: Dict[str, List[tuple[float,str]]] = {"Over": [], "Under": []}
     try:
         for r in js.get("response",[]) or []:
@@ -403,17 +473,19 @@ def fetch_odds_ou25(fid: int, prob_hint_over: Optional[float] = None) -> Dict[st
                                 by["Over"].append((float(v.get("odd") or 0), book))
                             elif "under" in lbl:
                                 by["Under"].append((float(v.get("odd") or 0), book))
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("[ODDS] parse failed for fixture=%s: %s", fid, e)
 
-    # require distinct books
+    fair_max_mult = ODDS_FAIR_MAX_MULT if source == "live" else PREMATCH_FALLBACK_FAIR_MAX_MULT
+
     out: Dict[str, Dict[str, Any]] = {}
     for side, lst in by.items():
         if len({b for (_, b) in lst}) < max(1, ODDS_REQUIRE_N_BOOKS):
             continue
-        ag, label = _aggregate_price(lst, prob_hint_over if side=="Over" else (1.0-(prob_hint_over or 0.0) if prob_hint_over is not None else None))
+        prob_hint = prob_hint_over if side == "Over" else (1.0-(prob_hint_over or 0.0) if prob_hint_over is not None else None)
+        ag, label = _aggregate_price(lst, prob_hint, fair_max_mult)
         if ag is not None:
-            out[side] = {"odds": float(ag), "book": label}
+            out[side] = {"odds": float(ag), "book": label, "source": source}
     return out
 
 # ───────── Helpers ─────────
@@ -440,14 +512,6 @@ def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
     ]
     nonzero = sum(1 for v in fields if (v or 0) > 0)
     return nonzero >= max(0, REQUIRE_DATA_FIELDS)
-
-def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
-    try:
-        import re
-        m = re.search(r'(\d+\.?\d*)', s or "")
-        return float(m.group(1)) if m else None
-    except Exception:
-        return None
 
 def _ev(prob: float, odds: float) -> float:
     return prob*max(0.0, float(odds)) - 1.0
@@ -570,12 +634,21 @@ def production_scan() -> Tuple[int, int]:
 
                 feat = extract_features(m)
                 minute = int(feat.get("minute", 0))
+                league_id, league = _league_name(m)
 
                 if minute < TIP_MIN_MINUTE:
                     continue
                 if is_feed_stale(fid, m, minute):
                     continue
-                if not stats_coverage_ok(feat, minute):
+
+                stats_ok = stats_coverage_ok(feat, minute)
+                if FEATURE_LOG_ENABLE and minute >= FEATURE_LOG_MIN_MINUTE:
+                    try:
+                        log_features(c, fid, league_id, league, minute, feat, stats_ok, now_ts)
+                    except Exception as e:
+                        log.warning("[FEATURE_LOG] failed for fixture=%s: %s", fid, e)
+
+                if not stats_ok:
                     continue
 
                 # Model prob for OVER 2.5
@@ -606,11 +679,9 @@ def production_scan() -> Tuple[int, int]:
                         continue
                     if int(round(_ev(prob, odds)*10000)) < EDGE_MIN_BPS:
                         continue
-                    if mk.startswith("Over/Under") and suggestion.startswith("Over 2.5") and odds is not None:
-                        if not _ou25_live_odds_plausible(float(odds), minute, int(feat.get("goals_sum", 0))):
-                            continue
+                    if not _ou25_live_odds_plausible(float(odds), minute, int(feat.get("goals_sum", 0)), side=side):
+                        continue
 
-                league_id, league = _league_name(m)
                 if PER_LEAGUE_CAP > 0 and per_league_counter.get(league_id, 0) >= PER_LEAGUE_CAP:
                     continue
 
@@ -683,10 +754,15 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
     now_ts=int(time.time()); cutoff=now_ts - 14*24*3600; updated=0
     with db_conn() as c:
         rows=c.execute("""
-            WITH last AS (SELECT match_id, MAX(created_ts) last_ts FROM tips WHERE created_ts >= %s GROUP BY match_id)
+            WITH combined AS (
+                SELECT match_id, created_ts AS ts FROM tips WHERE created_ts >= %s
+                UNION ALL
+                SELECT match_id, captured_ts AS ts FROM feature_log WHERE captured_ts >= %s
+            ),
+            last AS (SELECT match_id, MAX(ts) last_ts FROM combined GROUP BY match_id)
             SELECT l.match_id FROM last l LEFT JOIN match_results r ON r.match_id=l.match_id
             WHERE r.match_id IS NULL ORDER BY l.last_ts DESC LIMIT %s
-        """,(cutoff, max_rows)).fetchall()
+        """,(cutoff, cutoff, max_rows)).fetchall()
     for (mid,) in rows:
         fx=_fixture_by_id(int(mid))
         if not fx: continue
