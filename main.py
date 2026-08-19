@@ -30,7 +30,13 @@ PATCH NOTES (this revision):
      thread pool. This cache is shared between prematch_scan_save() and
      send_match_of_the_day(), so running both no longer doubles API calls.
   6. [MINOR] request.json (deprecated) -> request.get_json(silent=True).
+  7. [DEPLOY SAFETY] Added `from __future__ import annotations`. The file
+     uses PEP 604 union syntax (`tuple|list`, `str|None`) in a couple of
+     type hints, which raises TypeError at import time on Python <3.10.
+     Nothing pins a Python version in requirements.txt/railway.yaml, so
+     this makes the file safe regardless of what Nixpacks resolves to.
 """
+from __future__ import annotations
 
 import os, json, time, logging, requests, psycopg2
 from psycopg2.pool import ThreadedConnectionPool
