@@ -1892,6 +1892,15 @@ def http_status():
         n_results  = c.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
         n_tips     = c.execute("SELECT COUNT(*) FROM tips WHERE suggestion<>'HARVEST'").fetchone()[0]
         n_unsent   = c.execute("SELECT COUNT(*) FROM tips WHERE sent_ok=0").fetchone()[0]
+        # PATCH: directly checkable league_id coverage — this is what
+        # actually determines whether league_btts_rate/pm_league_* carry
+        # any real signal. If has_league_id is low relative to total, or
+        # distinct_leagues is 1, the league-rate feature will be near-
+        # constant and contribute nothing to training regardless of how
+        # correct the code is — exactly what happened on the first retrain
+        # after this feature was added, traced back to this.
+        n_has_league = c.execute("SELECT COUNT(*) FROM match_results WHERE league_id IS NOT NULL").fetchone()[0]
+        n_distinct_leagues = c.execute("SELECT COUNT(DISTINCT league_id) FROM match_results WHERE league_id IS NOT NULL").fetchone()[0]
     metrics_raw = get_setting_cached("model_metrics_latest")
     metrics = None
     if metrics_raw:
@@ -1904,6 +1913,8 @@ def http_status():
             "tip_snapshots": int(n_tip_snap),
             "prematch_snapshots": int(n_pre_snap),
             "match_results_resolved": int(n_results),
+            "match_results_with_league_id": int(n_has_league),
+            "distinct_leagues_in_match_results": int(n_distinct_leagues),
             "min_rows_needed_to_train": min_rows,
             "ready_to_train": bool(n_results >= min_rows),
         },
