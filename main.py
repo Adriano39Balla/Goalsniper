@@ -426,36 +426,21 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
 
 def _api_fixtures_by_league_season(league_id: int, season: int) -> Tuple[List[dict], dict]:
     """
-    NEW: bulk-fetches an ENTIRE league season in a handful of calls
-    (paginated defensively, but API-Football typically returns a full
-    single-league season in one response). This is what makes historical
-    backfill cheap on API quota — form/H2H for every fixture in the season
-    get computed locally from this one fetched list afterward, instead of
-    the live 3-calls-per-fixture path (_api_last_fixtures/_api_h2h) that
-    extract_prematch_features() uses for upcoming fixtures.
-
-    PATCH: now also returns API-Football's own "errors"/"results"/"paging"
-    metadata from the first page fetched. Previously this only looked at
-    the "response" array and silently discarded everything else — meaning
-    an empty result gave zero indication of WHY (subscription tier doesn't
-    include this season, invalid league/season combo, rate limit, etc. all
-    looked identical: just an empty list).
+    NEW: bulk-fetches an ENTIRE league season in one call. API-Football's
+    /fixtures?league&season returns the full season in a single response
+    with no pagination parameter — confirmed the hard way: a "page" param
+    on this endpoint gets the WHOLE request rejected with
+    errors:{"page":"The Page field do not exist."}, which is why the first
+    real run came back with fixtures_seen=0 across every season despite
+    league/season being valid. Fixed by simply not sending a page param.
     """
-    out=[]; page=1; diag={}
-    while True:
-        js=_api_get(FOOTBALL_API_URL, {"league": league_id, "season": season, "page": page}) or {}
-        if page==1:
-            diag={
-                "errors": js.get("errors") if isinstance(js,dict) else "no response from API (network/auth failure)",
-                "results": js.get("results") if isinstance(js,dict) else None,
-                "paging": js.get("paging") if isinstance(js,dict) else None,
-            }
-        resp=js.get("response",[]) if isinstance(js,dict) else []
-        out.extend(resp)
-        paging=js.get("paging") or {}
-        cur=int(paging.get("current") or 1); total=int(paging.get("total") or 1)
-        if cur>=total or not resp: break
-        page+=1
+    js=_api_get(FOOTBALL_API_URL, {"league": league_id, "season": season}) or {}
+    diag={
+        "errors": js.get("errors") if isinstance(js,dict) else "no response from API (network/auth failure)",
+        "results": js.get("results") if isinstance(js,dict) else None,
+        "paging": js.get("paging") if isinstance(js,dict) else None,
+    }
+    out=js.get("response",[]) if isinstance(js,dict) else []
     return out, diag
 
 def _fixture_ts(fx: dict) -> float:
