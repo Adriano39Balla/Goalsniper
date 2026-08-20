@@ -97,6 +97,13 @@ FEATURES: List[str] = [
     "possession_xg_interaction_h", "possession_xg_interaction_a",
     "sot_xg_ratio_h", "sot_xg_ratio_a",
     "match_minute_normalized", "time_weighted_xg_h", "time_weighted_xg_a",
+    # PATCH: per-league BTTS/Over base rates (see main.py's get_league_rates()).
+    # Root cause of PRE_BTTS_YES / PRE_OU_3.5 collapsing to majority-class
+    # guessing: no signal previously distinguished a low-scoring league from
+    # a high-scoring one. Zeroed for live rows here at training time isn't
+    # applicable — in-play rows get their OWN league_btts_rate/etc. computed
+    # below, this list entry is what serving reads via feat.get(k).
+    "league_btts_rate", "league_ov25_rate", "league_ov35_rate",
 ]
 
 # Advanced prematch features (matches main.py)
@@ -133,6 +140,15 @@ PRE_FEATURES: List[str] = [
     
     # Interaction features
     "pm_rating_form_interaction", "pm_attack_defense_ratio",
+
+    # PATCH: per-league BTTS/Over base rates — the actual fix for
+    # PRE_BTTS_YES / PRE_OU_3.5 collapsing to always predicting the
+    # majority class (confirmed via their confusion matrices: BTTS
+    # predicted "Yes" on every single row, OU_3.5 almost never predicted
+    # "Over"). Without a league-level anchor, matches from a low-scoring
+    # league and a high-scoring league were pooled with nothing to tell
+    # them apart beyond noisy team-level stats.
+    "pm_league_btts_rate", "pm_league_ov25_rate", "pm_league_ov35_rate",
     
     # Live features (set to 0 for prematch) - must include ALL in-play features
     "minute", "goals_h", "goals_a", "goals_sum", "goals_diff",
@@ -158,6 +174,7 @@ PRE_FEATURES: List[str] = [
     "possession_xg_interaction_h", "possession_xg_interaction_a",
     "sot_xg_ratio_h", "sot_xg_ratio_a",
     "match_minute_normalized", "time_weighted_xg_h", "time_weighted_xg_a",
+    "league_btts_rate", "league_ov25_rate", "league_ov35_rate",
 ]
 
 EPS = 1e-6
@@ -207,6 +224,44 @@ def _ensure_training_tables(conn) -> None:
 
 # ─────────────────────── Data load with Advanced Features ─────────────────────── #
 
+def _compute_league_rate_map(conn, min_n: int = 20) -> Dict[Any, Dict[str, float]]:
+    """
+    PATCH: one aggregate query over ALL of match_results, grouped by
+    league_id, giving BTTS/Over-2.5/Over-3.5 rates per league — plus a
+    "__GLOBAL__" entry used as the fallback for any league with fewer than
+    min_n resolved matches. Mirrors main.py's get_league_rates() exactly so
+    training computes the same numbers serving will look up later.
+    """
+    df = _read_sql(conn, """
+        SELECT league_id,
+               AVG(btts_yes)::float AS btts,
+               AVG(CASE WHEN final_goals_h+final_goals_a>2 THEN 1.0 ELSE 0.0 END) AS ov25,
+               AVG(CASE WHEN final_goals_h+final_goals_a>3 THEN 1.0 ELSE 0.0 END) AS ov35,
+               COUNT(*) AS n
+        FROM match_results GROUP BY league_id
+    """)
+    out: Dict[Any, Dict[str, float]] = {}
+    if df.empty:
+        out["__GLOBAL__"] = {"btts": 0.5, "ov25": 0.5, "ov35": 0.3}
+        return out
+    total_n = df["n"].sum()
+    global_btts = float((df["btts"] * df["n"]).sum() / total_n) if total_n else 0.5
+    global_ov25 = float((df["ov25"] * df["n"]).sum() / total_n) if total_n else 0.5
+    global_ov35 = float((df["ov35"] * df["n"]).sum() / total_n) if total_n else 0.3
+    out["__GLOBAL__"] = {"btts": global_btts, "ov25": global_ov25, "ov35": global_ov35}
+    for _, r in df.iterrows():
+        lid = r["league_id"]
+        if pd.isna(lid) or int(r["n"]) < min_n:
+            continue
+        out[lid] = {"btts": float(r["btts"] or 0.5), "ov25": float(r["ov25"] or 0.5), "ov35": float(r["ov35"] or 0.3)}
+    return out
+
+def _lookup_league_rate(rate_map: Dict[Any, Dict[str, float]], league_id) -> Dict[str, float]:
+    if league_id is None or pd.isna(league_id) or league_id not in rate_map:
+        return rate_map["__GLOBAL__"]
+    return rate_map[league_id]
+
+
 def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
     q = """
     WITH latest AS (
@@ -214,7 +269,7 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
       FROM tip_snapshots GROUP BY match_id
     )
     SELECT l.match_id, s.created_ts, s.payload,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
+           r.final_goals_h, r.final_goals_a, r.btts_yes, r.league_id
     FROM latest l
     JOIN tip_snapshots s ON s.match_id = l.match_id AND s.created_ts = l.ts
     JOIN match_results r ON r.match_id = l.match_id
@@ -222,6 +277,8 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
     rows = _read_sql(conn, q)
     if rows.empty:
         return pd.DataFrame()
+
+    league_rates = _compute_league_rate_map(conn)
 
     feats: List[Dict[str, Any]] = []
     for _, row in rows.iterrows():
@@ -335,7 +392,13 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
         f["match_minute_normalized"] = minute / 90.0
         f["time_weighted_xg_h"] = f["xg_h"] * (minute / 90.0)
         f["time_weighted_xg_a"] = f["xg_a"] * (minute / 90.0)
-        
+
+        # PATCH: per-league BTTS/Over base rates — computed the same way
+        # get_league_rates() does at serving time, using the SAME
+        # league_rates map built once above from ALL of match_results.
+        lr = _lookup_league_rate(league_rates, row["league_id"])
+        f["league_btts_rate"] = lr["btts"]; f["league_ov25_rate"] = lr["ov25"]; f["league_ov35_rate"] = lr["ov35"]
+
         # Final result
         gh_f = int(row["final_goals_h"] or 0)
         ga_f = int(row["final_goals_a"] or 0)
@@ -366,13 +429,15 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
 def load_prematch_data(conn) -> pd.DataFrame:
     q = """
     SELECT p.match_id, p.created_ts, p.payload,
-           r.final_goals_h, r.final_goals_a, r.btts_yes
+           r.final_goals_h, r.final_goals_a, r.btts_yes, r.league_id
     FROM prematch_snapshots p
     JOIN match_results r ON r.match_id = p.match_id
     """
     rows = _read_sql(conn, q)
     if rows.empty:
         return pd.DataFrame()
+
+    league_rates = _compute_league_rate_map(conn)
 
     feats: List[Dict[str, Any]] = []
     for _, row in rows.iterrows():
@@ -389,6 +454,18 @@ def load_prematch_data(conn) -> pd.DataFrame:
         for k in PRE_FEATURES:
             if k not in f:
                 f[k] = 0.0
+
+        # PATCH: always recompute from the CURRENT league_rates map rather
+        # than trusting whatever (if anything) was stored in the snapshot's
+        # payload at harvest time. This matters specifically for snapshots
+        # backfilled before this feature existed — those have no
+        # pm_league_* keys in their stored payload at all (would silently
+        # fall back to the 0.0 default above), but they DO have a real
+        # league_id via the match_results join, so this recovers the
+        # correct rate for them retroactively with no need to re-run the
+        # historical backfill.
+        lr = _lookup_league_rate(league_rates, row["league_id"])
+        f["pm_league_btts_rate"] = lr["btts"]; f["pm_league_ov25_rate"] = lr["ov25"]; f["pm_league_ov35_rate"] = lr["ov35"]
 
         gh_f = int(row["final_goals_h"] or 0)
         ga_f = int(row["final_goals_a"] or 0)
