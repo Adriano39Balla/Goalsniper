@@ -317,12 +317,22 @@ def init_db():
 
 # ───────── Telegram ─────────
 def send_telegram(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
+    # PATCH: this was completely silent on every failure path — missing
+    # token/chat ID, a bad request, a network error all just returned
+    # False with zero log output anywhere. That's exactly the situation
+    # here: "no startup message" with no way to tell why from logs. Now
+    # every failure path logs something actionable.
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("[TELEGRAM] not sent — TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is unset")
+        return False
     try:
         r=session.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                        data={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}, timeout=10)
+        if not r.ok:
+            log.warning("[TELEGRAM] send failed: HTTP %s — %s", r.status_code, r.text[:300])
         return r.ok
-    except Exception:
+    except Exception as e:
+        log.warning("[TELEGRAM] send raised: %s", e)
         return False
 
 # ───────── API helpers ─────────
