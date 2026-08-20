@@ -153,7 +153,19 @@ HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES = {"1H","HT","2H","ET","BT","P"}
 
 session = requests.Session()
-session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503,504], respect_retry_after_header=True)))
+# PATCH: pool_maxsize was left at requests' default (10). Concurrent
+# fetching added earlier (fetch_live_matches hydrates up to 8 matches at
+# once, each doing 2 concurrent sub-requests for stats+events) can open up
+# to ~16 simultaneous connections to v3.football.api-sports.io through
+# this one shared session — anything past 10 was being discarded and
+# re-opened from scratch (fresh TCP+TLS handshake) instead of reused,
+# which is exactly what pooling exists to avoid. Sized above the realistic
+# concurrent ceiling across all thread pools in this file, configurable
+# via env since ceiling depends on MAX_WORKERS-style constants elsewhere.
+HTTP_POOL_MAXSIZE = int(os.getenv("HTTP_POOL_MAXSIZE", "30"))
+session.mount("https://", HTTPAdapter(
+    max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503,504], respect_retry_after_header=True),
+    pool_connections=HTTP_POOL_MAXSIZE, pool_maxsize=HTTP_POOL_MAXSIZE))
 
 # ───────── Caches & timezones ─────────
 STATS_CACHE:  Dict[int, Tuple[float, list]] = {}
