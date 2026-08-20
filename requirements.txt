@@ -1,17 +1,18 @@
 # Core (essential)
 Flask==3.0.0
-psycopg2-binary==2.9.9
+# PATCH: psycopg2-binary==2.9.9 predates Python 3.13 support (added in
+# 2.9.12 per the official psycopg release notes — 2.9.9 doesn't know about
+# the 3.13 C-API changes, hence the _PyInterpreterState_Get compile error).
+# Same fix pattern as numpy/pandas/scikit-learn below: floor instead of
+# exact-pin so pip resolves to a version with an actual prebuilt wheel.
+psycopg2-binary>=2.9.9,<3.0
 requests==2.31.0
 
 # ML Core (minimal)
-# PATCH: switched from exact pins to floor/ceiling ranges. The exact pins
-# (numpy==1.26.3, pandas==2.2.0, scikit-learn==1.4.0) have no prebuilt
-# wheels for Python 3.13 — pandas in particular only got cp313 wheels
-# starting at 2.2.3, so pip was falling back to compiling pandas from
-# source and failing. Ranges let pip's resolver pick whatever mutually
-# compatible, wheel-available versions match the Python Railway actually
-# builds with, instead of needing an exact version pinned in advance for
-# an interpreter version outside our control.
+# Exact pins (numpy==1.26.3, pandas==2.2.0, scikit-learn==1.4.0) had no
+# prebuilt wheels for Python 3.13 — pandas only got cp313 wheels starting
+# at 2.2.3. Ranges let pip's resolver pick whatever mutually compatible,
+# wheel-available versions match whatever Python Railway builds with.
 numpy>=1.26.3,<3.0
 scikit-learn>=1.4.0,<2.0
 pandas>=2.2.3,<3.0
