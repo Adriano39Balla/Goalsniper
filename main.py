@@ -424,6 +424,131 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
     TEAM_FORM_CACHE[key]=(now,out)
     return out
 
+def _api_fixtures_by_league_season(league_id: int, season: int) -> List[dict]:
+    """
+    NEW: bulk-fetches an ENTIRE league season in a handful of calls
+    (paginated defensively, but API-Football typically returns a full
+    single-league season in one response). This is what makes historical
+    backfill cheap on API quota — form/H2H for every fixture in the season
+    get computed locally from this one fetched list afterward, instead of
+    the live 3-calls-per-fixture path (_api_last_fixtures/_api_h2h) that
+    extract_prematch_features() uses for upcoming fixtures.
+    """
+    out=[]; page=1
+    while True:
+        js=_api_get(FOOTBALL_API_URL, {"league": league_id, "season": season, "page": page}) or {}
+        resp=js.get("response",[]) if isinstance(js,dict) else []
+        out.extend(resp)
+        paging=js.get("paging") or {}
+        cur=int(paging.get("current") or 1); total=int(paging.get("total") or 1)
+        if cur>=total or not resp: break
+        page+=1
+    return out
+
+def _fixture_ts(fx: dict) -> float:
+    try:
+        d=(fx.get("fixture") or {}).get("date")
+        return datetime.fromisoformat((d or "").replace("Z","+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str, int]:
+    """
+    NEW: reconstructs prematch training data for past season(s) of a single
+    league. Unlike the live path, this needs only ~1-3 API calls PER SEASON
+    total (one bulk fixture-list fetch), not 3 calls per fixture — form and
+    H2H are computed locally from the fetched season(s) instead of live
+    API calls. This is what actually keeps a multi-season backfill cheap on
+    your daily quota.
+
+    Elo handling: ratings are replayed chronologically in an isolated
+    in-memory pass (seeded at ELO_DEFAULT per team) so each fixture's
+    features use the correct pre-match rating. When writing the final
+    ratings back to team_ratings, a team's row is only overwritten if it
+    has no existing row, or its existing updated_ts predates the last
+    fixture processed here — this prevents a historical backfill from
+    clobbering a rating that's already been advanced further by live
+    match results since deployment.
+    """
+    all_fx: Dict[int, dict] = {}
+    for s in seasons:
+        for fx in _api_fixtures_by_league_season(league_id, s):
+            fid=(fx.get("fixture") or {}).get("id")
+            if fid: all_fx[fid]=fx
+    fixtures=sorted(all_fx.values(), key=_fixture_ts)
+
+    team_history: Dict[int, List[dict]] = {}
+    for fx in fixtures:
+        st=(((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st not in {"FT","AET","PEN"}: continue
+        th=((fx.get("teams") or {}).get("home") or {}).get("id")
+        ta=((fx.get("teams") or {}).get("away") or {}).get("id")
+        if th: team_history.setdefault(th, []).append(fx)
+        if ta: team_history.setdefault(ta, []).append(fx)
+    for tid in team_history:
+        team_history[tid].sort(key=_fixture_ts)
+
+    elo_local: Dict[int, float] = {}
+    snapshots_saved=0; results_saved=0; last_ts=0.0
+
+    for fx in fixtures:
+        st=(((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st not in {"FT","AET","PEN"}: continue
+        fixture=fx.get("fixture") or {}
+        fid=fixture.get("id")
+        th=((fx.get("teams") or {}).get("home") or {}).get("id")
+        ta=((fx.get("teams") or {}).get("away") or {}).get("id")
+        if not fid or not th or not ta: continue
+        cutoff=_fixture_ts(fx)
+        last_ts=max(last_ts, cutoff)
+
+        last_h=[g for g in team_history.get(th,[]) if _fixture_ts(g)<cutoff][-5:]
+        last_a=[g for g in team_history.get(ta,[]) if _fixture_ts(g)<cutoff][-5:]
+        def _involves_both(g):
+            hh=((g.get("teams") or {}).get("home") or {}).get("id")
+            aa=((g.get("teams") or {}).get("away") or {}).get("id")
+            return {hh,aa}=={th,ta}
+        h2h=[g for g in team_history.get(th,[]) if _fixture_ts(g)<cutoff and _involves_both(g)][-5:]
+
+        rating_h=elo_local.get(th, ELO_DEFAULT)
+        rating_a=elo_local.get(ta, ELO_DEFAULT)
+        feat=_assemble_pre_features(th, ta, last_h, last_a, h2h, cutoff, rating_h, rating_a)
+
+        try:
+            save_prematch_snapshot(int(fid), feat)
+            snapshots_saved+=1
+        except Exception as e:
+            log.warning("[HIST-PRE] snapshot save failed for fixture %s: %s", fid, e)
+
+        gh=int((fx.get("goals") or {}).get("home") or 0); ga=int((fx.get("goals") or {}).get("away") or 0)
+        btts=1 if (gh>0 and ga>0) else 0
+        try:
+            with db_conn() as c:
+                c.execute("INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
+                          "VALUES(%s,%s,%s,%s,%s) ON CONFLICT(match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
+                          "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
+                          (int(fid), gh, ga, btts, int(time.time())))
+            results_saved+=1
+        except Exception as e:
+            log.warning("[HIST-PRE] result save failed for fixture %s: %s", fid, e)
+
+        # Advance local Elo AFTER using the pre-match rating for features above
+        exp_h=1.0/(1.0+10**(((rating_a)-(rating_h+ELO_HOME_ADV))/400.0))
+        score_h=1.0 if gh>ga else (0.5 if gh==ga else 0.0)
+        elo_local[th]=rating_h+ELO_K*(score_h-exp_h)
+        elo_local[ta]=rating_a+ELO_K*((1.0-score_h)-(1.0-exp_h))
+
+    with db_conn() as c:
+        for tid, rating in elo_local.items():
+            row=c.execute("SELECT updated_ts FROM team_ratings WHERE team_id=%s",(tid,)).fetchone()
+            if row and row[0] and int(row[0]) > int(last_ts):
+                continue  # a live update already advanced this team past what we just replayed
+            c.execute("INSERT INTO team_ratings(team_id,rating,updated_ts) VALUES(%s,%s,%s) "
+                      "ON CONFLICT(team_id) DO UPDATE SET rating=EXCLUDED.rating, updated_ts=EXCLUDED.updated_ts",
+                      (tid, float(rating), int(last_ts)))
+
+    return {"fixtures_seen": len(fixtures), "snapshots_saved": snapshots_saved, "results_saved": results_saved}
+
 def _collect_todays_prematch_fixtures() -> List[dict]:
     today_local=datetime.now(ZoneInfo("Europe/Berlin")).date()
     start_local=datetime.combine(today_local, datetime.min.time(), tzinfo=ZoneInfo("Europe/Berlin"))
@@ -1138,40 +1263,25 @@ def _h2h_counts(h2h: List[dict], home_id: int, away_id: int) -> Tuple[float,floa
     if played==0: return 0.0,0.0,0.0
     return hw/played, aw/played, dr/played
 
-def extract_prematch_features(fx: dict) -> Dict[str,float]:
-    teams=fx.get("teams") or {}; th=(teams.get("home") or {}).get("id"); ta=(teams.get("away") or {}).get("id")
-    if not th or not ta: return {}
-
-    # PATCH: fetch last-5-home, last-5-away, and H2H concurrently instead of
-    # sequentially — each is an independent HTTP call, and results are also
-    # cached (TEAM_FORM_CACHE) so repeat calls across a scan / MOTD run are free.
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        f_last_h = ex.submit(_api_last_fixtures, th, 5)
-        f_last_a = ex.submit(_api_last_fixtures, ta, 5)
-        f_h2h    = ex.submit(_api_h2h, th, ta, 5)
-        last_h, last_a, h2h = f_last_h.result(), f_last_a.result(), f_h2h.result()
-
+def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: list,
+                            kickoff_ts: float, rating_h: float, rating_a: float) -> Dict[str,float]:
+    """
+    PATCH: extracted from extract_prematch_features() so live scoring and
+    historical backfill (backfill_historical_prematch, added below) compute
+    features with the EXACT same formulas from the same shape of inputs —
+    team ids + fixture-list + kickoff timestamp + ratings. Two independent
+    implementations of this math would risk silently drifting apart.
+    """
     ov25_h,ov35_h,btts_h=_rate_totals(last_h); ov25_a,ov35_a,btts_a=_rate_totals(last_a); ov25_h2h,ov35_h2h,btts_h2h=_rate_totals(h2h)
     hw_h2h,aw_h2h,dr_h2h=_h2h_counts(h2h, th, ta)
-
     form_h=_team_form_stats(th, last_h); form_a=_team_form_stats(ta, last_a)
-
-    # PATCH: Elo ratings, backed by the team_ratings table (updated after
-    # each result in backfill_results_for_open_matches()).
-    ratings=get_team_ratings_bulk([th, ta])
-    rating_h=ratings.get(th, ELO_DEFAULT); rating_a=ratings.get(ta, ELO_DEFAULT)
 
     form_points_h = form_h["win"]*3.0 + form_h["draw"]*1.0
     form_points_a = form_a["win"]*3.0 + form_a["draw"]*1.0
 
-    # Rest days vs this fixture's kickoff
     rest_h = rest_a = 3.0  # neutral default when unknown
-    try:
-        kickoff_ts=datetime.fromisoformat(((fx.get("fixture") or {}).get("date") or "").replace("Z","+00:00")).timestamp()
-        if form_h["last_ts"]: rest_h=max(0.0, (kickoff_ts - form_h["last_ts"])/86400.0)
-        if form_a["last_ts"]: rest_a=max(0.0, (kickoff_ts - form_a["last_ts"])/86400.0)
-    except Exception:
-        pass
+    if form_h["last_ts"]: rest_h=max(0.0, (kickoff_ts - form_h["last_ts"])/86400.0)
+    if form_a["last_ts"]: rest_a=max(0.0, (kickoff_ts - form_a["last_ts"])/86400.0)
 
     attack_strength_h, defense_strength_h = form_h["gf"], form_h["ga"]
     attack_strength_a, defense_strength_a = form_a["gf"], form_a["ga"]
@@ -1212,9 +1322,36 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
         "fouls_per_minute":0.0,"discipline_score_h":0.0,"discipline_score_a":0.0,
         "possession_xg_interaction_h":0.0,"possession_xg_interaction_a":0.0,"sot_xg_ratio_h":0.0,"sot_xg_ratio_a":0.0,
         "match_minute_normalized":0.0,"time_weighted_xg_h":0.0,"time_weighted_xg_a":0.0,
-        # internal, not a model feature — used by save_prematch_snapshot()
-        "_home_id": float(th), "_away_id": float(ta),
     }
+
+def extract_prematch_features(fx: dict) -> Dict[str,float]:
+    teams=fx.get("teams") or {}; th=(teams.get("home") or {}).get("id"); ta=(teams.get("away") or {}).get("id")
+    if not th or not ta: return {}
+
+    # PATCH: fetch last-5-home, last-5-away, and H2H concurrently instead of
+    # sequentially — each is an independent HTTP call, and results are also
+    # cached (TEAM_FORM_CACHE) so repeat calls across a scan / MOTD run are free.
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_last_h = ex.submit(_api_last_fixtures, th, 5)
+        f_last_a = ex.submit(_api_last_fixtures, ta, 5)
+        f_h2h    = ex.submit(_api_h2h, th, ta, 5)
+        last_h, last_a, h2h = f_last_h.result(), f_last_a.result(), f_h2h.result()
+
+    # PATCH: Elo ratings, backed by the team_ratings table (updated after
+    # each result in backfill_results_for_open_matches()).
+    ratings=get_team_ratings_bulk([th, ta])
+    rating_h=ratings.get(th, ELO_DEFAULT); rating_a=ratings.get(ta, ELO_DEFAULT)
+
+    kickoff_ts = time.time()
+    try:
+        kickoff_ts=datetime.fromisoformat(((fx.get("fixture") or {}).get("date") or "").replace("Z","+00:00")).timestamp()
+    except Exception:
+        pass
+
+    feat = _assemble_pre_features(th, ta, last_h, last_a, h2h, kickoff_ts, rating_h, rating_a)
+    # internal, not a model feature — used by save_prematch_snapshot()
+    feat["_home_id"] = float(th); feat["_away_id"] = float(ta)
+    return feat
 
 def _kickoff_berlin(utc_iso: str|None) -> str:
     try:
@@ -1579,6 +1716,34 @@ def http_retry_unsent(): _require_admin(); n=retry_unsent_tips(30,200); return j
 
 @app.route("/admin/prematch-scan", methods=["POST","GET"])
 def http_prematch_scan(): _require_admin(); saved=prematch_scan_save(); return jsonify({"ok": True, "saved": int(saved)})
+
+@app.route("/admin/backfill-prematch-history", methods=["POST","GET"])
+def http_backfill_prematch_history():
+    """
+    NEW: reconstructs prematch training data for past season(s) of ONE
+    league at a time. Costs roughly 1-3 API calls PER SEASON (bulk fetch),
+    not per fixture — safe to run several of these in a day without
+    threatening your daily API quota.
+
+    Usage: /admin/backfill-prematch-history?league=39&seasons=2023,2024,2025&key=YOUR_KEY
+    (league = API-Football league ID, e.g. 39 = Premier League)
+    """
+    _require_admin()
+    try:
+        league_id = int(request.args.get("league", "0"))
+    except Exception:
+        league_id = 0
+    if not league_id:
+        return jsonify({"ok": False, "error": "missing or invalid ?league=<API-Football league id>"}), 400
+    seasons_raw = request.args.get("seasons", "")
+    try:
+        seasons = [int(s.strip()) for s in seasons_raw.split(",") if s.strip()]
+    except Exception:
+        seasons = []
+    if not seasons:
+        return jsonify({"ok": False, "error": "missing or invalid ?seasons=2023,2024,2025"}), 400
+    result = backfill_historical_prematch(league_id, seasons)
+    return jsonify({"ok": True, "league": league_id, "seasons": seasons, **result})
 
 @app.route("/admin/motd", methods=["POST","GET"])
 def http_motd():
