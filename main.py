@@ -286,6 +286,15 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS match_results (
             match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
+        # PATCH: league_id, needed to compute per-league BTTS/Over base
+        # rates (see get_league_rates()). Root-caused why PRE_BTTS_YES and
+        # PRE_OU_3.5 collapsed to always predicting the majority class:
+        # matches from high-scoring and low-scoring leagues were pooled
+        # with no signal distinguishing them, so the model had nothing to
+        # anchor on beyond noisy team-level stats for these two markets.
+        try: c.execute("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS league_id BIGINT")
+        except: pass
+        c.execute("CREATE INDEX IF NOT EXISTS idx_results_league ON match_results (league_id)")
         # PATCH: Elo-style team strength ratings, updated after each result.
         c.execute("""CREATE TABLE IF NOT EXISTS team_ratings (
             team_id BIGINT PRIMARY KEY, rating DOUBLE PRECISION NOT NULL DEFAULT 1500.0, updated_ts BIGINT)""")
@@ -513,7 +522,7 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
 
         rating_h=elo_local.get(th, ELO_DEFAULT)
         rating_a=elo_local.get(ta, ELO_DEFAULT)
-        feat=_assemble_pre_features(th, ta, last_h, last_a, h2h, cutoff, rating_h, rating_a)
+        feat=_assemble_pre_features(th, ta, last_h, last_a, h2h, cutoff, rating_h, rating_a, league_id=league_id)
 
         try:
             save_prematch_snapshot(int(fid), feat)
@@ -525,10 +534,11 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
         btts=1 if (gh>0 and ga>0) else 0
         try:
             with db_conn() as c:
-                c.execute("INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
-                          "VALUES(%s,%s,%s,%s,%s) ON CONFLICT(match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
-                          "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
-                          (int(fid), gh, ga, btts, int(time.time())))
+                c.execute("INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts, league_id) "
+                          "VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
+                          "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts, "
+                          "league_id=EXCLUDED.league_id",
+                          (int(fid), gh, ga, btts, int(time.time()), int(league_id)))
             results_saved+=1
         except Exception as e:
             log.warning("[HIST-PRE] result save failed for fixture %s: %s", fid, e)
@@ -680,6 +690,13 @@ def extract_features(m: dict) -> Dict[str,float]:
     f["match_minute_normalized"]=mnt/90.0
     f["time_weighted_xg_h"]=f["xg_h"]*(mnt/90.0)
     f["time_weighted_xg_a"]=f["xg_a"]*(mnt/90.0)
+
+    # PATCH: per-league BTTS/Over base rates — see get_league_rates() above
+    # for why this exists. Falls back to global rate for a league with too
+    # little history yet, so this is always populated with a real number.
+    league_id=((m.get("league") or {}).get("id"))
+    lr=get_league_rates(int(league_id) if league_id else None)
+    f["league_btts_rate"]=lr["btts"]; f["league_ov25_rate"]=lr["ov25"]; f["league_ov35_rate"]=lr["ov35"]
     return f
 
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
@@ -905,6 +922,63 @@ def update_team_ratings(home_id: int, away_id: int, gh: int, ga: int) -> None:
                   "ON CONFLICT(team_id) DO UPDATE SET rating=EXCLUDED.rating, updated_ts=EXCLUDED.updated_ts",
                   (away_id, float(new_ra), now))
 
+# ───────── League base rates (BTTS / Over 2.5 / Over 3.5) ─────────
+# PATCH: this is the fix for PRE_BTTS_YES and PRE_OU_3.5 collapsing to
+# always predicting the majority class. Both markets depend heavily on how
+# high- or low-scoring a league runs (a 0-0 grind in one league and a 4-3
+# thriller in another get pooled together with team-level Elo/form as the
+# ONLY signal) — without a league-level anchor, the model has nothing to
+# distinguish a low-scoring league from a high-scoring one, so for markets
+# where league context dominates team-level signal, it just learns the
+# global base rate and stops trying. This gives every prediction a
+# per-league prior computed from match_results.league_id (added above).
+LEAGUE_RATE_MIN_N = int(os.getenv("LEAGUE_RATE_MIN_N", "20"))
+LEAGUE_RATE_TTL    = int(os.getenv("LEAGUE_RATE_TTL_SEC", "21600"))  # 6h
+_LEAGUE_RATE_CACHE = _TTLCache(LEAGUE_RATE_TTL)
+
+def _global_rates() -> Dict[str,float]:
+    cached=_LEAGUE_RATE_CACHE.get("__GLOBAL__")
+    if cached is not None: return cached
+    with db_conn() as c:
+        row=c.execute("""
+            SELECT AVG(btts_yes)::float,
+                   AVG(CASE WHEN final_goals_h+final_goals_a>2 THEN 1.0 ELSE 0.0 END),
+                   AVG(CASE WHEN final_goals_h+final_goals_a>3 THEN 1.0 ELSE 0.0 END),
+                   COUNT(*)
+            FROM match_results
+        """).fetchone()
+    out={"btts":float(row[0] or 0.5),"ov25":float(row[1] or 0.5),"ov35":float(row[2] or 0.3),"n":int(row[3] or 0)}
+    _LEAGUE_RATE_CACHE.set("__GLOBAL__", out)
+    return out
+
+def get_league_rates(league_id: Optional[int]) -> Dict[str,float]:
+    """
+    Returns {"btts","ov25","ov35","n"} for a league, backed by
+    match_results.league_id. Falls back to the global rate across all
+    leagues when this specific league has fewer than LEAGUE_RATE_MIN_N
+    resolved matches — avoids a noisy per-league estimate for leagues that
+    barely have any history yet.
+    """
+    if not league_id: return _global_rates()
+    key=f"L{league_id}"
+    cached=_LEAGUE_RATE_CACHE.get(key)
+    if cached is not None: return cached
+    with db_conn() as c:
+        row=c.execute("""
+            SELECT AVG(btts_yes)::float,
+                   AVG(CASE WHEN final_goals_h+final_goals_a>2 THEN 1.0 ELSE 0.0 END),
+                   AVG(CASE WHEN final_goals_h+final_goals_a>3 THEN 1.0 ELSE 0.0 END),
+                   COUNT(*)
+            FROM match_results WHERE league_id=%s
+        """,(league_id,)).fetchone()
+    n=int(row[3] or 0)
+    if n < LEAGUE_RATE_MIN_N:
+        out=_global_rates()
+    else:
+        out={"btts":float(row[0] or 0.5),"ov25":float(row[1] or 0.5),"ov35":float(row[2] or 0.3),"n":n}
+    _LEAGUE_RATE_CACHE.set(key, out)
+    return out
+
 # ───────── Snapshots ─────────
 def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
     fx=m.get("fixture",{}) or {}; lg=m.get("league",{}) or {}
@@ -1002,11 +1076,13 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
         if not _is_final(st): continue
         g=fx.get("goals") or {}; gh=int(g.get("home") or 0); ga=int(g.get("away") or 0)
         btts=1 if (gh>0 and ga>0) else 0
+        league_id=int(((fx.get("league") or {}).get("id")) or 0) or None
         with db_conn() as c2:
-            c2.execute("INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts) "
-                       "VALUES(%s,%s,%s,%s,%s) ON CONFLICT(match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
-                       "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts",
-                       (int(mid), gh, ga, btts, int(time.time())))
+            c2.execute("INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts, league_id) "
+                       "VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
+                       "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts, "
+                       "league_id=EXCLUDED.league_id",
+                       (int(mid), gh, ga, btts, int(time.time()), league_id))
         # PATCH: update Elo ratings now that we know the result — this is
         # what feeds pm_rating_h/pm_rating_a/pm_rating_diff for future
         # prematch predictions. Nothing previously updated team_ratings at all.
@@ -1266,7 +1342,8 @@ def _h2h_counts(h2h: List[dict], home_id: int, away_id: int) -> Tuple[float,floa
     return hw/played, aw/played, dr/played
 
 def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: list,
-                            kickoff_ts: float, rating_h: float, rating_a: float) -> Dict[str,float]:
+                            kickoff_ts: float, rating_h: float, rating_a: float,
+                            league_id: Optional[int] = None) -> Dict[str,float]:
     """
     PATCH: extracted from extract_prematch_features() so live scoring and
     historical backfill (backfill_historical_prematch, added below) compute
@@ -1293,6 +1370,12 @@ def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: li
     rating_diff = rating_h - rating_a
     form_points_diff = form_points_h - form_points_a
 
+    # PATCH: per-league BTTS/Over base rates — see get_league_rates() above.
+    # This is the actual fix for PRE_BTTS_YES and PRE_OU_3.5 collapsing to
+    # majority-class guessing: without this, the model had no way to tell
+    # a low-scoring league from a high-scoring one.
+    lr=get_league_rates(league_id)
+
     return {
         "pm_gf_h":form_h["gf"],"pm_ga_h":form_h["ga"],"pm_win_h":form_h["win"],"pm_draw_h":form_h["draw"],"pm_loss_h":form_h["loss"],
         "pm_gf_a":form_a["gf"],"pm_ga_a":form_a["ga"],"pm_win_a":form_a["win"],"pm_draw_a":form_a["draw"],"pm_loss_a":form_a["loss"],
@@ -1310,6 +1393,7 @@ def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: li
         "pm_rest_diff":rest_h-rest_a,
         "pm_rating_form_interaction":rating_diff*form_points_diff,
         "pm_attack_defense_ratio":(attack_strength_h+attack_strength_a)/max(defense_strength_h+defense_strength_a, 0.1),
+        "pm_league_btts_rate":lr["btts"],"pm_league_ov25_rate":lr["ov25"],"pm_league_ov35_rate":lr["ov35"],
         # Live features are 0 for prematch (matches main.py's in-play keys)
         "minute":0.0,"goals_h":0.0,"goals_a":0.0,"goals_sum":0.0,"goals_diff":0.0,
         "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
@@ -1324,6 +1408,7 @@ def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: li
         "fouls_per_minute":0.0,"discipline_score_h":0.0,"discipline_score_a":0.0,
         "possession_xg_interaction_h":0.0,"possession_xg_interaction_a":0.0,"sot_xg_ratio_h":0.0,"sot_xg_ratio_a":0.0,
         "match_minute_normalized":0.0,"time_weighted_xg_h":0.0,"time_weighted_xg_a":0.0,
+        "league_btts_rate":0.0,"league_ov25_rate":0.0,"league_ov35_rate":0.0,
     }
 
 def extract_prematch_features(fx: dict) -> Dict[str,float]:
@@ -1350,7 +1435,9 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
     except Exception:
         pass
 
-    feat = _assemble_pre_features(th, ta, last_h, last_a, h2h, kickoff_ts, rating_h, rating_a)
+    league_id=((fx.get("league") or {}).get("id"))
+    feat = _assemble_pre_features(th, ta, last_h, last_a, h2h, kickoff_ts, rating_h, rating_a,
+                                   league_id=int(league_id) if league_id else None)
     # internal, not a model feature — used by save_prematch_snapshot()
     feat["_home_id"] = float(th); feat["_away_id"] = float(ta)
     return feat
@@ -1750,6 +1837,45 @@ def http_backfill_prematch_history():
 @app.route("/admin/motd", methods=["POST","GET"])
 def http_motd():
     _require_admin(); ok = send_match_of_the_day(); return jsonify({"ok": bool(ok)})
+
+@app.route("/admin/leagues", methods=["GET"])
+def http_leagues():
+    """
+    NEW: proxies API-Football's own /leagues endpoint so you get real,
+    always-correct league IDs directly from the source instead of a
+    hand-typed list that could be wrong or go stale. Search by name and/or
+    country (API-Football requires 3+ characters for `search`).
+
+    Usage:
+      /admin/leagues?search=premier&key=YOUR_KEY
+      /admin/leagues?country=England&key=YOUR_KEY
+    Also returns each league's available season years — pass those
+    directly into /admin/backfill-prematch-history?seasons=...
+    """
+    _require_admin()
+    search = request.args.get("search", "").strip()
+    country = request.args.get("country", "").strip()
+    params = {}
+    if search: params["search"] = search
+    if country: params["country"] = country
+    if not params:
+        return jsonify({"ok": False, "error": "provide ?search=<3+ chars> and/or ?country=<name>"}), 400
+    js = _api_get(f"{BASE_URL}/leagues", params) or {}
+    resp = js.get("response", []) if isinstance(js, dict) else []
+    out = []
+    for item in resp:
+        lg = item.get("league") or {}
+        ctry = item.get("country") or {}
+        seasons = item.get("seasons") or []
+        out.append({
+            "id": lg.get("id"),
+            "name": lg.get("name"),
+            "type": lg.get("type"),
+            "country": ctry.get("name"),
+            "available_seasons": sorted([s.get("year") for s in seasons if s.get("year")]),
+        })
+    return jsonify({"ok": True, "count": len(out), "leagues": out,
+                     "api_errors": js.get("errors") if isinstance(js, dict) else None})
 
 @app.route("/admin/status", methods=["GET"])
 def http_status():
