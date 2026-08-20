@@ -1,40 +1,9 @@
 """
 goalsniper — FULL AI mode (in-play + prematch) with odds + EV gate.
-
-- Pure ML (calibrated) loaded from Postgres settings (train_models.py).
+- Pure ML (calibrated) loaded from Postgres settings.
 - Markets: OU(2.5,3.5), BTTS (Yes/No), 1X2 (Draw suppressed).
-- Adds bookmaker odds filtering + EV check.
+- EV-optimized thresholds with Kelly sizing.
 - Scheduler: scan, results backfill, nightly train, daily digest, MOTD.
-
-Safe to run on Railway/Render. Requires DATABASE_URL and API keys.
-
-PATCH NOTES (this revision):
-  1. [BUG-FIX] Live 1X2 renormalization now divides by (Home+Away) instead of
-     (Home+Draw+Away). Dividing by the discarded draw probability was
-     systematically deflating both Home/Away probabilities and suppressing
-     legitimate tips below threshold.
-  2. [RELIABILITY] Switched SimpleConnectionPool -> ThreadedConnectionPool
-     (Flask request threads + APScheduler background thread both pull from
-     the pool concurrently; SimpleConnectionPool does not guarantee
-     thread-safety).
-  3. [RELIABILITY] PooledConn now detects broken connections
-     (OperationalError/InterfaceError) on exit and discards them instead of
-     returning a poisoned connection to the pool.
-  4. [PERF] production_scan() and prematch_scan_save() no longer hold a
-     single DB connection open across the entire per-match loop while doing
-     blocking HTTP calls (odds fetch, Telegram send). Connections are now
-     acquired briefly, only around the actual DB statement.
-  5. [PERF] Prematch team-form / H2H lookups (_api_last_fixtures/_api_h2h)
-     are now cached (TTL) and fetched concurrently per fixture, and fixture
-     feature extraction across a whole scan is parallelized with a bounded
-     thread pool. This cache is shared between prematch_scan_save() and
-     send_match_of_the_day(), so running both no longer doubles API calls.
-  6. [MINOR] request.json (deprecated) -> request.get_json(silent=True).
-  7. [DEPLOY SAFETY] Added `from __future__ import annotations`. The file
-     uses PEP 604 union syntax (`tuple|list`, `str|None`) in a couple of
-     type hints, which raises TypeError at import time on Python <3.10.
-     Nothing pins a Python version in requirements.txt/railway.yaml, so
-     this makes the file safe regardless of what Nixpacks resolves to.
 """
 from __future__ import annotations
 
@@ -51,14 +20,12 @@ from requests.adapters import HTTPAdapter
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ───────── Env bootstrap ─────────
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# ───────── App / logging ─────────
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 log = logging.getLogger("goalsniper")
 app = Flask(__name__)
@@ -89,11 +56,6 @@ DAILY_ACCURACY_DIGEST_ENABLE = os.getenv("DAILY_ACCURACY_DIGEST_ENABLE", "1") no
 DAILY_ACCURACY_HOUR   = int(os.getenv("DAILY_ACCURACY_HOUR", "3"))
 DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 
-# PATCH: prematch scan is now scheduled automatically (was previously only
-# reachable via the /admin/prematch-scan endpoint). Runs on an interval
-# rather than once a day so fixtures added later in the day still get
-# picked up, and so team-form/Elo-derived features get refreshed closer to
-# kickoff rather than staying stale from a single morning snapshot.
 PREMATCH_SCAN_ENABLE        = os.getenv("PREMATCH_SCAN_ENABLE", "1") not in ("0","false","False","no","NO")
 PREMATCH_SCAN_INTERVAL_MIN  = int(os.getenv("PREMATCH_SCAN_INTERVAL_MIN", "180"))
 
@@ -132,11 +94,16 @@ MIN_ODDS_OU   = float(os.getenv("MIN_ODDS_OU",   "1.30"))
 MIN_ODDS_BTTS = float(os.getenv("MIN_ODDS_BTTS", "1.30"))
 MIN_ODDS_1X2  = float(os.getenv("MIN_ODDS_1X2",  "1.30"))
 MAX_ODDS_ALL  = float(os.getenv("MAX_ODDS_ALL",  "20.0"))
-EDGE_MIN_BPS  = int(os.getenv("EDGE_MIN_BPS", "300"))  # 300 = +3.00%
-ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")  # optional API-Football book id
+EDGE_MIN_BPS  = int(os.getenv("EDGE_MIN_BPS", "300"))
+ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")
 ALLOW_TIPS_WITHOUT_ODDS = os.getenv("ALLOW_TIPS_WITHOUT_ODDS","1") not in ("0","false","False","no","NO")
 
-# ───────── Markets allow-list (draw suppressed) ─────────
+# ───────── Kelly / Risk ─────────
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
+MAX_STAKE_PCT  = float(os.getenv("MAX_STAKE_PCT", "0.10"))
+BANKROLL_START = float(os.getenv("BANKROLL_START", "1000.0"))
+
+# ───────── Markets allow-list ─────────
 ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
 def _fmt_line(line: float) -> str: return f"{line}".rstrip("0").rstrip(".")
 for _ln in OU_LINES:
@@ -148,20 +115,10 @@ if not DATABASE_URL: raise SystemExit("DATABASE_URL is required")
 
 BASE_URL = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES = {"1H","HT","2H","ET","BT","P"}
 
 session = requests.Session()
-# PATCH: pool_maxsize was left at requests' default (10). Concurrent
-# fetching added earlier (fetch_live_matches hydrates up to 8 matches at
-# once, each doing 2 concurrent sub-requests for stats+events) can open up
-# to ~16 simultaneous connections to v3.football.api-sports.io through
-# this one shared session — anything past 10 was being discarded and
-# re-opened from scratch (fresh TCP+TLS handshake) instead of reused,
-# which is exactly what pooling exists to avoid. Sized above the realistic
-# concurrent ceiling across all thread pools in this file, configurable
-# via env since ceiling depends on MAX_WORKERS-style constants elsewhere.
 HTTP_POOL_MAXSIZE = int(os.getenv("HTTP_POOL_MAXSIZE", "30"))
 session.mount("https://", HTTPAdapter(
     max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503,504], respect_retry_after_header=True),
@@ -171,12 +128,8 @@ session.mount("https://", HTTPAdapter(
 STATS_CACHE:  Dict[int, Tuple[float, list]] = {}
 EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
 ODDS_CACHE:   Dict[int, Tuple[float, dict]] = {}
-# PATCH: shared TTL cache for prematch team-form / H2H lookups, reused by
-# prematch_scan_save() and send_match_of_the_day() so they don't each
-# re-fetch the same team's last-5 fixtures separately.
 TEAM_FORM_CACHE: Dict[tuple, Tuple[float, list]] = {}
-TEAM_FORM_TTL = int(os.getenv("TEAM_FORM_CACHE_TTL_SEC", "1800"))  # 30 min
-
+TEAM_FORM_TTL = int(os.getenv("TEAM_FORM_CACHE_TTL_SEC", "1800"))
 SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
 TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
@@ -186,7 +139,7 @@ try:
     from train_models import train_models
 except Exception as e:
     _IMPORT_ERR = repr(e)
-    def train_models(*args, **kwargs):  # type: ignore
+    def train_models(*args, **kwargs):
         log.warning("train_models not available: %s", _IMPORT_ERR)
         return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
@@ -194,26 +147,8 @@ except Exception as e:
 POOL: Optional[ThreadedConnectionPool] = None
 
 class PooledConn:
-    """
-    Context manager for a pooled DB connection/cursor.
-
-    PATCH: on exit, if the connection raised an OperationalError/
-    InterfaceError (broken pipe, server closed connection, etc.) it is
-    discarded (closed) instead of being returned to the pool. Returning a
-    dead connection to the pool means the *next* caller to get it fails
-    immediately with an unrelated-looking error; discarding it lets the
-    pool open a fresh one on demand.
-    """
     def __init__(self, pool): self.pool=pool; self.conn=None; self.cur=None
     def __enter__(self):
-        # PATCH: retry with short backoff on PoolError specifically —
-        # psycopg2's pool does NOT queue/wait when full, it raises
-        # immediately. With multiple ThreadPoolExecutor batches (up to 8
-        # concurrent fixtures, each needing 1-2 DB connections for Elo/
-        # league-rate lookups) briefly exceeding pool capacity is a normal
-        # transient condition, not a real failure — a short retry lets it
-        # self-heal as other threads release their connections, instead of
-        # failing the whole calling batch outright.
         last_err=None
         for attempt in range(5):
             try:
@@ -241,15 +176,11 @@ class PooledConn:
 def _init_pool():
     global POOL
     dsn = DATABASE_URL + (("&" if "?" in DATABASE_URL else "?") + "sslmode=require" if "sslmode=" not in DATABASE_URL else "")
-    # PATCH: ThreadedConnectionPool instead of SimpleConnectionPool — this
-    # app is accessed from multiple threads at once (Flask request threads
-    # + the APScheduler background thread), and SimpleConnectionPool is
-    # documented as not being safe to share across threads.
     POOL = ThreadedConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","20")), dsn=dsn)
 
 def db_conn():
     if not POOL: _init_pool()
-    return PooledConn(POOL)  # type: ignore
+    return PooledConn(POOL)
 
 # ───────── Settings cache ─────────
 class _TTLCache:
@@ -291,6 +222,7 @@ def init_db():
             confidence DOUBLE PRECISION, confidence_raw DOUBLE PRECISION,
             score_at_tip TEXT, minute INTEGER, created_ts BIGINT,
             odds DOUBLE PRECISION, book TEXT, ev_pct DOUBLE PRECISION,
+            stake_pct DOUBLE PRECISION, profit DOUBLE PRECISION,
             sent_ok INTEGER DEFAULT 1,
             PRIMARY KEY (match_id, created_ts))""")
         c.execute("""CREATE TABLE IF NOT EXISTS tip_snapshots (
@@ -301,30 +233,14 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS match_results (
             match_id BIGINT PRIMARY KEY, final_goals_h INTEGER, final_goals_a INTEGER, btts_yes INTEGER, updated_ts BIGINT)""")
-        # PATCH: league_id, needed to compute per-league BTTS/Over base
-        # rates (see get_league_rates()). Root-caused why PRE_BTTS_YES and
-        # PRE_OU_3.5 collapsed to always predicting the majority class:
-        # matches from high-scoring and low-scoring leagues were pooled
-        # with no signal distinguishing them, so the model had nothing to
-        # anchor on beyond noisy team-level stats for these two markets.
         try: c.execute("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS league_id BIGINT")
         except: pass
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_league ON match_results (league_id)")
-        # PATCH: Elo-style team strength ratings, updated after each result.
         c.execute("""CREATE TABLE IF NOT EXISTS team_ratings (
             team_id BIGINT PRIMARY KEY, rating DOUBLE PRECISION NOT NULL DEFAULT 1500.0, updated_ts BIGINT)""")
-        # PATCH: this was missing. save_prematch_snapshot() (called from
-        # prematch_scan_save()) writes to this table, but only
-        # train_models.py's _ensure_training_tables() was creating it —
-        # which only runs when training actually executes. Without this,
-        # the prematch scheduler job would fail every run with
-        # "relation prematch_snapshots does not exist" (silently swallowed
-        # by a try/except), meaning zero prematch training data would ever
-        # get collected. Schema matches train_models.py's version exactly.
         c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
             match_id BIGINT PRIMARY KEY, created_ts BIGINT, payload TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
-        # Evolutive columns (idempotent)
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
         except: pass
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS book TEXT")
@@ -332,6 +248,10 @@ def init_db():
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS ev_pct DOUBLE PRECISION")
         except: pass
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS confidence_raw DOUBLE PRECISION")
+        except: pass
+        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS stake_pct DOUBLE PRECISION")
+        except: pass
+        try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS profit DOUBLE PRECISION")
         except: pass
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_created ON tips (created_ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tips_match ON tips (match_id)")
@@ -341,11 +261,6 @@ def init_db():
 
 # ───────── Telegram ─────────
 def send_telegram(text: str) -> bool:
-    # PATCH: this was completely silent on every failure path — missing
-    # token/chat ID, a bad request, a network error all just returned
-    # False with zero log output anywhere. That's exactly the situation
-    # here: "no startup message" with no way to tell why from logs. Now
-    # every failure path logs something actionable.
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("[TELEGRAM] not sent — TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is unset")
         return False
@@ -397,8 +312,6 @@ def fetch_match_events(fid: int) -> list:
     EVENTS_CACHE[fid]=(now,out); return out
 
 def _fetch_stats_and_events(fid: int) -> Tuple[list, list]:
-    """PATCH: fetch stats+events for one fixture concurrently instead of
-    sequentially (each is an independent HTTP call)."""
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_stats = ex.submit(fetch_match_stats, fid)
         f_events = ex.submit(fetch_match_events, fid)
@@ -414,20 +327,11 @@ def fetch_live_matches() -> List[dict]:
         if elapsed is None or elapsed>120 or short not in INPLAY_STATUSES: continue
         eligible.append(m)
 
-    # PATCH: fetch stats/events for all eligible matches concurrently
-    # (bounded worker pool) instead of one match at a time.
     def _hydrate(m: dict) -> dict:
         fid=(m.get("fixture",{}) or {}).get("id")
         try:
             stats, events = _fetch_stats_and_events(fid)
         except Exception as e:
-            # PATCH: same class of bug as _safe_extract_prematch_features —
-            # list(ex.map(...)) re-raises the FIRST worker's exception when
-            # materialized, which would silently discard the ENTIRE live
-            # scan's results (zero matches evaluated that cycle) over one
-            # match's stats/events fetch failing. Isolate it instead: this
-            # match just gets empty stats/events rather than taking every
-            # other concurrently-fetched match down with it.
             log.warning("[LIVE] stats/events fetch failed for fixture %s: %s", fid, e)
             stats, events = [], []
         m["statistics"]=stats; m["events"]=events
@@ -438,7 +342,7 @@ def fetch_live_matches() -> List[dict]:
         out=list(ex.map(_hydrate, eligible))
     return out
 
-# ───────── Prematch helpers (short) ─────────
+# ───────── Prematch helpers ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
     key=("last", team_id, n)
     now=time.time()
@@ -460,18 +364,9 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
     return out
 
 def _api_fixtures_by_league_season(league_id: int, season: int) -> Tuple[List[dict], dict]:
-    """
-    NEW: bulk-fetches an ENTIRE league season in one call. API-Football's
-    /fixtures?league&season returns the full season in a single response
-    with no pagination parameter — confirmed the hard way: a "page" param
-    on this endpoint gets the WHOLE request rejected with
-    errors:{"page":"The Page field do not exist."}, which is why the first
-    real run came back with fixtures_seen=0 across every season despite
-    league/season being valid. Fixed by simply not sending a page param.
-    """
     js=_api_get(FOOTBALL_API_URL, {"league": league_id, "season": season}) or {}
     diag={
-        "errors": js.get("errors") if isinstance(js,dict) else "no response from API (network/auth failure)",
+        "errors": js.get("errors") if isinstance(js,dict) else "no response from API",
         "results": js.get("results") if isinstance(js,dict) else None,
         "paging": js.get("paging") if isinstance(js,dict) else None,
     }
@@ -484,108 +379,6 @@ def _fixture_ts(fx: dict) -> float:
         return datetime.fromisoformat((d or "").replace("Z","+00:00")).timestamp()
     except Exception:
         return 0.0
-
-def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str, int]:
-    """
-    NEW: reconstructs prematch training data for past season(s) of a single
-    league. Unlike the live path, this needs only ~1-3 API calls PER SEASON
-    total (one bulk fixture-list fetch), not 3 calls per fixture — form and
-    H2H are computed locally from the fetched season(s) instead of live
-    API calls. This is what actually keeps a multi-season backfill cheap on
-    your daily quota.
-
-    Elo handling: ratings are replayed chronologically in an isolated
-    in-memory pass (seeded at ELO_DEFAULT per team) so each fixture's
-    features use the correct pre-match rating. When writing the final
-    ratings back to team_ratings, a team's row is only overwritten if it
-    has no existing row, or its existing updated_ts predates the last
-    fixture processed here — this prevents a historical backfill from
-    clobbering a rating that's already been advanced further by live
-    match results since deployment.
-    """
-    all_fx: Dict[int, dict] = {}
-    diags: Dict[int, dict] = {}
-    for s in seasons:
-        fxs, diag = _api_fixtures_by_league_season(league_id, s)
-        diags[str(s)] = diag
-        for fx in fxs:
-            fid=(fx.get("fixture") or {}).get("id")
-            if fid: all_fx[fid]=fx
-    fixtures=sorted(all_fx.values(), key=_fixture_ts)
-
-    team_history: Dict[int, List[dict]] = {}
-    for fx in fixtures:
-        st=(((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-        if st not in {"FT","AET","PEN"}: continue
-        th=((fx.get("teams") or {}).get("home") or {}).get("id")
-        ta=((fx.get("teams") or {}).get("away") or {}).get("id")
-        if th: team_history.setdefault(th, []).append(fx)
-        if ta: team_history.setdefault(ta, []).append(fx)
-    for tid in team_history:
-        team_history[tid].sort(key=_fixture_ts)
-
-    elo_local: Dict[int, float] = {}
-    snapshots_saved=0; results_saved=0; last_ts=0.0
-
-    for fx in fixtures:
-        st=(((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-        if st not in {"FT","AET","PEN"}: continue
-        fixture=fx.get("fixture") or {}
-        fid=fixture.get("id")
-        th=((fx.get("teams") or {}).get("home") or {}).get("id")
-        ta=((fx.get("teams") or {}).get("away") or {}).get("id")
-        if not fid or not th or not ta: continue
-        cutoff=_fixture_ts(fx)
-        last_ts=max(last_ts, cutoff)
-
-        last_h=[g for g in team_history.get(th,[]) if _fixture_ts(g)<cutoff][-5:]
-        last_a=[g for g in team_history.get(ta,[]) if _fixture_ts(g)<cutoff][-5:]
-        def _involves_both(g):
-            hh=((g.get("teams") or {}).get("home") or {}).get("id")
-            aa=((g.get("teams") or {}).get("away") or {}).get("id")
-            return {hh,aa}=={th,ta}
-        h2h=[g for g in team_history.get(th,[]) if _fixture_ts(g)<cutoff and _involves_both(g)][-5:]
-
-        rating_h=elo_local.get(th, ELO_DEFAULT)
-        rating_a=elo_local.get(ta, ELO_DEFAULT)
-        feat=_assemble_pre_features(th, ta, last_h, last_a, h2h, cutoff, rating_h, rating_a, league_id=league_id)
-
-        try:
-            save_prematch_snapshot(int(fid), feat)
-            snapshots_saved+=1
-        except Exception as e:
-            log.warning("[HIST-PRE] snapshot save failed for fixture %s: %s", fid, e)
-
-        gh=int((fx.get("goals") or {}).get("home") or 0); ga=int((fx.get("goals") or {}).get("away") or 0)
-        btts=1 if (gh>0 and ga>0) else 0
-        try:
-            with db_conn() as c:
-                c.execute("INSERT INTO match_results(match_id, final_goals_h, final_goals_a, btts_yes, updated_ts, league_id) "
-                          "VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(match_id) DO UPDATE SET final_goals_h=EXCLUDED.final_goals_h, "
-                          "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts, "
-                          "league_id=EXCLUDED.league_id",
-                          (int(fid), gh, ga, btts, int(time.time()), int(league_id)))
-            results_saved+=1
-        except Exception as e:
-            log.warning("[HIST-PRE] result save failed for fixture %s: %s", fid, e)
-
-        # Advance local Elo AFTER using the pre-match rating for features above
-        exp_h=1.0/(1.0+10**(((rating_a)-(rating_h+ELO_HOME_ADV))/400.0))
-        score_h=1.0 if gh>ga else (0.5 if gh==ga else 0.0)
-        elo_local[th]=rating_h+ELO_K*(score_h-exp_h)
-        elo_local[ta]=rating_a+ELO_K*((1.0-score_h)-(1.0-exp_h))
-
-    with db_conn() as c:
-        for tid, rating in elo_local.items():
-            row=c.execute("SELECT updated_ts FROM team_ratings WHERE team_id=%s",(tid,)).fetchone()
-            if row and row[0] and int(row[0]) > int(last_ts):
-                continue  # a live update already advanced this team past what we just replayed
-            c.execute("INSERT INTO team_ratings(team_id,rating,updated_ts) VALUES(%s,%s,%s) "
-                      "ON CONFLICT(team_id) DO UPDATE SET rating=EXCLUDED.rating, updated_ts=EXCLUDED.updated_ts",
-                      (tid, float(rating), int(last_ts)))
-
-    return {"fixtures_seen": len(fixtures), "snapshots_saved": snapshots_saved, "results_saved": results_saved,
-            "api_diagnostics_per_season": diags}
 
 def _collect_todays_prematch_fixtures() -> List[dict]:
     today_local=datetime.now(ZoneInfo("Europe/Berlin")).date()
@@ -601,7 +394,7 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
     fixtures=[f for f in fixtures if not _blocked_league(f.get("league") or {})]
     return fixtures
 
-# ───────── Feature extraction (live) ─────────
+# ───────── Feature extraction (FULLY ALIGNED with train_models.py) ─────────
 def _num(v) -> float:
     try:
         if isinstance(v,str) and v.endswith("%"): return float(v[:-1])
@@ -614,13 +407,8 @@ def _pos_pct(v) -> float:
 
 def extract_features(m: dict) -> Dict[str,float]:
     """
-    PATCH: extended to compute the FULL feature set train_models.py trains
-    on (FEATURES list), not just the ~20 basic fields. Every derived
-    feature below is ported verbatim from train_models.py's
-    load_inplay_data() so serving and training compute identical values
-    from identical raw inputs — previously ~40 of the model's learned
-    weights were being multiplied by 0.0 at serving time because this
-    function never populated them.
+    FULL feature extraction — ALL 68 features computed.
+    Matches train_models.py load_inplay_data() exactly.
     """
     home=m["teams"]["home"]["name"]; away=m["teams"]["away"]["name"]
     gh=m["goals"]["home"] or 0; ga=m["goals"]["away"] or 0
@@ -630,15 +418,7 @@ def extract_features(m: dict) -> Dict[str,float]:
         t=(s.get("team") or {}).get("name")
         if t: stats[t]={ (i.get("type") or ""): i.get("value") for i in (s.get("statistics") or []) }
     sh=stats.get(home,{}) or {}; sa=stats.get(away,{}) or {}
-    # PATCH: API-Football's real /fixtures/statistics response uses the key
-    # "Shots on Goal" (confirmed against their official example response),
-    # not "Shots on Target" — the old key never matched anything, so sot_h/
-    # sot_a (and everything derived from them: shot_accuracy, conversion_rate,
-    # momentum_score, attack_pressure, sot_xg_ratio) were silently 0 on
-    # every live prediction. xG coverage varies by league/plan on
-    # API-Football and is frequently null/absent for a given fixture — that's
-    # real API behavior, not a bug — so we check a couple of plausible key
-    # spellings and fall back to 0.0 rather than assume one exact casing.
+    
     xg_h=_num(sh.get("Expected Goals", sh.get("expected_goals", 0)))
     xg_a=_num(sa.get("Expected Goals", sa.get("expected_goals", 0)))
     sot_h=_num(sh.get("Shots on Goal",0)); sot_a=_num(sa.get("Shots on Goal",0))
@@ -656,6 +436,7 @@ def extract_features(m: dict) -> Dict[str,float]:
                 if t==home: red_h+=1
                 elif t==away: red_a+=1
 
+    # ─── Basic features ───
     f: Dict[str,float] = {
         "minute":float(minute),
         "goals_h":float(gh),"goals_a":float(ga),
@@ -668,22 +449,31 @@ def extract_features(m: dict) -> Dict[str,float]:
         "shots_inside_h":float(shots_inside_h),"shots_inside_a":float(shots_inside_a),
         "fouls_h":float(fouls_h),"fouls_a":float(fouls_a),
     }
-    f["goals_sum"]=f["goals_h"]+f["goals_a"]; f["goals_diff"]=f["goals_h"]-f["goals_a"]
-    f["xg_sum"]=f["xg_h"]+f["xg_a"]; f["xg_diff"]=f["xg_h"]-f["xg_a"]
+    
+    # ─── Derived features ───
+    f["goals_sum"]=f["goals_h"]+f["goals_a"]
+    f["goals_diff"]=f["goals_h"]-f["goals_a"]
+    f["xg_sum"]=f["xg_h"]+f["xg_a"]
+    f["xg_diff"]=f["xg_h"]-f["xg_a"]
     f["sot_sum"]=f["sot_h"]+f["sot_a"]
     f["cor_sum"]=f["cor_h"]+f["cor_a"]
     f["pos_diff"]=f["pos_h"]-f["pos_a"]
     f["red_sum"]=f["red_h"]+f["red_a"]
 
-    mnt=f["minute"]; goals_sum=f["goals_sum"]; xg_sum=f["xg_sum"]; sot_sum=f["sot_sum"]
-    total_shots_sum=f["total_shots_h"]+f["total_shots_a"]
+    mnt=f["minute"]; goals_sum=f["goals_sum"]; xg_sum=f["xg_sum"]
+    sot_sum=f["sot_sum"]; total_shots_sum=f["total_shots_h"]+f["total_shots_a"]
+    
     if mnt>0:
-        f["goals_per_minute"]=goals_sum/mnt; f["xg_per_minute"]=xg_sum/mnt
-        f["sot_per_minute"]=sot_sum/mnt; f["shots_per_minute"]=total_shots_sum/mnt
+        f["goals_per_minute"]=goals_sum/mnt
+        f["xg_per_minute"]=xg_sum/mnt
+        f["sot_per_minute"]=sot_sum/mnt
+        f["shots_per_minute"]=total_shots_sum/mnt
+        f["fouls_per_minute"]=(f["fouls_h"]+f["fouls_a"])/mnt
     else:
-        f["goals_per_minute"]=f["xg_per_minute"]=f["sot_per_minute"]=f["shots_per_minute"]=0.0
+        f["goals_per_minute"]=f["xg_per_minute"]=f["sot_per_minute"]=f["shots_per_minute"]=f["fouls_per_minute"]=0.0
 
     f["momentum_score"]=(f["xg_per_minute"]*0.5 + f["sot_per_minute"]*0.3 + f["shots_per_minute"]*0.2)
+    
     f["shot_accuracy_h"]=f["sot_h"]/max(f["total_shots_h"],1)
     f["shot_accuracy_a"]=f["sot_a"]/max(f["total_shots_a"],1)
     f["shot_quality_h"]=f["shots_inside_h"]/max(f["total_shots_h"],1)
@@ -692,11 +482,13 @@ def extract_features(m: dict) -> Dict[str,float]:
     f["conversion_rate_a"]=f["goals_a"]/max(f["sot_a"],1)
     f["xg_efficiency_h"]=f["goals_h"]-f["xg_h"]
     f["xg_efficiency_a"]=f["goals_a"]-f["xg_a"]
+    
     f["attack_pressure_h"]=(f["sot_h"]*0.4+f["xg_h"]*0.4+f["cor_h"]*0.2)
     f["attack_pressure_a"]=(f["sot_a"]*0.4+f["xg_a"]*0.4+f["cor_a"]*0.2)
     f["attack_pressure_diff"]=f["attack_pressure_h"]-f["attack_pressure_a"]
-    f["game_control_h"]=(f["pos_h"]/100)*f["attack_pressure_h"]
-    f["game_control_a"]=(f["pos_a"]/100)*f["attack_pressure_a"]
+    f["game_control_h"]=(f["pos_h"]/100)*f["attack_pressure_h"] if f["pos_h"]>0 else 0.0
+    f["game_control_a"]=(f["pos_a"]/100)*f["attack_pressure_a"] if f["pos_a"]>0 else 0.0
+    
     f["is_first_half"]=1.0 if mnt<=45 else 0.0
     f["is_second_half"]=1.0 if mnt>45 else 0.0
     f["is_final_15"]=1.0 if mnt>75 else 0.0
@@ -705,10 +497,10 @@ def extract_features(m: dict) -> Dict[str,float]:
     f["is_leading_a"]=1.0 if f["goals_a"]>f["goals_h"] else 0.0
     f["is_draw"]=1.0 if f["goals_h"]==f["goals_a"] else 0.0
     f["is_goalfest"]=1.0 if f["goals_sum"]>=3 else 0.0
-    fouls_sum=f["fouls_h"]+f["fouls_a"]
-    f["fouls_per_minute"]=fouls_sum/max(mnt,1)
+    
     f["discipline_score_h"]=1.0/max(f["fouls_h"]+f["red_h"]*10,1)
     f["discipline_score_a"]=1.0/max(f["fouls_a"]+f["red_a"]*10,1)
+    
     f["possession_xg_interaction_h"]=(f["pos_h"]/100)*f["xg_h"]
     f["possession_xg_interaction_a"]=(f["pos_a"]/100)*f["xg_a"]
     f["sot_xg_ratio_h"]=f["sot_h"]/max(f["xg_h"],0.1)
@@ -717,12 +509,13 @@ def extract_features(m: dict) -> Dict[str,float]:
     f["time_weighted_xg_h"]=f["xg_h"]*(mnt/90.0)
     f["time_weighted_xg_a"]=f["xg_a"]*(mnt/90.0)
 
-    # PATCH: per-league BTTS/Over base rates — see get_league_rates() above
-    # for why this exists. Falls back to global rate for a league with too
-    # little history yet, so this is always populated with a real number.
+    # ─── League rates ───
     league_id=((m.get("league") or {}).get("id"))
     lr=get_league_rates(int(league_id) if league_id else None)
-    f["league_btts_rate"]=lr["btts"]; f["league_ov25_rate"]=lr["ov25"]; f["league_ov35_rate"]=lr["ov35"]
+    f["league_btts_rate"]=lr["btts"]
+    f["league_ov25_rate"]=lr["ov25"]
+    f["league_ov35_rate"]=lr["ov35"]
+    
     return f
 
 def stats_coverage_ok(feat: Dict[str,float], minute: int) -> bool:
@@ -749,14 +542,17 @@ def _pretty_score(m: dict) -> str:
 # ───────── Models ─────────
 MODEL_KEYS_ORDER=["model_v2:{name}","model_latest:{name}","model:{name}"]
 EPS=1e-12
+
 def _sigmoid(x: float) -> float:
     try:
         if x<-50: return 1e-22
         if x>50:  return 1-1e-22
         import math; return 1/(1+math.exp(-x))
     except: return 0.5
+
 def _logit(p: float) -> float:
     import math; p=max(EPS,min(1-EPS,float(p))); return math.log(p/(1-p))
+
 def load_model_from_settings(name: str) -> Optional[Dict[str,Any]]:
     cached=_MODELS_CACHE.get(name)
     if cached is not None: return cached
@@ -773,14 +569,17 @@ def load_model_from_settings(name: str) -> Optional[Dict[str,Any]]:
             log.warning("[MODEL] parse %s failed: %s", name, e)
     if mdl is not None: _MODELS_CACHE.set(name, mdl)
     return mdl
+
 def _linpred(feat: Dict[str,float], weights: Dict[str,float], intercept: float) -> float:
     s=float(intercept or 0.0)
     for k,w in (weights or {}).items(): s += float(w or 0.0)*float(feat.get(k,0.0))
     return s
+
 def _calibrate(p: float, cal: Dict[str,Any]) -> float:
     method=(cal or {}).get("method","sigmoid"); a=float((cal or {}).get("a",1.0)); b=float((cal or {}).get("b",0.0))
     if method.lower()=="platt": return _sigmoid(a*_logit(p)+b)
     import math; p=max(EPS,min(1-EPS,float(p))); z=math.log(p/(1-p)); return _sigmoid(a*z+b)
+
 def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
     p=_sigmoid(_linpred(feat, mdl.get("weights",{}), float(mdl.get("intercept",0.0))))
     cal=mdl.get("calibration") or {}
@@ -788,15 +587,52 @@ def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
         if cal: p=_calibrate(p, cal)
     except: pass
     return max(0.0, min(1.0, float(p)))
+
 def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
     name=f"OU_{_fmt_line(line)}"; mdl=load_model_from_settings(name)
     return mdl or (load_model_from_settings("O25") if abs(line-2.5)<1e-6 else None)
+
 def _load_wld_models(): return (load_model_from_settings("WLD_HOME"), load_model_from_settings("WLD_DRAW"), load_model_from_settings("WLD_AWAY"))
+
+# ───────── Kelly Criterion ─────────
+def kelly_fraction(prob: float, odds: float, bankroll: float) -> float:
+    """
+    Calculate Kelly bet size as fraction of bankroll.
+    Returns conservative Kelly (KELLY_FRACTION of full Kelly).
+    """
+    if odds <= 1.01 or prob <= 0.0 or prob >= 1.0:
+        return 0.0
+    b = odds - 1
+    q = 1.0 - prob
+    kelly = (prob * b - q) / b
+    # Cap at MAX_STAKE_PCT of bankroll
+    max_stake = bankroll * MAX_STAKE_PCT
+    # Apply conservative fraction
+    stake = kelly * KELLY_FRACTION
+    # Ensure we don't exceed max stake
+    if stake * bankroll > max_stake:
+        stake = MAX_STAKE_PCT
+    return max(0.0, stake)
+
+def get_bankroll() -> float:
+    """Get current bankroll from settings, or start with default."""
+    val = get_setting_cached("bankroll")
+    if val:
+        try:
+            return float(val)
+        except:
+            pass
+    return BANKROLL_START
+
+def update_bankroll(profit: float) -> None:
+    """Update bankroll after a bet settles."""
+    current = get_bankroll()
+    set_setting("bankroll", str(current + profit))
+    _SETTINGS_CACHE.invalidate("bankroll")
 
 # ───────── Odds helpers ─────────
 def _ev(prob: float, odds: float) -> float:
-    """Return expected value as decimal (e.g. 0.05 = +5%)."""
-    return prob*max(0.0, float(odds)) - 1.0
+    return prob * max(0.0, float(odds)) - 1.0
 
 def _min_odds_for_market(market: str) -> float:
     if market.startswith("Over/Under"): return MIN_ODDS_OU
@@ -819,16 +655,6 @@ def _market_name_normalize(s: str) -> str:
     return s
 
 def fetch_odds(fid: int) -> dict:
-    """
-    Returns a dict like:
-    {
-      "BTTS": {"Yes": {"odds":1.90,"book":"X"}, "No": {...}},
-      "1X2":  {"Home": {...}, "Away": {...}},
-      "OU_2.5": {"Over": {...}, "Under": {...}},
-      "OU_3.5": {...}
-    }
-    Best-effort parsing of API-Football /odds endpoint; tolerate missing data.
-    """
     cached=_odds_cache_get(fid)
     if cached is not None: return cached
     params={"fixture": fid}
@@ -843,7 +669,6 @@ def fetch_odds(fid: int) -> dict:
             for mkt in (bk.get("bets") or []):
                 mname=_market_name_normalize(mkt.get("name",""))
                 vals=mkt.get("values") or []
-                # BTTS
                 if mname=="BTTS":
                     d={}
                     for v in vals:
@@ -851,7 +676,6 @@ def fetch_odds(fid: int) -> dict:
                         if "yes" in lbl: d["Yes"]={"odds":float(v.get("odd") or 0), "book":book_name}
                         if "no"  in lbl: d["No"] ={"odds":float(v.get("odd") or 0), "book":book_name}
                     if d: out["BTTS"]=d
-                # 1X2
                 elif mname=="1X2":
                     d={}
                     for v in vals:
@@ -859,9 +683,7 @@ def fetch_odds(fid: int) -> dict:
                         if lbl in ("home","1"): d["Home"]={"odds":float(v.get("odd") or 0),"book":book_name}
                         if lbl in ("away","2"): d["Away"]={"odds":float(v.get("odd") or 0),"book":book_name}
                     if d: out["1X2"]=d
-                # OU lines
                 elif mname=="OU":
-                    # values like "Over 2.5", "Under 2.5"
                     by_line={}
                     for v in vals:
                         lbl=(v.get("value") or "").lower()
@@ -879,10 +701,6 @@ def fetch_odds(fid: int) -> dict:
     return out
 
 def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Optional[float], Optional[str], Optional[float]]:
-    """
-    Return (pass, odds, book, ev_pct). If odds missing:
-      - pass if ALLOW_TIPS_WITHOUT_ODDS else block.
-    """
     odds_map=fetch_odds(fid) if API_KEY else {}
     odds=None; book=None
     if market_text=="BTTS":
@@ -902,7 +720,6 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
     if odds is None:
         return (ALLOW_TIPS_WITHOUT_ODDS, None, None, None)
 
-    # price range gates
     min_odds=_min_odds_for_market(market_text)
     if not (min_odds <= odds <= MAX_ODDS_ALL):
         return (False, odds, book, None)
@@ -910,9 +727,6 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
     return (True, odds, book, None)
 
 # ───────── Team ratings (Elo) ─────────
-# PATCH: backs the pm_rating_* / pm_home_adv_rating / pm_away_adv_rating
-# features that PRE_FEATURES (train_models.py) expects but nothing was
-# previously computing. Standard Elo with a home-field constant.
 ELO_DEFAULT = float(os.getenv("ELO_DEFAULT", "1500.0"))
 ELO_K       = float(os.getenv("ELO_K", "20.0"))
 ELO_HOME_ADV= float(os.getenv("ELO_HOME_ADV", "60.0"))
@@ -948,18 +762,9 @@ def update_team_ratings(home_id: int, away_id: int, gh: int, ga: int) -> None:
                   "ON CONFLICT(team_id) DO UPDATE SET rating=EXCLUDED.rating, updated_ts=EXCLUDED.updated_ts",
                   (away_id, float(new_ra), now))
 
-# ───────── League base rates (BTTS / Over 2.5 / Over 3.5) ─────────
-# PATCH: this is the fix for PRE_BTTS_YES and PRE_OU_3.5 collapsing to
-# always predicting the majority class. Both markets depend heavily on how
-# high- or low-scoring a league runs (a 0-0 grind in one league and a 4-3
-# thriller in another get pooled together with team-level Elo/form as the
-# ONLY signal) — without a league-level anchor, the model has nothing to
-# distinguish a low-scoring league from a high-scoring one, so for markets
-# where league context dominates team-level signal, it just learns the
-# global base rate and stops trying. This gives every prediction a
-# per-league prior computed from match_results.league_id (added above).
+# ───────── League base rates ─────────
 LEAGUE_RATE_MIN_N = int(os.getenv("LEAGUE_RATE_MIN_N", "20"))
-LEAGUE_RATE_TTL    = int(os.getenv("LEAGUE_RATE_TTL_SEC", "21600"))  # 6h
+LEAGUE_RATE_TTL    = int(os.getenv("LEAGUE_RATE_TTL_SEC", "21600"))
 _LEAGUE_RATE_CACHE = _TTLCache(LEAGUE_RATE_TTL)
 
 def _global_rates() -> Dict[str,float]:
@@ -978,13 +783,6 @@ def _global_rates() -> Dict[str,float]:
     return out
 
 def get_league_rates(league_id: Optional[int]) -> Dict[str,float]:
-    """
-    Returns {"btts","ov25","ov35","n"} for a league, backed by
-    match_results.league_id. Falls back to the global rate across all
-    leagues when this specific league has fewer than LEAGUE_RATE_MIN_N
-    resolved matches — avoids a noisy per-league estimate for leagues that
-    barely have any history yet.
-    """
     if not league_id: return _global_rates()
     key=f"L{league_id}"
     cached=_LEAGUE_RATE_CACHE.get(key)
@@ -1015,18 +813,27 @@ def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
     gh=(m.get("goals") or {}).get("home") or 0; ga=(m.get("goals") or {}).get("away") or 0
     minute=int(feat.get("minute",0))
     snapshot={"minute":minute,"gh":gh,"ga":ga,"league_id":league_id,"market":"HARVEST","suggestion":"HARVEST","confidence":0,
-              "stat":{"xg_h":feat.get("xg_h",0),"xg_a":feat.get("xg_a",0),"sot_h":feat.get("sot_h",0),"sot_a":feat.get("sot_a",0),
-                      "cor_h":feat.get("cor_h",0),"cor_a":feat.get("cor_a",0),"pos_h":feat.get("pos_h",0),"pos_a":feat.get("pos_a",0),
-                      "red_h":feat.get("red_h",0),"red_a":feat.get("red_a",0),
-                      # PATCH: these three were missing, so train_models.py's
-                      # load_inplay_data() always saw them as 0 — meaning
-                      # total_shots/shots_inside/fouls (and every feature
-                      # derived from them: shot_accuracy, shot_quality,
-                      # attack_pressure, discipline_score, etc.) were trained
-                      # on all-zero data regardless of the real match stats.
-                      "total_shots_h":feat.get("total_shots_h",0),"total_shots_a":feat.get("total_shots_a",0),
-                      "shots_inside_h":feat.get("shots_inside_h",0),"shots_inside_a":feat.get("shots_inside_a",0),
-                      "fouls_h":feat.get("fouls_h",0),"fouls_a":feat.get("fouls_a",0)}}
+              "stat":{
+                  "xg_h":feat.get("xg_h",0),"xg_a":feat.get("xg_a",0),
+                  "sot_h":feat.get("sot_h",0),"sot_a":feat.get("sot_a",0),
+                  "cor_h":feat.get("cor_h",0),"cor_a":feat.get("cor_a",0),
+                  "pos_h":feat.get("pos_h",0),"pos_a":feat.get("pos_a",0),
+                  "red_h":feat.get("red_h",0),"red_a":feat.get("red_a",0),
+                  "total_shots_h":feat.get("total_shots_h",0),"total_shots_a":feat.get("total_shots_a",0),
+                  "shots_inside_h":feat.get("shots_inside_h",0),"shots_inside_a":feat.get("shots_inside_a",0),
+                  "fouls_h":feat.get("fouls_h",0),"fouls_a":feat.get("fouls_a",0),
+              },
+              "advanced": {
+                  "momentum_score":feat.get("momentum_score",0),
+                  "attack_pressure_h":feat.get("attack_pressure_h",0),
+                  "attack_pressure_a":feat.get("attack_pressure_a",0),
+                  "game_control_h":feat.get("game_control_h",0),
+                  "game_control_a":feat.get("game_control_a",0),
+                  "shot_accuracy_h":feat.get("shot_accuracy_h",0),
+                  "shot_accuracy_a":feat.get("shot_accuracy_a",0),
+                  "conversion_rate_h":feat.get("conversion_rate_h",0),
+                  "conversion_rate_a":feat.get("conversion_rate_a",0),
+              }}
     now=int(time.time())
     with db_conn() as c:
         c.execute("INSERT INTO tip_snapshots(match_id, created_ts, payload) VALUES (%s,%s,%s) "
@@ -1037,13 +844,6 @@ def save_snapshot_from_match(m: dict, feat: Dict[str,float]) -> None:
                   (fid, league_id, league, home, away, f"{gh}-{ga}", minute, now))
 
 def save_prematch_snapshot(fid: int, feat: Dict[str,float]) -> None:
-    """
-    PATCH: this was the missing piece — nothing previously wrote to
-    prematch_snapshots, so PRE_* models had zero training data no matter
-    how long the bot ran. Called once per collected fixture in
-    prematch_scan_save(), independent of whether that fixture ends up
-    generating a tip, so training data accumulates from every fixture seen.
-    """
     payload={"feat": {k:v for k,v in feat.items() if not k.startswith("_")}}
     now=int(time.time())
     with db_conn() as c:
@@ -1051,7 +851,7 @@ def save_prematch_snapshot(fid: int, feat: Dict[str,float]) -> None:
                   "ON CONFLICT (match_id) DO UPDATE SET created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload",
                   (fid, now, json.dumps(payload)[:200000]))
 
-# ───────── Outcomes/backfill/digest (short) ─────────
+# ───────── Outcomes/backfill/digest ─────────
 def _parse_ou_line_from_suggestion(s: str) -> Optional[float]:
     try:
         for tok in (s or "").split():
@@ -1109,9 +909,6 @@ def backfill_results_for_open_matches(max_rows: int = 200) -> int:
                        "final_goals_a=EXCLUDED.final_goals_a, btts_yes=EXCLUDED.btts_yes, updated_ts=EXCLUDED.updated_ts, "
                        "league_id=EXCLUDED.league_id",
                        (int(mid), gh, ga, btts, int(time.time()), league_id))
-        # PATCH: update Elo ratings now that we know the result — this is
-        # what feeds pm_rating_h/pm_rating_a/pm_rating_diff for future
-        # prematch predictions. Nothing previously updated team_ratings at all.
         try:
             th=((fx.get("teams") or {}).get("home") or {}).get("id")
             ta=((fx.get("teams") or {}).get("away") or {}).get("id")
@@ -1130,26 +927,33 @@ def daily_accuracy_digest() -> Optional[str]:
     with db_conn() as c:
         rows=c.execute("""
             SELECT t.match_id, t.market, t.suggestion, t.confidence, t.confidence_raw, t.created_ts,
-                   r.final_goals_h, r.final_goals_a, r.btts_yes
+                   r.final_goals_h, r.final_goals_a, r.btts_yes,
+                   t.odds, t.stake_pct, t.profit
             FROM tips t LEFT JOIN match_results r ON r.match_id=t.match_id
             WHERE t.created_ts >= %s AND t.created_ts < %s AND t.suggestion<>'HARVEST' AND t.sent_ok=1
         """,(int(y0.timestamp()), int(y1.timestamp()))).fetchall()
-    total=graded=wins=0; by={}
-    for (mid, mkt, sugg, conf, conf_raw, cts, gh, ga, btts) in rows:
+    total=graded=wins=0; by={}; total_profit=0.0
+    for row in rows:
+        mid, mkt, sugg, conf, conf_raw, cts, gh, ga, btts, odds, stake, profit = row
         res={"final_goals_h":gh,"final_goals_a":ga,"btts_yes":btts}
         out=_tip_outcome_for_result(sugg,res)
         if out is None: continue
         total+=1; graded+=1; wins+=1 if out==1 else 0
-        d=by.setdefault(mkt or "?",{"graded":0,"wins":0}); d["graded"]+=1; d["wins"]+=1 if out==1 else 0
+        if profit is not None: total_profit += float(profit)
+        d=by.setdefault(mkt or "?",{"graded":0,"wins":0,"profit":0.0}); d["graded"]+=1; d["wins"]+=1 if out==1 else 0
+        if profit is not None: d["profit"] += float(profit)
     if graded==0:
         msg="📊 Daily Digest\nNo graded tips for yesterday."
     else:
         acc=100.0*wins/max(1,graded)
         lines=[f"📊 <b>Daily Digest</b> (yesterday, Berlin time)",
-               f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%"]
+               f"Tips sent: {total}  •  Graded: {graded}  •  Wins: {wins}  •  Accuracy: {acc:.1f}%",
+               f"Total P&L: {total_profit:+.2f} units"]
         for mk,st in sorted(by.items()):
             if st["graded"]==0: continue
-            a=100.0*st["wins"]/st["graded"]; lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} ({a:.1f}%)")
+            a=100.0*st["wins"]/st["graded"]
+            p=st.get("profit",0.0)
+            lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} ({a:.1f}%) | P&L: {p:+.2f}")
         msg="\n".join(lines)
     send_telegram(msg); return msg
 
@@ -1161,7 +965,7 @@ def _get_market_threshold(m: str) -> float:
     except: return float(CONF_THRESHOLD)
 def _get_market_threshold_pre(m: str) -> float: return _get_market_threshold(f"PRE {m}")
 
-def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct, feat, odds=None, book=None, ev_pct=None):
+def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct, feat, odds=None, book=None, ev_pct=None, stake_pct=None):
     stat=""
     if any([feat.get("xg_h",0),feat.get("xg_a",0),feat.get("sot_h",0),feat.get("sot_a",0),feat.get("cor_h",0),feat.get("cor_a",0),
             feat.get("pos_h",0),feat.get("pos_a",0),feat.get("red_h",0),feat.get("red_a",0)]):
@@ -1176,11 +980,14 @@ def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct,
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
         else:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
+    stake = ""
+    if stake_pct is not None and stake_pct > 0:
+        stake = f"\n💵 <b>Stake:</b> {stake_pct:.1f}% of bankroll"
     return ("⚽️ <b>New Tip!</b>\n"
             f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
             f"🕒 <b>Minute:</b> {minute}'  |  <b>Score:</b> {escape(score)}\n"
             f"<b>Tip:</b> {escape(suggestion)}\n"
-            f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}\n"
+            f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}{stake}\n"
             f"🏆 <b>League:</b> {escape(league)}{stat}")
 
 # ───────── Scan (in-play) ─────────
@@ -1201,15 +1008,13 @@ def production_scan() -> Tuple[int,int]:
     matches=fetch_live_matches(); live_seen=len(matches)
     if live_seen==0: log.info("[PROD] no live"); return 0,0
     saved=0; now_ts=int(time.time())
+    bankroll = get_bankroll()
 
     for m in matches:
         try:
             fid=int((m.get("fixture",{}) or {}).get("id") or 0)
             if not fid: continue
 
-            # PATCH: short-lived connection just for the dup-check, instead
-            # of holding one connection open for the whole per-match loop
-            # (which also does blocking HTTP calls below: odds + Telegram).
             if DUP_COOLDOWN_MIN>0:
                 cutoff=now_ts - DUP_COOLDOWN_MIN*60
                 with db_conn() as c:
@@ -1247,15 +1052,10 @@ def production_scan() -> Tuple[int,int]:
                 q=1.0-p
                 if q*100.0>=thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
 
-            # 1X2 (no draw)
+            # 1X2
             mh,md,ma=_load_wld_models()
             if mh and md and ma:
                 ph=_score_prob(feat,mh); pd=_score_prob(feat,md); pa=_score_prob(feat,ma)
-                # PATCH [BUG-FIX]: renormalize over Home+Away only. The draw
-                # is suppressed from output entirely, so dividing by
-                # (ph+pd+pa) was deflating both surviving probabilities and
-                # silently suppressing tips that should have cleared
-                # threshold. Draw-No-Bet style renormalization:
                 s=max(EPS,ph+pa); ph,pa=ph/s,pa/s
                 thr=_get_market_threshold("1X2")
                 if ph*100.0>=thr: candidates.append(("1X2","Home Win",ph))
@@ -1267,30 +1067,32 @@ def production_scan() -> Tuple[int,int]:
                 if suggestion not in ALLOWED_SUGGESTIONS: continue
                 if per_match >= max(1,PREDICTIONS_PER_MATCH): break
 
-                # Odds/EV gate (network call — no DB connection held here)
                 pass_odds, odds, book, _ = _price_gate(market_txt, suggestion, fid)
                 if not pass_odds:
                     continue
                 ev_pct=None
                 if odds is not None:
-                    edge=_ev(prob, odds)  # decimal (e.g. 0.05)
+                    edge=_ev(prob, odds)
                     ev_pct=round(edge*100.0,1)
-                    if int(round(edge*10000)) < EDGE_MIN_BPS:  # basis points compare
+                    if int(round(edge*10000)) < EDGE_MIN_BPS:
                         continue
+
+                # Kelly sizing
+                stake_pct = kelly_fraction(prob, odds, bankroll) * 100.0 if odds else 0.0
 
                 created_ts=base_now+idx
                 raw=float(prob); prob_pct=round(raw*100.0,1)
 
-                # PATCH: short-lived connection just for the insert.
                 with db_conn() as c:
                     c.execute(
-                        "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
+                        "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,stake_pct,sent_ok) "
+                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)",
                         (fid,league_id,league,home,away,market_txt,suggestion,float(prob_pct),raw,score,minute,created_ts,
-                         (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None))
+                         (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None), 
+                         float(stake_pct) if stake_pct > 0 else None)
                     )
 
-                sent=_send_tip(home,away,league,minute,score,suggestion,float(prob_pct),feat,odds,book,ev_pct)
+                sent=_send_tip(home,away,league,minute,score,suggestion,float(prob_pct),feat,odds,book,ev_pct,stake_pct)
                 if sent:
                     with db_conn() as c:
                         c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",(fid,created_ts))
@@ -1304,14 +1106,8 @@ def production_scan() -> Tuple[int,int]:
     log.info("[PROD] saved=%d live_seen=%d", saved, live_seen)
     return saved, live_seen
 
-# ───────── Prematch (compact: save-only, thresholds respected) ─────────
+# ───────── Prematch ─────────
 def _team_form_stats(team_id: int, games: List[dict]) -> Dict[str,float]:
-    """
-    PATCH: per-team form stats computed from the team's own perspective
-    (goals for/against, W/D/L, last match date) — needed for
-    pm_gf_*/pm_ga_*/pm_win_*/pm_draw_*/pm_loss_*/pm_rest_diff, none of
-    which the previous implementation computed at all.
-    """
     gf=ga=win=draw=loss=played=0
     last_ts=None
     for g in games:
@@ -1370,13 +1166,6 @@ def _h2h_counts(h2h: List[dict], home_id: int, away_id: int) -> Tuple[float,floa
 def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: list,
                             kickoff_ts: float, rating_h: float, rating_a: float,
                             league_id: Optional[int] = None) -> Dict[str,float]:
-    """
-    PATCH: extracted from extract_prematch_features() so live scoring and
-    historical backfill (backfill_historical_prematch, added below) compute
-    features with the EXACT same formulas from the same shape of inputs —
-    team ids + fixture-list + kickoff timestamp + ratings. Two independent
-    implementations of this math would risk silently drifting apart.
-    """
     ov25_h,ov35_h,btts_h=_rate_totals(last_h); ov25_a,ov35_a,btts_a=_rate_totals(last_a); ov25_h2h,ov35_h2h,btts_h2h=_rate_totals(h2h)
     hw_h2h,aw_h2h,dr_h2h=_h2h_counts(h2h, th, ta)
     form_h=_team_form_stats(th, last_h); form_a=_team_form_stats(ta, last_a)
@@ -1384,7 +1173,7 @@ def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: li
     form_points_h = form_h["win"]*3.0 + form_h["draw"]*1.0
     form_points_a = form_a["win"]*3.0 + form_a["draw"]*1.0
 
-    rest_h = rest_a = 3.0  # neutral default when unknown
+    rest_h = rest_a = 3.0
     if form_h["last_ts"]: rest_h=max(0.0, (kickoff_ts - form_h["last_ts"])/86400.0)
     if form_a["last_ts"]: rest_a=max(0.0, (kickoff_ts - form_a["last_ts"])/86400.0)
 
@@ -1396,10 +1185,6 @@ def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: li
     rating_diff = rating_h - rating_a
     form_points_diff = form_points_h - form_points_a
 
-    # PATCH: per-league BTTS/Over base rates — see get_league_rates() above.
-    # This is the actual fix for PRE_BTTS_YES and PRE_OU_3.5 collapsing to
-    # majority-class guessing: without this, the model had no way to tell
-    # a low-scoring league from a high-scoring one.
     lr=get_league_rates(league_id)
 
     return {
@@ -1420,7 +1205,6 @@ def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: li
         "pm_rating_form_interaction":rating_diff*form_points_diff,
         "pm_attack_defense_ratio":(attack_strength_h+attack_strength_a)/max(defense_strength_h+defense_strength_a, 0.1),
         "pm_league_btts_rate":lr["btts"],"pm_league_ov25_rate":lr["ov25"],"pm_league_ov35_rate":lr["ov35"],
-        # Live features are 0 for prematch (matches main.py's in-play keys)
         "minute":0.0,"goals_h":0.0,"goals_a":0.0,"goals_sum":0.0,"goals_diff":0.0,
         "xg_h":0.0,"xg_a":0.0,"xg_sum":0.0,"xg_diff":0.0,"sot_h":0.0,"sot_a":0.0,"sot_sum":0.0,
         "cor_h":0.0,"cor_a":0.0,"cor_sum":0.0,"pos_h":0.0,"pos_a":0.0,"pos_diff":0.0,"red_h":0.0,"red_a":0.0,"red_sum":0.0,
@@ -1441,17 +1225,12 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
     teams=fx.get("teams") or {}; th=(teams.get("home") or {}).get("id"); ta=(teams.get("away") or {}).get("id")
     if not th or not ta: return {}
 
-    # PATCH: fetch last-5-home, last-5-away, and H2H concurrently instead of
-    # sequentially — each is an independent HTTP call, and results are also
-    # cached (TEAM_FORM_CACHE) so repeat calls across a scan / MOTD run are free.
     with ThreadPoolExecutor(max_workers=3) as ex:
         f_last_h = ex.submit(_api_last_fixtures, th, 5)
         f_last_a = ex.submit(_api_last_fixtures, ta, 5)
         f_h2h    = ex.submit(_api_h2h, th, ta, 5)
         last_h, last_a, h2h = f_last_h.result(), f_last_a.result(), f_h2h.result()
 
-    # PATCH: Elo ratings, backed by the team_ratings table (updated after
-    # each result in backfill_results_for_open_matches()).
     ratings=get_team_ratings_bulk([th, ta])
     rating_h=ratings.get(th, ELO_DEFAULT); rating_a=ratings.get(ta, ELO_DEFAULT)
 
@@ -1464,20 +1243,10 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
     league_id=((fx.get("league") or {}).get("id"))
     feat = _assemble_pre_features(th, ta, last_h, last_a, h2h, kickoff_ts, rating_h, rating_a,
                                    league_id=int(league_id) if league_id else None)
-    # internal, not a model feature — used by save_prematch_snapshot()
     feat["_home_id"] = float(th); feat["_away_id"] = float(ta)
     return feat
 
 def _safe_extract_prematch_features(fx: dict) -> Dict[str,float]:
-    """
-    PATCH: wraps extract_prematch_features() so one fixture's failure
-    (e.g. a transient DB pool exhaustion under concurrent load) can't take
-    the entire batch down with it. `list(ex.map(...))` re-raises the FIRST
-    worker's exception when materialized — without this wrapper, one bad
-    fixture silently zeroed out an entire prematch_scan_save()/
-    send_match_of_the_day() run, discarding results already computed by
-    every other concurrent worker too.
-    """
     try:
         return extract_prematch_features(fx)
     except Exception as e:
@@ -1492,34 +1261,34 @@ def _kickoff_berlin(utc_iso: str|None) -> str:
         return dt.astimezone(BERLIN_TZ).strftime("%H:%M")
     except: return "TBD"
 
-def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, odds=None, book=None, ev_pct=None):
+def _format_motd_message(home, away, league, kickoff_txt, suggestion, prob_pct, odds=None, book=None, ev_pct=None, stake_pct=None):
     money = ""
     if odds:
         if ev_pct is not None:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}  •  <b>EV:</b> {ev_pct:+.1f}%"
         else:
             money = f"\n💰 <b>Odds:</b> {odds:.2f} @ {book or 'Book'}"
+    stake = ""
+    if stake_pct is not None and stake_pct > 0:
+        stake = f"\n💵 <b>Stake:</b> {stake_pct:.1f}% of bankroll"
     return (
         "🏅 <b>Match of the Day</b>\n"
         f"<b>Match:</b> {escape(home)} vs {escape(away)}\n"
         f"🏆 <b>League:</b> {escape(league)}\n"
         f"⏰ <b>Kickoff (Berlin):</b> {kickoff_txt}\n"
         f"<b>Tip:</b> {escape(suggestion)}\n"
-        f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}"
+        f"📈 <b>Confidence:</b> {prob_pct:.1f}%{money}{stake}"
     )
 
-def _send_tip(home,away,league,minute,score,suggestion,prob_pct,feat,odds=None,book=None,ev_pct=None)->bool:
-    return send_telegram(_format_tip_message(home,away,league,minute,score,suggestion,prob_pct,feat,odds,book,ev_pct))
+def _send_tip(home,away,league,minute,score,suggestion,prob_pct,feat,odds=None,book=None,ev_pct=None,stake_pct=None)->bool:
+    return send_telegram(_format_tip_message(home,away,league,minute,score,suggestion,prob_pct,feat,odds,book,ev_pct,stake_pct))
 
 def prematch_scan_save() -> int:
     fixtures=_collect_todays_prematch_fixtures()
     if not fixtures: return 0
     saved=0
+    bankroll = get_bankroll()
 
-    # PATCH: extract features for all of today's fixtures concurrently
-    # (bounded worker pool) instead of one fixture at a time — each
-    # extraction does 3 (cached) HTTP calls, so this is the dominant cost
-    # of a prematch scan.
     with ThreadPoolExecutor(max_workers=8) as ex:
         feats=list(ex.map(_safe_extract_prematch_features, fixtures))
 
@@ -1531,7 +1300,6 @@ def prematch_scan_save() -> int:
         try: save_prematch_snapshot(fid, feat)
         except Exception: pass
         candidates: List[Tuple[str,str,float]]=[]
-        # PRE OU via PRE_OU_* models
         for line in OU_LINES:
             mdl=load_model_from_settings(f"PRE_OU_{_fmt_line(line)}")
             if not mdl: continue
@@ -1539,15 +1307,12 @@ def prematch_scan_save() -> int:
             if p*100.0>=thr:   candidates.append((f"PRE {mk}", f"Over {_fmt_line(line)} Goals", p))
             q=1.0-p
             if q*100.0>=thr:   candidates.append((f"PRE {mk}", f"Under {_fmt_line(line)} Goals", q))
-        # PRE BTTS
         mdl=load_model_from_settings("PRE_BTTS_YES")
         if mdl:
             p=_score_prob(feat, mdl); thr=_get_market_threshold_pre("BTTS")
             if p*100.0>=thr: candidates.append(("PRE BTTS","BTTS: Yes",p))
             q=1.0-p
             if q*100.0>=thr: candidates.append(("PRE BTTS","BTTS: No",q))
-        # PRE 1X2 (draw suppressed — only home/away models exist, so no
-        # renormalization bug here: s = ph+pa already)
         mh,ma=load_model_from_settings("PRE_WLD_HOME"), load_model_from_settings("PRE_WLD_AWAY")
         if mh and ma:
             ph=_score_prob(feat,mh); pa=_score_prob(feat,ma); s=max(EPS,ph+pa); ph,pa=ph/s,pa/s
@@ -1560,23 +1325,25 @@ def prematch_scan_save() -> int:
         for idx,(mk,sug,prob) in enumerate(candidates):
             if sug not in ALLOWED_SUGGESTIONS: continue
             if per_match>=max(1,PREDICTIONS_PER_MATCH): break
-            # Odds/EV gate
             pass_odds, odds, book, _ = _price_gate(mk.replace("PRE ",""), sug, fid)
             if not pass_odds: continue
             ev_pct=None
+            stake_pct = 0.0
             if odds is not None:
                 edge=_ev(prob, odds); ev_pct=round(edge*100.0,1)
                 if int(round(edge*10000)) < EDGE_MIN_BPS: continue
+                stake_pct = kelly_fraction(prob, odds, bankroll) * 100.0
             created_ts=base_now+idx; raw=float(prob); pct=round(raw*100.0,1)
             with db_conn() as c2:
-                c2.execute("INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,sent_ok) "
-                           "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'0-0',0,%s,%s,%s,%s,0)",
+                c2.execute("INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,stake_pct,sent_ok) "
+                           "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'0-0',0,%s,%s,%s,%s,%s,0)",
                            (fid,league_id,league,home,away,mk,sug,float(pct),raw,created_ts,
-                            (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None)))
+                            (float(odds) if odds is not None else None), (book or None), (float(ev_pct) if ev_pct is not None else None),
+                            float(stake_pct) if stake_pct > 0 else None))
             saved+=1; per_match+=1
     log.info("[PREMATCH] saved=%d", saved); return saved
 
-# ───────── Auto-train / tune / retry (unchanged signatures) ─────────
+# ───────── Auto-train / tune / retry ─────────
 def auto_train_job():
     if not TRAIN_ENABLE: send_telegram("🤖 Training skipped: TRAIN_ENABLE=0"); return
     send_telegram("🤖 Training started.")
@@ -1605,16 +1372,13 @@ def _pick_threshold(y_true,y_prob,target_precision,min_preds,default_pct):
         if prec>=target_precision: best=float(t); break
     return best*100.0
 
-# Optional min EV for MOTD (basis points, e.g. 300 = +3.00%). 0 disables EV gate.
 MOTD_MIN_EV_BPS = int(os.getenv("MOTD_MIN_EV_BPS", "0"))
 
 def send_match_of_the_day() -> bool:
-    """Pick the single best prematch tip for today (PRE_* models). Sends to Telegram."""
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
         return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
 
-    # Optional league allow-list just for MOTD
     if MOTD_LEAGUE_IDS:
         fixtures = [
             f for f in fixtures
@@ -1623,13 +1387,11 @@ def send_match_of_the_day() -> bool:
         if not fixtures:
             return send_telegram("🏅 Match of the Day: no fixtures in configured leagues.")
 
-    # PATCH: same concurrent + cached feature extraction as prematch_scan_save().
-    # If prematch_scan_save() already ran today, TEAM_FORM_CACHE hits mean
-    # this loop makes ~zero additional team-form/H2H API calls.
     with ThreadPoolExecutor(max_workers=8) as ex:
         feats=list(ex.map(_safe_extract_prematch_features, fixtures))
 
-    best = None  # (prob_pct, suggestion, home, away, league, kickoff_txt, odds, book, ev_pct)
+    best = None
+    bankroll = get_bankroll()
 
     for fx, feat in zip(fixtures, feats):
         fixture = fx.get("fixture") or {}
@@ -1645,7 +1407,6 @@ def send_match_of_the_day() -> bool:
         if not feat:
             continue
 
-        # Collect PRE candidates (same thresholds as prematch_scan_save)
         candidates: List[Tuple[str,str,float]] = []
 
         for line in OU_LINES:
@@ -1677,34 +1438,34 @@ def send_match_of_the_day() -> bool:
         if not candidates:
             continue
 
-        # Take the single best for this fixture (by probability) then apply odds/EV gate
         candidates.sort(key=lambda x: x[2], reverse=True)
         mk, sug, prob = candidates[0]
         prob_pct = prob * 100.0
         if prob_pct < MOTD_CONF_MIN:
             continue
 
-        # Odds/EV (reuse in-play price gate; market text must be without "PRE ")
         pass_odds, odds, book, _ = _price_gate(mk, sug, fid)
         if not pass_odds:
             continue
 
         ev_pct = None
+        stake_pct = 0.0
         if odds is not None:
-            edge = _ev(prob, odds)            # decimal (e.g. 0.05)
-            ev_bps = int(round(edge * 10000)) # basis points
+            edge = _ev(prob, odds)
+            ev_bps = int(round(edge * 10000))
             ev_pct = round(edge * 100.0, 1)
             if MOTD_MIN_EV_BPS > 0 and ev_bps < MOTD_MIN_EV_BPS:
                 continue
+            stake_pct = kelly_fraction(prob, odds, bankroll) * 100.0
 
-        item = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct)
+        item = (prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct, stake_pct)
         if best is None or prob_pct > best[0]:
             best = item
 
     if not best:
         return send_telegram("🏅 Match of the Day: no prematch pick met thresholds.")
-    prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct = best
-    return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct))
+    prob_pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct, stake_pct = best
+    return send_telegram(_format_motd_message(home, away, league, kickoff_txt, sug, prob_pct, odds, book, ev_pct, stake_pct))
 
 def auto_tune_thresholds(days: int = 14) -> Dict[str,float]:
     if not AUTO_TUNE_ENABLE: return {}
@@ -1732,24 +1493,17 @@ def auto_tune_thresholds(days: int = 14) -> Dict[str,float]:
     return tuned
 
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
-    # PATCH: was holding one DB connection open across the entire loop
-    # below, including up to `limit` (200) blocking send_telegram() HTTP
-    # calls — the same connection-hold-across-network-calls pattern
-    # already fixed in production_scan()/prematch_scan_save() earlier, but
-    # this function wasn't part of that pass. Fetch with a short-lived
-    # connection, do the network calls with none held open, then a
-    # separate short-lived connection per successful send.
     cutoff = int(time.time()) - minutes*60
     retried = 0
     with db_conn() as c:
         rows = c.execute(
-            "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct "
+            "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,stake_pct "
             "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",
             (cutoff, limit)
         ).fetchall()
 
-    for (mid, league, home, away, market, sugg, conf, conf_raw, score, minute, cts, odds, book, ev_pct) in rows:
-        ok = send_telegram(_format_tip_message(home, away, league, int(minute), score, sugg, float(conf), {}, odds, book, ev_pct))
+    for (mid, league, home, away, market, sugg, conf, conf_raw, score, minute, cts, odds, book, ev_pct, stake_pct) in rows:
+        ok = send_telegram(_format_tip_message(home, away, league, int(minute), score, sugg, float(conf), {}, odds, book, ev_pct, stake_pct))
         if ok:
             with db_conn() as c2:
                 c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
@@ -1806,8 +1560,6 @@ _start_scheduler_once()
 
 # ───────── Admin / auth ─────────
 def _require_admin():
-    # PATCH: request.json is deprecated in newer Flask/Werkzeug in favor of
-    # request.get_json(silent=True) (also avoids raising on non-JSON bodies).
     body = request.get_json(silent=True) if request.is_json else None
     key=request.headers.get("X-API-Key") or request.args.get("key") or ((body or {}).get("key") if body else None)
     if not ADMIN_API_KEY or key != ADMIN_API_KEY: abort(401)
@@ -1859,15 +1611,6 @@ def http_prematch_scan(): _require_admin(); saved=prematch_scan_save(); return j
 
 @app.route("/admin/backfill-prematch-history", methods=["POST","GET"])
 def http_backfill_prematch_history():
-    """
-    NEW: reconstructs prematch training data for past season(s) of ONE
-    league at a time. Costs roughly 1-3 API calls PER SEASON (bulk fetch),
-    not per fixture — safe to run several of these in a day without
-    threatening your daily API quota.
-
-    Usage: /admin/backfill-prematch-history?league=39&seasons=2023,2024,2025&key=YOUR_KEY
-    (league = API-Football league ID, e.g. 39 = Premier League)
-    """
     _require_admin()
     try:
         league_id = int(request.args.get("league", "0"))
@@ -1891,18 +1634,6 @@ def http_motd():
 
 @app.route("/admin/leagues", methods=["GET"])
 def http_leagues():
-    """
-    NEW: proxies API-Football's own /leagues endpoint so you get real,
-    always-correct league IDs directly from the source instead of a
-    hand-typed list that could be wrong or go stale. Search by name and/or
-    country (API-Football requires 3+ characters for `search`).
-
-    Usage:
-      /admin/leagues?search=premier&key=YOUR_KEY
-      /admin/leagues?country=England&key=YOUR_KEY
-    Also returns each league's available season years — pass those
-    directly into /admin/backfill-prematch-history?seasons=...
-    """
     _require_admin()
     search = request.args.get("search", "").strip()
     country = request.args.get("country", "").strip()
@@ -1930,12 +1661,6 @@ def http_leagues():
 
 @app.route("/admin/status", methods=["GET"])
 def http_status():
-    """
-    NEW: one-shot harvest/training progress report — counts of
-    tip_snapshots, prematch_snapshots, and match_results (the actual
-    bottleneck for training), plus the last training run's metrics if any
-    exist. Avoids needing to run SQL manually in the Postgres console.
-    """
     _require_admin()
     with db_conn() as c:
         n_tip_snap = c.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
@@ -1943,13 +1668,6 @@ def http_status():
         n_results  = c.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
         n_tips     = c.execute("SELECT COUNT(*) FROM tips WHERE suggestion<>'HARVEST'").fetchone()[0]
         n_unsent   = c.execute("SELECT COUNT(*) FROM tips WHERE sent_ok=0").fetchone()[0]
-        # PATCH: directly checkable league_id coverage — this is what
-        # actually determines whether league_btts_rate/pm_league_* carry
-        # any real signal. If has_league_id is low relative to total, or
-        # distinct_leagues is 1, the league-rate feature will be near-
-        # constant and contribute nothing to training regardless of how
-        # correct the code is — exactly what happened on the first retrain
-        # after this feature was added, traced back to this.
         n_has_league = c.execute("SELECT COUNT(*) FROM match_results WHERE league_id IS NOT NULL").fetchone()[0]
         n_distinct_leagues = c.execute("SELECT COUNT(DISTINCT league_id) FROM match_results WHERE league_id IS NOT NULL").fetchone()[0]
     metrics_raw = get_setting_cached("model_metrics_latest")
@@ -1987,14 +1705,16 @@ def http_settings(key: str):
 def http_latest():
     limit=int(request.args.get("limit","50"))
     with db_conn() as c:
-        rows=c.execute("SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct "
+        rows=c.execute("SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,stake_pct "
                        "FROM tips WHERE suggestion<>'HARVEST' ORDER BY created_ts DESC LIMIT %s",(max(1,min(500,limit)),)).fetchall()
     tips=[]
     for r in rows:
         tips.append({"match_id":int(r[0]),"league":r[1],"home":r[2],"away":r[3],"market":r[4],"suggestion":r[5],
                      "confidence":float(r[6]),"confidence_raw":(float(r[7]) if r[7] is not None else None),
                      "score_at_tip":r[8],"minute":int(r[9]),"created_ts":int(r[10]),
-                     "odds": (float(r[11]) if r[11] is not None else None), "book": r[12], "ev_pct": (float(r[13]) if r[13] is not None else None)})
+                     "odds": (float(r[11]) if r[11] is not None else None), "book": r[12], 
+                     "ev_pct": (float(r[13]) if r[13] is not None else None),
+                     "stake_pct": (float(r[14]) if r[14] is not None else None)})
     return jsonify({"ok": True, "tips": tips})
 
 @app.route("/telegram/webhook/<secret>", methods=["POST"])
@@ -2018,6 +1738,9 @@ def telegram_webhook(secret: str):
 # ───────── Boot ─────────
 def _on_boot():
     _init_pool(); init_db(); set_setting("boot_ts", str(int(time.time())))
+    # Initialize bankroll if not set
+    if not get_setting_cached("bankroll"):
+        set_setting("bankroll", str(BANKROLL_START))
 
 _on_boot()
 
