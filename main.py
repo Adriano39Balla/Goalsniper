@@ -206,7 +206,22 @@ class PooledConn:
     """
     def __init__(self, pool): self.pool=pool; self.conn=None; self.cur=None
     def __enter__(self):
-        self.conn=self.pool.getconn(); self.conn.autocommit=True; self.cur=self.conn.cursor(); return self
+        # PATCH: retry with short backoff on PoolError specifically —
+        # psycopg2's pool does NOT queue/wait when full, it raises
+        # immediately. With multiple ThreadPoolExecutor batches (up to 8
+        # concurrent fixtures, each needing 1-2 DB connections for Elo/
+        # league-rate lookups) briefly exceeding pool capacity is a normal
+        # transient condition, not a real failure — a short retry lets it
+        # self-heal as other threads release their connections, instead of
+        # failing the whole calling batch outright.
+        last_err=None
+        for attempt in range(5):
+            try:
+                self.conn=self.pool.getconn(); self.conn.autocommit=True; self.cur=self.conn.cursor(); return self
+            except psycopg2.pool.PoolError as e:
+                last_err=e
+                time.sleep(0.2 * (attempt+1))
+        raise last_err
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
             if self.cur: self.cur.close()
@@ -230,7 +245,7 @@ def _init_pool():
     # app is accessed from multiple threads at once (Flask request threads
     # + the APScheduler background thread), and SimpleConnectionPool is
     # documented as not being safe to share across threads.
-    POOL = ThreadedConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","5")), dsn=dsn)
+    POOL = ThreadedConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX","20")), dsn=dsn)
 
 def db_conn():
     if not POOL: _init_pool()
@@ -403,7 +418,18 @@ def fetch_live_matches() -> List[dict]:
     # (bounded worker pool) instead of one match at a time.
     def _hydrate(m: dict) -> dict:
         fid=(m.get("fixture",{}) or {}).get("id")
-        stats, events = _fetch_stats_and_events(fid)
+        try:
+            stats, events = _fetch_stats_and_events(fid)
+        except Exception as e:
+            # PATCH: same class of bug as _safe_extract_prematch_features —
+            # list(ex.map(...)) re-raises the FIRST worker's exception when
+            # materialized, which would silently discard the ENTIRE live
+            # scan's results (zero matches evaluated that cycle) over one
+            # match's stats/events fetch failing. Isolate it instead: this
+            # match just gets empty stats/events rather than taking every
+            # other concurrently-fetched match down with it.
+            log.warning("[LIVE] stats/events fetch failed for fixture %s: %s", fid, e)
+            stats, events = [], []
         m["statistics"]=stats; m["events"]=events
         return m
 
@@ -1442,6 +1468,23 @@ def extract_prematch_features(fx: dict) -> Dict[str,float]:
     feat["_home_id"] = float(th); feat["_away_id"] = float(ta)
     return feat
 
+def _safe_extract_prematch_features(fx: dict) -> Dict[str,float]:
+    """
+    PATCH: wraps extract_prematch_features() so one fixture's failure
+    (e.g. a transient DB pool exhaustion under concurrent load) can't take
+    the entire batch down with it. `list(ex.map(...))` re-raises the FIRST
+    worker's exception when materialized — without this wrapper, one bad
+    fixture silently zeroed out an entire prematch_scan_save()/
+    send_match_of_the_day() run, discarding results already computed by
+    every other concurrent worker too.
+    """
+    try:
+        return extract_prematch_features(fx)
+    except Exception as e:
+        fid=((fx.get("fixture") or {}).get("id"))
+        log.warning("[PREMATCH] feature extraction failed for fixture %s: %s", fid, e)
+        return {}
+
 def _kickoff_berlin(utc_iso: str|None) -> str:
     try:
         if not utc_iso: return "TBD"
@@ -1478,7 +1521,7 @@ def prematch_scan_save() -> int:
     # extraction does 3 (cached) HTTP calls, so this is the dominant cost
     # of a prematch scan.
     with ThreadPoolExecutor(max_workers=8) as ex:
-        feats=list(ex.map(extract_prematch_features, fixtures))
+        feats=list(ex.map(_safe_extract_prematch_features, fixtures))
 
     for fx, feat in zip(fixtures, feats):
         fixture=fx.get("fixture") or {}; lg=fx.get("league") or {}; teams=fx.get("teams") or {}
@@ -1584,7 +1627,7 @@ def send_match_of_the_day() -> bool:
     # If prematch_scan_save() already ran today, TEAM_FORM_CACHE hits mean
     # this loop makes ~zero additional team-form/H2H API calls.
     with ThreadPoolExecutor(max_workers=8) as ex:
-        feats=list(ex.map(extract_prematch_features, fixtures))
+        feats=list(ex.map(_safe_extract_prematch_features, fixtures))
 
     best = None  # (prob_pct, suggestion, home, away, league, kickoff_txt, odds, book, ev_pct)
 
@@ -1689,6 +1732,13 @@ def auto_tune_thresholds(days: int = 14) -> Dict[str,float]:
     return tuned
 
 def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
+    # PATCH: was holding one DB connection open across the entire loop
+    # below, including up to `limit` (200) blocking send_telegram() HTTP
+    # calls — the same connection-hold-across-network-calls pattern
+    # already fixed in production_scan()/prematch_scan_save() earlier, but
+    # this function wasn't part of that pass. Fetch with a short-lived
+    # connection, do the network calls with none held open, then a
+    # separate short-lived connection per successful send.
     cutoff = int(time.time()) - minutes*60
     retried = 0
     with db_conn() as c:
@@ -1698,11 +1748,12 @@ def retry_unsent_tips(minutes: int = 30, limit: int = 200) -> int:
             (cutoff, limit)
         ).fetchall()
 
-        for (mid, league, home, away, market, sugg, conf, conf_raw, score, minute, cts, odds, book, ev_pct) in rows:
-            ok = send_telegram(_format_tip_message(home, away, league, int(minute), score, sugg, float(conf), {}, odds, book, ev_pct))
-            if ok:
-                c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
-                retried += 1
+    for (mid, league, home, away, market, sugg, conf, conf_raw, score, minute, cts, odds, book, ev_pct) in rows:
+        ok = send_telegram(_format_tip_message(home, away, league, int(minute), score, sugg, float(conf), {}, odds, book, ev_pct))
+        if ok:
+            with db_conn() as c2:
+                c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
+            retried += 1
     if retried:
         log.info("[RETRY] resent %d", retried)
     return retried
