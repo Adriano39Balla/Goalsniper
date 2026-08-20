@@ -1584,6 +1584,40 @@ def http_prematch_scan(): _require_admin(); saved=prematch_scan_save(); return j
 def http_motd():
     _require_admin(); ok = send_match_of_the_day(); return jsonify({"ok": bool(ok)})
 
+@app.route("/admin/status", methods=["GET"])
+def http_status():
+    """
+    NEW: one-shot harvest/training progress report — counts of
+    tip_snapshots, prematch_snapshots, and match_results (the actual
+    bottleneck for training), plus the last training run's metrics if any
+    exist. Avoids needing to run SQL manually in the Postgres console.
+    """
+    _require_admin()
+    with db_conn() as c:
+        n_tip_snap = c.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0]
+        n_pre_snap = c.execute("SELECT COUNT(*) FROM prematch_snapshots").fetchone()[0]
+        n_results  = c.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
+        n_tips     = c.execute("SELECT COUNT(*) FROM tips WHERE suggestion<>'HARVEST'").fetchone()[0]
+        n_unsent   = c.execute("SELECT COUNT(*) FROM tips WHERE sent_ok=0").fetchone()[0]
+    metrics_raw = get_setting_cached("model_metrics_latest")
+    metrics = None
+    if metrics_raw:
+        try: metrics = json.loads(metrics_raw)
+        except Exception: metrics = None
+    min_rows = int(os.getenv("MIN_ROWS", "150"))
+    return jsonify({
+        "ok": True,
+        "harvest": {
+            "tip_snapshots": int(n_tip_snap),
+            "prematch_snapshots": int(n_pre_snap),
+            "match_results_resolved": int(n_results),
+            "min_rows_needed_to_train": min_rows,
+            "ready_to_train": bool(n_results >= min_rows),
+        },
+        "tips": {"sent_or_pending": int(n_tips), "currently_unsent": int(n_unsent)},
+        "last_training_run": metrics,
+    })
+
 @app.route("/settings/<key>", methods=["GET","POST"])
 def http_settings(key: str):
     _require_admin()
