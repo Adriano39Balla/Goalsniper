@@ -424,7 +424,7 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
     TEAM_FORM_CACHE[key]=(now,out)
     return out
 
-def _api_fixtures_by_league_season(league_id: int, season: int) -> List[dict]:
+def _api_fixtures_by_league_season(league_id: int, season: int) -> Tuple[List[dict], dict]:
     """
     NEW: bulk-fetches an ENTIRE league season in a handful of calls
     (paginated defensively, but API-Football typically returns a full
@@ -433,17 +433,30 @@ def _api_fixtures_by_league_season(league_id: int, season: int) -> List[dict]:
     get computed locally from this one fetched list afterward, instead of
     the live 3-calls-per-fixture path (_api_last_fixtures/_api_h2h) that
     extract_prematch_features() uses for upcoming fixtures.
+
+    PATCH: now also returns API-Football's own "errors"/"results"/"paging"
+    metadata from the first page fetched. Previously this only looked at
+    the "response" array and silently discarded everything else — meaning
+    an empty result gave zero indication of WHY (subscription tier doesn't
+    include this season, invalid league/season combo, rate limit, etc. all
+    looked identical: just an empty list).
     """
-    out=[]; page=1
+    out=[]; page=1; diag={}
     while True:
         js=_api_get(FOOTBALL_API_URL, {"league": league_id, "season": season, "page": page}) or {}
+        if page==1:
+            diag={
+                "errors": js.get("errors") if isinstance(js,dict) else "no response from API (network/auth failure)",
+                "results": js.get("results") if isinstance(js,dict) else None,
+                "paging": js.get("paging") if isinstance(js,dict) else None,
+            }
         resp=js.get("response",[]) if isinstance(js,dict) else []
         out.extend(resp)
         paging=js.get("paging") or {}
         cur=int(paging.get("current") or 1); total=int(paging.get("total") or 1)
         if cur>=total or not resp: break
         page+=1
-    return out
+    return out, diag
 
 def _fixture_ts(fx: dict) -> float:
     try:
@@ -471,8 +484,11 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
     match results since deployment.
     """
     all_fx: Dict[int, dict] = {}
+    diags: Dict[int, dict] = {}
     for s in seasons:
-        for fx in _api_fixtures_by_league_season(league_id, s):
+        fxs, diag = _api_fixtures_by_league_season(league_id, s)
+        diags[str(s)] = diag
+        for fx in fxs:
             fid=(fx.get("fixture") or {}).get("id")
             if fid: all_fx[fid]=fx
     fixtures=sorted(all_fx.values(), key=_fixture_ts)
@@ -547,7 +563,8 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
                       "ON CONFLICT(team_id) DO UPDATE SET rating=EXCLUDED.rating, updated_ts=EXCLUDED.updated_ts",
                       (tid, float(rating), int(last_ts)))
 
-    return {"fixtures_seen": len(fixtures), "snapshots_saved": snapshots_saved, "results_saved": results_saved}
+    return {"fixtures_seen": len(fixtures), "snapshots_saved": snapshots_saved, "results_saved": results_saved,
+            "api_diagnostics_per_season": diags}
 
 def _collect_todays_prematch_fixtures() -> List[dict]:
     today_local=datetime.now(ZoneInfo("Europe/Berlin")).date()
