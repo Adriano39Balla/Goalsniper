@@ -4,6 +4,7 @@ psycopg2-binary==2.9.9
 requests==2.31.0
 jsonschema
 numba
+python==3.12
 
 # ML Core (minimal)
 numpy==1.26.3
