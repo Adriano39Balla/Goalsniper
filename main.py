@@ -277,6 +277,17 @@ def init_db():
         # PATCH: Elo-style team strength ratings, updated after each result.
         c.execute("""CREATE TABLE IF NOT EXISTS team_ratings (
             team_id BIGINT PRIMARY KEY, rating DOUBLE PRECISION NOT NULL DEFAULT 1500.0, updated_ts BIGINT)""")
+        # PATCH: this was missing. save_prematch_snapshot() (called from
+        # prematch_scan_save()) writes to this table, but only
+        # train_models.py's _ensure_training_tables() was creating it —
+        # which only runs when training actually executes. Without this,
+        # the prematch scheduler job would fail every run with
+        # "relation prematch_snapshots does not exist" (silently swallowed
+        # by a try/except), meaning zero prematch training data would ever
+        # get collected. Schema matches train_models.py's version exactly.
+        c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
+            match_id BIGINT PRIMARY KEY, created_ts BIGINT, payload TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pre_snap_ts ON prematch_snapshots (created_ts DESC)")
         # Evolutive columns (idempotent)
         try: c.execute("ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION")
         except: pass
