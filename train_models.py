@@ -204,6 +204,31 @@ def _set_setting(conn, key: str, value: str) -> None:
           "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
           (key, value))
 
+def _is_threshold_locked(conn, label: str) -> bool:
+    """
+    NEW: checks for a `conf_threshold_locked:{label}` = "1" setting.
+    Lets you manually suppress a market (e.g. set conf_threshold:PRE BTTS
+    to 99 via /settings) and have it actually STAY suppressed across
+    nightly retraining — previously every training run unconditionally
+    overwrote every market's threshold with its own freshly auto-picked
+    value, silently undoing any manual suppression the very next night.
+    This is almost certainly why PRE BTTS / PRE Over/Under 3.5's earlier
+    manual suppression didn't hold.
+    """
+    try:
+        df = _read_sql(conn, "SELECT value FROM settings WHERE key=%s", (f"conf_threshold_locked:{label}",))
+        return (not df.empty) and str(df.iloc[0]["value"]).strip() == "1"
+    except Exception:
+        return False
+
+def _set_threshold(conn, label: str, thr_pct: float) -> None:
+    """NEW: use this instead of a bare _set_setting for any
+    conf_threshold:* write — respects the lock above."""
+    if _is_threshold_locked(conn, label):
+        logger.info("[THRESHOLD] %s is locked — skipping auto-picked value %.2f%%", label, thr_pct)
+        return
+    _set_setting(conn, f"conf_threshold:{label}", f"{thr_pct:.2f}")
+
 def _ensure_training_tables(conn) -> None:
     # safety: ensure prematch_snapshots/settings exist (others are created by main.py)
     _exec(conn, """
@@ -692,7 +717,7 @@ def _train_binary_head(
             default_threshold=default_thr_prob,
         )
         thr_pct = float(np.clip(_percent(thr_prob), min_thresh_pct, max_thresh_pct))
-        _set_setting(conn, f"conf_threshold:{threshold_label}", f"{thr_pct:.2f}")
+        _set_threshold(conn, threshold_label, thr_pct)
 
     return True, mets, p_cal
 
@@ -870,7 +895,7 @@ def train_models(
                     default_threshold=0.45,
                 )
                 thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
-                _set_setting(conn, "conf_threshold:1X2", f"{thr_pct:.2f}")
+                _set_threshold(conn, "1X2", thr_pct)
                 summary["thresholds"]["1X2"] = thr_pct
         else:
             logger.info("In-Play: not enough labeled data (have %d, need >= %d).", len(df_ip), min_rows)
@@ -983,7 +1008,7 @@ def train_models(
                         default_threshold=0.45,
                     )
                     thr_pct = float(np.clip(_percent(thr_prob), min_thresh, max_thresh))
-                    _set_setting(conn, "conf_threshold:PRE 1X2", f"{thr_pct:.2f}")
+                    _set_threshold(conn, "PRE 1X2", thr_pct)
                     summary["thresholds"]["PRE 1X2"] = thr_pct
         else:
             logger.info("Prematch: not enough labeled data (have %d, need >= %d).", len(df_pre), min_rows)
