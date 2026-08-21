@@ -2089,10 +2089,30 @@ def http_status():
         "last_training_run": metrics,
     })
 
-@app.route("/settings/<key>", methods=["GET","POST"])
+@app.route("/settings/<path:key>", methods=["GET","POST"])
 def http_settings(key: str):
     _require_admin()
+    # PATCH: was <key> (Flask's default converter), which treats "/" as a
+    # path separator and never matches it inside the captured value.
+    # Several real setting keys contain a literal "/" — e.g.
+    # "conf_threshold:PRE Over/Under 3.5" — so any URL for those 404'd
+    # unconditionally, regardless of encoding (%2F gets decoded before the
+    # converter sees it) or HTTP method (GET or POST, made no difference).
+    # <path:key> allows "/" inside the captured value, fixing this for
+    # every key that contains one.
+    # PATCH: a plain browser address bar can only issue GET requests, but
+    # writing a setting previously required POST with a JSON body — meaning
+    # you needed curl/Postman/etc. just to set a threshold. Now a GET with
+    # ?value=... performs the write directly, consistent with how every
+    # other /admin/* endpoint in this file already accepts GET for
+    # browser convenience. GET without ?value= still just reads, unchanged.
+    #   Read:  /settings/conf_threshold:PRE%20BTTS?key=YOUR_KEY
+    #   Write: /settings/conf_threshold:PRE%20BTTS?value=99&key=YOUR_KEY
     if request.method=="GET":
+        qval = request.args.get("value")
+        if qval is not None:
+            set_setting(key, str(qval)); _SETTINGS_CACHE.invalidate(key); invalidate_model_caches_for_key(key)
+            return jsonify({"ok": True, "key": key, "value": str(qval), "wrote_via": "GET ?value="})
         val=get_setting_cached(key); return jsonify({"ok": True, "key": key, "value": val})
     val=(request.get_json(silent=True) or {}).get("value")
     if val is None: abort(400)
