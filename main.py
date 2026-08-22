@@ -96,6 +96,19 @@ DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 # kickoff rather than staying stale from a single morning snapshot.
 PREMATCH_SCAN_ENABLE        = os.getenv("PREMATCH_SCAN_ENABLE", "1") not in ("0","false","False","no","NO")
 PREMATCH_SCAN_INTERVAL_MIN  = int(os.getenv("PREMATCH_SCAN_INTERVAL_MIN", "180"))
+# PATCH: this is the fix for prematch burning the whole daily API-Football
+# quota before games even start. TEAM_FORM_CACHE's TTL (30 min, below) is
+# far shorter than PREMATCH_SCAN_INTERVAL_MIN (180 min) — meaning it was
+# expired by the time the NEXT scan ran, providing ~zero protection across
+# scan cycles. Every 3-hour scan was re-fetching last-5-fixtures + H2H (3
+# API calls) for EVERY still-not-started fixture scheduled that day, from
+# scratch, regardless of whether it was fully processed an hour ago. A
+# fixture's team-form/H2H numbers don't meaningfully change hour to hour —
+# this governs how long a saved prematch_snapshots row is treated as
+# "fresh enough to reuse" before paying the network cost again. Default 6h
+# means a fixture gets its features refreshed ~2-4x today instead of on
+# every single scan cycle.
+PREMATCH_SNAPSHOT_TTL_SEC   = int(os.getenv("PREMATCH_SNAPSHOT_TTL_SEC", "21600"))
 
 AUTO_TUNE_ENABLE        = os.getenv("AUTO_TUNE_ENABLE", "0") not in ("0","false","False","no","NO")
 TARGET_PRECISION        = float(os.getenv("TARGET_PRECISION", "0.60"))
@@ -1573,6 +1586,62 @@ def _safe_extract_prematch_features(fx: dict) -> Dict[str,float]:
         log.warning("[PREMATCH] feature extraction failed for fixture %s: %s", fid, e)
         return {}
 
+def _load_fresh_snapshot_feats(fids: List[int], now_ts: int) -> Dict[int, Dict[str,float]]:
+    """
+    NEW: the actual fix for prematch burning the whole daily API-Football
+    quota before games start. Bulk-checks prematch_snapshots for fixtures
+    that already have a feature snapshot saved within PREMATCH_SNAPSHOT_TTL_SEC,
+    and returns their stored feat dict straight from Postgres — zero
+    network calls. Fixtures with no snapshot yet, or one older than the
+    TTL, are simply absent here, so the caller knows to fetch those (and
+    only those) from the network.
+    """
+    if not fids: return {}
+    cutoff = now_ts - PREMATCH_SNAPSHOT_TTL_SEC
+    with db_conn() as c:
+        rows = c.execute(
+            "SELECT match_id, payload FROM prematch_snapshots WHERE match_id = ANY(%s) AND created_ts >= %s",
+            (fids, cutoff)
+        ).fetchall()
+    out={}
+    for mid, payload in rows:
+        try:
+            feat=(json.loads(payload) or {}).get("feat") or {}
+            if feat: out[int(mid)]=feat
+        except Exception:
+            continue
+    return out
+
+def _get_prematch_features_bulk(fixtures: List[dict]) -> Tuple[Dict[int, Dict[str,float]], Dict[int, Dict[str,float]]]:
+    """
+    NEW: shared choke point for prematch_scan_save() and
+    send_match_of_the_day() — returns (all_feats, freshly_fetched_feats)
+    keyed by fixture id. Reuses a fresh DB snapshot wherever one exists
+    (no network cost) and only hits the API — concurrently, same as
+    before — for fixtures that actually need it. This is what stops both
+    callers from re-fetching every fixture's team-form/H2H on every single
+    scan cycle regardless of whether anything changed.
+    """
+    now_ts=int(time.time())
+    fid_map: Dict[int, dict] = {}
+    for fx in fixtures:
+        fid=(fx.get("fixture") or {}).get("id")
+        if fid: fid_map[int(fid)]=fx
+    cached = _load_fresh_snapshot_feats(list(fid_map.keys()), now_ts)
+    need_fetch = [fx for fid,fx in fid_map.items() if fid not in cached]
+    fetched: Dict[int, Dict[str,float]] = {}
+    if need_fetch:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            feats=list(ex.map(_safe_extract_prematch_features, need_fetch))
+        for fx, feat in zip(need_fetch, feats):
+            fid=(fx.get("fixture") or {}).get("id")
+            if fid and feat:
+                fetched[int(fid)]=feat
+    log.info("[PREMATCH] features: %d reused from snapshot cache, %d fetched fresh (%d fixtures total)",
+              len(cached), len(fetched), len(fid_map))
+    out=dict(cached); out.update(fetched)
+    return out, fetched
+
 def _kickoff_berlin(utc_iso: str|None) -> str:
     try:
         if not utc_iso: return "TBD"
@@ -1604,20 +1673,26 @@ def prematch_scan_save() -> int:
     if not fixtures: return 0
     saved=0
 
-    # PATCH: extract features for all of today's fixtures concurrently
-    # (bounded worker pool) instead of one fixture at a time — each
-    # extraction does 3 (cached) HTTP calls, so this is the dominant cost
-    # of a prematch scan.
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        feats=list(ex.map(_safe_extract_prematch_features, fixtures))
+    # PATCH: was unconditionally re-fetching team-form/H2H for every
+    # fixture on every scan cycle regardless of freshness — see
+    # PREMATCH_SNAPSHOT_TTL_SEC and _get_prematch_features_bulk() above
+    # for why this was burning the daily API quota. Now only fixtures
+    # without a recent enough snapshot actually hit the network.
+    feats_by_fid, freshly_fetched = _get_prematch_features_bulk(fixtures)
 
-    for fx, feat in zip(fixtures, feats):
+    for fx in fixtures:
         fixture=fx.get("fixture") or {}; lg=fx.get("league") or {}; teams=fx.get("teams") or {}
         home=(teams.get("home") or {}).get("name",""); away=(teams.get("away") or {}).get("name","")
         league_id=int((lg.get("id") or 0)); league=f"{lg.get('country','')} - {lg.get('name','')}".strip(" -"); fid=int((fixture.get("id") or 0))
+        feat = feats_by_fid.get(fid)
         if not fid or not feat: continue
-        try: save_prematch_snapshot(fid, feat)
-        except Exception: pass
+        # PATCH: only write a new snapshot for fixtures that were actually
+        # freshly fetched this run — re-saving a reused-from-cache feat
+        # would just reset its created_ts and defeat the whole point of
+        # the freshness window above.
+        if fid in freshly_fetched:
+            try: save_prematch_snapshot(fid, feat)
+            except Exception: pass
         candidates: List[Tuple[str,str,float]]=[]
         # PRE OU via PRE_OU_* models
         for line in OU_LINES:
@@ -1711,19 +1786,25 @@ def send_match_of_the_day() -> bool:
         if not fixtures:
             return send_telegram("🏅 Match of the Day: no fixtures in configured leagues.")
 
-    # PATCH: same concurrent + cached feature extraction as prematch_scan_save().
-    # If prematch_scan_save() already ran today, TEAM_FORM_CACHE hits mean
-    # this loop makes ~zero additional team-form/H2H API calls.
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        feats=list(ex.map(_safe_extract_prematch_features, fixtures))
+    # PATCH: uses the same snapshot-freshness reuse as prematch_scan_save()
+    # (see PREMATCH_SNAPSHOT_TTL_SEC / _get_prematch_features_bulk above).
+    # If prematch_scan_save() already ran today, this makes ~zero
+    # additional network calls — was previously re-fetching every fixture
+    # unconditionally even when the day's scan had just done it minutes
+    # earlier.
+    feats_by_fid, freshly_fetched = _get_prematch_features_bulk(fixtures)
+    for fid, feat in freshly_fetched.items():
+        try: save_prematch_snapshot(fid, feat)
+        except Exception: pass
 
     best = None  # (prob_pct, suggestion, home, away, league, kickoff_txt, odds, book, ev_pct)
 
-    for fx, feat in zip(fixtures, feats):
+    for fx in fixtures:
         fixture = fx.get("fixture") or {}
         lg      = fx.get("league") or {}
         teams   = fx.get("teams") or {}
         fid     = int((fixture.get("id") or 0))
+        feat    = feats_by_fid.get(fid)
 
         home = (teams.get("home") or {}).get("name","")
         away = (teams.get("away") or {}).get("name","")
