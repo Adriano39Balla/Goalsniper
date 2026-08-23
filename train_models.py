@@ -626,7 +626,12 @@ def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray, np
     if "_ts" not in df.columns:
         n = len(df)
         idx = np.arange(n)
-        rng = np.random.default_rng(42)
+        # PATCH: was hardcoded 42. This branch only ever runs if a
+        # DataFrame somehow lacks the _ts column (shouldn't happen in
+        # normal operation — every snapshot payload includes created_ts —
+        # but keeping the fallback path's randomness configurable rather
+        # than silently fixed is low-cost and one less hidden constant.
+        rng = np.random.default_rng(int(os.getenv("TRAIN_SPLIT_SEED", "42")))
         rng.shuffle(idx)
         cut = int((1 - test_size) * n)
         tr = np.zeros(n, dtype=bool); te = np.zeros(n, dtype=bool)
