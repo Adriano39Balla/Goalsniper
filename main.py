@@ -389,8 +389,16 @@ def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY: return None
     try:
         r=session.get(url, headers=HEADERS, params=params, timeout=timeout)
-        return r.json() if r.ok else None
-    except Exception:
+        if r.ok: return r.json()
+        # PATCH: this was silently swallowing every non-2xx response with
+        # zero log output — the exact "no way to tell why from logs"
+        # problem already fixed for send_telegram() earlier, just missed
+        # here. API-Football rate-limits/auth failures would previously
+        # look identical to "no data available" from the caller's side.
+        log.debug("[API] non-OK response: HTTP %s for %s — %s", r.status_code, url, r.text[:200])
+        return None
+    except Exception as e:
+        log.debug("[API] request raised for %s: %s", url, e)
         return None
 
 # ───────── League filter ─────────
