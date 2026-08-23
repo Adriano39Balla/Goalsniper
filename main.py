@@ -38,7 +38,7 @@ PATCH NOTES (this revision):
 """
 from __future__ import annotations
 
-import os, json, time, logging, requests, psycopg2
+import os, json, time, logging, requests, psycopg2, math, random
 from psycopg2.pool import ThreadedConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
@@ -109,6 +109,19 @@ PREMATCH_SCAN_INTERVAL_MIN  = int(os.getenv("PREMATCH_SCAN_INTERVAL_MIN", "180")
 # means a fixture gets its features refreshed ~2-4x today instead of on
 # every single scan cycle.
 PREMATCH_SNAPSHOT_TTL_SEC   = int(os.getenv("PREMATCH_SNAPSHOT_TTL_SEC", "21600"))
+# PATCH: prematch had NO equivalent of the live path's DUP_COOLDOWN_MIN —
+# every fixture still sitting as "not started" got fully re-tipped on
+# EVERY scan cycle (every PREMATCH_SCAN_INTERVAL_MIN, by default 8x/day)
+# from midnight until kickoff. A single fixture could rack up 5-6 separate
+# tip inserts across one day, all counted as distinct volume. Once a
+# fixture has received a real (non-HARVEST) prematch tip, it's skipped on
+# every later scan for the rest of that day — a prematch pick for a given
+# match only needs to be made once, not refreshed every 3 hours.
+PREMATCH_DEDUP_ENABLE       = os.getenv("PREMATCH_DEDUP_ENABLE", "1") not in ("0","false","False","no","NO")
+# PATCH: backstop cap, mirroring MAX_TIPS_PER_SCAN (which only ever
+# applied to the live path) — even with dedup and locked-down markets, a
+# single heavy fixture day shouldn't be able to flood Telegram unbounded.
+MAX_PREMATCH_TIPS_PER_SCAN  = int(os.getenv("MAX_PREMATCH_TIPS_PER_SCAN", "40"))
 
 AUTO_TUNE_ENABLE        = os.getenv("AUTO_TUNE_ENABLE", "0") not in ("0","false","False","no","NO")
 TARGET_PRECISION        = float(os.getenv("TARGET_PRECISION", "0.60"))
@@ -116,7 +129,6 @@ THRESH_MIN_PREDICTIONS  = int(os.getenv("THRESH_MIN_PREDICTIONS", "25"))
 MIN_THRESH              = float(os.getenv("MIN_THRESH", "55"))
 MAX_THRESH              = float(os.getenv("MAX_THRESH", "85"))
 
-MOTD_PREMATCH_ENABLE    = os.getenv("MOTD_PREMATCH_ENABLE", "1") not in ("0","false","False","no","NO")
 MOTD_PREDICT            = os.getenv("MOTD_PREDICT", "1") not in ("0","false","False","no","NO")
 MOTD_HOUR               = int(os.getenv("MOTD_HOUR", "19"))
 MOTD_MINUTE             = int(os.getenv("MOTD_MINUTE", "15"))
@@ -804,7 +816,7 @@ def _score_prob(feat: Dict[str,float], mdl: Dict[str,Any]) -> float:
 def _load_ou_model_for_line(line: float) -> Optional[Dict[str,Any]]:
     name=f"OU_{_fmt_line(line)}"; mdl=load_model_from_settings(name)
     return mdl or (load_model_from_settings("O25") if abs(line-2.5)<1e-6 else None)
-def _load_wld_models(): return (load_model_from_settings("WLD_HOME"), load_model_from_settings("WLD_DRAW"), load_model_from_settings("WLD_AWAY"))
+def _load_wld_models(): return (load_model_from_settings("WLD_HOME"), load_model_from_settings("WLD_AWAY"))
 
 # ───────── Odds helpers ─────────
 def _ev(prob: float, odds: float) -> float:
@@ -929,6 +941,31 @@ def _price_gate(market_text: str, suggestion: str, fid: int) -> Tuple[bool, Opti
 ELO_DEFAULT = float(os.getenv("ELO_DEFAULT", "1500.0"))
 ELO_K       = float(os.getenv("ELO_K", "20.0"))
 ELO_HOME_ADV= float(os.getenv("ELO_HOME_ADV", "60.0"))
+# PATCH: this file's header has claimed "Exponential decay weighted form"
+# since the very first revision, but _team_form_stats()/_rate_totals()/
+# _h2h_counts() below were always flat averages — every game in the
+# last-5 window counted equally, no matter how long ago it was. That's a
+# real gap between what the code claims and what it does. FORM_DECAY_RATE
+# is the actual decay factor now applied: most recent game weight 1.0,
+# next 0.8, then 0.64, 0.512, 0.41 — a team's most recent result matters
+# more than its 5th-most-recent, which is the whole point of "form."
+FORM_DECAY_RATE = float(os.getenv("FORM_DECAY_RATE", "0.8"))
+
+def _decay_weights_for_games(games: List[dict]) -> Dict[int, float]:
+    """
+    NEW: exponential recency-decay weight per game, keyed by id(dict).
+    Ranks by ACTUAL kickoff timestamp (_fixture_ts), not list position —
+    _api_last_fixtures() (live path) returns most-recent-first, but
+    backfill_historical_prematch() builds its last-5 windows chronologically
+    (oldest first) via `[...][-5:]`. Trusting list position would silently
+    invert the weighting for whichever caller doesn't match the assumption.
+    Sorting by real timestamp here makes this correct for both callers
+    regardless of what order they hand games in.
+    """
+    dated = [(g, _fixture_ts(g)) for g in games]
+    dated.sort(key=lambda x: x[1], reverse=True)  # most recent first
+    return {id(g): FORM_DECAY_RATE ** i for i, (g, _) in enumerate(dated)}
+
 
 def get_team_rating(team_id: int) -> float:
     if not team_id: return ELO_DEFAULT
@@ -1211,6 +1248,206 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0) -> Dict[str, Any
                  "Historical-backfilled fixtures are excluded — no real odds were ever fetched for them."),
     }
 
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF, no scipy dependency (uses math.erf)."""
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+def compute_calibration(days: Optional[int] = None) -> Dict[str, Any]:
+    """
+    NEW: is a "70% confidence" tip actually right ~70% of the time? This
+    checks it directly, bucket by bucket, instead of relying on eyeballing
+    one suspicious tip at a time (which is how the 75.6%-confidence-at-
+    32%-market-price mismatch got caught earlier — this generalizes that
+    check across every graded tip). Uses confidence_raw (the model's own
+    probability before any odds/EV filtering) against actual outcomes.
+    """
+    cutoff = int(time.time()) - days*86400 if days else 0
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT t.market, t.suggestion, t.confidence_raw,
+                   r.final_goals_h, r.final_goals_a, r.btts_yes
+            FROM tips t JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.suggestion<>'HARVEST' AND t.confidence_raw IS NOT NULL AND t.created_ts >= %s
+        """, (cutoff,)).fetchall()
+
+    buckets = [(0.50,0.55),(0.55,0.60),(0.60,0.65),(0.65,0.70),(0.70,0.75),
+               (0.75,0.80),(0.80,0.85),(0.85,0.90),(0.90,0.95),(0.95,1.01)]
+    out = {}
+    for lo, hi in buckets:
+        n=0; wins=0
+        for (mkt, sugg, conf_raw, gh, ga, btts) in rows:
+            if conf_raw is None or not (lo <= float(conf_raw) < hi): continue
+            outcome = _tip_outcome_for_result(sugg, {"final_goals_h":gh,"final_goals_a":ga,"btts_yes":btts})
+            if outcome is None: continue
+            n+=1; wins += 1 if outcome==1 else 0
+        if n < 5:  # too few to say anything meaningful
+            continue
+        expected = (lo+hi)/2.0*100.0
+        actual = 100.0*wins/n
+        key = f"{lo*100:.0f}-{hi*100:.0f}%"
+        out[key] = {"n": n, "expected_win_rate_pct": round(expected,1),
+                     "actual_win_rate_pct": round(actual,1),
+                     "gap_pct": round(actual-expected,1)}
+    return {"buckets": out,
+            "note": "expected_win_rate is the bucket midpoint; a large negative gap means the "
+                    "model is overconfident in that range (exactly the pattern that caught the "
+                    "75.6%-confidence-at-32%-market-price live tip earlier)."}
+
+def compute_market_significance(days: Optional[int] = None, min_n: int = 20) -> Dict[str, Any]:
+    """
+    NEW: for each market, a proper z-test of "is the actual win rate
+    statistically distinguishable from what the odds implied" — not just
+    a descriptive ROI number. A positive ROI on a small sample can easily
+    be noise; this says whether it's more than that.
+    """
+    cutoff = int(time.time()) - days*86400 if days else 0
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT t.market, t.suggestion, t.odds,
+                   r.final_goals_h, r.final_goals_a, r.btts_yes
+            FROM tips t JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.suggestion<>'HARVEST' AND t.odds IS NOT NULL AND t.created_ts >= %s
+        """, (cutoff,)).fetchall()
+
+    by_market: Dict[str, List[Tuple[float,int]]] = {}
+    for (mkt, sugg, odds, gh, ga, btts) in rows:
+        outcome = _tip_outcome_for_result(sugg, {"final_goals_h":gh,"final_goals_a":ga,"btts_yes":btts})
+        if outcome is None: continue
+        by_market.setdefault(mkt or "?", []).append((float(odds), outcome))
+
+    out = {}
+    for mkt, arr in by_market.items():
+        n = len(arr)
+        if n < min_n: continue
+        implied_probs = [1.0/o for (o,_) in arr]
+        avg_implied = sum(implied_probs)/n
+        wins = sum(y for (_,y) in arr)
+        actual_rate = wins/n
+        se = math.sqrt(avg_implied*(1-avg_implied)/n) if 0 < avg_implied < 1 else 0
+        z = (actual_rate - avg_implied)/se if se > 0 else 0.0
+        p_value = 2*(1-_norm_cdf(abs(z)))
+        out[mkt] = {
+            "n": n, "actual_win_rate_pct": round(actual_rate*100,1),
+            "market_implied_win_rate_pct": round(avg_implied*100,1),
+            "z_score": round(z,2), "p_value": round(p_value,4),
+            "statistically_significant": bool(abs(z) > 1.96),
+        }
+    return {"by_market": out, "min_n_required": min_n,
+            "note": "statistically_significant=true means the gap between actual and "
+                    "market-implied win rate is unlikely to be chance at 95% confidence — "
+                    "still check n before trusting a 'significant' result on a small market."}
+
+def monte_carlo_bankroll(days: Optional[int], initial_bankroll: float, stake_pct: float,
+                          simulations: int = 5000) -> Dict[str, Any]:
+    """
+    NEW: reshuffles your REAL historical tip outcomes (real odds only,
+    same as compute_pnl()) thousands of times to show the actual spread of
+    outcomes a staking plan produces — not just the one sequence that
+    already happened. Directly relevant after tonight's stake-sizing
+    conversation: this answers "what's my realistic risk of ruin at X%
+    stake" using your own system's real track record, not guesswork.
+    """
+    # PATCH: guard against a caller passing simulations=0 (or negative) via
+    # the query string — without this, `finals` stays empty and the
+    # finals[n//2]/finals[int(n*0.1)] lookups below raise IndexError.
+    simulations = max(1, int(simulations))
+    cutoff = int(time.time()) - days*86400 if days else 0
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT t.suggestion, t.odds, r.final_goals_h, r.final_goals_a, r.btts_yes
+            FROM tips t JOIN match_results r ON r.match_id = t.match_id
+            WHERE t.suggestion<>'HARVEST' AND t.odds IS NOT NULL AND t.created_ts >= %s
+        """, (cutoff,)).fetchall()
+
+    outcomes = []
+    for (sugg, odds, gh, ga, btts) in rows:
+        out = _tip_outcome_for_result(sugg, {"final_goals_h":gh,"final_goals_a":ga,"btts_yes":btts})
+        if out is None: continue
+        outcomes.append((float(odds), out))
+
+    if len(outcomes) < 10:
+        return {"error": f"only {len(outcomes)} graded real-odds tips available — need at least 10 for a meaningful simulation"}
+
+    finals = []; ruin_count = 0; max_drawdowns = []
+    for _ in range(simulations):
+        bankroll = initial_bankroll
+        peak = bankroll
+        max_dd = 0.0
+        shuffled = outcomes[:]
+        random.shuffle(shuffled)
+        for odds, outcome in shuffled:
+            stake = bankroll * (stake_pct/100.0)
+            if outcome == 1:
+                bankroll += stake*(odds-1.0)
+            else:
+                bankroll -= stake
+            if bankroll > peak: peak = bankroll
+            if peak > 0:
+                dd = (peak-bankroll)/peak*100.0
+                if dd > max_dd: max_dd = dd
+            if bankroll <= 0:
+                bankroll = 0.0
+                ruin_count += 1
+                break
+        finals.append(bankroll)
+        max_drawdowns.append(max_dd)
+
+    finals.sort()
+    n = len(finals)
+    return {
+        "initial_bankroll": initial_bankroll, "stake_pct": stake_pct,
+        "simulations": simulations, "real_tips_used": len(outcomes),
+        "probability_of_ruin_pct": round(100.0*ruin_count/simulations, 2),
+        "median_final_bankroll": round(finals[n//2], 2),
+        "worst_10pct_final_bankroll": round(finals[int(n*0.1)], 2),
+        "best_10pct_final_bankroll": round(finals[int(n*0.9)], 2),
+        "avg_max_drawdown_pct": round(sum(max_drawdowns)/len(max_drawdowns), 1),
+        "note": "Reshuffles your real graded tip history (real odds only) — same underlying "
+                "data as /admin/pnl, replayed in random order thousands of times to show the "
+                "range of outcomes this staking plan could realistically produce.",
+    }
+
+def compute_league_breakdown(market: Optional[str] = None, days: Optional[int] = None,
+                              min_n: int = 5) -> Dict[str, Any]:
+    """
+    NEW: read-only per-league accuracy for a market (or all markets) —
+    automates the manual "is PRE 1X2 failing specifically in leagues
+    outside the backfilled ones" investigation from earlier, instead of
+    pulling /tips/latest and eyeballing it by hand. Deliberately read-only:
+    this reports a pattern, it does NOT auto-adjust any threshold — that
+    decision stays with a human reviewing the numbers, same discipline as
+    the conf_threshold_locked mechanism.
+    """
+    cutoff = int(time.time()) - days*86400 if days else 0
+    q = """
+        SELECT t.league, t.market, t.suggestion,
+               r.final_goals_h, r.final_goals_a, r.btts_yes
+        FROM tips t JOIN match_results r ON r.match_id = t.match_id
+        WHERE t.suggestion<>'HARVEST' AND t.created_ts >= %s
+    """
+    params = [cutoff]
+    if market:
+        q += " AND t.market = %s"
+        params.append(market)
+    with db_conn() as c:
+        rows = c.execute(q, tuple(params)).fetchall()
+
+    by_league: Dict[str, Dict[str, int]] = {}
+    for (league, mkt, sugg, gh, ga, btts) in rows:
+        outcome = _tip_outcome_for_result(sugg, {"final_goals_h":gh,"final_goals_a":ga,"btts_yes":btts})
+        if outcome is None: continue
+        d = by_league.setdefault(league or "?", {"n":0,"wins":0})
+        d["n"] += 1; d["wins"] += 1 if outcome==1 else 0
+
+    out = {}
+    for league, d in by_league.items():
+        if d["n"] < min_n: continue
+        out[league] = {"n": d["n"], "wins": d["wins"], "win_rate_pct": round(100.0*d["wins"]/d["n"],1)}
+    ranked = sorted(out.items(), key=lambda kv: kv[1]["win_rate_pct"])
+    return {"market_filter": market or "ALL", "by_league": out,
+            "worst_5": ranked[:5], "best_5": ranked[-5:],
+            "note": "Read-only diagnostic — nothing here changes any threshold automatically."}
+
 def daily_accuracy_digest() -> Optional[str]:
     if not DAILY_ACCURACY_DIGEST_ENABLE: return None
     now_local=datetime.now(BERLIN_TZ)
@@ -1349,9 +1586,18 @@ def production_scan() -> Tuple[int,int]:
                 if q*100.0>=thr and _candidate_is_sane("BTTS: No", feat):  candidates.append(("BTTS","BTTS: No",q))
 
             # 1X2 (no draw)
-            mh,md,ma=_load_wld_models()
-            if mh and md and ma:
-                ph=_score_prob(feat,mh); pd=_score_prob(feat,md); pa=_score_prob(feat,ma)
+            mh,ma=_load_wld_models()
+            # PATCH: was `mh,md,ma=_load_wld_models()` gated on `if mh and md and ma`.
+            # md (the draw model's probability) was computed via _score_prob() every
+            # single scan and then NEVER used for anything — the renormalization
+            # below deliberately excludes it (s=ph+pa, draw is suppressed from
+            # output entirely). But the block was still gated on WLD_DRAW loading
+            # successfully, meaning if that one model ever failed to train (e.g.
+            # insufficient draw-labeled rows, a real possibility since draws are a
+            # minority class), the ENTIRE live 1X2 market would silently stop firing
+            # even though Home/Away were both healthy and usable on their own.
+            if mh and ma:
+                ph=_score_prob(feat,mh); pa=_score_prob(feat,ma)
                 # PATCH [BUG-FIX]: renormalize over Home+Away only. The draw
                 # is suppressed from output entirely, so dividing by
                 # (ph+pd+pa) was deflating both surviving probabilities and
@@ -1408,12 +1654,12 @@ def production_scan() -> Tuple[int,int]:
 # ───────── Prematch (compact: save-only, thresholds respected) ─────────
 def _team_form_stats(team_id: int, games: List[dict]) -> Dict[str,float]:
     """
-    PATCH: per-team form stats computed from the team's own perspective
-    (goals for/against, W/D/L, last match date) — needed for
-    pm_gf_*/pm_ga_*/pm_win_*/pm_draw_*/pm_loss_*/pm_rest_diff, none of
-    which the previous implementation computed at all.
+    PATCH: now genuinely recency-weighted (see FORM_DECAY_RATE above) —
+    previously every game in the window counted equally regardless of age
+    despite the file header claiming decay weighting since day one.
     """
-    gf=ga=win=draw=loss=played=0
+    weights = _decay_weights_for_games(games)
+    gf=ga=win=draw=loss=0.0; total_w=0.0; played=0
     last_ts=None
     for g in games:
         st=(((g.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
@@ -1424,49 +1670,54 @@ def _team_form_stats(team_id: int, games: List[dict]) -> Dict[str,float]:
         if team_id==th: my,opp=gh,ga_
         elif team_id==ta: my,opp=ga_,gh
         else: continue
-        gf+=my; ga+=opp; played+=1
-        if my>opp: win+=1
-        elif my==opp: draw+=1
-        else: loss+=1
+        w=weights.get(id(g), 1.0)
+        gf+=my*w; ga+=opp*w; played+=1; total_w+=w
+        if my>opp: win+=w
+        elif my==opp: draw+=w
+        else: loss+=w
         try:
             d=(g.get("fixture") or {}).get("date")
             if d:
                 ts=datetime.fromisoformat(d.replace("Z","+00:00")).timestamp()
                 if last_ts is None or ts>last_ts: last_ts=ts
         except Exception: pass
-    if played==0:
+    if played==0 or total_w<=0:
         return {"gf":0.0,"ga":0.0,"win":0.0,"draw":0.0,"loss":0.0,"played":0,"last_ts":None}
-    return {"gf":gf/played,"ga":ga/played,"win":win/played,"draw":draw/played,"loss":loss/played,"played":played,"last_ts":last_ts}
+    return {"gf":gf/total_w,"ga":ga/total_w,"win":win/total_w,"draw":draw/total_w,"loss":loss/total_w,"played":played,"last_ts":last_ts}
 
 def _rate_totals(games: List[dict]) -> Tuple[float,float,float]:
-    ov25=ov35=btts=played=0
+    """PATCH: recency-weighted, same reasoning as _team_form_stats()."""
+    weights=_decay_weights_for_games(games)
+    ov25=ov35=btts=0.0; total_w=0.0
     for g in games:
         st=(((g.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
         if st not in {"FT","AET","PEN"}: continue
         gh=int((g.get("goals") or {}).get("home") or 0); ga=int((g.get("goals") or {}).get("away") or 0)
-        played+=1
-        if gh+ga>2: ov25+=1
-        if gh+ga>3: ov35+=1
-        if gh>0 and ga>0: btts+=1
-    if played==0: return 0.0,0.0,0.0
-    return ov25/played, ov35/played, btts/played
+        w=weights.get(id(g), 1.0); total_w+=w
+        if gh+ga>2: ov25+=w
+        if gh+ga>3: ov35+=w
+        if gh>0 and ga>0: btts+=w
+    if total_w<=0: return 0.0,0.0,0.0
+    return ov25/total_w, ov35/total_w, btts/total_w
 
 def _h2h_counts(h2h: List[dict], home_id: int, away_id: int) -> Tuple[float,float,float]:
-    hw=aw=dr=played=0
+    """PATCH: recency-weighted, same reasoning as _team_form_stats()."""
+    weights=_decay_weights_for_games(h2h)
+    hw=aw=dr=0.0; total_w=0.0
     for g in h2h:
         st=(((g.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
         if st not in {"FT","AET","PEN"}: continue
         th=((g.get("teams") or {}).get("home") or {}).get("id")
         gh=int((g.get("goals") or {}).get("home") or 0); ga=int((g.get("goals") or {}).get("away") or 0)
-        played+=1
-        if gh==ga: dr+=1
+        w=weights.get(id(g), 1.0); total_w+=w
+        if gh==ga: dr+=w
         else:
             winner_home = gh>ga
             winner_id = th if winner_home else ((g.get("teams") or {}).get("away") or {}).get("id")
-            if winner_id==home_id: hw+=1
-            elif winner_id==away_id: aw+=1
-    if played==0: return 0.0,0.0,0.0
-    return hw/played, aw/played, dr/played
+            if winner_id==home_id: hw+=w
+            elif winner_id==away_id: aw+=w
+    if total_w<=0: return 0.0,0.0,0.0
+    return hw/total_w, aw/total_w, dr/total_w
 
 def _assemble_pre_features(th: int, ta: int, last_h: list, last_a: list, h2h: list,
                             kickoff_ts: float, rating_h: float, rating_a: float,
@@ -1686,13 +1937,32 @@ def prematch_scan_save() -> int:
         league_id=int((lg.get("id") or 0)); league=f"{lg.get('country','')} - {lg.get('name','')}".strip(" -"); fid=int((fixture.get("id") or 0))
         feat = feats_by_fid.get(fid)
         if not fid or not feat: continue
+
         # PATCH: only write a new snapshot for fixtures that were actually
         # freshly fetched this run — re-saving a reused-from-cache feat
         # would just reset its created_ts and defeat the whole point of
-        # the freshness window above.
+        # the freshness window above. Deliberately BEFORE the dedup-skip
+        # below — training-data collection (prematch_snapshots) and
+        # user-facing tip generation (tips) are separate concerns; a
+        # fixture already tipped once shouldn't stop its features from
+        # refreshing for training purposes.
         if fid in freshly_fetched:
             try: save_prematch_snapshot(fid, feat)
             except Exception: pass
+
+        # PATCH: this is the fix for prematch retipping the same fixture on
+        # every scan cycle before kickoff. Short-lived connection, same
+        # pattern as the live path's dup-check.
+        if PREMATCH_DEDUP_ENABLE:
+            with db_conn() as c:
+                dup = c.execute("SELECT 1 FROM tips WHERE match_id=%s AND suggestion<>'HARVEST' LIMIT 1",(fid,)).fetchone()
+            if dup:
+                continue
+
+        # PATCH: backstop volume cap — see MAX_PREMATCH_TIPS_PER_SCAN above.
+        if MAX_PREMATCH_TIPS_PER_SCAN and saved >= MAX_PREMATCH_TIPS_PER_SCAN:
+            break
+
         candidates: List[Tuple[str,str,float]]=[]
         # PRE OU via PRE_OU_* models
         for line in OU_LINES:
@@ -2124,6 +2394,70 @@ def http_pnl():
     except Exception:
         stake = 1.0
     return jsonify({"ok": True, "pnl": compute_pnl(days=days, stake=stake)})
+
+@app.route("/admin/diagnostics/calibration", methods=["GET"])
+def http_calibration():
+    """
+    Usage: /admin/diagnostics/calibration?days=30&key=YOUR_KEY (days omitted = all-time)
+    Checks whether a "70% confidence" tip actually wins ~70% of the time,
+    bucketed. Large negative gaps mean overconfidence in that range.
+    """
+    _require_admin()
+    days = request.args.get("days")
+    try: days = int(days) if days else None
+    except Exception: days = None
+    return jsonify({"ok": True, "calibration": compute_calibration(days=days)})
+
+@app.route("/admin/diagnostics/significance", methods=["GET"])
+def http_significance():
+    """
+    Usage: /admin/diagnostics/significance?days=30&min_n=20&key=YOUR_KEY
+    Z-test per market: is the real win rate distinguishable from what the
+    odds implied, or could the observed ROI just be noise on this sample.
+    """
+    _require_admin()
+    days = request.args.get("days")
+    try: days = int(days) if days else None
+    except Exception: days = None
+    try: min_n = int(request.args.get("min_n", "20"))
+    except Exception: min_n = 20
+    return jsonify({"ok": True, "significance": compute_market_significance(days=days, min_n=min_n)})
+
+@app.route("/admin/diagnostics/monte-carlo", methods=["GET"])
+def http_monte_carlo():
+    """
+    Usage: /admin/diagnostics/monte-carlo?bankroll=1000&stake_pct=2&days=30&key=YOUR_KEY
+    Reshuffles your real graded tip history thousands of times to show the
+    realistic spread of outcomes (and risk of ruin) for a given stake %.
+    """
+    _require_admin()
+    days = request.args.get("days")
+    try: days = int(days) if days else None
+    except Exception: days = None
+    try: bankroll = float(request.args.get("bankroll", "1000"))
+    except Exception: bankroll = 1000.0
+    try: stake_pct = float(request.args.get("stake_pct", "2.0"))
+    except Exception: stake_pct = 2.0
+    try: sims = int(request.args.get("simulations", "5000"))
+    except Exception: sims = 5000
+    return jsonify({"ok": True, "simulation": monte_carlo_bankroll(days, bankroll, stake_pct, sims)})
+
+@app.route("/admin/diagnostics/league-breakdown", methods=["GET"])
+def http_league_breakdown():
+    """
+    Usage: /admin/diagnostics/league-breakdown?market=PRE%201X2&days=30&key=YOUR_KEY
+    Read-only per-league win rate for a market (or all markets if omitted)
+    — automates the "which leagues is this market actually failing in"
+    check, doesn't touch any threshold.
+    """
+    _require_admin()
+    market = request.args.get("market")
+    days = request.args.get("days")
+    try: days = int(days) if days else None
+    except Exception: days = None
+    try: min_n = int(request.args.get("min_n", "5"))
+    except Exception: min_n = 5
+    return jsonify({"ok": True, "breakdown": compute_league_breakdown(market=market, days=days, min_n=min_n)})
 
 @app.route("/admin/status", methods=["GET"])
 def http_status():
