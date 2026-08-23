@@ -53,7 +53,7 @@ from sklearn.metrics import (
     classification_report
 )
 import psycopg2
-from datetime import datetime, timedelta
+from datetime import datetime
 
 try:
     from dotenv import load_dotenv
@@ -313,7 +313,6 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
             continue
         
         stat = (payload.get("stat") or {})
-        advanced = (payload.get("advanced") or {})
         
         # Basic stats
         f = {
