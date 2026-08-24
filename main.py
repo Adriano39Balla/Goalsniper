@@ -1501,6 +1501,20 @@ def daily_accuracy_digest() -> Optional[str]:
 
 # ───────── Thresholds & formatting ─────────
 def _get_market_threshold_key(m: str) -> str: return f"conf_threshold:{m}"
+def _is_threshold_locked(m: str) -> bool:
+    """
+    NEW: main.py's own copy of the lock check that already existed in
+    train_models.py. auto_tune_thresholds() below writes conf_threshold:*
+    directly via set_setting() — a second, separate write path from the
+    nightly training run, and one the lock mechanism never covered. If
+    AUTO_TUNE_ENABLE is ever turned on, this second door could silently
+    undo a manual suppression the exact same way the original bug did.
+    """
+    try:
+        v=get_setting_cached(f"conf_threshold_locked:{m}")
+        return v is not None and str(v).strip()=="1"
+    except Exception:
+        return False
 def _get_market_threshold(m: str) -> float:
     try:
         v=get_setting_cached(_get_market_threshold_key(m)); return float(v) if v is not None else float(CONF_THRESHOLD)
@@ -2171,6 +2185,14 @@ def auto_tune_thresholds(days: int = 14) -> Dict[str,float]:
     tuned={}
     for mk,arr in by.items():
         if len(arr)<THRESH_MIN_PREDICTIONS: continue
+        # PATCH: this is the fix — respect the same lock that already
+        # protects the nightly training write path. Without this,
+        # auto-tune could silently overwrite a manually-suppressed market
+        # (e.g. BTTS/OU2.5 at 99%) the exact same way the original
+        # unlocked-training bug did, just via a different job.
+        if _is_threshold_locked(mk):
+            log.info("[AUTO-TUNE] %s is locked — skipping auto-picked value", mk)
+            continue
         probs=[p for (p,_) in arr]; wins=[y for (_,y) in arr]
         pct=_pick_threshold(wins, probs, TARGET_PRECISION, THRESH_MIN_PREDICTIONS, CONF_THRESHOLD)
         set_setting(f"conf_threshold:{mk}", f"{pct:.2f}"); _SETTINGS_CACHE.invalidate(f"conf_threshold:{mk}"); tuned[mk]=pct
