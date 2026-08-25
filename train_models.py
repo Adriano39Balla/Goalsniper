@@ -31,6 +31,68 @@ PATCH NOTES (this revision):
   computes these into tip_snapshots/prematch_snapshots, send it so main.py's
   live extraction can be brought in sync. Otherwise this feature list should
   be trimmed down to what main.py actually produces.
+
+PATCH NOTES (this revision — code-review hardening pass, applied per a
+follow-up code review of this file):
+  4. [DOCS] The "STILL OPEN" feature-serving-mismatch note above is now
+     stale: the main.py this bot currently runs against computes the full
+     FEATURES set in extract_features() and the full PRE_FEATURES set in
+     _assemble_pre_features() (both verified field-for-field against the
+     lists below), so none of these should be silently defaulting to 0.0
+     at serving time anymore. Left as a note rather than deleted, in case
+     main.py's feature computation regresses in the future — if a
+     confusion-matrix or calibration check ever looks off again, this is
+     the first thing worth re-verifying.
+  5. [RELIABILITY] confusion_matrix() falling back to a size != 4 result
+     (e.g. every prediction landing in one class) is now logged instead of
+     silently producing an all-zero confusion matrix with no trace of why.
+  6. [RELIABILITY] Added basic data validation (_validate_training_data)
+     before fitting each binary head: rejects non-finite feature values,
+     non-binary labels, and a feature-count/column mismatch, with a clear
+     log message instead of a downstream sklearn exception (or worse, a
+     silently-wrong fit) with no context about which market/head failed.
+  7. [OBSERVABILITY] Added structured per-head logging of train/test split
+     sizes; added a startup summary logging every currently-locked
+     conf_threshold_locked:* setting (previously the lock's effect was
+     only visible as a single INFO line at the moment it actually blocked
+     a write); that line is now WARNING since a suppressed auto-tuned
+     threshold is worth noticing, not just noting.
+  8. [MAINTAINABILITY] Magic numbers moved to named module-level constants:
+     DEFAULT_LEAGUE_RATE_MIN_N, DEFAULT_LEAGUE_RATES, MIN_COUNT_DENOM,
+     MIN_XG_DENOM — previously repeated inline (0.5/0.5/0.3 defaults in
+     two places, bare `1`/`0.1` denominators throughout the feature block,
+     `min_n: int = 20` as the only reference to the league-rate sample
+     threshold).
+  9. [MAINTAINABILITY] Extracted _clean_feature_df() for the
+     replace-inf/fillna-0/ensure-columns step duplicated identically in
+     load_inplay_data() and load_prematch_data().
+ 10. [OBSERVABILITY] model_metrics_latest is now also written under a
+     timestamped key (model_metrics:<UTC timestamp>) so past training runs'
+     metrics remain queryable instead of being overwritten by the next run.
+ 11. [DOCS] Noted near FEATURES/PRE_FEATURES that these are raw,
+     unscaled values on very different natural ranges (minute 0-120 vs.
+     xg 0-~10 vs. is_* flags 0/1) — no clipping/scaling is applied here
+     deliberately (see PATCH NOTES 1-3 above on why a scaler broke
+     train/serve parity), so any future outlier handling must be
+     implemented identically in main.py's serving path or it will
+     reintroduce the same class of bug removed in NOTE 1.
+
+  Not done in this pass (flagged, not attempted): true atomic/checkpointed
+  training (item 10 in the review) — every _train_binary_head() call still
+  writes its model straight to `settings` as soon as it fits, so a
+  mid-run failure (e.g. prematch training throwing after in-play already
+  wrote several models) still leaves a partial update in place rather than
+  rolling back. Fixing this properly means buffering every _set_setting/
+  _set_threshold call through this function and only flushing at the very
+  end, which touches most of the call chain — flagged here rather than
+  changed by half-measure. Also not done: extracting a single shared
+  feature-builder for load_inplay_data()/load_prematch_data() (their
+  actual per-feature logic differs enough — one derives ~40 fields from
+  raw match stats, the other mostly copies pm_* fields from a stored
+  payload — that forcing a shared builder risks obscuring rather than
+  reducing the real duplication, which was the inf/nan/fillna cleanup now
+  extracted in NOTE 9) and k-fold cross-validation (a real modeling change
+  best made deliberately, not folded into a lint-style pass).
 """
 
 import argparse
@@ -64,7 +126,26 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# PATCH: type alias for DB connection objects, used across this file's
+# type hints (review item: "Missing Type Hints" — `conn` previously had no
+# annotation anywhere). psycopg2.extensions.connection is the real runtime
+# type returned by psycopg2.connect(); Python doesn't enforce this at
+# runtime, so this is purely documentation/IDE-support, zero behavior change.
+PGConnection = psycopg2.extensions.connection
+
 # ───────────────────────── Feature sets ───────────────────────── #
+
+# PATCH (review item 2 / "scale disparity"): FEATURES and PRE_FEATURES
+# below are raw, UNSCALED values on very different natural ranges —
+# `minute` runs 0-120, `xg_h`/`xg_a` roughly 0-10, momentum/pressure
+# scores are small decimals, and the `is_*`/flag features are strictly
+# 0/1. This is intentional (see PATCH NOTES 1-3 above: a StandardScaler
+# was removed because its fitted mean_/scale_ were never persisted, so
+# serving could never reproduce the transform) — but it means no outlier
+# clipping or rescaling happens anywhere in this pipeline. If clipping is
+# ever added here to handle outliers, the exact same transform must be
+# implemented in main.py's extract_features()/extract_prematch_features()
+# or train/serve parity breaks again the same way the scaler did.
 
 # Advanced in-play features (matches main.py)
 FEATURES: List[str] = [
@@ -179,10 +260,17 @@ PRE_FEATURES: List[str] = [
 
 EPS = 1e-6
 
+# PATCH (review item 6 — magic numbers): named constants replacing values
+# that were previously repeated inline across this file.
+DEFAULT_LEAGUE_RATE_MIN_N = 20  # was the bare `min_n: int = 20` default
+DEFAULT_LEAGUE_RATES: Dict[str, float] = {"btts": 0.5, "ov25": 0.5, "ov35": 0.3}
+MIN_COUNT_DENOM = 1.0   # was inline `max(..., 1)` guarding shot/foul-count ratios
+MIN_XG_DENOM = 0.1      # was inline `max(..., 0.1)` guarding xG-ratio denominators
+
 
 # ─────────────────────── DB helpers ─────────────────────── #
 
-def _connect(db_url: str):
+def _connect(db_url: str) -> PGConnection:
     if not db_url:
         raise SystemExit("DATABASE_URL must be set.")
     if "sslmode=" not in db_url:
@@ -191,20 +279,20 @@ def _connect(db_url: str):
     conn.autocommit = True
     return conn
 
-def _read_sql(conn, sql: str, params: Tuple = ()) -> pd.DataFrame:
+def _read_sql(conn: PGConnection, sql: str, params: Tuple = ()) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn, params=params)
 
-def _exec(conn, sql: str, params: Tuple = ()) -> None:
+def _exec(conn: PGConnection, sql: str, params: Tuple = ()) -> None:
     with conn.cursor() as cur:
         cur.execute(sql, params)
 
-def _set_setting(conn, key: str, value: str) -> None:
+def _set_setting(conn: PGConnection, key: str, value: str) -> None:
     _exec(conn,
           "INSERT INTO settings(key,value) VALUES(%s,%s) "
           "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
           (key, value))
 
-def _is_threshold_locked(conn, label: str) -> bool:
+def _is_threshold_locked(conn: PGConnection, label: str) -> bool:
     """
     NEW: checks for a `conf_threshold_locked:{label}` = "1" setting.
     Lets you manually suppress a market (e.g. set conf_threshold:PRE BTTS
@@ -221,15 +309,44 @@ def _is_threshold_locked(conn, label: str) -> bool:
     except Exception:
         return False
 
-def _set_threshold(conn, label: str, thr_pct: float) -> None:
+def _log_locked_thresholds(conn: PGConnection) -> List[str]:
+    """
+    PATCH (review item 5 — "threshold locking undocumented"): startup
+    summary of every currently-locked market, logged once per training
+    run so a locked market's effect on that run's thresholds is visible
+    up front instead of only inferable from scattered per-head log lines
+    (or not noticed at all if that market didn't happen to hit the
+    min-predictions bar this run).
+    """
+    labels: List[str] = []
+    try:
+        df = _read_sql(
+            conn,
+            "SELECT key FROM settings WHERE key LIKE 'conf_threshold_locked:%%' AND value='1'"
+        )
+        for k in df["key"].tolist():
+            labels.append(str(k)[len("conf_threshold_locked:"):])
+    except Exception as e:
+        logger.warning("[THRESHOLD] could not read locked-threshold list: %s", e)
+        return []
+    if labels:
+        logger.info("[THRESHOLD] locked markets this run (auto-tune will skip these): %s", ", ".join(sorted(labels)))
+    else:
+        logger.info("[THRESHOLD] no markets currently locked.")
+    return labels
+
+def _set_threshold(conn: PGConnection, label: str, thr_pct: float) -> None:
     """NEW: use this instead of a bare _set_setting for any
     conf_threshold:* write — respects the lock above."""
     if _is_threshold_locked(conn, label):
-        logger.info("[THRESHOLD] %s is locked — skipping auto-picked value %.2f%%", label, thr_pct)
+        # PATCH (review item 5): raised from INFO to WARNING — a suppressed
+        # auto-tuned threshold is a case worth noticing while scanning logs,
+        # not just a routine note.
+        logger.warning("[THRESHOLD] %s is locked — skipping auto-picked value %.2f%%", label, thr_pct)
         return
     _set_setting(conn, f"conf_threshold:{label}", f"{thr_pct:.2f}")
 
-def _ensure_training_tables(conn) -> None:
+def _ensure_training_tables(conn: PGConnection) -> None:
     # safety: ensure prematch_snapshots/settings exist (others are created by main.py)
     _exec(conn, """
       CREATE TABLE IF NOT EXISTS settings (
@@ -249,7 +366,7 @@ def _ensure_training_tables(conn) -> None:
 
 # ─────────────────────── Data load with Advanced Features ─────────────────────── #
 
-def _compute_league_rate_map(conn, min_n: int = 20) -> Dict[Any, Dict[str, float]]:
+def _compute_league_rate_map(conn: PGConnection, min_n: int = DEFAULT_LEAGUE_RATE_MIN_N) -> Dict[Any, Dict[str, float]]:
     """
     PATCH: one aggregate query over ALL of match_results, grouped by
     league_id, giving BTTS/Over-2.5/Over-3.5 rates per league — plus a
@@ -267,18 +384,22 @@ def _compute_league_rate_map(conn, min_n: int = 20) -> Dict[Any, Dict[str, float
     """)
     out: Dict[Any, Dict[str, float]] = {}
     if df.empty:
-        out["__GLOBAL__"] = {"btts": 0.5, "ov25": 0.5, "ov35": 0.3}
+        out["__GLOBAL__"] = dict(DEFAULT_LEAGUE_RATES)
         return out
     total_n = df["n"].sum()
-    global_btts = float((df["btts"] * df["n"]).sum() / total_n) if total_n else 0.5
-    global_ov25 = float((df["ov25"] * df["n"]).sum() / total_n) if total_n else 0.5
-    global_ov35 = float((df["ov35"] * df["n"]).sum() / total_n) if total_n else 0.3
+    global_btts = float((df["btts"] * df["n"]).sum() / total_n) if total_n else DEFAULT_LEAGUE_RATES["btts"]
+    global_ov25 = float((df["ov25"] * df["n"]).sum() / total_n) if total_n else DEFAULT_LEAGUE_RATES["ov25"]
+    global_ov35 = float((df["ov35"] * df["n"]).sum() / total_n) if total_n else DEFAULT_LEAGUE_RATES["ov35"]
     out["__GLOBAL__"] = {"btts": global_btts, "ov25": global_ov25, "ov35": global_ov35}
     for _, r in df.iterrows():
         lid = r["league_id"]
         if pd.isna(lid) or int(r["n"]) < min_n:
             continue
-        out[lid] = {"btts": float(r["btts"] or 0.5), "ov25": float(r["ov25"] or 0.5), "ov35": float(r["ov35"] or 0.3)}
+        out[lid] = {
+            "btts": float(r["btts"] or DEFAULT_LEAGUE_RATES["btts"]),
+            "ov25": float(r["ov25"] or DEFAULT_LEAGUE_RATES["ov25"]),
+            "ov35": float(r["ov35"] or DEFAULT_LEAGUE_RATES["ov35"]),
+        }
     return out
 
 def _lookup_league_rate(rate_map: Dict[Any, Dict[str, float]], league_id) -> Dict[str, float]:
@@ -287,7 +408,26 @@ def _lookup_league_rate(rate_map: Dict[Any, Dict[str, float]], league_id) -> Dic
     return rate_map[league_id]
 
 
-def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
+def _clean_feature_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """
+    PATCH (review item 4 / "data loading duplication"): the
+    ensure-columns-exist + replace-inf-with-nan + fillna(0.0) sequence was
+    byte-identical between load_inplay_data() and load_prematch_data(),
+    just parameterized by a different column list (FEATURES vs
+    PRE_FEATURES). Extracted here so the two callers can't silently drift
+    apart on this step. (The rest of each loader's feature-computation
+    logic is genuinely different — one derives ~40 fields from raw match
+    stats, the other mostly copies pm_* fields from a stored payload — so
+    that part is deliberately NOT merged; see the top-of-file patch notes.)
+    """
+    for col in cols:
+        if col not in df.columns:
+            df[col] = 0.0
+    df[cols] = df[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return df
+
+
+def load_inplay_data(conn: PGConnection, min_minute: int = 15) -> pd.DataFrame:
     q = """
     WITH latest AS (
       SELECT match_id, MAX(created_ts) AS ts
@@ -372,12 +512,12 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
                                f.get("shots_per_minute", 0) * 0.2)
         
         # Shot quality and efficiency
-        f["shot_accuracy_h"] = f["sot_h"] / max(f["total_shots_h"], 1)
-        f["shot_accuracy_a"] = f["sot_a"] / max(f["total_shots_a"], 1)
-        f["shot_quality_h"] = f["shots_inside_h"] / max(f["total_shots_h"], 1)
-        f["shot_quality_a"] = f["shots_inside_a"] / max(f["total_shots_a"], 1)
-        f["conversion_rate_h"] = f["goals_h"] / max(f["sot_h"], 1)
-        f["conversion_rate_a"] = f["goals_a"] / max(f["sot_a"], 1)
+        f["shot_accuracy_h"] = f["sot_h"] / max(f["total_shots_h"], MIN_COUNT_DENOM)
+        f["shot_accuracy_a"] = f["sot_a"] / max(f["total_shots_a"], MIN_COUNT_DENOM)
+        f["shot_quality_h"] = f["shots_inside_h"] / max(f["total_shots_h"], MIN_COUNT_DENOM)
+        f["shot_quality_a"] = f["shots_inside_a"] / max(f["total_shots_a"], MIN_COUNT_DENOM)
+        f["conversion_rate_h"] = f["goals_h"] / max(f["sot_h"], MIN_COUNT_DENOM)
+        f["conversion_rate_a"] = f["goals_a"] / max(f["sot_a"], MIN_COUNT_DENOM)
         f["xg_efficiency_h"] = f["goals_h"] - f["xg_h"]
         f["xg_efficiency_a"] = f["goals_a"] - f["xg_a"]
         
@@ -402,15 +542,15 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
         
         # Discipline
         fouls_sum = f["fouls_h"] + f["fouls_a"]
-        f["fouls_per_minute"] = fouls_sum / max(minute, 1)
-        f["discipline_score_h"] = 1.0 / max(f["fouls_h"] + f["red_h"] * 10, 1)
-        f["discipline_score_a"] = 1.0 / max(f["fouls_a"] + f["red_a"] * 10, 1)
+        f["fouls_per_minute"] = fouls_sum / max(minute, MIN_COUNT_DENOM)
+        f["discipline_score_h"] = 1.0 / max(f["fouls_h"] + f["red_h"] * 10, MIN_COUNT_DENOM)
+        f["discipline_score_a"] = 1.0 / max(f["fouls_a"] + f["red_a"] * 10, MIN_COUNT_DENOM)
         
         # Cross-feature interactions
         f["possession_xg_interaction_h"] = (f["pos_h"] / 100) * f["xg_h"]
         f["possession_xg_interaction_a"] = (f["pos_a"] / 100) * f["xg_a"]
-        f["sot_xg_ratio_h"] = f["sot_h"] / max(f["xg_h"], 0.1)
-        f["sot_xg_ratio_a"] = f["sot_a"] / max(f["xg_a"], 0.1)
+        f["sot_xg_ratio_h"] = f["sot_h"] / max(f["xg_h"], MIN_XG_DENOM)
+        f["sot_xg_ratio_a"] = f["sot_a"] / max(f["xg_a"], MIN_XG_DENOM)
         
         # Match context
         f["match_minute_normalized"] = minute / 90.0
@@ -438,19 +578,15 @@ def load_inplay_data(conn, min_minute: int = 15) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(feats)
-    
-    # Ensure all FEATURES are present
-    for col in FEATURES:
-        if col not in df.columns:
-            df[col] = 0.0
-    
-    df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # PATCH (review item 4/9): shared cleanup helper — see _clean_feature_df().
+    df = _clean_feature_df(df, FEATURES)
     df["minute"] = df["minute"].clip(0, 120)
     df = df[df["minute"] >= float(min_minute)].copy()
     return df
 
 
-def load_prematch_data(conn) -> pd.DataFrame:
+def load_prematch_data(conn: PGConnection) -> pd.DataFrame:
     q = """
     SELECT p.match_id, p.created_ts, p.payload,
            r.final_goals_h, r.final_goals_a, r.btts_yes, r.league_id
@@ -505,12 +641,8 @@ def load_prematch_data(conn) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(feats)
-    # Ensure all PRE_FEATURES are present
-    for col in PRE_FEATURES:
-        if col not in df.columns:
-            df[col] = 0.0
-    
-    df[PRE_FEATURES] = df[PRE_FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # PATCH (review item 4/9): shared cleanup helper — see _clean_feature_df().
+    df = _clean_feature_df(df, PRE_FEATURES)
     return df
 
 
@@ -554,6 +686,37 @@ def build_model_blob(model: LogisticRegression, features: List[str],
 
 def _fmt_line(line: float) -> str:
     return f"{line}".rstrip("0").rstrip(".")
+
+
+def _validate_training_data(X: np.ndarray, y: np.ndarray, feature_names: List[str], context: str) -> bool:
+    """
+    PATCH (review item 8 — "no validation of loaded data"): sanity-checks
+    a single head's training matrix right before it's fit, with a clear,
+    context-tagged log message on failure instead of either a confusing
+    downstream sklearn exception (e.g. "Input contains NaN") or, worse, a
+    fit that silently "succeeds" on bad data (a constant/near-constant
+    label column, a shape mismatch that numpy broadcast around).
+    Returns True if X/y look fit-able, False otherwise — callers treat a
+    False the same way they already treat "not enough data": skip that
+    head, don't crash the whole training run over one bad market.
+    """
+    if X.ndim != 2 or X.shape[0] != len(y):
+        logger.warning("[VALIDATE] %s: X/y shape mismatch (X=%s, y=%s) — skipping.", context, X.shape, len(y))
+        return False
+    if X.shape[1] != len(feature_names):
+        logger.warning("[VALIDATE] %s: X has %d columns but %d feature names given — skipping.",
+                        context, X.shape[1], len(feature_names))
+        return False
+    if not np.all(np.isfinite(X)):
+        n_bad = int(np.sum(~np.isfinite(X)))
+        logger.warning("[VALIDATE] %s: %d non-finite (NaN/Inf) values found in features after cleanup — skipping.",
+                        context, n_bad)
+        return False
+    uniq_y = np.unique(y)
+    if not np.all(np.isin(uniq_y, [0, 1])):
+        logger.warning("[VALIDATE] %s: labels are not strictly binary 0/1 (found %s) — skipping.", context, uniq_y)
+        return False
+    return True
 
 
 # ─────────────────────── Thresholding with Learning Integration ─────────────────────── #
@@ -651,7 +814,7 @@ def time_order_split(df: pd.DataFrame, test_size: float) -> Tuple[np.ndarray, np
 # ─────────────────────── Core fit with Enhanced Metrics ─────────────────────── #
 
 def _train_binary_head(
-    conn,
+    conn: PGConnection,
     X_all: np.ndarray,
     y_all: np.ndarray,
     mask_tr: np.ndarray,
@@ -669,8 +832,23 @@ def _train_binary_head(
     if len(np.unique(y_all)) < 2:
         return False, {}, None
 
+    # PATCH (review item 8): validate the full (pre-split) matrix before
+    # doing any further work — catches shape/finiteness/label problems in
+    # one place regardless of which specific head is being trained.
+    if not _validate_training_data(X_all, y_all, feature_names, context=metrics_name or model_key):
+        return False, {}, None
+
     X_tr, X_te = X_all[mask_tr], X_all[mask_te]
     y_tr, y_te = y_all[mask_tr], y_all[mask_te]
+
+    # PATCH (review item 9 — sparse logging): per-head train/test split
+    # sizes, previously only inferable indirectly from n_test/n_train
+    # inside the metrics dict (and not logged at all for heads that don't
+    # end up training, e.g. due to a single-class y_tr).
+    logger.info("[SPLIT] %s: train=%d test=%d (prevalence train=%.3f test=%.3f)",
+                metrics_name or model_key, len(y_tr), len(y_te),
+                float(y_tr.mean()) if len(y_tr) else 0.0,
+                float(y_te.mean()) if len(y_te) else 0.0)
 
     m = fit_lr_safe(X_tr, y_tr)
     if m is None:
@@ -688,7 +866,20 @@ def _train_binary_head(
     # Enhanced metrics
     pred_binary = (p_cal >= 0.5).astype(int)
     cm = confusion_matrix(y_te, pred_binary)
-    tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+    if cm.size == 4:
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        # PATCH (review item 7 — "confusion matrix logic is fragile"):
+        # this only happens when the test set (or the predictions) collapse
+        # to a single class — e.g. every prediction landed "No" — which is
+        # itself a signal something's off with this head (severe class
+        # imbalance in the test split, or a threshold effectively always
+        # predicting the majority class). Previously this silently fell
+        # back to all-zero counts with no trace of why in the logs.
+        logger.warning("[METRICS] %s: confusion matrix degenerate (shape=%s, unique preds=%s, unique y_te=%s) "
+                        "— falling back to zero counts.",
+                        metrics_name or model_key, cm.shape, np.unique(pred_binary), np.unique(y_te))
+        tn, fp, fn, tp = 0, 0, 0, 0
     
     mets = {
         "brier": float(brier_score_loss(y_te, p_cal)),
@@ -736,6 +927,12 @@ def train_models(
 ) -> Dict[str, Any]:
     conn = _connect(db_url or os.getenv("DATABASE_URL"))
     _ensure_training_tables(conn)
+
+    # PATCH (review item 5): log which markets are locked before this run
+    # touches anything, so the run's log output is self-explanatory about
+    # why a given market's threshold didn't change even if it hit the
+    # min-predictions bar.
+    _log_locked_thresholds(conn)
 
     min_minute = int(min_minute if min_minute is not None else os.getenv("TRAIN_MIN_MINUTE", 15))
     test_size = float(test_size if test_size is not None else os.getenv("TRAIN_TEST_SIZE", 0.25))
@@ -1019,8 +1216,9 @@ def train_models(
             summary["trained"]["PRE_BTTS_YES"] = False
 
         # Bundle metrics snapshot (handy for /settings fetch)
+        trained_at = pd.Timestamp.utcnow()
         metrics_bundle = {
-            "trained_at_utc": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
+            "trained_at_utc": trained_at.isoformat(timespec="seconds") + "Z",
             **summary["metrics"],
             "features_inplay": FEATURES,
             "features_prematch": PRE_FEATURES,
@@ -1033,6 +1231,12 @@ def train_models(
             "data_stats": summary.get("data_stats", {}),
         }
         _set_setting(conn, "model_metrics_latest", json.dumps(metrics_bundle))
+        # PATCH (review item 12 — "metrics not persisted for comparison"):
+        # also write under a timestamped key so this run's metrics remain
+        # queryable after the next training run overwrites
+        # model_metrics_latest, without needing a separate history table.
+        history_key = f"model_metrics:{trained_at.strftime('%Y%m%dT%H%M%SZ')}"
+        _set_setting(conn, history_key, json.dumps(metrics_bundle))
         
         # Log learning system insights
         log_learning_insights(conn, df_ip, df_pre)
@@ -1057,7 +1261,7 @@ def train_models(
             pass
 
 
-def log_learning_insights(conn, df_ip: pd.DataFrame, df_pre: pd.DataFrame):
+def log_learning_insights(conn: PGConnection, df_ip: pd.DataFrame, df_pre: pd.DataFrame) -> None:
     """Log insights for the learning system"""
     insights = []
     
@@ -1100,7 +1304,7 @@ def log_learning_insights(conn, df_ip: pd.DataFrame, df_pre: pd.DataFrame):
 
 # ─────────────────────── Settings read helper ─────────────────────── #
 
-def _get_setting_json(conn, key: str) -> Optional[dict]:
+def _get_setting_json(conn: PGConnection, key: str) -> Optional[dict]:
     try:
         df = _read_sql(conn, "SELECT value FROM settings WHERE key=%s", (key,))
         if df.empty:
