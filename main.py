@@ -35,10 +35,29 @@ PATCH NOTES (this revision):
      type hints, which raises TypeError at import time on Python <3.10.
      Nothing pins a Python version in requirements.txt/railway.yaml, so
      this makes the file safe regardless of what Nixpacks resolves to.
+
+PATCH NOTES (this revision, cont. — code-review hardening pass):
+  8. [RELIABILITY] All in-memory caches (STATS_CACHE, EVENTS_CACHE,
+     ODDS_CACHE, TEAM_FORM_CACHE, _LEAGUE_RATE_CACHE, _SETTINGS_CACHE,
+     _MODELS_CACHE) are now backed by a single thread-safe, size-bounded
+     TTL cache class instead of plain dicts. These are mutated from
+     multiple threads at once (Flask request threads + the APScheduler
+     background thread) — plain dicts are not safe for that in CPython
+     and can raise `RuntimeError: dictionary changed size during
+     iteration` or hand back a corrupted read. Bounding maxsize also
+     prevents unbounded memory growth from unique cache keys accumulating
+     over a long-running process.
+  9. [SECURITY] _require_admin() now compares the admin API key with
+     hmac.compare_digest() instead of `==`, to avoid leaking timing
+     information about how many leading characters of the key match.
+ 10. [RELIABILITY] Added SIGTERM/SIGINT handlers that close the DB pool
+     and HTTP session cleanly on shutdown, so container restarts/redeploys
+     don't leave connections dangling.
 """
 from __future__ import annotations
 
-import os, json, time, logging, requests, psycopg2, math, random
+import os, json, time, logging, requests, psycopg2, math, random, hmac, signal, threading
+from collections import OrderedDict
 from psycopg2.pool import ThreadedConnectionPool
 from html import escape
 from zoneinfo import ZoneInfo
@@ -192,15 +211,75 @@ session.mount("https://", HTTPAdapter(
     max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503,504], respect_retry_after_header=True),
     pool_connections=HTTP_POOL_MAXSIZE, pool_maxsize=HTTP_POOL_MAXSIZE))
 
+# ───────── Thread-safe bounded TTL cache ─────────
+# PATCH (review item 8): every in-memory cache in this file (STATS_CACHE,
+# EVENTS_CACHE, ODDS_CACHE, TEAM_FORM_CACHE, _LEAGUE_RATE_CACHE,
+# _SETTINGS_CACHE, _MODELS_CACHE) used to be either a plain dict mutated
+# directly (`CACHE[key] = (ts, val)`) or the old single-threaded _TTLCache
+# below. Both are unsafe here: Flask serves each request on its own thread,
+# APScheduler's background jobs run on yet another thread, and several of
+# these caches are read/written from inside a ThreadPoolExecutor.map() on
+# top of that (fetch_live_matches, extract_prematch_features). Concurrent
+# dict mutation in CPython can raise `RuntimeError: dictionary changed
+# size during iteration` or hand back a torn/corrupted read — this class
+# replaces every one of those cache instances with a single thread-safe,
+# size-bounded implementation instead. Bounding size (maxsize) also caps
+# memory growth from cache keys that accumulate over a long-running
+# process (e.g. one STATS_CACHE entry per distinct fixture id ever seen).
+class _TTLCache:
+    def __init__(self, ttl: float, maxsize: int = 5000):
+        self.ttl = ttl
+        self.maxsize = max(1, int(maxsize))
+        self._data: "OrderedDict[Any, Tuple[float, Any]]" = OrderedDict()
+        self._lock = threading.RLock()
+
+    def get(self, k):
+        with self._lock:
+            v = self._data.get(k)
+            if v is None:
+                return None
+            ts, val = v
+            if time.time() - ts > self.ttl:
+                self._data.pop(k, None)
+                return None
+            # touch for LRU-ish recency ordering
+            self._data.move_to_end(k)
+            return val
+
+    def set(self, k, v):
+        with self._lock:
+            self._data[k] = (time.time(), v)
+            self._data.move_to_end(k)
+            # PATCH: enforce maxsize — evict oldest entries once over the
+            # bound, instead of letting the dict grow unbounded forever.
+            while len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+
+    def pop(self, k, default=None):
+        with self._lock:
+            v = self._data.pop(k, None)
+            if v is None:
+                return default
+            return v[1]
+
+    def invalidate(self, k=None):
+        with self._lock:
+            if k is None: self._data.clear()
+            else: self._data.pop(k, None)
+
+    def clear(self):
+        self.invalidate(None)
+
 # ───────── Caches & timezones ─────────
-STATS_CACHE:  Dict[int, Tuple[float, list]] = {}
-EVENTS_CACHE: Dict[int, Tuple[float, list]] = {}
-ODDS_CACHE:   Dict[int, Tuple[float, dict]] = {}
+TEAM_FORM_TTL = int(os.getenv("TEAM_FORM_CACHE_TTL_SEC", "1800"))  # 30 min
+
+STATS_CACHE  = _TTLCache(ttl=90,  maxsize=int(os.getenv("STATS_CACHE_MAXSIZE", "1000")))
+EVENTS_CACHE = _TTLCache(ttl=90,  maxsize=int(os.getenv("EVENTS_CACHE_MAXSIZE", "1000")))
+ODDS_CACHE   = _TTLCache(ttl=120, maxsize=int(os.getenv("ODDS_CACHE_MAXSIZE", "1000")))
 # PATCH: shared TTL cache for prematch team-form / H2H lookups, reused by
 # prematch_scan_save() and send_match_of_the_day() so they don't each
 # re-fetch the same team's last-5 fixtures separately.
-TEAM_FORM_CACHE: Dict[tuple, Tuple[float, list]] = {}
-TEAM_FORM_TTL = int(os.getenv("TEAM_FORM_CACHE_TTL_SEC", "1800"))  # 30 min
+TEAM_FORM_CACHE = _TTLCache(ttl=TEAM_FORM_TTL, maxsize=int(os.getenv("TEAM_FORM_CACHE_MAXSIZE", "8000")))
 
 SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC","60"))
 MODELS_TTL   = int(os.getenv("MODELS_CACHE_TTL_SEC","120"))
@@ -276,18 +355,39 @@ def db_conn():
     if not POOL: _init_pool()
     return PooledConn(POOL)  # type: ignore
 
-# ───────── Settings cache ─────────
-class _TTLCache:
-    def __init__(self, ttl): self.ttl=ttl; self.data={}
-    def get(self, k):
-        v=self.data.get(k)
-        if not v: return None
-        ts,val=v
-        if time.time()-ts>self.ttl: self.data.pop(k,None); return None
-        return val
-    def set(self,k,v): self.data[k]=(time.time(),v)
-    def invalidate(self,k=None): self.data.clear() if k is None else self.data.pop(k,None)
+# ───────── Shutdown handling ─────────
+# PATCH (review item 10): close the DB pool and HTTP session cleanly on
+# SIGTERM/SIGINT. Platforms like Railway/Render send SIGTERM on redeploy/
+# restart; without this, in-flight pooled DB connections and the shared
+# requests.Session's underlying TCP connections are just abandoned rather
+# than closed, which is untidy at best and can leave the DB server holding
+# stale connections briefly at worst. Best-effort: swallow errors so a
+# failure here never blocks process exit.
+def _shutdown(signum=None, frame=None):
+    log.info("[SHUTDOWN] signal %s received, cleaning up", signum)
+    try:
+        if POOL:
+            POOL.closeall()
+    except Exception as e:
+        log.warning("[SHUTDOWN] pool close failed: %s", e)
+    try:
+        session.close()
+    except Exception as e:
+        log.warning("[SHUTDOWN] session close failed: %s", e)
+    log.info("[SHUTDOWN] cleanup complete")
 
+try:
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+except Exception as e:
+    # PATCH: signal.signal() only works on the main thread of the main
+    # interpreter — some WSGI servers (e.g. gunicorn with certain worker
+    # classes) install their own handlers or run this module off the main
+    # thread, where registering here would raise ValueError. Don't let
+    # that take the whole app down at import time.
+    log.warning("[SHUTDOWN] could not register signal handlers: %s", e)
+
+# ───────── Settings cache ─────────
 _SETTINGS_CACHE, _MODELS_CACHE = _TTLCache(SETTINGS_TTL), _TTLCache(MODELS_TTL)
 
 def get_setting(key: str) -> Optional[str]:
@@ -416,18 +516,18 @@ def _blocked_league(league_obj: dict) -> bool:
 
 # ───────── Live fetches ─────────
 def fetch_match_stats(fid: int) -> list:
-    now=time.time()
-    if fid in STATS_CACHE and now-STATS_CACHE[fid][0] < 90: return STATS_CACHE[fid][1]
+    cached = STATS_CACHE.get(fid)
+    if cached is not None: return cached
     js=_api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
     out=js.get("response",[]) if isinstance(js,dict) else []
-    STATS_CACHE[fid]=(now,out); return out
+    STATS_CACHE.set(fid, out); return out
 
 def fetch_match_events(fid: int) -> list:
-    now=time.time()
-    if fid in EVENTS_CACHE and now-EVENTS_CACHE[fid][0] < 90: return EVENTS_CACHE[fid][1]
+    cached = EVENTS_CACHE.get(fid)
+    if cached is not None: return cached
     js=_api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
     out=js.get("response",[]) if isinstance(js,dict) else []
-    EVENTS_CACHE[fid]=(now,out); return out
+    EVENTS_CACHE.set(fid, out); return out
 
 def _fetch_stats_and_events(fid: int) -> Tuple[list, list]:
     """PATCH: fetch stats+events for one fixture concurrently instead of
@@ -474,22 +574,20 @@ def fetch_live_matches() -> List[dict]:
 # ───────── Prematch helpers (short) ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
     key=("last", team_id, n)
-    now=time.time()
     cached=TEAM_FORM_CACHE.get(key)
-    if cached and now-cached[0] < TEAM_FORM_TTL: return cached[1]
+    if cached is not None: return cached
     js=_api_get(f"{BASE_URL}/fixtures", {"team":team_id,"last":n}) or {}
     out = js.get("response",[]) if isinstance(js,dict) else []
-    TEAM_FORM_CACHE[key]=(now,out)
+    TEAM_FORM_CACHE.set(key, out)
     return out
 
 def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
     key=("h2h", home_id, away_id, n)
-    now=time.time()
     cached=TEAM_FORM_CACHE.get(key)
-    if cached and now-cached[0] < TEAM_FORM_TTL: return cached[1]
+    if cached is not None: return cached
     js=_api_get(f"{BASE_URL}/fixtures/headtohead", {"h2h":f"{home_id}-{away_id}","last":n}) or {}
     out = js.get("response",[]) if isinstance(js,dict) else []
-    TEAM_FORM_CACHE[key]=(now,out)
+    TEAM_FORM_CACHE.set(key, out)
     return out
 
 def _api_fixtures_by_league_season(league_id: int, season: int) -> Tuple[List[dict], dict]:
@@ -838,11 +936,10 @@ def _min_odds_for_market(market: str) -> float:
     return 1.01
 
 def _odds_cache_get(fid: int) -> Optional[dict]:
-    rec=ODDS_CACHE.get(fid)
-    if not rec: return None
-    ts,data=rec
-    if time.time()-ts>120: ODDS_CACHE.pop(fid,None); return None
-    return data
+    # PATCH: TTL/eviction logic now lives inside the shared _TTLCache class
+    # (see review item 8) — this wrapper is kept so callers/behavior are
+    # unchanged, it just delegates instead of re-implementing TTL checks.
+    return ODDS_CACHE.get(fid)
 
 def _market_name_normalize(s: str) -> str:
     s=(s or "").lower()
@@ -906,7 +1003,7 @@ def fetch_odds(fid: int) -> dict:
                                 by_line.setdefault(key,{}).update({side: {"odds":float(v.get("odd") or 0),"book":book_name}})
                             except: pass
                     for k,v in by_line.items(): out[k]=v
-        ODDS_CACHE[fid]=(time.time(), out)
+        ODDS_CACHE.set(fid, out)
     except Exception:
         out={}
     return out
@@ -2279,7 +2376,16 @@ def _require_admin():
     # request.get_json(silent=True) (also avoids raising on non-JSON bodies).
     body = request.get_json(silent=True) if request.is_json else None
     key=request.headers.get("X-API-Key") or request.args.get("key") or ((body or {}).get("key") if body else None)
-    if not ADMIN_API_KEY or key != ADMIN_API_KEY: abort(401)
+    # PATCH (review item 9): use hmac.compare_digest() instead of `==` for
+    # the admin key comparison. A plain `==` short-circuits on the first
+    # mismatched byte, so the time it takes to reject a wrong key leaks how
+    # many leading characters were correct — a timing side-channel an
+    # attacker can exploit to brute-force the key byte-by-byte instead of
+    # all at once. compare_digest() always takes the same time regardless
+    # of where the strings first differ. Also now explicitly rejects a
+    # missing/empty key up front rather than relying on `!=` against None.
+    if not ADMIN_API_KEY or not key or not hmac.compare_digest(str(key), str(ADMIN_API_KEY)):
+        abort(401)
 
 # ───────── HTTP endpoints ─────────
 @app.route("/")
