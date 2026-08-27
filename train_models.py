@@ -734,6 +734,10 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
 
 # ─────────────────────── Core fit ─────────────────────── #
 
+MIN_HOLDOUT_SELECTIONS = int(os.getenv("MIN_HOLDOUT_SELECTIONS", "30"))
+MIN_HOLDOUT_LIFT_SE = float(os.getenv("MIN_HOLDOUT_LIFT_SE", "2.5"))
+
+
 def _threshold_on_holdout(y_te: np.ndarray, p_te: np.ndarray, thr_prob: float) -> Dict[str, Any]:
     """
     Re-measure a chosen threshold on data that had no part in choosing it.
@@ -741,8 +745,15 @@ def _threshold_on_holdout(y_te: np.ndarray, p_te: np.ndarray, thr_prob: float) -
     This is the number that decides whether a market is real. The calibration
     split's precision_at_threshold is the best of ~90 grid points, so it is
     biased upward; the holdout figure is not. A market whose calibration lift is
-    +4pp and whose holdout lift is +0.2pp did not find an edge, it found a
+    +4pp and whose holdout lift is +0.8pp did not find an edge, it found a
     fluctuation.
+
+    The standard error is computed under the NULL (the base rate), not from the
+    observed precision. Using the observed precision collapses the SE to zero
+    whenever a threshold selects a handful of rows that all lose — PRE_OU_3.5
+    selected exactly one holdout row, got it wrong, and reported a lift of
+    -12424 standard errors. Under the null the SE stays finite and the statistic
+    stays interpretable.
     """
     if y_te is None or p_te is None or len(y_te) == 0 or len(p_te) == 0:
         return {"note": "no holdout available"}
@@ -751,19 +762,50 @@ def _threshold_on_holdout(y_te: np.ndarray, p_te: np.ndarray, thr_prob: float) -
     base = float(np.mean(y_te))
     if n_sel == 0:
         return {"n_at_threshold": 0, "base_rate": round(base, 4),
+                "lift_in_std_errors": None,
                 "note": "threshold selects nothing on the holdout"}
+
     prec = float(np.mean(np.asarray(y_te)[sel]))
-    # Binomial standard error on the selected subset, so the lift can be read
-    # against its own noise floor rather than eyeballed.
-    se_pp = 100.0 * math.sqrt(max(prec * (1 - prec), 1e-9) / n_sel)
     lift_pp = 100.0 * (prec - base)
-    return {"n_at_threshold": n_sel,
-            "precision_at_threshold": round(prec, 4),
-            "base_rate": round(base, 4),
-            "lift_over_base_pp": round(lift_pp, 2),
-            "lift_se_pp": round(se_pp, 2),
-            "lift_in_std_errors": round(lift_pp / se_pp, 2) if se_pp > 0 else None,
-            "note": "measured on the holdout — this threshold had no say in its own selection"}
+    se_pp = 100.0 * math.sqrt(max(base * (1.0 - base), 1e-12) / n_sel)
+    out = {"n_at_threshold": n_sel,
+           "precision_at_threshold": round(prec, 4),
+           "base_rate": round(base, 4),
+           "lift_over_base_pp": round(lift_pp, 2),
+           "lift_se_pp": round(se_pp, 2),
+           "note": "measured on the holdout — this threshold had no say in its own selection"}
+    if n_sel < MIN_HOLDOUT_SELECTIONS:
+        out["lift_in_std_errors"] = None
+        out["note"] = (f"only {n_sel} holdout selections (<{MIN_HOLDOUT_SELECTIONS}) — "
+                       f"too few to distinguish signal from noise")
+    else:
+        out["lift_in_std_errors"] = round(lift_pp / se_pp, 2) if se_pp > 0 else None
+    return out
+
+
+def _holdout_verdict(holdout: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Does the holdout confirm the threshold well enough to trade it?
+
+    HONEST CAVEAT: using the holdout to make this go/no-go call means it is no
+    longer a pristine holdout for that decision. The justification is that this
+    is a single conservative bit — trade or don't — rather than parameter
+    selection, and the downside of the two errors is wildly asymmetric: wrongly
+    suppressing a market costs nothing but time, wrongly opening one costs
+    money. The only genuinely clean confirmation is live closing-line value.
+    """
+    n = holdout.get("n_at_threshold")
+    if not n:
+        return False, "threshold selects nothing on the holdout"
+    if n < MIN_HOLDOUT_SELECTIONS:
+        return False, f"only {n} holdout selections"
+    se = holdout.get("lift_in_std_errors")
+    if se is None:
+        return False, "lift not measurable"
+    if se < MIN_HOLDOUT_LIFT_SE:
+        return False, (f"holdout lift {holdout.get('lift_over_base_pp')}pp is only {se} standard "
+                       f"errors (need {MIN_HOLDOUT_LIFT_SE}) — consistent with noise")
+    return True, f"holdout lift {holdout.get('lift_over_base_pp')}pp at {se} standard errors"
 
 
 def _train_binary_head(
@@ -865,15 +907,23 @@ def _train_binary_head(
         thr_prob, diag = _pick_threshold(y_ca, p_ca, target_precision, min_preds,
                                          default_thr_prob, max_thresh_pct=max_thresh_pct)
         thr_pct = float(np.clip(thr_prob * 100.0, min_thresh_pct, max_thresh_pct))
+        holdout = _threshold_on_holdout(y_te, p_te, thr_pct / 100.0)
+
+        if diag.get("method") != "suppressed":
+            confirmed, why = _holdout_verdict(holdout)
+            holdout["verdict"] = why
+            if not confirmed:
+                thr_pct = float(max_thresh_pct)
+                holdout["action"] = "SUPPRESSED — calibration lift did not survive the holdout"
+                logger.warning("[HOLDOUT] %s: %s. Calibration said %s. Suppressing at %.1f%%.",
+                               ctx, why, diag.get("lift_over_base_pp"), thr_pct)
+            else:
+                holdout["action"] = "confirmed — threshold kept"
+
         buf.set_threshold(threshold_label, thr_pct, summary)
         mets["threshold_pct"] = round(thr_pct, 2)
         mets["threshold_selection"] = diag
-        # The threshold was CHOSEN on the calibration split, so its precision
-        # there is optimistic by construction — it is the maximum over ~90 grid
-        # points. This re-measures the same threshold on the holdout, which had
-        # no say in picking it. If holdout lift collapses toward zero, the
-        # calibration lift was grid-search noise.
-        mets["holdout_at_threshold"] = _threshold_on_holdout(y_te, p_te, thr_pct / 100.0)
+        mets["holdout_at_threshold"] = holdout
 
     return True, mets, p_ca, p_te
 
@@ -1136,6 +1186,18 @@ def _fit_1x2_threshold(heads: Dict[str, Tuple[bool, Optional[np.ndarray], Option
     thr_prob, diag = _pick_threshold(ys, probs, target_precision, min_preds, 0.45,
                                      max_thresh_pct=max_thresh)
     thr_pct = float(np.clip(thr_prob * 100.0, min_thresh, max_thresh))
+    holdout = _threshold_on_holdout_1x2(heads, gd, m_te, thr_prob)
+
+    if diag.get("method") != "suppressed":
+        confirmed, why = _holdout_verdict(holdout)
+        holdout["verdict"] = why
+        if not confirmed:
+            thr_pct = float(max_thresh)
+            holdout["action"] = "SUPPRESSED — calibration lift did not survive the holdout"
+            logger.warning("[HOLDOUT] %s: %s. Suppressing at %.1f%%.", label, why, thr_pct)
+        else:
+            holdout["action"] = "confirmed — threshold kept"
+
     buf.set_threshold(label, thr_pct, summary)
 
     # IMPORTANT CAVEAT, recorded in the payload so it cannot be misread later:
@@ -1148,7 +1210,6 @@ def _fit_1x2_threshold(heads: Dict[str, Tuple[bool, Optional[np.ndarray], Option
     diag["base_rate_caveat"] = ("pooled home-or-away win rate; a high lift here is mechanical "
                                 "(favourites win more than an average side) and is not an edge. "
                                 "Benchmark against the de-vigged market price instead.")
-    holdout = _threshold_on_holdout_1x2(heads, gd, m_te, thr_prob)
     summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
     summary["metrics"][f"{label}_holdout_at_threshold"] = holdout
     logger.info("[1X2] %s threshold %.2f%% (%s); holdout lift %s",
