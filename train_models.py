@@ -153,6 +153,47 @@ def _exec(conn: PGConnection, sql: str, params: Tuple = ()) -> None:
         cur.execute(sql, params)
 
 
+def _as_int(v: Any, default: int = 0) -> int:
+    """
+    NaN-safe int coercion.
+
+    BUG THIS FIXES: a Postgres NULL comes back as None, but building a
+    DataFrame from those rows makes pandas promote any integer column
+    containing a NULL to float64, turning the None into np.nan. And np.nan is
+    TRUTHY, so a chain like
+
+        int(row["kickoff_ts"] or row["created_ts"] or 0)
+
+    never falls through to the next candidate — it hands np.nan straight to
+    int(), which raises "cannot convert float NaN to integer" and aborts the
+    entire training run. Every pre-existing tip_snapshots and match_results row
+    has a NULL kickoff_ts (the column was added by ALTER TABLE and backfilled as
+    NULL), so this fired on the first row of the first load.
+    """
+    if v is None:
+        return default
+    try:
+        if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+            return default
+        if pd.isna(v):
+            return default
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _first_int(*candidates: Any, default: int = 0) -> int:
+    """First candidate that coerces to a non-zero int, else `default`."""
+    for c in candidates:
+        v = _as_int(c, 0)
+        if v:
+            return v
+    return default
+
+
 class SettingsBuffer:
     """
     Accumulates every settings write for a training run and commits them in ONE
@@ -266,7 +307,7 @@ def _compute_league_rate_map(conn: PGConnection, train_match_ids: Sequence[int],
     league sat near min_n. Small leak, but it inflated precisely the two markets
     the feature was added to rescue.
     """
-    ids = [int(x) for x in train_match_ids if x is not None]
+    ids = [i for i in (_as_int(x, 0) for x in train_match_ids) if i]
     if not ids:
         return {"__GLOBAL__": dict(DEFAULT_LEAGUE_RATES)}
     df = _read_sql(conn, """
@@ -344,6 +385,7 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
 
     feats: List[Dict[str, Any]] = []
     legacy = 0
+    no_ts = 0
     for _, row in rows.iterrows():
         try:
             payload = json.loads(row["payload"]) or {}
@@ -367,18 +409,27 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
         # League rates are injected after the split; a neutral placeholder here.
         f = build_inplay_features(raw, DEFAULT_LEAGUE_RATES)
 
-        gh_f = int(row["final_goals_h"] or 0)
-        ga_f = int(row["final_goals_a"] or 0)
-        f["_match_id"] = int(row["match_id"])
+        gh_f = _as_int(row["final_goals_h"])
+        ga_f = _as_int(row["final_goals_a"])
+        f["_match_id"] = _as_int(row["match_id"])
         f["_league_id"] = row["league_id"] if pd.notna(row["league_id"]) else None
-        f["_ts"] = int(row["kickoff_ts"] or row["res_kickoff"] or row["created_ts"] or 0)
+        # Prefer the fixture's kickoff; fall back to the row's insert time for
+        # legacy rows written before kickoff_ts existed.
+        f["_ts"] = _first_int(row["kickoff_ts"], row["res_kickoff"], row["created_ts"])
+        if not f["_ts"]:
+            no_ts += 1
         f["final_goals_sum"] = gh_f + ga_f
         f["final_goals_diff"] = gh_f - ga_f
-        f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
+        f["label_btts"] = 1 if _as_int(row["btts_yes"]) == 1 else 0
         feats.append(f)
 
     if legacy:
         logger.info("[LOAD] %d legacy-schema in-play snapshots read via compatibility shim", legacy)
+    if no_ts:
+        logger.warning("[LOAD] %d in-play snapshots have no usable timestamp — they sort to the "
+                       "front of the chronological split (i.e. into TRAIN). Harmless for legacy "
+                       "rows, but if this count keeps growing, kickoff_ts is not being written.",
+                       no_ts)
     if not feats:
         return pd.DataFrame()
     df = pd.DataFrame(feats)
@@ -397,6 +448,7 @@ def load_prematch_data(conn: PGConnection) -> pd.DataFrame:
         return pd.DataFrame()
 
     feats: List[Dict[str, Any]] = []
+    no_ts = 0
     for _, row in rows.iterrows():
         try:
             payload = json.loads(row["payload"]) or {}
@@ -407,20 +459,26 @@ def load_prematch_data(conn: PGConnection) -> pd.DataFrame:
             continue
 
         f = {k: float(feat.get(k, 0.0) or 0.0) for k in PRE_FEATURES}
-        gh_f = int(row["final_goals_h"] or 0)
-        ga_f = int(row["final_goals_a"] or 0)
-        f["_match_id"] = int(row["match_id"])
+        gh_f = _as_int(row["final_goals_h"])
+        ga_f = _as_int(row["final_goals_a"])
+        f["_match_id"] = _as_int(row["match_id"])
         f["_league_id"] = row["league_id"] if pd.notna(row["league_id"]) else None
         # FIX: kickoff, not insert time. Historical-backfill rows all carried
         # time.time(), so once the split was repaired a 2023 fixture would have
         # sorted AFTER last week's and landed in the holdout.
-        f["_ts"] = int(row["kickoff_ts"] or row["res_kickoff"] or payload.get("kickoff_ts")
-                       or row["created_ts"] or 0)
+        f["_ts"] = _first_int(row["kickoff_ts"], row["res_kickoff"],
+                              payload.get("kickoff_ts"), row["created_ts"])
+        if not f["_ts"]:
+            no_ts += 1
         f["final_goals_sum"] = gh_f + ga_f
         f["final_goals_diff"] = gh_f - ga_f
-        f["label_btts"] = 1 if int(row["btts_yes"] or 0) == 1 else 0
+        f["label_btts"] = 1 if _as_int(row["btts_yes"]) == 1 else 0
         feats.append(f)
 
+    if no_ts:
+        logger.warning("[LOAD] %d prematch snapshots have no usable timestamp — they sort into "
+                       "TRAIN. Re-run /admin/backfill-prematch-history to stamp historical rows "
+                       "with their real kickoff time.", no_ts)
     if not feats:
         return pd.DataFrame()
     df = pd.DataFrame(feats)
