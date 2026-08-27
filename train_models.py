@@ -975,7 +975,7 @@ def train_models(
             gd = df_ip["final_goals_diff"].to_numpy(dtype=int)
             heads = {}
             for key, y in (("WLD_HOME", (gd > 0)), ("WLD_DRAW", (gd == 0)), ("WLD_AWAY", (gd < 0))):
-                ok, mets, p_ca, _ = _train_binary_head(
+                ok, mets, p_ca, p_te = _train_binary_head(
                     buf, X, y.astype(int), m_tr, m_ca, m_te, FEATURES,
                     key, None, summary, target_precision, min_preds,
                     min_thresh, max_thresh, 0.45, key)
@@ -1036,7 +1036,7 @@ def train_models(
             # against 1X2 odds (the old bug) or a hardcoded draw prior.
             for key, y in (("PRE_WLD_HOME", (gd > 0)), ("PRE_WLD_DRAW", (gd == 0)),
                            ("PRE_WLD_AWAY", (gd < 0))):
-                ok, mets, p_ca, _ = _train_binary_head(
+                ok, mets, p_ca, p_te = _train_binary_head(
                     buf, Xp, y.astype(int), m_tr, m_ca, m_te, PRE_FEATURES,
                     key, None, summary, target_precision, min_preds,
                     min_thresh, max_thresh, 0.45, key)
