@@ -644,46 +644,91 @@ def _validate(X: np.ndarray, y: np.ndarray, feature_names: List[str], context: s
 
 # ─────────────────────── Thresholding ─────────────────────── #
 
-def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
-                    min_preds: int, default_threshold: float) -> Tuple[float, Dict[str, Any]]:
-    """
-    Smallest threshold reaching target precision with at least min_preds
-    selections. Fallbacks: best F1, then default.
+THRESHOLD_MARGIN = float(os.getenv("TARGET_PRECISION_MARGIN", "0.03"))
+THRESHOLD_FALLBACK = os.getenv("THRESHOLD_FALLBACK", "suppress").strip().lower()
 
-    Evaluated on the CALIBRATION split only, so the holdout remains untouched
-    for reporting. The old version picked this on the same rows it then reported
-    precision from.
+
+def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
+                    min_preds: int, default_threshold: float,
+                    max_thresh_pct: float = 85.0) -> Tuple[float, Dict[str, Any]]:
+    """
+    Smallest threshold reaching the precision target with at least min_preds
+    selections, evaluated on the CALIBRATION split only.
+
+    TWO CHANGES, both forced by what the first two live runs showed.
+
+    1. THE TARGET IS NOW RELATIVE TO THE BASE RATE.
+       A fixed TARGET_PRECISION of 0.60 is not a filter for a market whose base
+       rate is already 0.59 — Over 2.5 "hit its 60% target" at precision 0.6054
+       and 0.6015 on two consecutive runs, i.e. about one point above simply
+       betting Over on everything, which is noise on ~1,000 selections. The
+       target is now max(TARGET_PRECISION, base_rate + TARGET_PRECISION_MARGIN),
+       so a market has to demonstrate it beats its own base rate, not an
+       arbitrary constant that may sit below it.
+
+    2. FAILING TO FIND A THRESHOLD NOW SUPPRESSES THE MARKET.
+       The old fallback was "best F1". For any market with prevalence above 50%
+       that is degenerate: F1 is maximised by predicting the positive class
+       everywhere, so the fallback returned the LOWEST possible threshold.
+       PRE_BTTS_YES landed there on both runs (method "best_f1", F1 0.6997,
+       clipped up to MIN_THRESH) — meaning the market that demonstrably has zero
+       signal was handed the most permissive threshold in the system. Backwards.
+       A market that cannot show precision above its base rate should go quiet,
+       not open up. Set THRESHOLD_FALLBACK=best_f1 to restore the old behaviour.
     """
     y = y_true.astype(int)
     p = np.asarray(p, dtype=float)
+    base_rate = float(y.mean()) if len(y) else 0.0
+    effective_target = max(float(target_precision), base_rate + THRESHOLD_MARGIN)
     grid = np.arange(0.50, 0.951, 0.005)
-    diag: Dict[str, Any] = {"method": "default", "n_at_threshold": 0}
 
     for t in grid:
         pred = (p >= t).astype(int)
         n_pred = int(pred.sum())
         if n_pred < min_preds:
             continue
-        if precision_score(y, pred, zero_division=0) >= target_precision:
-            diag = {"method": "target_precision", "n_at_threshold": n_pred,
-                    "precision_at_threshold": round(float(precision_score(y, pred, zero_division=0)), 4)}
-            return float(t), diag
+        prec = float(precision_score(y, pred, zero_division=0))
+        if prec >= effective_target:
+            return float(t), {"method": "target_precision", "n_at_threshold": n_pred,
+                              "precision_at_threshold": round(prec, 4),
+                              "base_rate": round(base_rate, 4),
+                              "effective_target": round(effective_target, 4),
+                              "lift_over_base_pp": round(100.0 * (prec - base_rate), 2)}
 
-    best_t, best_f1 = None, -1.0
+    best_t, best_prec, best_n = None, -1.0, 0
     for t in grid:
         pred = (p >= t).astype(int)
-        if int(pred.sum()) < min_preds:
+        n_pred = int(pred.sum())
+        if n_pred < min_preds:
             continue
-        f1 = f1_score(y, pred, zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_t = f1, float(t)
-    if best_t is not None:
-        return best_t, {"method": "best_f1", "f1": round(float(best_f1), 4)}
+        prec = float(precision_score(y, pred, zero_division=0))
+        if prec > best_prec:
+            best_prec, best_t, best_n = prec, float(t), n_pred
 
-    logger.warning("[THRESHOLD] no threshold reached %d selections on the calibration split "
-                   "— falling back to default %.2f. Treat this market as untuned.",
-                   min_preds, default_threshold)
-    return float(default_threshold), diag
+    diag = {"base_rate": round(base_rate, 4), "effective_target": round(effective_target, 4),
+            "best_precision_found": round(best_prec, 4) if best_prec >= 0 else None,
+            "best_n": best_n}
+
+    if THRESHOLD_FALLBACK == "best_f1":
+        b_t, b_f1 = None, -1.0
+        for t in grid:
+            pred = (p >= t).astype(int)
+            if int(pred.sum()) < min_preds:
+                continue
+            f1 = f1_score(y, pred, zero_division=0)
+            if f1 > b_f1:
+                b_f1, b_t = f1, float(t)
+        if b_t is not None:
+            diag.update({"method": "best_f1", "f1": round(float(b_f1), 4)})
+            return b_t, diag
+
+    diag["method"] = "suppressed"
+    logger.warning("[THRESHOLD] no threshold beat base rate %.3f by %.0fpp with >=%d selections "
+                   "(best was %.4f). SUPPRESSING this market at %.1f%% — it has not demonstrated "
+                   "an edge over simply always betting the majority side.",
+                   base_rate, THRESHOLD_MARGIN * 100, min_preds,
+                   best_prec if best_prec >= 0 else float("nan"), max_thresh_pct)
+    return float(max_thresh_pct) / 100.0, diag
 
 
 # ─────────────────────── Core fit ─────────────────────── #
@@ -784,7 +829,8 @@ def _train_binary_head(
         zip(feature_names, m.coef_.ravel().tolist()), key=lambda x: abs(x[1]), reverse=True)[:10])
 
     if threshold_label:
-        thr_prob, diag = _pick_threshold(y_ca, p_ca, target_precision, min_preds, default_thr_prob)
+        thr_prob, diag = _pick_threshold(y_ca, p_ca, target_precision, min_preds,
+                                         default_thr_prob, max_thresh_pct=max_thresh_pct)
         thr_pct = float(np.clip(thr_prob * 100.0, min_thresh_pct, max_thresh_pct))
         buf.set_threshold(threshold_label, thr_pct, summary)
         mets["threshold_pct"] = round(thr_pct, 2)
@@ -1041,7 +1087,8 @@ def _fit_1x2_threshold(heads: Dict[str, Tuple[bool, Optional[np.ndarray]]], gd: 
 
     probs = np.concatenate([phn, pan])
     ys = np.concatenate([y_home, y_away])
-    thr_prob, diag = _pick_threshold(ys, probs, target_precision, min_preds, 0.45)
+    thr_prob, diag = _pick_threshold(ys, probs, target_precision, min_preds, 0.45,
+                                     max_thresh_pct=max_thresh)
     thr_pct = float(np.clip(thr_prob * 100.0, min_thresh, max_thresh))
     buf.set_threshold(label, thr_pct, summary)
     summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
