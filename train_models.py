@@ -310,22 +310,34 @@ def _compute_league_rate_map(conn: PGConnection, train_match_ids: Sequence[int],
     ids = [i for i in (_as_int(x, 0) for x in train_match_ids) if i]
     if not ids:
         return {"__GLOBAL__": dict(DEFAULT_LEAGUE_RATES)}
+    # NOTE the ::float casts on ALL THREE aggregates. Postgres AVG() over a
+    # numeric expression returns `numeric`, which psycopg2 hands back as
+    # decimal.Decimal — and Decimal / float raises TypeError. Only `btts` was
+    # cast before, so the two CASE-based averages came back as Decimal and blew
+    # up the weighted-global calculation below.
     df = _read_sql(conn, """
         SELECT league_id,
                AVG(btts_yes)::float AS btts,
-               AVG(CASE WHEN final_goals_h+final_goals_a>2 THEN 1.0 ELSE 0.0 END) AS ov25,
-               AVG(CASE WHEN final_goals_h+final_goals_a>3 THEN 1.0 ELSE 0.0 END) AS ov35,
-               COUNT(*) AS n
+               AVG(CASE WHEN final_goals_h+final_goals_a>2 THEN 1.0 ELSE 0.0 END)::float AS ov25,
+               AVG(CASE WHEN final_goals_h+final_goals_a>3 THEN 1.0 ELSE 0.0 END)::float AS ov35,
+               COUNT(*)::bigint AS n
         FROM match_results WHERE match_id = ANY(%s) GROUP BY league_id
     """, (ids,))
-    out: Dict[Any, Dict[str, float]] = {}
     if df.empty:
         return {"__GLOBAL__": dict(DEFAULT_LEAGUE_RATES)}
+
+    # Belt and braces: coerce regardless of what the driver returned, so a
+    # future schema or driver change cannot reintroduce a Decimal here.
+    for col in ("btts", "ov25", "ov35"):
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+    df["n"] = pd.to_numeric(df["n"], errors="coerce").fillna(0).astype("int64")
+
+    out: Dict[Any, Dict[str, float]] = {}
     total_n = float(df["n"].sum()) or 1.0
     out["__GLOBAL__"] = {
-        "btts": float((df["btts"].fillna(0.5) * df["n"]).sum() / total_n),
-        "ov25": float((df["ov25"].fillna(0.5) * df["n"]).sum() / total_n),
-        "ov35": float((df["ov35"].fillna(0.3) * df["n"]).sum() / total_n),
+        "btts": float((df["btts"].fillna(DEFAULT_LEAGUE_RATES["btts"]) * df["n"]).sum() / total_n),
+        "ov25": float((df["ov25"].fillna(DEFAULT_LEAGUE_RATES["ov25"]) * df["n"]).sum() / total_n),
+        "ov35": float((df["ov35"].fillna(DEFAULT_LEAGUE_RATES["ov35"]) * df["n"]).sum() / total_n),
     }
     for _, r in df.iterrows():
         lid = r["league_id"]
