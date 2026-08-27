@@ -613,9 +613,9 @@ def _global_rates() -> Dict[str, float]:
     with db_conn() as c:
         row = c.execute("""
             SELECT AVG(btts_yes)::float,
-                   AVG(CASE WHEN final_goals_h+final_goals_a>2 THEN 1.0 ELSE 0.0 END),
-                   AVG(CASE WHEN final_goals_h+final_goals_a>3 THEN 1.0 ELSE 0.0 END),
-                   COUNT(*)
+                   AVG(CASE WHEN final_goals_h+final_goals_a>2 THEN 1.0 ELSE 0.0 END)::float,
+                   AVG(CASE WHEN final_goals_h+final_goals_a>3 THEN 1.0 ELSE 0.0 END)::float,
+                   COUNT(*)::bigint
             FROM match_results""").fetchone()
     out = {"btts": float(row[0] if row[0] is not None else DEFAULT_LEAGUE_RATES["btts"]),
            "ov25": float(row[1] if row[1] is not None else DEFAULT_LEAGUE_RATES["ov25"]),
@@ -635,9 +635,9 @@ def get_league_rates(league_id: Optional[int]) -> Dict[str, float]:
     with db_conn() as c:
         row = c.execute("""
             SELECT AVG(btts_yes)::float,
-                   AVG(CASE WHEN final_goals_h+final_goals_a>2 THEN 1.0 ELSE 0.0 END),
-                   AVG(CASE WHEN final_goals_h+final_goals_a>3 THEN 1.0 ELSE 0.0 END),
-                   COUNT(*)
+                   AVG(CASE WHEN final_goals_h+final_goals_a>2 THEN 1.0 ELSE 0.0 END)::float,
+                   AVG(CASE WHEN final_goals_h+final_goals_a>3 THEN 1.0 ELSE 0.0 END)::float,
+                   COUNT(*)::bigint
             FROM match_results WHERE league_id=%s""", (league_id,)).fetchone()
     n = int(row[3] or 0)
     out = _global_rates() if n < LEAGUE_RATE_MIN_N else {
