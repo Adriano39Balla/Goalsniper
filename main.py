@@ -1520,9 +1520,28 @@ def production_scan() -> Tuple[int, int]:
             if not fid:
                 continue
 
-            # FIX (audit 0.5): exclude HARVEST. New code no longer writes them,
-            # but an existing database is full of them and they would otherwise
-            # keep suppressing tips for 20 minutes at a time.
+            raw, feat = extract_features(m)
+            minute = int(feat.get("minute", 0))
+            if minute < TIP_MIN_MINUTE or not stats_coverage_ok(raw, minute):
+                continue
+
+            # Harvesting happens BEFORE the duplicate check. These are two
+            # different concerns: the cooldown exists to stop us tipping the
+            # same fixture repeatedly, not to stop us recording what happened
+            # in it. Under the old ordering the dup check `continue`d first, so
+            # a fixture that had been tipped (or, before the HARVEST fix, one
+            # that had merely been harvested) stopped producing training rows
+            # for the whole cooldown window. That is why the first real run
+            # found only 741 snapshots across 635 fixtures — roughly 1.2 rows
+            # per match, when 3-minute harvesting over a 90-minute game should
+            # produce closer to 8-10.
+            is_harvest_tick = HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % HARVEST_EVERY_MINUTES == 0
+            if is_harvest_tick:
+                try:
+                    save_snapshot_from_match(m, raw)
+                except Exception as e:
+                    log.warning("[HARVEST] snapshot failed for %s: %s", fid, e)
+
             if DUP_COOLDOWN_MIN > 0:
                 with db_conn() as c:
                     dup = c.execute(
@@ -1531,18 +1550,6 @@ def production_scan() -> Tuple[int, int]:
                         (fid, now_ts - DUP_COOLDOWN_MIN * 60)).fetchone()
                 if dup:
                     continue
-
-            raw, feat = extract_features(m)
-            minute = int(feat.get("minute", 0))
-            if minute < TIP_MIN_MINUTE or not stats_coverage_ok(raw, minute):
-                continue
-
-            is_harvest_tick = HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % HARVEST_EVERY_MINUTES == 0
-            if is_harvest_tick:
-                try:
-                    save_snapshot_from_match(m, raw)
-                except Exception as e:
-                    log.warning("[HARVEST] snapshot failed for %s: %s", fid, e)
 
             league_id, league = _league_name(m)
             home, away = _teams(m)
