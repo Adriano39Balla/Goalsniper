@@ -95,6 +95,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -733,6 +734,38 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
 
 # ─────────────────────── Core fit ─────────────────────── #
 
+def _threshold_on_holdout(y_te: np.ndarray, p_te: np.ndarray, thr_prob: float) -> Dict[str, Any]:
+    """
+    Re-measure a chosen threshold on data that had no part in choosing it.
+
+    This is the number that decides whether a market is real. The calibration
+    split's precision_at_threshold is the best of ~90 grid points, so it is
+    biased upward; the holdout figure is not. A market whose calibration lift is
+    +4pp and whose holdout lift is +0.2pp did not find an edge, it found a
+    fluctuation.
+    """
+    if y_te is None or p_te is None or len(y_te) == 0 or len(p_te) == 0:
+        return {"note": "no holdout available"}
+    sel = np.asarray(p_te) >= float(thr_prob)
+    n_sel = int(sel.sum())
+    base = float(np.mean(y_te))
+    if n_sel == 0:
+        return {"n_at_threshold": 0, "base_rate": round(base, 4),
+                "note": "threshold selects nothing on the holdout"}
+    prec = float(np.mean(np.asarray(y_te)[sel]))
+    # Binomial standard error on the selected subset, so the lift can be read
+    # against its own noise floor rather than eyeballed.
+    se_pp = 100.0 * math.sqrt(max(prec * (1 - prec), 1e-9) / n_sel)
+    lift_pp = 100.0 * (prec - base)
+    return {"n_at_threshold": n_sel,
+            "precision_at_threshold": round(prec, 4),
+            "base_rate": round(base, 4),
+            "lift_over_base_pp": round(lift_pp, 2),
+            "lift_se_pp": round(se_pp, 2),
+            "lift_in_std_errors": round(lift_pp / se_pp, 2) if se_pp > 0 else None,
+            "note": "measured on the holdout — this threshold had no say in its own selection"}
+
+
 def _train_binary_head(
     buf: SettingsBuffer,
     X_all: np.ndarray, y_all: np.ndarray,
@@ -835,6 +868,12 @@ def _train_binary_head(
         buf.set_threshold(threshold_label, thr_pct, summary)
         mets["threshold_pct"] = round(thr_pct, 2)
         mets["threshold_selection"] = diag
+        # The threshold was CHOSEN on the calibration split, so its precision
+        # there is optimistic by construction — it is the maximum over ~90 grid
+        # points. This re-measures the same threshold on the holdout, which had
+        # no say in picking it. If holdout lift collapses toward zero, the
+        # calibration lift was grid-search noise.
+        mets["holdout_at_threshold"] = _threshold_on_holdout(y_te, p_te, thr_pct / 100.0)
 
     return True, mets, p_ca, p_te
 
@@ -943,9 +982,9 @@ def train_models(
                 summary["trained"][key] = ok
                 if ok:
                     summary["metrics"][key] = mets
-                heads[key] = (ok, p_ca)
+                heads[key] = (ok, p_ca, p_te)
 
-            _fit_1x2_threshold(heads, gd, m_ca, buf, summary, "1X2",
+            _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "1X2",
                                target_precision, min_preds, min_thresh, max_thresh)
         else:
             reason = (f"have {n_ip} snapshots / {n_ip_matches} fixtures, "
@@ -1004,9 +1043,9 @@ def train_models(
                 summary["trained"][key] = ok
                 if ok:
                     summary["metrics"][key] = mets
-                heads[key.replace("PRE_", "")] = (ok, p_ca)
+                heads[key.replace("PRE_", "")] = (ok, p_ca, p_te)
 
-            _fit_1x2_threshold(heads, gd, m_ca, buf, summary, "PRE 1X2",
+            _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "PRE 1X2",
                                target_precision, min_preds, min_thresh, max_thresh)
         else:
             reason = f"have {n_pre} rows, need {need_pre}"
@@ -1052,8 +1091,26 @@ def train_models(
             pass
 
 
-def _fit_1x2_threshold(heads: Dict[str, Tuple[bool, Optional[np.ndarray]]], gd: np.ndarray,
-                       m_ca: np.ndarray, buf: SettingsBuffer, summary: Dict[str, Any],
+def _normalise_1x2(heads, key_h="WLD_HOME", key_d="WLD_DRAW", key_a="WLD_AWAY", idx=1):
+    """Return (p_home_norm, p_away_norm) over Home+Draw+Away, or (None, None)."""
+    ok_h, *ph_arrs = heads.get(key_h, (False, None, None))
+    ok_d, *pd_arrs = heads.get(key_d, (False, None, None))
+    ok_a, *pa_arrs = heads.get(key_a, (False, None, None))
+    p_h, p_a = ph_arrs[idx - 1], pa_arrs[idx - 1]
+    p_d = pd_arrs[idx - 1] if ok_d else None
+    if not (ok_h and ok_a) or p_h is None or p_a is None or len(p_h) == 0:
+        return None, None
+    p_hc = np.clip(p_h, EPS, 1 - EPS)
+    p_ac = np.clip(p_a, EPS, 1 - EPS)
+    p_dc = np.clip(p_d, EPS, 1 - EPS) if p_d is not None and len(p_d) == len(p_hc) \
+        else np.full_like(p_hc, 0.26)
+    s = np.maximum(p_hc + p_dc + p_ac, EPS)
+    return p_hc / s, p_ac / s
+
+
+def _fit_1x2_threshold(heads: Dict[str, Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]],
+                       gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray,
+                       buf: SettingsBuffer, summary: Dict[str, Any],
                        label: str, target_precision: float, min_preds: int,
                        min_thresh: float, max_thresh: float) -> None:
     """
@@ -1068,31 +1125,47 @@ def _fit_1x2_threshold(heads: Dict[str, Tuple[bool, Optional[np.ndarray]]], gd: 
     _wld_candidates does), then pool (p_home, home_won) and (p_away, away_won)
     and choose the cut that reaches target precision on that pooled set.
     """
-    ok_h, p_h = heads.get("WLD_HOME", (False, None))
-    ok_d, p_d = heads.get("WLD_DRAW", (False, None))
-    ok_a, p_a = heads.get("WLD_AWAY", (False, None))
-    if not (ok_h and ok_a) or p_h is None or p_a is None:
+    phn_ca, pan_ca = _normalise_1x2(heads, idx=1)
+    if phn_ca is None:
         logger.info("[1X2] %s: home/away heads unavailable — threshold not set", label)
         return
 
-    p_hc = np.clip(p_h, EPS, 1 - EPS)
-    p_ac = np.clip(p_a, EPS, 1 - EPS)
-    p_dc = np.clip(p_d, EPS, 1 - EPS) if (ok_d and p_d is not None) else np.full_like(p_hc, 0.26)
-    s = np.maximum(p_hc + p_dc + p_ac, EPS)
-    phn, pan = p_hc / s, p_ac / s
-
     gd_ca = gd[m_ca]
-    y_home = (gd_ca > 0).astype(int)
-    y_away = (gd_ca < 0).astype(int)
-
-    probs = np.concatenate([phn, pan])
-    ys = np.concatenate([y_home, y_away])
+    probs = np.concatenate([phn_ca, pan_ca])
+    ys = np.concatenate([(gd_ca > 0).astype(int), (gd_ca < 0).astype(int)])
     thr_prob, diag = _pick_threshold(ys, probs, target_precision, min_preds, 0.45,
                                      max_thresh_pct=max_thresh)
     thr_pct = float(np.clip(thr_prob * 100.0, min_thresh, max_thresh))
     buf.set_threshold(label, thr_pct, summary)
+
+    # IMPORTANT CAVEAT, recorded in the payload so it cannot be misread later:
+    # base_rate here is the POOLED rate of "a given side (home or away) wins",
+    # around 0.38. Thresholding at >=0.55 selects strong favourites, which win
+    # more often than a randomly chosen side by construction. So a large
+    # lift_over_base_pp on 1X2 is largely mechanical and is NOT evidence of an
+    # edge. The only meaningful 1X2 benchmark is the de-vigged market price,
+    # which is measured live by /admin/diagnostics/significance.
+    diag["base_rate_caveat"] = ("pooled home-or-away win rate; a high lift here is mechanical "
+                                "(favourites win more than an average side) and is not an edge. "
+                                "Benchmark against the de-vigged market price instead.")
+    holdout = _threshold_on_holdout_1x2(heads, gd, m_te, thr_prob)
     summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
-    logger.info("[1X2] %s threshold set to %.2f%% (%s)", label, thr_pct, diag.get("method"))
+    summary["metrics"][f"{label}_holdout_at_threshold"] = holdout
+    logger.info("[1X2] %s threshold %.2f%% (%s); holdout lift %s",
+                label, thr_pct, diag.get("method"), holdout.get("lift_over_base_pp"))
+
+
+def _threshold_on_holdout_1x2(heads, gd: np.ndarray, m_te: np.ndarray,
+                              thr_prob: float) -> Dict[str, Any]:
+    phn_te, pan_te = _normalise_1x2(heads, idx=2)
+    if phn_te is None:
+        return {"note": "no holdout available"}
+    gd_te = gd[m_te]
+    if len(gd_te) != len(phn_te):
+        return {"note": "holdout length mismatch"}
+    probs = np.concatenate([phn_te, pan_te])
+    ys = np.concatenate([(gd_te > 0).astype(int), (gd_te < 0).astype(int)])
+    return _threshold_on_holdout(ys, probs, thr_prob)
 
 
 # ─────────────────────── CLI ─────────────────────── #
