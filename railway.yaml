@@ -3,21 +3,18 @@ build:
   builder: NIXPACKS
   buildCommand: pip install -r requirements.txt
 deploy:
-  startCommand: uvicorn main:app --host=0.0.0.0 --port=${PORT:-8000}
+  startCommand: gunicorn main:app --bind 0.0.0.0:${PORT:-8000}
   healthcheckPath: /health
   healthcheckTimeout: 30
   restartPolicy:
     maxRetries: 3
     delay: 10s
   env:
+    - name: DATABASE_URL
+    - name: API_KEY
+    - name: ADMIN_API_KEY
     - name: TELEGRAM_BOT_TOKEN
     - name: TELEGRAM_CHAT_ID
-    - name: API_FOOTBALL_KEY
-    - name: SUPABASE_URL
-    - name: SUPABASE_KEY
-    - name: BETFAIR_USERNAME
-    - name: BETFAIR_PASSWORD
-    - name: BETFAIR_APP_KEY
-    - name: OPENWEATHER_API_KEY
+    - name: TELEGRAM_WEBHOOK_SECRET
     - name: ENVIRONMENT
       value: production
