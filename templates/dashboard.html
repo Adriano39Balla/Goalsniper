@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goalsniper</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14; --panel: #131a22; --panel2: #0e141b; --border: #24303c;
+    --text: #e7edf3; --muted: #8ea0b3; --accent: #35d07f; --accent-dim: #1f6b46;
+    --danger: #ff6b6b; --warn: #f2b84b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); min-height: 100vh;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px;
+    padding: 14px 18px; background: rgba(11,15,20,0.92); backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border);
+  }
+  header .logo { font-size: 20px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .status { font-size: 12px; color: var(--muted); margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  header a.logout { color: var(--muted); font-size: 12px; text-decoration: none; border: 1px solid var(--border); padding: 5px 10px; border-radius: 6px; }
+  header a.logout:hover { color: var(--text); border-color: var(--muted); }
+
+  main { max-width: 980px; margin: 0 auto; padding: 18px; }
+
+  .controls { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+  .controls select {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px;
+  }
+  .controls .spacer { flex: 1; }
+  .controls .updated { font-size: 12px; color: var(--muted); }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+  }
+  .stat .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .stat .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+  .stat .value.pos { color: var(--accent); }
+  .stat .value.neg { color: var(--danger); }
+
+  .section-title { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 24px 0 10px; }
+
+  .tips { display: flex; flex-direction: column; gap: 8px; }
+  .tip {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+    display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center;
+  }
+  .tip .match { font-weight: 600; font-size: 14px; }
+  .tip .league { font-size: 11.5px; color: var(--muted); }
+  .tip .sugg { font-size: 13px; color: var(--accent); font-weight: 600; }
+  .tip .meta { font-size: 11.5px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; grid-column: 1 / -1; margin-top: 2px; }
+  .tip .badge {
+    font-size: 10.5px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted);
+  }
+  .tip .badge.live { color: var(--accent); border-color: var(--accent-dim); }
+  .tip .conf { text-align: right; font-size: 18px; font-weight: 700; }
+  .tip .conf .pct { font-size: 11px; color: var(--muted); font-weight: 500; display: block; }
+  .tip .unsent { color: var(--warn); }
+
+  .empty, .error { text-align: center; color: var(--muted); padding: 40px 10px; font-size: 13.5px; }
+  .error { color: var(--danger); }
+
+  table.market-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.market-table th, table.market-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  table.market-table th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  table.market-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .market-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="logo">⚽️</div>
+    <h1>goalsniper</h1>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting…</span></div>
+    <a class="logout" href="{{ url_for('dashboard_logout') }}"
+       onclick="return confirm('Sign out?')">Sign out</a>
+  </header>
+  <main>
+    <div class="controls">
+      <select id="daysSel">
+        <option value="7">Last 7 days</option>
+        <option value="30" selected>Last 30 days</option>
+        <option value="90">Last 90 days</option>
+        <option value="">All time</option>
+      </select>
+      <div class="spacer"></div>
+      <div class="updated" id="updated">—</div>
+    </div>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="section-title">By market</div>
+    <div class="market-wrap"><table class="market-table" id="marketTable"></table></div>
+
+    <div class="section-title">Recent tips</div>
+    <div class="tips" id="tips"><div class="empty">Loading…</div></div>
+  </main>
+
+<script>
+const REFRESH_MS = {{ refresh_sec }} * 1000;
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statusText');
+const updated = document.getElementById('updated');
+const statsEl = document.getElementById('stats');
+const marketTableEl = document.getElementById('marketTable');
+const tipsEl = document.getElementById('tips');
+const daysSel = document.getElementById('daysSel');
+
+function fmtMoney(n) {
+  if (n === null || n === undefined) return '—';
+  const s = n >= 0 ? '+' : '';
+  return s + n.toFixed(2) + 'u';
+}
+function fmtPct(n, digits=1) {
+  if (n === null || n === undefined) return '—';
+  return n.toFixed(digits) + '%';
+}
+function cls(n) { return n > 0 ? 'pos' : (n < 0 ? 'neg' : ''); }
+
+function renderStats(pnl) {
+  if (!pnl || pnl.error) {
+    statsEl.innerHTML = '<div class="stat"><div class="label">P&amp;L</div><div class="value">unavailable</div></div>';
+    marketTableEl.innerHTML = '';
+    return;
+  }
+  const cards = [
+    ['Bets', pnl.n_bets ?? 0, ''],
+    ['Win rate', fmtPct(pnl.win_rate_pct), ''],
+    ['ROI', fmtPct(pnl.roi_pct), cls(pnl.roi_pct)],
+    ['Profit', fmtMoney(pnl.total_profit), cls(pnl.total_profit)],
+    ['Mean CLV', pnl.mean_clv_pct != null ? fmtPct(pnl.mean_clv_pct) : '—', cls(pnl.mean_clv_pct || 0)],
+  ];
+  statsEl.innerHTML = cards.map(([label, value, c]) =>
+    `<div class="stat"><div class="label">${label}</div><div class="value ${c}">${value}</div></div>`
+  ).join('');
+
+  const rows = Object.entries(pnl.by_market || {});
+  if (!rows.length) {
+    marketTableEl.innerHTML = '<tr><td style="padding:14px;color:var(--muted)">No graded bets in this window yet.</td></tr>';
+    return;
+  }
+  marketTableEl.innerHTML = `
+    <tr><th>Market</th><th class="num">Bets</th><th class="num">Win %</th><th class="num">ROI</th><th class="num">Profit</th></tr>
+    ${rows.map(([mkt, d]) => `
+      <tr>
+        <td>${mkt}</td>
+        <td class="num">${d.bets}</td>
+        <td class="num">${fmtPct(d.win_rate_pct)}</td>
+        <td class="num" style="color:var(--${d.roi_pct >= 0 ? 'accent' : 'danger'})">${fmtPct(d.roi_pct)}</td>
+        <td class="num">${fmtMoney(d.profit)}</td>
+      </tr>`).join('')}
+  `;
+}
+
+function renderTips(tips) {
+  if (!tips || !tips.length) {
+    tipsEl.innerHTML = '<div class="empty">No tips yet in this window.</div>';
+    return;
+  }
+  tipsEl.innerHTML = tips.map(t => {
+    const when = new Date(t.created_ts * 1000).toLocaleString(undefined, {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+    });
+    const badge = t.is_prematch ? 'PREMATCH' : `LIVE ${t.minute ?? ''}'`;
+    const badgeCls = t.is_prematch ? '' : 'live';
+    const odds = t.odds ? `@ ${t.odds.toFixed(2)}${t.book ? ' (' + t.book + ')' : ''}` : 'no price';
+    const ev = t.ev_pct != null ? `EV ${t.ev_pct > 0 ? '+' : ''}${t.ev_pct.toFixed(1)}%` : '';
+    const stake = t.stake_units ? `${t.stake_units.toFixed(2)}u` : '';
+    const unsent = t.sent_ok === 0 ? '<span class="unsent">· not delivered</span>' : '';
+    return `
+      <div class="tip">
+        <div>
+          <div class="match">${t.home} vs ${t.away}</div>
+          <div class="league">${t.league || ''}</div>
+        </div>
+        <div class="conf">${t.confidence != null ? t.confidence.toFixed(1) + '%' : '—'}<span class="pct">confidence</span></div>
+        <div class="sugg">${t.suggestion} <span style="color:var(--muted);font-weight:400">· ${t.market}</span></div>
+        <div class="meta">
+          <span class="badge ${badgeCls}">${badge}</span>
+          <span>${when}</span>
+          <span>${odds}</span>
+          <span>${ev}</span>
+          <span>${stake}</span>
+          ${unsent}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function refresh() {
+  const days = daysSel.value;
+  const url = '{{ url_for("dashboard_data") }}?limit=50' + (days ? '&days=' + days : '');
+  try {
+    const r = await fetch(url, { credentials: 'same-origin' });
+    if (r.status === 401) { window.location.href = '{{ url_for("dashboard_login") }}'; return; }
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'unknown error');
+    renderStats(data.pnl);
+    renderTips(data.tips);
+    dot.classList.add('live');
+    statusText.textContent = 'live';
+    updated.textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    dot.classList.remove('live');
+    statusText.textContent = 'connection issue';
+    tipsEl.innerHTML = `<div class="error">Could not load data: ${e.message}</div>`;
+  }
+}
+
+daysSel.addEventListener('change', refresh);
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

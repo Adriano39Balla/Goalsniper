@@ -50,7 +50,13 @@ import psycopg2
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from flask import Flask, abort, jsonify, request
+from flask import (
+    Flask, abort, jsonify, redirect, render_template, request, url_for,
+)
+# Aliased: main.py already has a module-level `session` (a requests.Session()
+# used for outbound HTTP, defined further down) that would otherwise shadow
+# Flask's session proxy the moment that line executes.
+from flask import session as flask_session
 from psycopg2.pool import ThreadedConnectionPool
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -72,6 +78,20 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 log = logging.getLogger("goalsniper")
 app = Flask(__name__)
+
+# SECRET_KEY signs the dashboard's session cookie. Without a fixed value every
+# process restart invalidates existing sessions (everyone gets logged out) —
+# harmless, just annoying on a platform that restarts on every deploy. Set
+# SECRET_KEY to a fixed random value (e.g. `python -c "import secrets;
+# print(secrets.token_hex(32))"`) to avoid that.
+app.secret_key = os.getenv("SECRET_KEY") or os.urandom(32).hex()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("ENVIRONMENT", "").lower() == "production",
+)
+if not os.getenv("SECRET_KEY"):
+    log.warning("[DASHBOARD] SECRET_KEY not set — every restart will sign everyone out of /dashboard.")
 
 
 def _env_flag(name: str, default: str) -> bool:
@@ -3001,6 +3021,73 @@ def http_settings(key: str):
     _SETTINGS_CACHE.invalidate(key)
     invalidate_model_caches_for_key(key)
     return jsonify({"ok": True})
+
+
+# ───────── Web dashboard ─────────
+# Browser-facing alternative to the Telegram feed. Auth is session-based: the
+# admin key is checked once at /dashboard/login and, on success, a signed
+# (HttpOnly, SameSite=Lax) session cookie is set — the raw key is never
+# stored client-side or re-sent on every page load the way a bookmarked
+# ?key=... URL would. Read-only: nothing under /dashboard can train models,
+# trigger scans, or change settings.
+DASHBOARD_REFRESH_SEC = int(os.getenv("DASHBOARD_REFRESH_SEC", "60"))
+
+
+def _dashboard_authed() -> bool:
+    return bool(flask_session.get("dash_authed"))
+
+
+@app.route("/dashboard/login", methods=["GET", "POST"])
+def dashboard_login():
+    if request.method == "POST":
+        key = request.form.get("key", "")
+        if ADMIN_API_KEY and hmac.compare_digest(str(key), str(ADMIN_API_KEY)):
+            flask_session.clear()
+            flask_session["dash_authed"] = True
+            flask_session.permanent = True
+            return redirect(url_for("dashboard"))
+        return render_template("dashboard_login.html", error="Incorrect key."), 401
+    if _dashboard_authed():
+        return redirect(url_for("dashboard"))
+    return render_template("dashboard_login.html", error=None)
+
+
+@app.route("/dashboard/logout", methods=["GET", "POST"])
+def dashboard_logout():
+    flask_session.clear()
+    return redirect(url_for("dashboard_login"))
+
+
+@app.route("/dashboard")
+def dashboard():
+    if not _dashboard_authed():
+        return redirect(url_for("dashboard_login"))
+    return render_template("dashboard.html", refresh_sec=DASHBOARD_REFRESH_SEC)
+
+
+@app.route("/dashboard/data")
+def dashboard_data():
+    if not _dashboard_authed():
+        abort(401)
+    limit = max(1, min(200, _arg_int("limit", 50) or 50))
+    days = _arg_int("days")
+    with db_conn() as c:
+        rows = c.execute(
+            "SELECT match_id,league,home,away,market,suggestion,confidence,"
+            "score_at_tip,minute,created_ts,odds,book,ev_pct,fair_prob,stake_units,"
+            "clv_pct,is_prematch,sent_ok "
+            "FROM tips WHERE suggestion<>'HARVEST' ORDER BY created_ts DESC LIMIT %s", (limit,)
+        ).fetchall()
+    keys = ["match_id", "league", "home", "away", "market", "suggestion", "confidence",
+            "score_at_tip", "minute", "created_ts", "odds", "book", "ev_pct", "fair_prob",
+            "stake_units", "clv_pct", "is_prematch", "sent_ok"]
+    tips = [dict(zip(keys, r)) for r in rows]
+    try:
+        pnl = compute_pnl(days=days, stake=1.0)
+    except Exception as e:
+        log.warning("[DASHBOARD] pnl computation failed: %s", e)
+        pnl = {"error": str(e)}
+    return jsonify({"ok": True, "tips": tips, "pnl": pnl, "server_ts": int(time.time())})
 
 
 @app.route("/tips/latest")
