@@ -431,3 +431,34 @@ def kelly_fraction(prob: float, odds: float) -> float:
         return 0.0
     p = float(prob)
     return (p * b - (1.0 - p)) / b
+
+
+def enforce_ou_monotonicity(line_probs: List[Tuple[float, float]]) -> Dict[float, float]:
+    """
+    Project independently-scored Over/Under lines onto the one constraint they
+    must obey: P(Over line) is non-increasing as the line rises. Over 3.5 can
+    never be more likely than Over 2.5 — it is a strict subset of it — but
+    OU_2.5 and OU_3.5 are separate logistic heads with no such constraint
+    baked in, and in practice they do occasionally cross (train_models.py's
+    module docstring flags this as a known, deliberately-deferred gap: "three
+    unconstrained logistic heads can and do emit P(Over 3.5) > P(Over 2.5)").
+
+    This is pool-adjacent-violators (isotonic regression) for a non-increasing
+    sequence: the least-squares projection of the raw probabilities onto the
+    monotone cone, sorted by line. When the inputs are already coherent this
+    is a no-op; only genuine crossings get pulled toward each other.
+    """
+    items = sorted(line_probs, key=lambda x: x[0])
+    if len(items) <= 1:
+        return dict(items)
+    blocks: List[List[float]] = []  # each: [sum_of_probs, count]
+    for _line, p in items:
+        blocks.append([p, 1.0])
+        while len(blocks) >= 2 and (blocks[-2][0] / blocks[-2][1]) < (blocks[-1][0] / blocks[-1][1]):
+            b2 = blocks.pop()
+            b1 = blocks.pop()
+            blocks.append([b1[0] + b2[0], b1[1] + b2[1]])
+    out_vals: List[float] = []
+    for total, count in blocks:
+        out_vals.extend([total / count] * int(count))
+    return {line: v for (line, _), v in zip(items, out_vals)}

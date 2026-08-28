@@ -60,6 +60,7 @@ from feature_spec import (
     DEFAULT_LEAGUE_RATES, RAW_INPLAY_KEYS,
     assemble_prematch_features, build_inplay_features,
     devig, ev as _ev, fixture_ts as _fixture_ts, kelly_fraction,
+    enforce_ou_monotonicity,
 )
 
 try:
@@ -168,6 +169,10 @@ OU_LINES = [ln for ln in _parse_lines(os.getenv("OU_LINES", "2.5,3.5"), [2.5, 3.
 MIN_ODDS_OU = float(os.getenv("MIN_ODDS_OU", "1.30"))
 MIN_ODDS_BTTS = float(os.getenv("MIN_ODDS_BTTS", "1.30"))
 MIN_ODDS_1X2 = float(os.getenv("MIN_ODDS_1X2", "1.30"))
+# Double Chance and Draw No Bet naturally price shorter than 1X2 (they cover
+# 2 of 3 outcomes), so their floors are lower.
+MIN_ODDS_DC = float(os.getenv("MIN_ODDS_DC", "1.15"))
+MIN_ODDS_DNB = float(os.getenv("MIN_ODDS_DNB", "1.20"))
 MAX_ODDS_ALL = float(os.getenv("MAX_ODDS_ALL", "20.0"))
 
 # EV measured at the price you can actually get.
@@ -203,7 +208,11 @@ CLV_MAX_AGE_MIN = int(os.getenv("CLV_MAX_AGE_MIN", "90"))
 PREDICTION_LOG_ENABLE = _env_flag("PREDICTION_LOG_ENABLE", "1")
 PREDICTION_LOG_MIN_PROB = float(os.getenv("PREDICTION_LOG_MIN_PROB", "0.35"))
 
-ALLOWED_SUGGESTIONS = {"BTTS: Yes", "BTTS: No", "Home Win", "Away Win"}
+ALLOWED_SUGGESTIONS = {
+    "BTTS: Yes", "BTTS: No", "Home Win", "Away Win",
+    "Double Chance: 1X", "Double Chance: X2", "Double Chance: 12",
+    "Draw No Bet: Home", "Draw No Bet: Away",
+}
 
 
 def _fmt_line(line: float) -> str:
@@ -218,6 +227,12 @@ for _ln in OU_LINES:
 # Selections that all move with "more goals". Used for the correlation guard.
 _GOALS_UP = {"BTTS: Yes"} | {f"Over {_fmt_line(l)} Goals" for l in OU_LINES}
 _GOALS_DOWN = {"BTTS: No"} | {f"Under {_fmt_line(l)} Goals" for l in OU_LINES}
+# Selections that all move with "home side outperforms" / "away side
+# outperforms". Double Chance: 12 excludes the draw either way, so it
+# correlates with both sides.
+_HOME_SIDE = {"Home Win", "Double Chance: 1X", "Double Chance: 12", "Draw No Bet: Home"}
+_AWAY_SIDE = {"Away Win", "Double Chance: X2", "Double Chance: 12", "Draw No Bet: Away"}
+_CORRELATION_FAMILIES = (_GOALS_UP, _GOALS_DOWN, _HOME_SIDE, _AWAY_SIDE)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -845,6 +860,10 @@ def _min_odds_for_market(market: str) -> float:
         return MIN_ODDS_BTTS
     if market == "1X2":
         return MIN_ODDS_1X2
+    if market == "Double Chance":
+        return MIN_ODDS_DC
+    if market == "Draw No Bet":
+        return MIN_ODDS_DNB
     return 1.01
 
 
@@ -852,6 +871,10 @@ def _market_name_normalize(s: str) -> str:
     s = (s or "").lower()
     if "both teams" in s or "btts" in s:
         return "BTTS"
+    if "double chance" in s:
+        return "DC"
+    if "draw no bet" in s:
+        return "DNB"
     if "match winner" in s or "winner" in s or "1x2" in s:
         return "1X2"
     if "over/under" in s or "total" in s or "goals" in s:
@@ -889,6 +912,32 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
             elif lbl in ("away", "2"):
                 d["Away"] = o
         return ("1X2", d) if d else None
+    if mname == "DC":
+        d = {}
+        for v in vals:
+            lbl = (v.get("value") or "").strip().lower().replace(" ", "")
+            o = float(v.get("odd") or 0)
+            if o <= 1.0:
+                continue
+            if lbl in ("home/draw", "1x", "homeordraw"):
+                d["1X"] = o
+            elif lbl in ("draw/away", "x2", "draworaway"):
+                d["X2"] = o
+            elif lbl in ("home/away", "12", "homeoraway"):
+                d["12"] = o
+        return ("DC", d) if d else None
+    if mname == "DNB":
+        d = {}
+        for v in vals:
+            lbl = (v.get("value") or "").strip().lower()
+            o = float(v.get("odd") or 0)
+            if o <= 1.0:
+                continue
+            if lbl in ("home", "1"):
+                d["Home"] = o
+            elif lbl in ("away", "2"):
+                d["Away"] = o
+        return ("DNB", d) if d else None
     if mname == "OU":
         by_line: Dict[str, Dict[str, float]] = {}
         for v in vals:
@@ -966,7 +1015,7 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
                         if cur is None or o > cur["odds"]:
                             best[mkey][name] = {"odds": float(o), "book": book_name}
                     # Only de-vig a COMPLETE market.
-                    needed = {"BTTS": 2, "1X2": 3}.get(mkey, 2)
+                    needed = {"BTTS": 2, "1X2": 3, "DC": 3, "DNB": 2}.get(mkey, 2)
                     if len(sel) >= needed:
                         implied = {k: 1.0 / v for k, v in sel.items() if v > 1.0}
                         for k, p in devig(implied).items():
@@ -992,6 +1041,20 @@ def _market_key_and_selection(market_text: str, suggestion: str) -> Tuple[Option
             return "1X2", "Home"
         if suggestion == "Away Win":
             return "1X2", "Away"
+        return None, None
+    if mt == "Double Chance":
+        if suggestion.endswith("1X"):
+            return "DC", "1X"
+        if suggestion.endswith("X2"):
+            return "DC", "X2"
+        if suggestion.endswith("12"):
+            return "DC", "12"
+        return None, None
+    if mt == "Draw No Bet":
+        if suggestion.endswith("Home"):
+            return "DNB", "Home"
+        if suggestion.endswith("Away"):
+            return "DNB", "Away"
         return None, None
     if mt.startswith("Over/Under"):
         try:
@@ -1202,6 +1265,16 @@ def _tip_outcome_for_result(suggestion: str, res: Dict[str, Any]) -> Optional[in
         return 1 if gh > ga else 0
     if s == "Away Win":
         return 1 if ga > gh else 0
+    if s == "Double Chance: 1X":
+        return 1 if gh >= ga else 0
+    if s == "Double Chance: X2":
+        return 1 if ga >= gh else 0
+    if s == "Double Chance: 12":
+        return 1 if gh != ga else 0
+    if s == "Draw No Bet: Home":
+        return None if gh == ga else int(gh > ga)
+    if s == "Draw No Bet: Away":
+        return None if gh == ga else int(ga > gh)
     return None
 
 
@@ -1436,12 +1509,22 @@ def _candidate_is_sane(sug: str, feat: Dict[str, float]) -> bool:
 
 
 def _ou_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
-    out = []
+    raw_probs: List[Tuple[float, float]] = []
     for line in OU_LINES:
         mdl = _load_ou_model_for_line(line, prefix=prefix)
         if not mdl:
             continue
-        p_over = _score_prob(feat, mdl)
+        raw_probs.append((line, _score_prob(feat, mdl)))
+    if not raw_probs:
+        return []
+    # FIX (coherence): independent per-line heads can emit P(Over 3.5) >
+    # P(Over 2.5), which is impossible — Over 3.5 is a strict subset of
+    # Over 2.5. Project onto the non-increasing-in-line constraint before
+    # building candidates. No-op when the raw outputs are already coherent.
+    coherent = enforce_ou_monotonicity(raw_probs) if len(raw_probs) > 1 else dict(raw_probs)
+    out = []
+    for line in sorted(coherent):
+        p_over = coherent[line]
         mk = f"Over/Under {_fmt_line(line)}"
         thr = thr_fn(mk)
         for sug, p in ((f"Over {_fmt_line(line)} Goals", p_over),
@@ -1459,7 +1542,7 @@ def _btts_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[
     return [("BTTS", "BTTS: Yes", p, thr), ("BTTS", "BTTS: No", 1.0 - p, thr)]
 
 
-def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
+def _wld_probs(feat: Dict[str, float], prefix: str) -> Optional[Tuple[float, float, float]]:
     """
     FIX (audit 0.3) — the most expensive bug in the system.
 
@@ -1471,14 +1554,14 @@ def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[s
     tip" with a fabricated +20% EV.
 
     The draw head is trained and now actually used, so the normalisation is
-    over all three outcomes and ph is a genuine P(Home). The draw is suppressed
-    from OUTPUT (we don't tip draws) but not from the DENOMINATOR.
+    over all three outcomes and ph is a genuine P(Home). Returns (p_home,
+    p_draw, p_away) summing to 1, or None if the required heads are missing.
     """
     mh = load_model_from_settings(f"{prefix}WLD_HOME")
     md = load_model_from_settings(f"{prefix}WLD_DRAW")
     ma = load_model_from_settings(f"{prefix}WLD_AWAY")
     if not (mh and ma):
-        return []
+        return None
     ph = _score_prob(feat, mh)
     pa = _score_prob(feat, ma)
     if md:
@@ -1490,16 +1573,49 @@ def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[s
         pd_ = float(os.getenv("FALLBACK_DRAW_PROB", "0.26"))
         log.warning("[1X2] %sWLD_DRAW model missing — using fallback draw prior %.2f", prefix, pd_)
     s = max(EPS, ph + pd_ + pa)
-    ph, pa = ph / s, pa / s
+    return ph / s, pd_ / s, pa / s
+
+
+def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
+    """1X2. The draw is suppressed from OUTPUT (we don't tip draws) but not
+    from the DENOMINATOR — see _wld_probs."""
+    probs = _wld_probs(feat, prefix)
+    if probs is None:
+        return []
+    ph, _pd, pa = probs
     thr = thr_fn("1X2")
     return [("1X2", "Home Win", ph, thr), ("1X2", "Away Win", pa, thr)]
 
 
+def _dc_dnb_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
+    """
+    Double Chance and Draw No Bet. Both are algebraic transforms of the same
+    (p_home, p_draw, p_away) the 1X2 heads already produce — no new model, no
+    new training, no new holdout to fail. They inherit 1X2's calibration
+    quality exactly; there is no independent verification for these two
+    markets the way _fit_1x2_threshold provides for 1X2 itself.
+    """
+    probs = _wld_probs(feat, prefix)
+    if probs is None:
+        return []
+    ph, pd_, pa = probs
+    dc_thr = thr_fn("Double Chance")
+    dnb_thr = thr_fn("Draw No Bet")
+    dnb_s = max(EPS, ph + pa)
+    return [
+        ("Double Chance", "Double Chance: 1X", ph + pd_, dc_thr),
+        ("Double Chance", "Double Chance: X2", pd_ + pa, dc_thr),
+        ("Double Chance", "Double Chance: 12", ph + pa, dc_thr),
+        ("Draw No Bet", "Draw No Bet: Home", ph / dnb_s, dnb_thr),
+        ("Draw No Bet", "Draw No Bet: Away", pa / dnb_s, dnb_thr),
+    ]
+
+
 def _correlation_blocked(suggestion: str, taken: List[str]) -> bool:
-    fam = _GOALS_UP if suggestion in _GOALS_UP else (_GOALS_DOWN if suggestion in _GOALS_DOWN else None)
-    if fam is None:
-        return False
-    return any(t in fam for t in taken)
+    for fam in _CORRELATION_FAMILIES:
+        if suggestion in fam and any(t in fam for t in taken):
+            return True
+    return False
 
 
 # ───────── In-play scan ─────────
@@ -1558,7 +1674,8 @@ def production_scan() -> Tuple[int, int]:
 
             candidates = (_ou_candidates(feat, "", _get_market_threshold)
                           + _btts_candidates(feat, "", _get_market_threshold)
-                          + _wld_candidates(feat, "", _get_market_threshold))
+                          + _wld_candidates(feat, "", _get_market_threshold)
+                          + _dc_dnb_candidates(feat, "", _get_market_threshold))
             candidates = [c for c in candidates
                           if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)]
             candidates.sort(key=lambda x: x[2], reverse=True)
@@ -1787,7 +1904,8 @@ def prematch_scan_save() -> int:
 
         candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
                       + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre))
+                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
         candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS]
         candidates.sort(key=lambda x: x[2], reverse=True)
 
@@ -1885,7 +2003,8 @@ def send_match_of_the_day() -> bool:
 
         candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
                       + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre))
+                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
         candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS and c[2] * 100.0 >= c[3]]
         if not candidates:
             continue
