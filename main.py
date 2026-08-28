@@ -1639,6 +1639,33 @@ def _correlation_blocked(suggestion: str, taken: List[str]) -> bool:
 
 
 # ───────── In-play scan ─────────
+def _last_snapshot_ts_bulk(fids: List[int]) -> Dict[int, int]:
+    """
+    Most recent tip_snapshots.created_ts per fixture, in ONE query per scan.
+
+    Backs the time-based harvest cadence below. Reading from the table rather
+    than an in-process dict means the cadence survives restarts and stays
+    correct when more than one instance is scanning.
+
+    On failure this returns {}, which makes every fixture look un-harvested and
+    therefore harvests on this scan. That is the safe direction to fail: the
+    cost is at most one extra row per fixture per scan, versus silently
+    starving training of data.
+    """
+    ids = [int(f) for f in set(fids) if f]
+    if not ids:
+        return {}
+    try:
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT match_id, MAX(created_ts) FROM tip_snapshots "
+                "WHERE match_id = ANY(%s) GROUP BY match_id", (ids,)).fetchall()
+        return {int(mid): int(ts or 0) for mid, ts in rows}
+    except Exception as e:
+        log.warning("[HARVEST] last-snapshot lookup failed (harvesting anyway): %s", e)
+        return {}
+
+
 def production_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
@@ -1649,6 +1676,17 @@ def production_scan() -> Tuple[int, int]:
     saved = 0
     now_ts = int(time.time())
     pred_rows: List[tuple] = []
+    harvested = 0
+    # Guarded at the call site as well as inside: harvesting is a side concern,
+    # and nothing about it should be able to take down a whole scan of every
+    # live fixture. Worst case we fall back to {} and harvest this round.
+    last_snap: Dict[int, int] = {}
+    if HARVEST_MODE:
+        try:
+            last_snap = _last_snapshot_ts_bulk(
+                [int((m.get("fixture") or {}).get("id") or 0) for m in matches])
+        except Exception as e:
+            log.warning("[HARVEST] cadence lookup failed (harvesting anyway): %s", e)
 
     for m in matches:
         try:
@@ -1667,14 +1705,31 @@ def production_scan() -> Tuple[int, int]:
             # in it. Under the old ordering the dup check `continue`d first, so
             # a fixture that had been tipped (or, before the HARVEST fix, one
             # that had merely been harvested) stopped producing training rows
-            # for the whole cooldown window. That is why the first real run
-            # found only 741 snapshots across 635 fixtures — roughly 1.2 rows
-            # per match, when 3-minute harvesting over a 90-minute game should
-            # produce closer to 8-10.
-            is_harvest_tick = HARVEST_MODE and minute >= TRAIN_MIN_MINUTE and minute % HARVEST_EVERY_MINUTES == 0
+            # for the whole cooldown window.
+            #
+            # FIX (harvest rate): the cadence was `minute % HARVEST_EVERY_MINUTES
+            # == 0`, which fires only when the elapsed minute the API happens to
+            # report at scan time is divisible by 3. Nothing aligns the scan
+            # schedule (SCAN_INTERVAL_SEC, default 300) with that arithmetic, so
+            # roughly two thirds of scans harvested nothing — and a fixture whose
+            # observed minute never landed on a multiple of 3 was never harvested
+            # at all. Simulating scans at the default interval: ~5.2 snapshots per
+            # match under the old rule versus ~15.2 under this one.
+            #
+            # The rule is now what was actually meant all along: harvest when this
+            # fixture's last snapshot is at least HARVEST_EVERY_MINUTES old. It
+            # degrades correctly if SCAN_INTERVAL_SEC changes, since it is stated
+            # in time rather than in whatever minute a scan happens to observe.
+            is_harvest_tick = (
+                HARVEST_MODE
+                and minute >= TRAIN_MIN_MINUTE
+                and (now_ts - last_snap.get(fid, 0)) >= HARVEST_EVERY_MINUTES * 60
+            )
             if is_harvest_tick:
                 try:
                     save_snapshot_from_match(m, raw)
+                    last_snap[fid] = now_ts
+                    harvested += 1
                 except Exception as e:
                     log.warning("[HARVEST] snapshot failed for %s: %s", fid, e)
 
@@ -1764,7 +1819,8 @@ def production_scan() -> Tuple[int, int]:
             continue
 
     _log_predictions(pred_rows)
-    log.info("[PROD] saved=%d live_seen=%d candidates_logged=%d", saved, live_seen, len(pred_rows))
+    log.info("[PROD] saved=%d live_seen=%d candidates_logged=%d harvested=%d",
+             saved, live_seen, len(pred_rows), harvested)
     return saved, live_seen
 
 
