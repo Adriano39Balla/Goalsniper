@@ -204,8 +204,19 @@ MAX_ODDS_ALL = float(os.getenv("MAX_ODDS_ALL", "20.0"))
 
 EDGE_MIN_BPS = int(os.getenv("EDGE_MIN_BPS", "300"))
 FAIR_EDGE_MIN_BPS = int(os.getenv("FAIR_EDGE_MIN_BPS", "200"))
-MAX_MODEL_EDGE_BPS = int(os.getenv("MAX_MODEL_EDGE_BPS", "1500"))
+# Sanity cap, tightened from 1500. Live Double Chance tips went out claiming
+# 10.2 and 12.9 percentage-point disagreements with a de-vigged consensus. In a
+# market that liquid a double-digit edge is model error every time, and the old
+# cap was loose enough to wave both through.
+MAX_MODEL_EDGE_BPS = int(os.getenv("MAX_MODEL_EDGE_BPS", "800"))
 REQUIRE_FAIR_PRICE = _env_flag("REQUIRE_FAIR_PRICE", "1")
+# A "consensus" fair price built from one bookmaker is not a consensus. Those
+# live tips came from Danish 2. Division and Swedish Division 2 — thin markets
+# where a single stale quote can both set the best price and define "fair",
+# manufacturing an overlay that does not exist (best 1.53 against a "fair" 1.41).
+# Best price is still taken across every book; this governs whether the FAIR side
+# is trustworthy enough to bet against.
+MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")
 ALLOW_TIPS_WITHOUT_ODDS = _env_flag("ALLOW_TIPS_WITHOUT_ODDS", "0")
 
@@ -1160,6 +1171,11 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
     fair = (entry.get("fair") or {}).get(sel)
     if fair is None:
         res["decision"] = "no_fair_price"
+        if REQUIRE_FAIR_PRICE:
+            return res
+    elif res["n_books"] < MIN_BOOKS_FOR_FAIR:
+        res["decision"] = "too_few_books"
+        res["fair_prob"] = float(fair)
         if REQUIRE_FAIR_PRICE:
             return res
     else:
