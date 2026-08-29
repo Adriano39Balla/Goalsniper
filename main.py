@@ -1,29 +1,41 @@
 """
 goalsniper — in-play + prematch football tipping service.
 
-This revision applies the full audit. The headline changes, in the order they
-matter:
+Headline corrections, in the order they matter:
 
-  T0.1  Feature building moved to feature_spec.py, imported by BOTH this file
-        and train_models.py. Train/serve drift is now structurally impossible.
-  T0.3  1X2 now normalises over Home+Draw+Away, producing a real P(Home) that
+  T0.1  Feature building lives in feature_spec.py, imported by BOTH this file
+        and train_models.py. Train/serve drift is structurally impossible.
+  T0.3  1X2 normalises over Home+Draw+Away, producing a real P(Home) that
         matches how the bet is priced and graded. The previous Home/(Home+Away)
         normalisation was a Draw-No-Bet probability priced against 1X2 odds,
         inflating every 1X2 confidence by ~1.30-1.35x.
-  T0.4  In-play prices now come from /odds/live. /odds is prematch-only and is
-        used only for the prematch and MOTD paths.
-  T0.5  HARVEST rows no longer go into `tips` at all; they live in
-        tip_snapshots where they belong. The live duplicate check additionally
-        excludes them, so old rows in an existing database cannot suppress tips.
-  T0.6  ALLOW_TIPS_WITHOUT_ODDS now defaults to 0. A bet you cannot price is a
-        bet you do not place.
-  T1.2  Models carry their own StandardScaler (mean/scale) in the blob and it is
-        applied here before scoring, so L2 regularization is scale-correct at
-        fit time without breaking serving.
+  T0.4  In-play prices come from /odds/live. /odds is prematch-only.
+  T0.5  HARVEST rows live in tip_snapshots, not `tips`.
+  T0.6  ALLOW_TIPS_WITHOUT_ODDS defaults to 0.
+  T1.2  Models carry their own StandardScaler (mean/scale) in the blob.
   NEW   De-vigged fair prices, a fair-edge gate, a model-sanity edge cap,
-        closing-line-value capture, fractional-Kelly stake sizing, and a
-        `predictions` log that records EVERY candidate (not just the ones that
-        cleared threshold) so calibration can be measured without selection bias.
+        closing-line-value capture, fractional-Kelly staking, and a
+        `predictions` log recording EVERY candidate so calibration can be
+        measured without selection bias.
+
+THIS REVISION FIXES THREE DEFECTS FOUND IN THE DOUBLE CHANCE / DRAW NO BET AND
+DASHBOARD ADDITIONS:
+
+  1. Double Chance de-vig was normalising to 1.0. DC selections are not
+     mutually exclusive — 1X, X2 and 12 each cover two of three outcomes, so
+     their true probabilities sum to 2.0. Every DC fair price came out at
+     exactly half its true value, which read as a ~36 percentage-point edge and
+     tripped MAX_MODEL_EDGE_BPS on every DC candidate. Now uses
+     feature_spec.MARKET_PROBABILITY_TOTAL.
+  2. Double Chance and Draw No Bet had no trained threshold, so
+     _get_market_threshold() fell through to CONF_THRESHOLD (70) while the 1X2
+     heads they derive from sat suppressed at 85. train_models.py now trains and
+     holdout-verifies both, and this file refuses to serve a derived market
+     whose threshold has never been written.
+  3. The dashboard generated a random SECRET_KEY when the env var was unset.
+     Under multiple workers each worker signs cookies with a different key, so
+     logins fail at random. The dashboard now refuses to start without an
+     explicit SECRET_KEY, and the login endpoint is rate-limited.
 
 Requires DATABASE_URL and API_KEY.
 """
@@ -39,7 +51,7 @@ import signal
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape
@@ -53,9 +65,9 @@ from apscheduler.triggers.cron import CronTrigger
 from flask import (
     Flask, abort, jsonify, redirect, render_template, request, url_for,
 )
-# Aliased: main.py already has a module-level `session` (a requests.Session()
-# used for outbound HTTP, defined further down) that would otherwise shadow
-# Flask's session proxy the moment that line executes.
+# Aliased: this module already has a module-level `session` (a requests.Session
+# for outbound HTTP, defined below) that would otherwise shadow Flask's session
+# proxy the moment that line executes.
 from flask import session as flask_session
 from psycopg2.pool import ThreadedConnectionPool
 from requests.adapters import HTTPAdapter
@@ -63,8 +75,8 @@ from urllib3.util.retry import Retry
 
 from feature_spec import (
     ELO_DEFAULT, ELO_HOME_ADV, ELO_K,
-    DEFAULT_LEAGUE_RATES, RAW_INPLAY_KEYS,
-    assemble_prematch_features, build_inplay_features,
+    DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, RAW_INPLAY_KEYS,
+    assemble_prematch_features, build_inplay_features, derive_dc_dnb,
     devig, ev as _ev, fixture_ts as _fixture_ts, kelly_fraction,
     enforce_ou_monotonicity,
 )
@@ -79,23 +91,31 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(
 log = logging.getLogger("goalsniper")
 app = Flask(__name__)
 
-# SECRET_KEY signs the dashboard's session cookie. Without a fixed value every
-# process restart invalidates existing sessions (everyone gets logged out) —
-# harmless, just annoying on a platform that restarts on every deploy. Set
-# SECRET_KEY to a fixed random value (e.g. `python -c "import secrets;
-# print(secrets.token_hex(32))"`) to avoid that.
-app.secret_key = os.getenv("SECRET_KEY") or os.urandom(32).hex()
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.getenv("ENVIRONMENT", "").lower() == "production",
-)
-if not os.getenv("SECRET_KEY"):
-    log.warning("[DASHBOARD] SECRET_KEY not set — every restart will sign everyone out of /dashboard.")
-
 
 def _env_flag(name: str, default: str) -> bool:
     return os.getenv(name, default) not in ("0", "false", "False", "no", "NO")
+
+
+# ───────── Dashboard session security ─────────
+# FIX: the previous code fell back to os.urandom() when SECRET_KEY was unset.
+# That is not merely "everyone gets logged out on restart" — with more than one
+# gunicorn worker each worker generates its OWN key, so a cookie signed by
+# worker A is rejected by worker B and login fails at random. There is no safe
+# automatic fallback for a multi-process signing key, so the dashboard is
+# disabled instead of being silently broken.
+SECRET_KEY = os.getenv("SECRET_KEY")
+DASHBOARD_ENABLED = bool(SECRET_KEY)
+app.secret_key = SECRET_KEY or os.urandom(32).hex()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=_env_flag("SESSION_COOKIE_SECURE", "1"),
+    PERMANENT_SESSION_LIFETIME=timedelta(days=int(os.getenv("DASHBOARD_SESSION_DAYS", "7"))),
+)
+if not DASHBOARD_ENABLED:
+    log.warning("[DASHBOARD] SECRET_KEY is not set — /dashboard is DISABLED. Generate one with "
+                "`python -c \"import secrets; print(secrets.token_hex(32))\"` and set it as an "
+                "env var. Everything else runs normally.")
 
 
 # ───────── Core env ─────────
@@ -112,14 +132,7 @@ DUP_COOLDOWN_MIN = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 TIP_MIN_MINUTE = int(os.getenv("TIP_MIN_MINUTE", "8"))
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
 
-# FIX (audit 3.7): correlated same-fixture bets. Over 2.5, Over 3.5 and BTTS Yes
-# are three views of one "will there be goals" signal; taking the top two by
-# probability reliably picked the two MOST correlated selections, and nothing
-# downstream (P&L, significance, Monte Carlo) knew they weren't independent.
-# One bet per fixture by default.
 PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "1"))
-# If you raise the above, a second selection in the same goal-direction family
-# must clear this much extra EV (basis points) to be taken.
 CORRELATED_EXTRA_EV_BPS = int(os.getenv("CORRELATED_EXTRA_EV_BPS", "400"))
 
 HARVEST_MODE = _env_flag("HARVEST_MODE", "1")
@@ -151,10 +164,6 @@ def _int_list(env_val: str) -> List[int]:
     return out
 
 
-# FIX (audit 3.3): the prematch scan used to pull every not-started fixture on
-# earth (300-600/day), each costing 3 API calls when uncached — 1,000-1,800
-# calls before a single bet was placed. Restrict to leagues you actually have
-# history for. Empty means "all", which is almost certainly wrong for you.
 PREMATCH_LEAGUE_IDS = _int_list(os.getenv("PREMATCH_LEAGUE_IDS", ""))
 MOTD_LEAGUE_IDS = _int_list(os.getenv("MOTD_LEAGUE_IDS", ""))
 
@@ -189,44 +198,32 @@ OU_LINES = [ln for ln in _parse_lines(os.getenv("OU_LINES", "2.5,3.5"), [2.5, 3.
 MIN_ODDS_OU = float(os.getenv("MIN_ODDS_OU", "1.30"))
 MIN_ODDS_BTTS = float(os.getenv("MIN_ODDS_BTTS", "1.30"))
 MIN_ODDS_1X2 = float(os.getenv("MIN_ODDS_1X2", "1.30"))
-# Double Chance and Draw No Bet naturally price shorter than 1X2 (they cover
-# 2 of 3 outcomes), so their floors are lower.
 MIN_ODDS_DC = float(os.getenv("MIN_ODDS_DC", "1.15"))
 MIN_ODDS_DNB = float(os.getenv("MIN_ODDS_DNB", "1.20"))
 MAX_ODDS_ALL = float(os.getenv("MAX_ODDS_ALL", "20.0"))
 
-# EV measured at the price you can actually get.
 EDGE_MIN_BPS = int(os.getenv("EDGE_MIN_BPS", "300"))
-# FIX (audit "structurally missing" #2): edge measured against the DE-VIGGED
-# market probability, in percentage points. EV alone can be satisfied purely by
-# a generous price on a bet you are wrong about; this requires you to actually
-# disagree with the fair market.
 FAIR_EDGE_MIN_BPS = int(os.getenv("FAIR_EDGE_MIN_BPS", "200"))
-# Sanity cap. If the model claims a bigger edge than this over the de-vigged
-# market, the model is wrong, not the market. This single line would have caught
-# the 75.6%-confidence-at-32%-market-price tip automatically.
 MAX_MODEL_EDGE_BPS = int(os.getenv("MAX_MODEL_EDGE_BPS", "1500"))
-# Require both sides of the market so a fair price can be computed at all.
 REQUIRE_FAIR_PRICE = _env_flag("REQUIRE_FAIR_PRICE", "1")
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")
-# FIX (audit 0.6): was "1". Default off.
 ALLOW_TIPS_WITHOUT_ODDS = _env_flag("ALLOW_TIPS_WITHOUT_ODDS", "0")
 
-# Stake sizing (audit "structurally missing" #6).
 BANKROLL_UNITS = float(os.getenv("BANKROLL_UNITS", "100"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 MAX_STAKE_PCT = float(os.getenv("MAX_STAKE_PCT", "2.0"))
 
-# Closing-line-value capture (audit "structurally missing" #1).
 CLV_ENABLE = _env_flag("CLV_ENABLE", "1")
 CLV_CAPTURE_EVERY_MIN = int(os.getenv("CLV_CAPTURE_EVERY_MIN", "5"))
 CLV_MAX_AGE_MIN = int(os.getenv("CLV_MAX_AGE_MIN", "90"))
 
-# Prediction logging (audit 2.4). Live candidates are logged on the harvest
-# cadence rather than every scan, to keep row volume proportional to the data
-# you actually gain.
 PREDICTION_LOG_ENABLE = _env_flag("PREDICTION_LOG_ENABLE", "1")
 PREDICTION_LOG_MIN_PROB = float(os.getenv("PREDICTION_LOG_MIN_PROB", "0.35"))
+
+# Markets with no model of their own — they are algebraic transforms of the 1X2
+# heads. They must never fall back to a default threshold: see
+# _get_market_threshold().
+DERIVED_MARKETS = {"Double Chance", "Draw No Bet"}
 
 ALLOWED_SUGGESTIONS = {
     "BTTS: Yes", "BTTS: No", "Home Win", "Away Win",
@@ -244,12 +241,9 @@ for _ln in OU_LINES:
     ALLOWED_SUGGESTIONS.add(f"Over {_s} Goals")
     ALLOWED_SUGGESTIONS.add(f"Under {_s} Goals")
 
-# Selections that all move with "more goals". Used for the correlation guard.
 _GOALS_UP = {"BTTS: Yes"} | {f"Over {_fmt_line(l)} Goals" for l in OU_LINES}
 _GOALS_DOWN = {"BTTS: No"} | {f"Under {_fmt_line(l)} Goals" for l in OU_LINES}
-# Selections that all move with "home side outperforms" / "away side
-# outperforms". Double Chance: 12 excludes the draw either way, so it
-# correlates with both sides.
+# Double Chance: 12 excludes the draw either way, so it correlates with both sides.
 _HOME_SIDE = {"Home Win", "Double Chance: 1X", "Double Chance: 12", "Draw No Bet: Home"}
 _AWAY_SIDE = {"Away Win", "Double Chance: X2", "Double Chance: 12", "Draw No Bet: Away"}
 _CORRELATION_FAMILIES = (_GOALS_UP, _GOALS_DOWN, _HOME_SIDE, _AWAY_SIDE)
@@ -260,7 +254,6 @@ if not DATABASE_URL:
 
 BASE_URL = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
-# FIX (audit 0.4): /odds is the PREMATCH book. /odds/live is the in-play book.
 ODDS_PREMATCH_URL = f"{BASE_URL}/odds"
 ODDS_LIVE_URL = f"{BASE_URL}/odds/live"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
@@ -278,20 +271,28 @@ TZ_UTC, BERLIN_TZ = ZoneInfo("UTC"), ZoneInfo("Europe/Berlin")
 EPS = 1e-12
 
 
+def _safe_compare(a: Any, b: Any) -> bool:
+    """
+    Constant-time comparison that cannot raise.
+
+    hmac.compare_digest() raises TypeError when handed a str containing
+    non-ASCII characters, which would turn a mistyped key into a 500 rather than
+    a clean 401. Comparing the UTF-8 bytes keeps it constant-time and total.
+    """
+    try:
+        return hmac.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+    except Exception:
+        return False
+
+
 # ───────── Thread-safe bounded TTL cache ─────────
 _MISS = object()
 
 
 class _TTLCache:
     """
-    Thread-safe, size-bounded TTL cache.
-
-    FIX (audit 3.4): get() now returns a caller-supplied default on miss, so a
-    cached None is distinguishable from an absent key. Previously
-    get_setting_cached() hit Postgres on every single lookup of any key that
-    did not exist — which is every conf_threshold:* before the first successful
-    training run and every conf_threshold_locked:* forever, called per market,
-    per line, per match, per scan.
+    Thread-safe, size-bounded TTL cache. get() returns a caller-supplied default
+    on miss, so a cached None is distinguishable from an absent key.
     """
 
     def __init__(self, ttl: float, maxsize: int = 5000):
@@ -466,11 +467,6 @@ def init_db():
             updated_ts BIGINT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS prematch_snapshots (
             match_id BIGINT PRIMARY KEY, created_ts BIGINT, payload TEXT)""")
-
-        # FIX (audit 2.4): every evaluated candidate, not just the ones that
-        # cleared threshold. `tips` is a filtered sample of this table, so
-        # calibration measured on `tips` alone can never see the region it
-        # filters on. This is the unbiased source.
         c.execute("""CREATE TABLE IF NOT EXISTS predictions (
             id BIGSERIAL PRIMARY KEY,
             match_id BIGINT, league_id BIGINT, kickoff_ts BIGINT,
@@ -480,7 +476,6 @@ def init_db():
             odds DOUBLE PRECISION, fair_prob DOUBLE PRECISION,
             ev_pct DOUBLE PRECISION, decision TEXT)""")
 
-        # Evolutive columns, all idempotent.
         for stmt in [
             "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS league_id BIGINT",
             "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS kickoff_ts BIGINT",
@@ -494,9 +489,6 @@ def init_db():
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS stake_units DOUBLE PRECISION",
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS closing_odds DOUBLE PRECISION",
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS clv_pct DOUBLE PRECISION",
-            # kickoff_ts on snapshots is the correct time axis for the training
-            # split. created_ts stays as the row's insert time because the
-            # prematch freshness window depends on it (audit 1.9).
             "ALTER TABLE tip_snapshots ADD COLUMN IF NOT EXISTS kickoff_ts BIGINT",
             "ALTER TABLE prematch_snapshots ADD COLUMN IF NOT EXISTS kickoff_ts BIGINT",
         ]:
@@ -525,9 +517,6 @@ def init_db():
             except Exception as e:
                 log.warning("[SCHEMA] %s -> %s", stmt, e)
 
-        # FIX (audit 0.5): purge legacy HARVEST rows from `tips`. They are not
-        # bets, they were suppressing live tips through the duplicate check, and
-        # they are fully duplicated by tip_snapshots.
         if _env_flag("PURGE_LEGACY_HARVEST_TIPS", "1"):
             try:
                 n = c.execute("DELETE FROM tips WHERE suggestion='HARVEST'").rowcount
@@ -748,12 +737,8 @@ def extract_features(m: dict) -> Tuple[Dict[str, float], Dict[str, float]]:
 
 
 def stats_coverage_ok(raw: Dict[str, float], minute: int) -> bool:
-    """
-    FIX (audit 3.x / early-minute garbage): the old default let tips fire from
-    minute 8 with an all-zero stats vector, in which case the model output is
-    just sigmoid(intercept) and carries no match information. Coverage is now
-    required from TIP_MIN_MINUTE onwards, not from minute 35.
-    """
+    """Coverage is required from TIP_MIN_MINUTE onward: an all-zero stats vector
+    makes the model output sigmoid(intercept), which carries no match info."""
     require_from = int(os.getenv("REQUIRE_STATS_MINUTE", str(TIP_MIN_MINUTE)))
     require_fields = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
     if minute < require_from:
@@ -826,13 +811,10 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
 
 def _linpred(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
     """
-    FIX (audit 1.2): apply the model's persisted StandardScaler before the dot
-    product. Training now fits on standardized features (so L2 penalises every
-    feature on a comparable scale — previously an ELO coefficient was penalised
-    ~1500x harder than a 0/1 flag, effectively deleting your best signal) and
-    ships mean/scale inside the blob, so serving reproduces the transform
-    exactly. Blobs without a scaler are treated as raw, for backwards
-    compatibility with anything already in `settings`.
+    Apply the model's persisted StandardScaler before the dot product. Training
+    fits on standardized features (so L2 penalises every feature on a comparable
+    scale) and ships mean/scale inside the blob, so serving reproduces the
+    transform exactly. Blobs without a scaler are treated as raw.
     """
     scaler = mdl.get("scaler") or {}
     mean = scaler.get("mean") or {}
@@ -887,8 +869,26 @@ def _min_odds_for_market(market: str) -> float:
     return 1.01
 
 
-def _market_name_normalize(s: str) -> str:
-    s = (s or "").lower()
+def _txt(v: Any) -> str:
+    """
+    Coerce an odds-feed field to a string.
+
+    THE BUG THIS FIXES: 530 occurrences of
+        [ODDS] parse failed ... 'int' object has no attribute 'lower'
+    in six hours. The parser did `(v.get("value") or "").strip().lower()` and
+    `(mkt.get("name","")).lower()`. When the feed returns a NUMBER rather than a
+    string — which it does for some bookmakers' market names and for Asian-style
+    Over/Under values — `int or ""` evaluates to the int (it's truthy), which is
+    then handed straight to .lower()/.strip(). None, ints and floats all become
+    strings here instead.
+    """
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else str(v)
+
+
+def _market_name_normalize(s: Any) -> str:
+    s = _txt(s).lower()
     if "both teams" in s or "btts" in s:
         return "BTTS"
     if "double chance" in s:
@@ -902,15 +902,26 @@ def _market_name_normalize(s: str) -> str:
     return s
 
 
+def _odd_value(v: dict) -> float:
+    """Parse a price, tolerating strings, commas and nulls. 0.0 means unusable."""
+    try:
+        raw = v.get("odd")
+        if raw is None:
+            return 0.0
+        return float(_txt(raw).replace(",", "."))
+    except Exception:
+        return 0.0
+
+
 def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
     """Parse one bookmaker's one market into {market_key: {selection: odds}}."""
-    mname = _market_name_normalize(mkt.get("name", ""))
+    mname = _market_name_normalize(mkt.get("name"))
     vals = mkt.get("values") or []
     if mname == "BTTS":
         d = {}
         for v in vals:
-            lbl = (v.get("value") or "").strip().lower()
-            o = float(v.get("odd") or 0)
+            lbl = _txt(v.get("value")).strip().lower()
+            o = _odd_value(v)
             if o <= 1.0:
                 continue
             if lbl.startswith("yes"):
@@ -921,8 +932,8 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
     if mname == "1X2":
         d = {}
         for v in vals:
-            lbl = (v.get("value") or "").strip().lower()
-            o = float(v.get("odd") or 0)
+            lbl = _txt(v.get("value")).strip().lower()
+            o = _odd_value(v)
             if o <= 1.0:
                 continue
             if lbl in ("home", "1"):
@@ -935,8 +946,8 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
     if mname == "DC":
         d = {}
         for v in vals:
-            lbl = (v.get("value") or "").strip().lower().replace(" ", "")
-            o = float(v.get("odd") or 0)
+            lbl = _txt(v.get("value")).strip().lower().replace(" ", "")
+            o = _odd_value(v)
             if o <= 1.0:
                 continue
             if lbl in ("home/draw", "1x", "homeordraw"):
@@ -949,8 +960,8 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
     if mname == "DNB":
         d = {}
         for v in vals:
-            lbl = (v.get("value") or "").strip().lower()
-            o = float(v.get("odd") or 0)
+            lbl = _txt(v.get("value")).strip().lower()
+            o = _odd_value(v)
             if o <= 1.0:
                 continue
             if lbl in ("home", "1"):
@@ -961,22 +972,27 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
     if mname == "OU":
         by_line: Dict[str, Dict[str, float]] = {}
         for v in vals:
-            lbl = (v.get("value") or "").lower()
+            lbl = _txt(v.get("value")).strip().lower()
             if "over" not in lbl and "under" not in lbl:
                 continue
+            o = _odd_value(v)
+            if o <= 1.0:
+                continue
             try:
-                ln = float(lbl.split()[-1])
-                o = float(v.get("odd") or 0)
-                if o <= 1.0:
-                    continue
-                key = f"OU_{_fmt_line(ln)}"
-                side = "Over" if "over" in lbl else "Under"
-                by_line.setdefault(key, {})[side] = o
+                ln = float(lbl.split()[-1].replace(",", "."))
             except Exception:
-                pass
-        # Caller handles the multi-line case.
+                continue
+            key = f"OU_{_fmt_line(ln)}"
+            side = "Over" if "over" in lbl else "Under"
+            by_line.setdefault(key, {})[side] = o
         return ("OU_MULTI", by_line) if by_line else None
     return None
+
+
+# Selections required before a market can be de-vigged, and what its true
+# probabilities sum to. OU lines are keyed OU_<line> at runtime and default to
+# 2 selections / total 1.0.
+_MARKET_SELECTION_COUNT = {"BTTS": 2, "1X2": 3, "DC": 3, "DNB": 2}
 
 
 def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
@@ -986,17 +1002,13 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
        "fair": {selection: float},          # consensus de-vigged probability
        "n_books": int}
 
-    Two things the old version got wrong:
-
-    1. It read only `bookmakers[0]`, so the price used was whichever book the
-       API happened to list first.
-    2. There was no de-vigging at all, so nothing in the system had a concept of
-       a fair price.
-
-    De-vigging is done WITHIN each bookmaker's complete market (de-vigging
+    De-vigging happens WITHIN each bookmaker's complete market (de-vigging
     across best-of-many-books prices would produce a fake sub-1.0 overround and
-    a systematically optimistic fair price), then averaged across books. The
+    a systematically optimistic fair price), then averages across books. The
     best available price across all books is used separately for EV.
+
+    FIX: the market total is now looked up per market rather than assumed to be
+    1.0. Double Chance sums to 2.0 — see feature_spec.devig().
     """
     key = (fid, bool(live))
     cached = ODDS_CACHE.get(key, _MISS)
@@ -1011,38 +1023,57 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     best: Dict[str, Dict[str, Dict[str, Any]]] = {}
     fair_acc: Dict[str, Dict[str, List[float]]] = {}
     books_seen: Dict[str, set] = {}
+    parse_errors = 0
 
-    try:
-        for r in (js.get("response", []) if isinstance(js, dict) else []):
-            for bk in (r.get("bookmakers") or []):
-                book_name = bk.get("name") or "Book"
-                per_market: Dict[str, Dict[str, float]] = {}
-                for mkt in (bk.get("bets") or []):
+    # FIX: the try/except used to wrap the ENTIRE response, and its handler
+    # reset best/fair/books to {}. So a single malformed value, in a single
+    # market, from a single bookmaker, threw away every price for that fixture —
+    # all markets, all books. That is why 530 parse failures produced zero
+    # priced candidates rather than merely degraded ones. Failures are now
+    # isolated to the market that caused them; everything else survives.
+    for r in (js.get("response", []) if isinstance(js, dict) else []):
+        for bk in (r.get("bookmakers") or []):
+            book_name = _txt(bk.get("name")) or "Book"
+            per_market: Dict[str, Dict[str, float]] = {}
+            for mkt in (bk.get("bets") or []):
+                try:
                     parsed = _parse_book_market(mkt)
-                    if not parsed:
-                        continue
-                    mkey, payload = parsed
-                    if mkey == "OU_MULTI":
-                        for k, sel in payload.items():
-                            per_market.setdefault(k, {}).update(sel)
-                    else:
-                        per_market.setdefault(mkey, {}).update(payload)
+                except Exception as e:
+                    parse_errors += 1
+                    log.debug("[ODDS] fixture %s book %s market %r unparseable: %s",
+                              fid, book_name, mkt.get("name"), e)
+                    continue
+                if not parsed:
+                    continue
+                mkey, payload = parsed
+                if mkey == "OU_MULTI":
+                    for k, sel in payload.items():
+                        per_market.setdefault(k, {}).update(sel)
+                else:
+                    per_market.setdefault(mkey, {}).update(payload)
 
-                for mkey, sel in per_market.items():
+            for mkey, sel in per_market.items():
+                try:
                     books_seen.setdefault(mkey, set()).add(book_name)
                     for name, o in sel.items():
                         cur = best.setdefault(mkey, {}).get(name)
                         if cur is None or o > cur["odds"]:
                             best[mkey][name] = {"odds": float(o), "book": book_name}
-                    # Only de-vig a COMPLETE market.
-                    needed = {"BTTS": 2, "1X2": 3, "DC": 3, "DNB": 2}.get(mkey, 2)
+                    # Only de-vig a COMPLETE market, and normalise to the total
+                    # that market's true probabilities actually sum to.
+                    needed = _MARKET_SELECTION_COUNT.get(mkey, 2)
                     if len(sel) >= needed:
+                        total = MARKET_PROBABILITY_TOTAL.get(mkey, 1.0)
                         implied = {k: 1.0 / v for k, v in sel.items() if v > 1.0}
-                        for k, p in devig(implied).items():
+                        for k, p in devig(implied, market_total=total).items():
                             fair_acc.setdefault(mkey, {}).setdefault(k, []).append(p)
-    except Exception as e:
-        log.warning("[ODDS] parse failed for fixture %s (live=%s): %s", fid, live, e)
-        best, fair_acc, books_seen = {}, {}, {}
+                except Exception as e:
+                    parse_errors += 1
+                    log.debug("[ODDS] fixture %s market %s aggregation failed: %s", fid, mkey, e)
+
+    if parse_errors:
+        log.debug("[ODDS] fixture %s (live=%s): %d market(s) unparseable, %d market(s) usable",
+                  fid, live, parse_errors, len(best))
 
     out: Dict[str, Any] = {}
     for mkey, sels in best.items():
@@ -1147,8 +1178,8 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
             res["decision"] = "fair_edge_below_min"
             return res
         if int(round(fair_edge * 10000)) > MAX_MODEL_EDGE_BPS:
-            # The model is claiming to be enormously smarter than a liquid
-            # market. That is a model failure, not an opportunity.
+            # The model claims to be enormously smarter than a liquid market.
+            # That is a model failure, not an opportunity.
             res["decision"] = "edge_implausible"
             log.warning("[SANITY] fixture %s %s: model %.1f%% vs fair %.1f%% — suppressed",
                         fid, suggestion, prob * 100, float(fair) * 100)
@@ -1169,6 +1200,24 @@ def _stake_units(prob: float, odds: Optional[float]) -> Optional[float]:
 
 
 # ───────── Prediction log ─────────
+# Cap on prediction-log rows per fixture. The logs showed 15,590 candidate rows
+# from ONE prematch scan (1,297 fixtures x ~12 candidates). At 8 scans a day that
+# is ~124k rows/day of which the overwhelming majority are far below any
+# threshold and carry no calibration information. Keeping the highest-probability
+# few per fixture preserves everything the calibration curve actually needs.
+PREDICTION_LOG_MAX_PER_FIXTURE = int(os.getenv("PREDICTION_LOG_MAX_PER_FIXTURE", "4"))
+
+
+def _trim_fixture_predictions(rows: List[tuple]) -> List[tuple]:
+    """Keep every tipped candidate plus the top-N remaining by probability."""
+    if len(rows) <= PREDICTION_LOG_MAX_PER_FIXTURE:
+        return rows
+    tipped = [r for r in rows if r[13] == "tipped"]
+    rest = sorted((r for r in rows if r[13] != "tipped"), key=lambda r: r[8], reverse=True)
+    keep = max(0, PREDICTION_LOG_MAX_PER_FIXTURE - len(tipped))
+    return tipped + rest[:keep]
+
+
 _PRED_SQL = ("INSERT INTO predictions(match_id,league_id,kickoff_ts,created_ts,phase,minute,"
              "market,suggestion,prob,threshold_pct,odds,fair_prob,ev_pct,decision) "
              "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
@@ -1218,14 +1267,9 @@ def update_team_ratings(home_id: int, away_id: int, gh: int, ga: int) -> None:
 # ───────── Snapshots ─────────
 def save_snapshot_from_match(m: dict, raw: Dict[str, float]) -> None:
     """
-    FIX (audit 0.5): writes ONLY to tip_snapshots. The old version also inserted
-    a row into `tips` with suggestion='HARVEST', which (a) was counted by the
-    live duplicate check and therefore locked the fixture out of tipping for
-    DUP_COOLDOWN_MIN, and (b) could collide on the (match_id, created_ts)
-    primary key with the real tip inserted moments later in the same second.
-
-    Stores the RAW field set, which is what feature_spec.build_inplay_features()
-    consumes — so training reconstructs the identical vector.
+    Writes ONLY to tip_snapshots, in the RAW field set that
+    feature_spec.build_inplay_features() consumes — so training reconstructs the
+    identical vector.
     """
     fx = m.get("fixture", {}) or {}
     lg = m.get("league", {}) or {}
@@ -1291,6 +1335,7 @@ def _tip_outcome_for_result(suggestion: str, res: Dict[str, Any]) -> Optional[in
         return 1 if ga >= gh else 0
     if s == "Double Chance: 12":
         return 1 if gh != ga else 0
+    # Draw No Bet voids on a draw — stake returned, not a loss.
     if s == "Draw No Bet: Home":
         return None if gh == ga else int(gh > ga)
     if s == "Draw No Bet: Away":
@@ -1306,11 +1351,9 @@ def _fixture_by_id(mid: int) -> Optional[dict]:
 
 def backfill_results_for_open_matches(max_rows: int = 400) -> int:
     """
-    FIX (audit 3.10): also covers fixtures that only ever produced a snapshot,
-    not just fixtures that produced a tip. Elo previously only advanced for
-    matches you happened to tip, so pm_rating_diff sat at exactly 0 (the
-    "evenly matched" value) for most fixtures — the single most useful prematch
-    feature was silently absent.
+    Covers fixtures that only ever produced a snapshot, not just fixtures that
+    produced a tip — otherwise Elo only advances for matches you happened to
+    tip, leaving pm_rating_diff at exactly 0 for most fixtures.
     """
     now_ts = int(time.time())
     cutoff = now_ts - BACKFILL_DAYS * 24 * 3600
@@ -1370,15 +1413,11 @@ def backfill_results_for_open_matches(max_rows: int = 400) -> int:
 # ───────── Closing line value ─────────
 def capture_closing_lines(limit: int = 200) -> int:
     """
-    CLV is the single most reliable leading indicator that a betting model has a
-    real edge — far more so than ROI over a few hundred bets. This records, for
-    every prematch tip, the best available price at (or just after) kickoff and
-    stores tip_odds/closing_odds - 1.
+    Records, for every prematch tip, the best available price at (or just after)
+    kickoff, and stores tip_odds/closing_odds - 1.
 
-    Scope, stated honestly: this is PREMATCH ONLY. An in-play bet has no
-    well-defined closing line — the market for "Over 2.5 at minute 62" ceases to
-    exist the moment the state changes, so there is nothing to compare against.
-    In-play edge has to be judged on realised P&L and calibration instead.
+    PREMATCH ONLY. An in-play bet has no well-defined closing line — the market
+    for "Over 2.5 at minute 62" ceases to exist the moment the state changes.
     """
     if not CLV_ENABLE:
         return 0
@@ -1439,8 +1478,7 @@ def compute_clv(days: Optional[int] = None) -> Dict[str, Any]:
             "by_market": {k: _summary(v) for k, v in by.items() if v},
             "note": "mean_clv_pct > 0 sustained over a few hundred prematch bets is the "
                     "strongest available evidence of a real edge. Negative CLV with positive "
-                    "ROI means you have been lucky, not right. Prematch only — in-play bets "
-                    "have no closing line."}
+                    "ROI means you have been lucky, not right. Prematch only."}
 
 
 # ───────── Message formatting ─────────
@@ -1492,11 +1530,32 @@ def _kickoff_berlin(utc_iso: Optional[str]) -> str:
 
 # ───────── Thresholds ─────────
 def _get_market_threshold(m: str) -> float:
+    """
+    Confidence threshold for a market.
+
+    FIX: markets in DERIVED_MARKETS (Double Chance, Draw No Bet) have no model
+    of their own — they are transforms of the 1X2 heads. Previously training
+    never wrote a threshold for them, so this function fell through to
+    CONF_THRESHOLD (70) while the 1X2 heads they derive from could be suppressed
+    at 85 for failing their holdout. Double Chance then fired at 70 on any
+    fixture with a competent home side.
+
+    train_models.py now writes and holdout-verifies both. If a derived market's
+    threshold is still absent (e.g. training has not run since this release), it
+    is treated as SUPPRESSED rather than defaulted — an unverified derived
+    market must not trade.
+    """
+    base = m.replace("PRE ", "")
     try:
         v = get_setting_cached(f"conf_threshold:{m}")
-        return float(v) if v is not None else float(CONF_THRESHOLD)
+        if v is not None:
+            return float(v)
     except Exception:
-        return float(CONF_THRESHOLD)
+        pass
+    if base in DERIVED_MARKETS:
+        log.debug("[THRESHOLD] %s has no verified threshold — suppressed at %.1f%%", m, MAX_THRESH + 100)
+        return MAX_THRESH + 100.0  # unreachable: never fires
+    return float(CONF_THRESHOLD)
 
 
 def _get_market_threshold_pre(m: str) -> float:
@@ -1513,7 +1572,16 @@ def _is_threshold_locked(m: str) -> bool:
 
 # ───────── Candidate generation ─────────
 def _candidate_is_sane(sug: str, feat: Dict[str, float]) -> bool:
-    """Reject selections that are already decided by the current score."""
+    """
+    Reject selections already decided by the current score.
+
+    Over/Under and BTTS can settle mid-match (three goals in means Over 2.5 has
+    already won and Under 2.5 has already lost), so those are checked here.
+    Double Chance, Draw No Bet and 1X2 cannot settle before full time — a
+    two-goal lead at minute 88 is near-certain but not decided — so they have no
+    branch. Near-certain cases are filtered by the per-market minimum odds
+    (MIN_ODDS_DC / MIN_ODDS_DNB), which a 1.01 price cannot clear.
+    """
     goals_sum = feat.get("goals_sum", 0.0)
     goals_h = (feat.get("goals_sum", 0.0) + feat.get("goals_diff", 0.0)) / 2.0
     goals_a = (feat.get("goals_sum", 0.0) - feat.get("goals_diff", 0.0)) / 2.0
@@ -1537,10 +1605,9 @@ def _ou_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[st
         raw_probs.append((line, _score_prob(feat, mdl)))
     if not raw_probs:
         return []
-    # FIX (coherence): independent per-line heads can emit P(Over 3.5) >
-    # P(Over 2.5), which is impossible — Over 3.5 is a strict subset of
-    # Over 2.5. Project onto the non-increasing-in-line constraint before
-    # building candidates. No-op when the raw outputs are already coherent.
+    # Independent per-line heads can emit P(Over 3.5) > P(Over 2.5), which is
+    # impossible — Over 3.5 is a strict subset of Over 2.5. Project onto the
+    # non-increasing-in-line constraint. No-op when already coherent.
     coherent = enforce_ou_monotonicity(raw_probs) if len(raw_probs) > 1 else dict(raw_probs)
     out = []
     for line in sorted(coherent):
@@ -1564,18 +1631,14 @@ def _btts_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[
 
 def _wld_probs(feat: Dict[str, float], prefix: str) -> Optional[Tuple[float, float, float]]:
     """
-    FIX (audit 0.3) — the most expensive bug in the system.
+    Normalised (p_home, p_draw, p_away) summing to 1, or None if heads missing.
 
     The old code did `s = ph + pa; ph, pa = ph/s, pa/s`, which yields
     P(Home | not a draw): a Draw-No-Bet probability. But the suggestion is
-    graded as a LOSS on a draw and priced against 1X2 Home odds, both of which
-    are full 1X2 semantics. That inflated every 1X2 probability by roughly
-    1/(1 - P(draw)) ≈ 1.30-1.35x, turning a true 45% home side into a "60%
-    tip" with a fabricated +20% EV.
-
-    The draw head is trained and now actually used, so the normalisation is
-    over all three outcomes and ph is a genuine P(Home). Returns (p_home,
-    p_draw, p_away) summing to 1, or None if the required heads are missing.
+    graded as a LOSS on a draw and priced against 1X2 Home odds, both full 1X2
+    semantics. That inflated every 1X2 probability by roughly 1/(1 - P(draw)) ≈
+    1.30-1.35x. The draw head is trained and used, so the normalisation is over
+    all three outcomes.
     """
     mh = load_model_from_settings(f"{prefix}WLD_HOME")
     md = load_model_from_settings(f"{prefix}WLD_DRAW")
@@ -1587,9 +1650,8 @@ def _wld_probs(feat: Dict[str, float], prefix: str) -> Optional[Tuple[float, flo
     if md:
         pd_ = _score_prob(feat, md)
     else:
-        # No draw head available. Rather than silently reverting to the DNB
-        # error, fall back to the league's empirical draw rate so the
-        # denominator is still a full 1X2 denominator.
+        # Rather than silently reverting to the DNB error, fall back to an
+        # empirical draw prior so the denominator is still a full 1X2 one.
         pd_ = float(os.getenv("FALLBACK_DRAW_PROB", "0.26"))
         log.warning("[1X2] %sWLD_DRAW model missing — using fallback draw prior %.2f", prefix, pd_)
     s = max(EPS, ph + pd_ + pa)
@@ -1597,8 +1659,8 @@ def _wld_probs(feat: Dict[str, float], prefix: str) -> Optional[Tuple[float, flo
 
 
 def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
-    """1X2. The draw is suppressed from OUTPUT (we don't tip draws) but not
-    from the DENOMINATOR — see _wld_probs."""
+    """1X2. The draw is suppressed from OUTPUT (we don't tip draws) but not from
+    the DENOMINATOR — see _wld_probs."""
     probs = _wld_probs(feat, prefix)
     if probs is None:
         return []
@@ -1609,25 +1671,27 @@ def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[s
 
 def _dc_dnb_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
     """
-    Double Chance and Draw No Bet. Both are algebraic transforms of the same
-    (p_home, p_draw, p_away) the 1X2 heads already produce — no new model, no
-    new training, no new holdout to fail. They inherit 1X2's calibration
-    quality exactly; there is no independent verification for these two
-    markets the way _fit_1x2_threshold provides for 1X2 itself.
+    Double Chance and Draw No Bet — algebraic transforms of the same
+    (p_home, p_draw, p_away) the 1X2 heads produce, via the shared
+    feature_spec.derive_dc_dnb() that training also uses.
+
+    These have no model of their own, so they used to have no threshold either.
+    They are now trained and holdout-verified by train_models.py exactly like
+    every other market, and _get_market_threshold() suppresses them outright if
+    that verification has never run.
     """
     probs = _wld_probs(feat, prefix)
     if probs is None:
         return []
-    ph, pd_, pa = probs
+    d = derive_dc_dnb(*probs)
     dc_thr = thr_fn("Double Chance")
     dnb_thr = thr_fn("Draw No Bet")
-    dnb_s = max(EPS, ph + pa)
     return [
-        ("Double Chance", "Double Chance: 1X", ph + pd_, dc_thr),
-        ("Double Chance", "Double Chance: X2", pd_ + pa, dc_thr),
-        ("Double Chance", "Double Chance: 12", ph + pa, dc_thr),
-        ("Draw No Bet", "Draw No Bet: Home", ph / dnb_s, dnb_thr),
-        ("Draw No Bet", "Draw No Bet: Away", pa / dnb_s, dnb_thr),
+        ("Double Chance", "Double Chance: 1X", d["1X"], dc_thr),
+        ("Double Chance", "Double Chance: X2", d["X2"], dc_thr),
+        ("Double Chance", "Double Chance: 12", d["12"], dc_thr),
+        ("Draw No Bet", "Draw No Bet: Home", d["DNB_Home"], dnb_thr),
+        ("Draw No Bet", "Draw No Bet: Away", d["DNB_Away"], dnb_thr),
     ]
 
 
@@ -1643,14 +1707,10 @@ def _last_snapshot_ts_bulk(fids: List[int]) -> Dict[int, int]:
     """
     Most recent tip_snapshots.created_ts per fixture, in ONE query per scan.
 
-    Backs the time-based harvest cadence below. Reading from the table rather
-    than an in-process dict means the cadence survives restarts and stays
-    correct when more than one instance is scanning.
-
-    On failure this returns {}, which makes every fixture look un-harvested and
-    therefore harvests on this scan. That is the safe direction to fail: the
-    cost is at most one extra row per fixture per scan, versus silently
-    starving training of data.
+    Reading from the table rather than an in-process dict means the harvest
+    cadence survives restarts and stays correct with more than one instance
+    scanning. On failure this returns {}, which makes every fixture look
+    un-harvested and therefore harvests on this scan — the safe direction.
     """
     ids = [int(f) for f in set(fids) if f]
     if not ids:
@@ -1677,9 +1737,7 @@ def production_scan() -> Tuple[int, int]:
     now_ts = int(time.time())
     pred_rows: List[tuple] = []
     harvested = 0
-    # Guarded at the call site as well as inside: harvesting is a side concern,
-    # and nothing about it should be able to take down a whole scan of every
-    # live fixture. Worst case we fall back to {} and harvest this round.
+    no_coverage = 0
     last_snap: Dict[int, int] = {}
     if HARVEST_MODE:
         try:
@@ -1696,30 +1754,26 @@ def production_scan() -> Tuple[int, int]:
 
             raw, feat = extract_features(m)
             minute = int(feat.get("minute", 0))
-            if minute < TIP_MIN_MINUTE or not stats_coverage_ok(raw, minute):
+            if minute < TIP_MIN_MINUTE:
                 continue
 
-            # Harvesting happens BEFORE the duplicate check. These are two
-            # different concerns: the cooldown exists to stop us tipping the
-            # same fixture repeatedly, not to stop us recording what happened
-            # in it. Under the old ordering the dup check `continue`d first, so
-            # a fixture that had been tipped (or, before the HARVEST fix, one
-            # that had merely been harvested) stopped producing training rows
-            # for the whole cooldown window.
+            # Harvest BEFORE the coverage and duplicate gates. Three separate
+            # concerns, previously collapsed into one:
+            #   - the cooldown stops us TIPPING a fixture repeatedly
+            #   - the coverage gate stops us TIPPING on an all-zero stats vector
+            #   - harvesting is DATA COLLECTION and should be blocked by neither
             #
-            # FIX (harvest rate): the cadence was `minute % HARVEST_EVERY_MINUTES
-            # == 0`, which fires only when the elapsed minute the API happens to
-            # report at scan time is divisible by 3. Nothing aligns the scan
-            # schedule (SCAN_INTERVAL_SEC, default 300) with that arithmetic, so
-            # roughly two thirds of scans harvested nothing — and a fixture whose
-            # observed minute never landed on a multiple of 3 was never harvested
-            # at all. Simulating scans at the default interval: ~5.2 snapshots per
-            # match under the old rule versus ~15.2 under this one.
+            # THE REGRESSION THIS FIXES: I moved stats_coverage_ok() ahead of
+            # the harvest block and tightened it from minute 35 to minute 8. Any
+            # fixture whose /fixtures/statistics feed was empty then hit
+            # `continue` before harvesting. Six hours of logs: 33 scans,
+            # 316 live fixtures seen, harvested=1. In-play data collection was
+            # effectively dead, which is also why candidates_logged was 0 —
+            # live predictions are logged on the harvest tick.
             #
-            # The rule is now what was actually meant all along: harvest when this
-            # fixture's last snapshot is at least HARVEST_EVERY_MINUTES old. It
-            # degrades correctly if SCAN_INTERVAL_SEC changes, since it is stated
-            # in time rather than in whatever minute a scan happens to observe.
+            # The cadence is stated in TIME, not "the elapsed minute happens to
+            # be divisible by 3", because nothing aligns the scan schedule with
+            # that arithmetic.
             is_harvest_tick = (
                 HARVEST_MODE
                 and minute >= TRAIN_MIN_MINUTE
@@ -1732,6 +1786,13 @@ def production_scan() -> Tuple[int, int]:
                     harvested += 1
                 except Exception as e:
                     log.warning("[HARVEST] snapshot failed for %s: %s", fid, e)
+
+            # Coverage governs TIPPING only. An all-zero stats vector makes the
+            # model output sigmoid(intercept), which carries no match
+            # information — fine to record, not fine to bet on.
+            if not stats_coverage_ok(raw, minute):
+                no_coverage += 1
+                continue
 
             if DUP_COOLDOWN_MIN > 0:
                 with db_conn() as c:
@@ -1758,6 +1819,7 @@ def production_scan() -> Tuple[int, int]:
             per_match = 0
             taken: List[str] = []
             base_now = int(time.time())
+            fixture_preds: List[tuple] = []
 
             for idx, (market_txt, suggestion, prob, thr) in enumerate(candidates):
                 below = prob * 100.0 < thr
@@ -1773,10 +1835,10 @@ def production_scan() -> Tuple[int, int]:
                             pc["decision"] = "correlated_with_existing_tip"
 
                 if PREDICTION_LOG_ENABLE and (is_harvest_tick or pc["passed"]) and prob >= PREDICTION_LOG_MIN_PROB:
-                    pred_rows.append((fid, league_id, kickoff, base_now, "live", minute,
-                                      market_txt, suggestion, float(prob), float(thr),
-                                      pc.get("odds"), pc.get("fair_prob"), pc.get("ev_pct"),
-                                      pc["decision"]))
+                    fixture_preds.append((fid, league_id, kickoff, base_now, "live", minute,
+                                          market_txt, suggestion, float(prob), float(thr),
+                                          pc.get("odds"), pc.get("fair_prob"), pc.get("ev_pct"),
+                                          pc["decision"]))
 
                 if not pc["passed"]:
                     continue
@@ -1812,6 +1874,7 @@ def production_scan() -> Tuple[int, int]:
                     break
                 if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
                     break
+            pred_rows.extend(_trim_fixture_predictions(fixture_preds))
             if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
                 break
         except Exception as e:
@@ -1819,8 +1882,15 @@ def production_scan() -> Tuple[int, int]:
             continue
 
     _log_predictions(pred_rows)
-    log.info("[PROD] saved=%d live_seen=%d candidates_logged=%d harvested=%d",
-             saved, live_seen, len(pred_rows), harvested)
+    log.info("[PROD] saved=%d live_seen=%d candidates_logged=%d harvested=%d no_coverage=%d",
+             saved, live_seen, len(pred_rows), harvested, no_coverage)
+    if live_seen and no_coverage >= live_seen:
+        # Every live fixture lacked usable statistics. Harvesting still runs, but
+        # the rows are goals/minute only and nothing can be tipped. Usually means
+        # the API plan does not include /fixtures/statistics.
+        log.warning("[PROD] no fixture had usable statistics this scan (%d live). "
+                    "Check that your API-Football plan includes /fixtures/statistics — "
+                    "without it the in-play model has nothing to score.", live_seen)
     return saved, live_seen
 
 
@@ -1988,6 +2058,7 @@ def prematch_scan_save() -> int:
         per_match = 0
         taken: List[str] = []
         base_now = int(time.time())
+        fixture_preds: List[tuple] = []
 
         for idx, (mk, sug, prob, thr) in enumerate(candidates):
             below = prob * 100.0 < thr
@@ -2003,9 +2074,10 @@ def prematch_scan_save() -> int:
                         pc["decision"] = "correlated_with_existing_tip"
 
             if PREDICTION_LOG_ENABLE and prob >= PREDICTION_LOG_MIN_PROB:
-                pred_rows.append((fid, league_id, kickoff, base_now, "prematch", 0,
-                                  f"PRE {mk}", sug, float(prob), float(thr),
-                                  pc.get("odds"), pc.get("fair_prob"), pc.get("ev_pct"), pc["decision"]))
+                fixture_preds.append((fid, league_id, kickoff, base_now, "prematch", 0,
+                                      f"PRE {mk}", sug, float(prob), float(thr),
+                                      pc.get("odds"), pc.get("fair_prob"), pc.get("ev_pct"),
+                                      pc["decision"]))
 
             if not pc["passed"]:
                 continue
@@ -2025,11 +2097,6 @@ def prematch_scan_save() -> int:
                      float(pct), float(prob), created_ts, pc.get("odds"), pc.get("book"),
                      pc.get("ev_pct"), pc.get("fair_prob"), kickoff, stake))
 
-            # FIX (audit 3.2): prematch tips are sent HERE, with prematch
-            # formatting. Previously they were inserted with sent_ok=0 and only
-            # leaked out via retry_unsent_tips(), formatted as an in-play tip
-            # reading "Minute: 0' | Score: 0-0", and were orphaned forever if
-            # they aged past the 30-minute retry window.
             sent = send_telegram(_format_tip_message(
                 home, away, league, 0, "", sug, pct, None,
                 pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"),
@@ -2044,6 +2111,8 @@ def prematch_scan_save() -> int:
             taken.append(sug)
             if per_match >= max(1, PREDICTIONS_PER_MATCH):
                 break
+
+        pred_rows.extend(_trim_fixture_predictions(fixture_preds))
 
     _log_predictions(pred_rows)
     log.info("[PREMATCH] saved=%d candidates_logged=%d", saved, len(pred_rows))
@@ -2120,13 +2189,8 @@ def _api_fixtures_by_league_season(league_id: int, season: int) -> Tuple[List[di
 def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str, int]:
     """
     Reconstructs prematch training data for past seasons of one league using
-    ~1 bulk API call per season.
-
-    FIX (audit 1.9): snapshots and results are stamped with the fixture's
-    KICKOFF timestamp, not time.time(). Previously every backfilled fixture
-    carried today's date, so once the time split was fixed a 2023 match would
-    have sorted AFTER a match from last week and landed in the test set —
-    training on recent data and testing on three-year-old matches.
+    ~1 bulk API call per season. Snapshots and results are stamped with the
+    fixture's KICKOFF timestamp, not time.time().
     """
     all_fx: Dict[int, dict] = {}
     diags: Dict[str, dict] = {}
@@ -2293,19 +2357,18 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
         "by_market": market_summary,
         "equity_curve": equity,
         "note": ("Real odds captured at tip time, never synthetic. Tips sent without odds are "
-                 "excluded — there is no price to grade them against. Historical-backfilled "
-                 "fixtures are excluded for the same reason. If mean_clv_pct is negative while "
-                 "roi_pct is positive, treat the ROI as variance, not edge."),
+                 "excluded — there is no price to grade them against. Draw No Bet pushes on a "
+                 "draw and is excluded rather than counted as a loss. If mean_clv_pct is "
+                 "negative while roi_pct is positive, treat the ROI as variance, not edge."),
     }
 
 
 def compute_calibration(days: Optional[int] = None, phase: Optional[str] = None,
                         min_n: int = 20) -> Dict[str, Any]:
     """
-    FIX (audit 2.4): reads from `predictions`, which records every candidate
-    evaluated, not from `tips`, which by construction only contains candidates
-    that already cleared the threshold. Calibrating on a threshold-filtered
-    sample cannot detect miscalibration in the region you filter on.
+    Reads from `predictions`, which records every candidate evaluated, not from
+    `tips`, which by construction only contains candidates that already cleared
+    the threshold.
     """
     cutoff = int(time.time()) - days * 86400 if days else 0
     q = """
@@ -2342,8 +2405,6 @@ def compute_calibration(days: Optional[int] = None, phase: Optional[str] = None,
         if len(arr) < min_n:
             continue
         n = len(arr)
-        # FIX (audit 2.4 minor): expected = MEAN predicted probability in the
-        # bucket, not the bucket midpoint.
         expected = 100.0 * sum(p for p, _ in arr) / n
         actual = 100.0 * sum(y for _, y in arr) / n
         out[f"{lo*100:.0f}-{hi*100:.0f}%"] = {
@@ -2356,22 +2417,14 @@ def compute_calibration(days: Optional[int] = None, phase: Optional[str] = None,
             "n_graded": total_n,
             "overall_gap_pct": round(weighted_gap / total_n, 2) if total_n else None,
             "source": "predictions (all evaluated candidates, unfiltered)",
-            "note": "A large negative gap means overconfidence in that band. Because this reads "
-                    "the unfiltered prediction log, bands BELOW your live threshold are visible "
-                    "too — which is where miscalibration usually starts."}
+            "note": "A large negative gap means overconfidence in that band. Bands BELOW your "
+                    "live threshold are visible too — which is where miscalibration starts."}
 
 
 def compute_market_significance(days: Optional[int] = None, min_n: int = 50) -> Dict[str, Any]:
     """
-    FIX (audit 2.3), two changes:
-
-    1. Variance. Bets have heterogeneous probabilities, so the correct standard
-       error for the count of wins is sqrt(Σ pᵢ(1-pᵢ)) / n (Poisson-binomial),
-       not sqrt(p̄(1-p̄)/n).
-    2. Vig. The benchmark is now the DE-VIGGED fair probability stored on the
-       tip. Comparing against 1/odds benchmarks you against a target that
-       includes the bookmaker's margin — a target you can never beat, which
-       makes a genuinely profitable model look insignificant.
+    Benchmark is the DE-VIGGED fair probability stored on the tip, and the
+    variance is Poisson-binomial because the bets have different probabilities.
     """
     cutoff = int(time.time()) - days * 86400 if days else 0
     with db_conn() as c:
@@ -2413,26 +2466,16 @@ def compute_market_significance(days: Optional[int] = None, min_n: int = 50) -> 
         }
     return {"by_market": out, "min_n_required": min_n,
             "tips_without_fair_price_skipped": skipped_no_fair,
-            "note": "Benchmark is the de-vigged fair probability, not 1/odds. Poisson-binomial "
-                    "variance is used because the bets have different probabilities."}
+            "note": "Benchmark is the de-vigged fair probability, not 1/odds."}
 
 
 def monte_carlo_bankroll(days: Optional[int], initial_bankroll: float, stake_pct: float,
                          simulations: int = 5000, ruin_pct: float = 20.0) -> Dict[str, Any]:
     """
-    FIX (audit 2.1 and 2.2), three changes:
-
-    1. Ruin was structurally impossible. With percentage staking the bankroll is
-       multiplied by (1 - stake_pct/100) on a loss, so it approaches zero
-       asymptotically and only reaches <= 0 if you stake 100%. The old
-       probability_of_ruin_pct was always 0.00 regardless of how bad the edge
-       was. Ruin is now "bankroll fell below ruin_pct of its starting value".
-    2. It permuted a fixed multiset, so every simulation had an identical
-       win/loss count and only the ORDER varied. That collapses the outcome
-       distribution. Now resamples WITH replacement.
-    3. It resampled individual bets, ignoring that multiple tips on one fixture
-       move together. Now resamples at the MATCH level so correlated bets stay
-       together.
+    Bootstrap (with replacement) over real graded history, resampled at the
+    FIXTURE level so correlated same-match bets move together. Ruin is a
+    drawdown threshold, because with percentage staking a bankroll approaches
+    zero asymptotically and never reaches it.
     """
     simulations = max(1, int(simulations))
     cutoff = int(time.time()) - days * 86400 if days else 0
@@ -2470,7 +2513,7 @@ def monte_carlo_bankroll(days: Optional[int], initial_bankroll: float, stake_pct
         max_dd = 0.0
         ruined = False
         for _i in range(n_draws):
-            grp = random.choice(groups)  # with replacement, whole fixture at a time
+            grp = random.choice(groups)
             for odds, outcome in grp:
                 s = bankroll * (stake_pct / 100.0)
                 bankroll += s * (odds - 1.0) if outcome == 1 else -s
@@ -2497,8 +2540,6 @@ def monte_carlo_bankroll(days: Optional[int], initial_bankroll: float, stake_pct
         "worst_10pct_final_bankroll": round(finals[int(n * 0.1)], 2),
         "best_10pct_final_bankroll": round(finals[min(n - 1, int(n * 0.9))], 2),
         "avg_max_drawdown_pct": round(sum(max_dds) / len(max_dds), 1),
-        "note": "Bootstrap (with replacement) over your real graded history, resampled at the "
-                "FIXTURE level so correlated same-match bets move together.",
     }
 
 
@@ -2560,8 +2601,7 @@ def daily_accuracy_digest() -> Optional[str]:
     total = graded = wins = pushes = 0
     by: Dict[str, Dict[str, int]] = {}
     for (mkt, sugg, gh, ga, btts) in rows:
-        total += 1  # FIX (audit 2.5): counted before the grading guard, so
-        # "Tips sent" no longer equals "Graded" by construction.
+        total += 1  # counted before the grading guard, so "Sent" != "Graded"
         if gh is None:
             continue
         out = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
@@ -2640,14 +2680,8 @@ def auto_train_job():
 
 
 def auto_tune_thresholds(days: int = 30) -> Dict[str, float]:
-    """
-    Reads from `predictions` rather than `tips`.
-
-    The old version tuned on realised tips only, which are already filtered by
-    the current threshold — a closed loop that can observe the region above the
-    threshold but never learn that the region below it was fine, so it could
-    only ratchet in one direction.
-    """
+    """Reads from `predictions` rather than `tips`, so it can observe the region
+    below the current threshold rather than ratcheting in one direction."""
     if not AUTO_TUNE_ENABLE:
         return {}
     cutoff = int(time.time()) - days * 86400
@@ -2697,7 +2731,7 @@ def auto_tune_thresholds(days: int = 30) -> Dict[str, float]:
 
 
 def retry_unsent_tips(minutes: int = 120, limit: int = 200) -> int:
-    """Both scan paths now send inline; this only catches Telegram outages."""
+    """Both scan paths send inline; this only catches Telegram outages."""
     cutoff = int(time.time()) - minutes * 60
     with db_conn() as c:
         rows = c.execute(
@@ -2793,12 +2827,10 @@ def _start_scheduler_once():
 
 def _shutdown(signum=None, frame=None):
     """
-    FIX (audit 3.1): the old handler closed the DB pool and the HTTP session and
-    then RETURNED. Installing a SIGTERM handler replaces the default terminate
-    behaviour, so the process kept running — with a dead connection pool and a
-    closed session — until the platform escalated to SIGKILL. Every request and
-    scheduled job in that window failed. Now it stops the scheduler, releases
-    resources, and actually exits.
+    Installing a SIGTERM handler REPLACES the default terminate behaviour, so a
+    handler that only releases resources and returns leaves the process running
+    with a dead connection pool until the platform escalates to SIGKILL. This
+    stops the scheduler, releases resources, and exits.
     """
     log.info("[SHUTDOWN] signal %s received", signum)
     try:
@@ -2831,7 +2863,7 @@ def _require_admin():
     body = request.get_json(silent=True) if request.is_json else None
     key = (request.headers.get("X-API-Key") or request.args.get("key")
            or ((body or {}).get("key") if body else None))
-    if not ADMIN_API_KEY or not key or not hmac.compare_digest(str(key), str(ADMIN_API_KEY)):
+    if not ADMIN_API_KEY or not key or not _safe_compare(key, ADMIN_API_KEY):
         abort(401)
 
 
@@ -3026,6 +3058,37 @@ def http_league_breakdown():
         market=request.args.get("market"), days=_arg_int("days"), min_n=_arg_int("min_n", 20))})
 
 
+@app.route("/admin/thresholds", methods=["GET"])
+def http_thresholds():
+    """
+    Every market's live threshold in one view, with derived markets flagged.
+
+    A derived market showing "SUPPRESSED (never verified)" means training has
+    not written a threshold for it — it will not fire, which is correct until
+    it has passed a holdout.
+    """
+    _require_admin()
+    markets = ["BTTS", "1X2", "Double Chance", "Draw No Bet"] + \
+              [f"Over/Under {_fmt_line(l)}" for l in OU_LINES]
+    out = {}
+    for phase_prefix in ("", "PRE "):
+        for mk in markets:
+            label = f"{phase_prefix}{mk}"
+            raw = get_setting_cached(f"conf_threshold:{label}")
+            effective = _get_market_threshold(label)
+            out[label] = {
+                "stored": float(raw) if raw is not None else None,
+                "effective_pct": round(effective, 2),
+                "derived_market": mk in DERIVED_MARKETS,
+                "locked": _is_threshold_locked(label),
+                "status": ("SUPPRESSED (never verified)" if raw is None and mk in DERIVED_MARKETS
+                           else "suppressed" if effective >= MAX_THRESH
+                           else "active" if raw is not None
+                           else "default (untrained)"),
+            }
+    return jsonify({"ok": True, "max_thresh": MAX_THRESH, "thresholds": out})
+
+
 @app.route("/admin/status", methods=["GET"])
 def http_status():
     _require_admin()
@@ -3047,14 +3110,17 @@ def http_status():
         metrics = json.loads(metrics_raw) if metrics_raw else None
     except Exception:
         metrics = None
+    snap_ratio = (float(n_tip_snap) / n_snap_matches) if n_snap_matches else 0.0
     return jsonify({
         "ok": True,
         "harvest": {"tip_snapshots": int(n_tip_snap), "distinct_matches_snapshotted": int(n_snap_matches),
+                    "snapshots_per_match": round(snap_ratio, 2),
                     "prematch_snapshots": int(n_pre_snap), "match_results_resolved": int(n_results),
                     "match_results_with_league_id": int(n_has_league),
                     "distinct_leagues": int(n_leagues), "teams_rated": int(n_rated)},
         "tips": {"total": int(n_tips), "unsent": int(n_unsent), "with_closing_price": int(n_clv)},
         "predictions_logged": int(n_preds),
+        "dashboard_enabled": DASHBOARD_ENABLED,
         "last_training_run": metrics,
     })
 
@@ -3080,28 +3146,71 @@ def http_settings(key: str):
 
 
 # ───────── Web dashboard ─────────
-# Browser-facing alternative to the Telegram feed. Auth is session-based: the
-# admin key is checked once at /dashboard/login and, on success, a signed
-# (HttpOnly, SameSite=Lax) session cookie is set — the raw key is never
-# stored client-side or re-sent on every page load the way a bookmarked
-# ?key=... URL would. Read-only: nothing under /dashboard can train models,
-# trigger scans, or change settings.
+# Read-only browser view. Auth is session-based: the admin key is checked once
+# at /dashboard/login and a signed HttpOnly cookie is set, so the raw key is
+# never stored client-side or re-sent on every page load the way a bookmarked
+# ?key=... URL would be. Nothing here can train, scan, or change settings.
 DASHBOARD_REFRESH_SEC = int(os.getenv("DASHBOARD_REFRESH_SEC", "60"))
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "8"))
+LOGIN_WINDOW_SEC = int(os.getenv("LOGIN_WINDOW_SEC", "900"))
+_login_attempts: Dict[str, List[float]] = defaultdict(list)
+_login_lock = threading.Lock()
+
+
+def _login_rate_limited(ip: str) -> bool:
+    """
+    Throttle /dashboard/login. Without this the endpoint is an unthrottled
+    oracle for the admin key.
+
+    Per-process, so with N workers the effective limit is N x
+    LOGIN_MAX_ATTEMPTS. That is still a hard ceiling on guessing rate and needs
+    no shared state; a long random ADMIN_API_KEY remains the real defence.
+    """
+    now = time.time()
+    with _login_lock:
+        hits = [t for t in _login_attempts[ip] if now - t < LOGIN_WINDOW_SEC]
+        _login_attempts[ip] = hits
+        if len(_login_attempts) > 10000:      # bound memory
+            _login_attempts.clear()
+        return len(hits) >= LOGIN_MAX_ATTEMPTS
+
+
+def _login_record_failure(ip: str) -> None:
+    with _login_lock:
+        _login_attempts[ip].append(time.time())
 
 
 def _dashboard_authed() -> bool:
-    return bool(flask_session.get("dash_authed"))
+    return DASHBOARD_ENABLED and bool(flask_session.get("dash_authed"))
+
+
+def _dashboard_unavailable():
+    return jsonify({
+        "ok": False,
+        "error": "dashboard disabled",
+        "reason": "SECRET_KEY is not set. Without a fixed signing key each worker process "
+                  "signs session cookies differently, so logins fail at random.",
+        "fix": "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\" "
+               "and set it as the SECRET_KEY environment variable.",
+    }), 503
 
 
 @app.route("/dashboard/login", methods=["GET", "POST"])
 def dashboard_login():
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
     if request.method == "POST":
-        key = request.form.get("key", "")
-        if ADMIN_API_KEY and hmac.compare_digest(str(key), str(ADMIN_API_KEY)):
+        if _login_rate_limited(ip):
+            log.warning("[DASHBOARD] login rate-limited for %s", ip)
+            return render_template("dashboard_login.html",
+                                   error="Too many attempts. Try again later."), 429
+        if ADMIN_API_KEY and _safe_compare(request.form.get("key", ""), ADMIN_API_KEY):
             flask_session.clear()
             flask_session["dash_authed"] = True
             flask_session.permanent = True
             return redirect(url_for("dashboard"))
+        _login_record_failure(ip)
         return render_template("dashboard_login.html", error="Incorrect key."), 401
     if _dashboard_authed():
         return redirect(url_for("dashboard"))
@@ -3116,6 +3225,8 @@ def dashboard_logout():
 
 @app.route("/dashboard")
 def dashboard():
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
     if not _dashboard_authed():
         return redirect(url_for("dashboard_login"))
     return render_template("dashboard.html", refresh_sec=DASHBOARD_REFRESH_SEC)
@@ -3123,6 +3234,8 @@ def dashboard():
 
 @app.route("/dashboard/data")
 def dashboard_data():
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
     if not _dashboard_authed():
         abort(401)
     limit = max(1, min(200, _arg_int("limit", 50) or 50))
@@ -3148,8 +3261,6 @@ def dashboard_data():
 
 @app.route("/tips/latest")
 def http_latest():
-    # FIX (audit 3.5): this was the one route without auth, and it exposed the
-    # full tip history including prices and confidences.
     _require_admin()
     limit = max(1, min(500, _arg_int("limit", 50) or 50))
     with db_conn() as c:
@@ -3165,7 +3276,7 @@ def http_latest():
 
 @app.route("/telegram/webhook/<secret>", methods=["POST"])
 def telegram_webhook(secret: str):
-    if not WEBHOOK_SECRET or not hmac.compare_digest(str(WEBHOOK_SECRET), str(secret)):
+    if not WEBHOOK_SECRET or not _safe_compare(WEBHOOK_SECRET, secret):
         abort(403)
     update = request.get_json(silent=True) or {}
     try:
@@ -3180,9 +3291,7 @@ def telegram_webhook(secret: str):
             send_telegram(f"<pre>{escape(json.dumps(compute_clv(days=30), indent=2)[:3500])}</pre>")
         elif msg.startswith("/scan"):
             parts = msg.split()
-            # FIX (audit 3.6): was a plain == comparison, leaking timing
-            # information about the admin key one byte at a time.
-            if len(parts) > 1 and ADMIN_API_KEY and hmac.compare_digest(parts[1], str(ADMIN_API_KEY)):
+            if len(parts) > 1 and ADMIN_API_KEY and _safe_compare(parts[1], ADMIN_API_KEY):
                 s, l = production_scan()
                 send_telegram(f"🔁 Scan done. Saved: {s}, Live seen: {l}")
             else:
