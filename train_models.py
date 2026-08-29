@@ -912,15 +912,18 @@ def _wld_triple(heads: Dict[str, Tuple[bool, Optional[np.ndarray], Optional[np.n
 def _fit_1x2_threshold(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray,
                        buf: SettingsBuffer, summary: Dict[str, Any],
                        label: str, target_precision: float, min_preds: int,
-                       min_thresh: float, max_thresh: float) -> None:
+                       min_thresh: float, max_thresh: float) -> bool:
     """
     Pick the 1X2 threshold on EXACTLY the statistic serving compares against:
     the 3-way normalised per-side probability, pooled over home and away.
+
+    Returns True if the threshold survived its holdout. Double Chance and Draw
+    No Bet inherit that verdict — they are transforms of these same heads.
     """
     tri_ca = _wld_triple(heads, idx=1)
     if tri_ca is None:
         logger.info("[1X2] %s: home/away heads unavailable — threshold not set", label)
-        return
+        return False
     phn_ca, _pdn_ca, pan_ca = tri_ca
     gd_ca = gd[m_ca]
     probs_ca = np.concatenate([phn_ca, pan_ca])
@@ -945,34 +948,63 @@ def _fit_1x2_threshold(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray
 
     summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
     summary["metrics"][f"{label}_holdout_at_threshold"] = holdout
-    logger.info("[1X2] %s threshold %.2f%% (%s); holdout lift %s",
-                label, thr_pct, diag.get("method"), holdout.get("lift_over_base_pp"))
+    confirmed = thr_pct < max_thresh and diag.get("method") != "suppressed"
+    logger.info("[1X2] %s threshold %.2f%% (%s); holdout lift %s; confirmed=%s",
+                label, thr_pct, diag.get("method"), holdout.get("lift_over_base_pp"), confirmed)
+    return confirmed
+
+
+MIN_DERIVED_LIFT_PP = float(os.getenv("MIN_DERIVED_LIFT_PP", "3.0"))
 
 
 def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray,
                                    buf: SettingsBuffer, summary: Dict[str, Any],
                                    prefix: str, target_precision: float, min_preds: int,
-                                   min_thresh: float, max_thresh: float) -> None:
+                                   min_thresh: float, max_thresh: float,
+                                   parent_confirmed: bool) -> None:
     """
     Double Chance and Draw No Bet, verified rather than defaulted.
 
-    THE BUG THIS CLOSES: these two markets are algebraic transforms of the 1X2
-    heads, and main.py serves them — but training never wrote a threshold for
-    either, so _get_market_threshold() fell through to CONF_THRESHOLD (70).
-    PRE 1X2 could therefore sit suppressed at 85 for failing its holdout while
-    Double Chance, built from those same failed heads, fired at 70 on any
-    fixture with a competent home side (DC 1X is ~0.72 for a mid favourite and
-    ~0.82 for a strong one). That was a hole straight through the suppression
-    system.
+    No new model is fitted. The probabilities come from the already calibrated
+    1X2 triple via feature_spec.derive_dc_dnb — the same function serving uses —
+    and go through the identical pick-on-CAL, verify-on-HOLDOUT path as
+    everything else.
 
-    No new model is fitted. The probabilities are derived from the already
-    calibrated 1X2 triple via feature_spec.derive_dc_dnb — the same function
-    serving uses — and then put through the identical pick-on-CAL,
-    verify-on-HOLDOUT, suppress-on-failure path as everything else.
+    TWO EXTRA GATES, both forced by the first live run of this code:
+
+      PRE 1X2          lift 16.69pp = 2.19 SE  -> SUPPRESSED
+      PRE Double Chance lift  1.40pp           -> confirmed at 55%
+      PRE Draw No Bet   lift  6.53pp           -> confirmed at 55%
+
+    1. PARENT GATE. Double Chance and Draw No Bet are transforms of the very
+       heads that just failed their own holdout. It is incoherent for a derived
+       market to trade when the market it is derived from does not, so they now
+       inherit the 1X2 verdict: parent suppressed means derived suppressed.
+
+    2. ECONOMIC FLOOR. Double Chance pools three selections across the whole
+       holdout (~7,600 rows), which makes the standard error tiny — a 1.40pp
+       lift clears 2.5 SE purely on sample size. But DC prices sit at 1.15-1.40,
+       where 1.4pp over the base rate does not begin to cover the margin.
+       Statistical significance is necessary, not sufficient; a derived market
+       must also show at least MIN_DERIVED_LIFT_PP of actual lift.
 
     Draw No Bet voids on a draw, so drawn fixtures are excluded from its sample
-    rather than counted as losses; that matches how main.py grades it.
+    rather than counted as losses — matching how main.py grades it.
     """
+    if not parent_confirmed:
+        for name in ("Double Chance", "Draw No Bet"):
+            label = f"{prefix}{name}"
+            buf.set_threshold(label, float(max_thresh), summary)
+            summary.setdefault("metrics", {})[f"{label}_holdout_at_threshold"] = {
+                "action": "SUPPRESSED — parent 1X2 market did not pass its own holdout",
+                "derived_from": f"{prefix}WLD_* heads",
+                "lift_in_std_errors": None,
+            }
+        logger.warning("[DERIVED] %sDouble Chance / %sDraw No Bet suppressed at %.1f%% — "
+                       "the %s1X2 heads they derive from failed their holdout.",
+                       prefix, prefix, max_thresh, prefix)
+        return
+
     tri_ca = _wld_triple(heads, idx=1)
     if tri_ca is None:
         logger.info("[DERIVED] %sDouble Chance / Draw No Bet: 1X2 heads unavailable — "
@@ -988,7 +1020,7 @@ def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te
         g = gd[mask]
         if len(g) != len(ph):
             return None
-        d = np.array([derive_dc_dnb(a, b, c) for a, b, c in zip(ph, pd_, pa)])
+        d = [derive_dc_dnb(a, b, c) for a, b, c in zip(ph, pd_, pa)]
         p_1x = np.array([x["1X"] for x in d])
         p_x2 = np.array([x["X2"] for x in d])
         p_12 = np.array([x["12"] for x in d])
@@ -996,8 +1028,7 @@ def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te
         p_da = np.array([x["DNB_Away"] for x in d])
         dc_p = np.concatenate([p_1x, p_x2, p_12])
         dc_y = np.concatenate([(g >= 0).astype(int), (g <= 0).astype(int), (g != 0).astype(int)])
-        # Draw No Bet: drop draws entirely (stake returned, not a loss).
-        nd = g != 0
+        nd = g != 0  # Draw No Bet: drop draws entirely (stake returned).
         dnb_p = np.concatenate([p_dh[nd], p_da[nd]])
         dnb_y = np.concatenate([(g[nd] > 0).astype(int), (g[nd] < 0).astype(int)])
         return dc_p, dc_y, dnb_p, dnb_y
@@ -1029,6 +1060,19 @@ def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te
             y_ca, p_ca, y_te, p_te, label, buf, summary,
             target_precision, min_preds, min_thresh, max_thresh, 0.65, label,
             extra_diag={"derived_from": f"{prefix}WLD_* heads", "note": note})
+
+        # Economic floor, applied after the statistical one.
+        lift = holdout.get("lift_over_base_pp")
+        if thr_pct < max_thresh and lift is not None and lift < MIN_DERIVED_LIFT_PP:
+            buf.set_threshold(label, float(max_thresh), summary)
+            thr_pct = float(max_thresh)
+            holdout["action"] = (f"SUPPRESSED — holdout lift {lift}pp is below the "
+                                 f"{MIN_DERIVED_LIFT_PP}pp economic floor for a derived market. "
+                                 f"Significant only because the pooled sample is large; at "
+                                 f"1.15-1.40 prices it does not cover the margin.")
+            logger.warning("[DERIVED] %s: lift %.2fpp below the %.1fpp economic floor — "
+                           "suppressing at %.1f%%.", label, lift, MIN_DERIVED_LIFT_PP, max_thresh)
+
         summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
         summary["metrics"][f"{label}_holdout_at_threshold"] = holdout
         logger.info("[DERIVED] %s threshold %.2f%% (%s); holdout lift %s",
@@ -1131,10 +1175,11 @@ def train_models(
                     summary["metrics"][key] = mets
                 heads[key] = (ok, p_ca, p_te)
 
-            _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "1X2",
-                               target_precision, min_preds, min_thresh, max_thresh)
-            _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "",
+            parent_ok = _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "1X2",
                                            target_precision, min_preds, min_thresh, max_thresh)
+            _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "",
+                                           target_precision, min_preds, min_thresh, max_thresh,
+                                           parent_confirmed=parent_ok)
         else:
             reason = (f"have {n_ip} snapshots / {n_ip_matches} fixtures, "
                       f"need {need_ip} / {min_matches_inplay}")
@@ -1190,10 +1235,11 @@ def train_models(
                     summary["metrics"][key] = mets
                 heads[key.replace("PRE_", "")] = (ok, p_ca, p_te)
 
-            _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "PRE 1X2",
-                               target_precision, min_preds, min_thresh, max_thresh)
-            _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "PRE ",
+            parent_ok = _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "PRE 1X2",
                                            target_precision, min_preds, min_thresh, max_thresh)
+            _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "PRE ",
+                                           target_precision, min_preds, min_thresh, max_thresh,
+                                           parent_confirmed=parent_ok)
         else:
             reason = f"have {n_pre} rows, need {need_pre}"
             logger.info("Prematch: not enough data (%s).", reason)
