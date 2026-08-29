@@ -887,8 +887,36 @@ def _txt(v: Any) -> str:
     return v if isinstance(v, str) else str(v)
 
 
+# Markets whose names contain the words we match on but which are a DIFFERENT
+# BET from the full-time goals market they superficially resemble.
+#
+# The matcher below keys on "goals" / "total" / "over/under" appearing anywhere,
+# which also catches "Goals Over/Under First Half", "Total Corners" and
+# "Total Cards". Those parse cleanly — "Over 2.5", "Under 3.5" — and land in the
+# SAME OU_<line> keys as full-time goals. fetch_odds then keeps the best price
+# per selection, so the wrong-scope price wins whenever it is longer:
+#
+#   Under 3.5 corners  ~10.00   vs   Under 3.5 goals  ~1.30   -> 10.00 selected
+#   Over  2.5 1st half  ~6.20   vs   Over  2.5 goals  ~1.95   ->  6.20 selected
+#
+# The bet is then placed and priced against a market it has nothing to do with,
+# with enormous fabricated EV. This is a WRONG price, not a missing one, so no
+# downstream gate catches it — EV and fair-edge both look excellent.
+#
+# Until the crash on non-str values was fixed these markets usually raised and
+# took the whole fixture's odds down with them, which accidentally masked this.
+# With parsing now robust they succeed, so the contamination is live.
+_MARKET_SCOPE_EXCLUSIONS = (
+    "first half", "1st half", "second half", "2nd half", "half time", "halftime",
+    "home team", "away team", "exact", "corner", "card", "booking", "player",
+    "minute", "handicap", "asian", "odd/even", "odd or even", "shots", "offside",
+)
+
+
 def _market_name_normalize(s: Any) -> str:
     s = _txt(s).lower()
+    if any(w in s for w in _MARKET_SCOPE_EXCLUSIONS):
+        return s  # unrecognised -> _parse_book_market returns None
     if "both teams" in s or "btts" in s:
         return "BTTS"
     if "double chance" in s:
