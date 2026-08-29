@@ -67,6 +67,19 @@ FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
 DEFAULT_LEAGUE_RATES: Dict[str, float] = {"btts": 0.5, "ov25": 0.5, "ov35": 0.3}
 
+# How much the true probabilities of a market's selections sum to.
+#
+# This is NOT always 1.0, and getting it wrong silently halves every fair price.
+# Double Chance selections are not mutually exclusive — 1X, X2 and 12 each cover
+# two of the three outcomes, so P(1X) + P(X2) + P(12) = 2(P(H)+P(D)+P(A)) = 2.0.
+# See devig().
+MARKET_PROBABILITY_TOTAL: Dict[str, float] = {
+    "1X2": 1.0,
+    "BTTS": 1.0,
+    "DNB": 1.0,   # two mutually exclusive outcomes, draw is void
+    "DC": 2.0,    # three selections, each covering two of three outcomes
+}
+
 
 # ───────── In-play ─────────
 
@@ -399,12 +412,47 @@ def assemble_prematch_features(
     return {k: float(f.get(k, 0.0)) for k in PRE_FEATURES}
 
 
+# ───────── Derived 1X2 markets ─────────
+
+def derive_dc_dnb(p_home: float, p_draw: float, p_away: float) -> Dict[str, float]:
+    """
+    Double Chance and Draw No Bet probabilities from a normalised 1X2 triple.
+
+    Single implementation so serving and training compute these identically —
+    the same reason build_inplay_features() lives here.
+
+    Draw No Bet is conditional on the draw not happening (the stake is returned
+    on a draw), hence the ph+pa denominator. Double Chance is not conditional:
+    1X simply covers two outcomes, so its probability is the plain sum.
+    """
+    s = max(p_home + p_draw + p_away, 1e-12)
+    ph, pd, pa = p_home / s, p_draw / s, p_away / s
+    dnb_s = max(ph + pa, 1e-12)
+    return {
+        "1X": ph + pd,
+        "X2": pd + pa,
+        "12": ph + pa,
+        "DNB_Home": ph / dnb_s,
+        "DNB_Away": pa / dnb_s,
+    }
+
+
 # ───────── Market maths (de-vig, EV, Kelly) ─────────
 
-def devig(probs: Dict[str, float]) -> Dict[str, float]:
+def devig(probs: Dict[str, float], market_total: float = 1.0) -> Dict[str, float]:
     """
-    Multiplicative de-vig: divide each implied probability by the book's
-    overround so the market sums to 1.
+    Multiplicative de-vig: rescale implied probabilities so the market sums to
+    its true total, removing the bookmaker's overround.
+
+    THE market_total ARGUMENT IS NOT COSMETIC. It defaults to 1.0, which is
+    right for mutually exclusive markets (1X2, BTTS, Over/Under, Draw No Bet).
+    It is WRONG for Double Chance: 1X, X2 and 12 each cover two of three
+    outcomes, so their true probabilities sum to 2.0. Normalising DC to 1.0
+    halves every fair price — a fair P(1X) of 0.72 comes out as 0.36, which
+    then reads as a +36 percentage-point "edge" and trips the model-sanity cap
+    on every single Double Chance candidate.
+
+    See MARKET_PROBABILITY_TOTAL for the per-market values.
 
     This is the minimum correct treatment. Shin's method or the power method
     handle favourite-longshot bias better and are worth revisiting once you have
@@ -413,7 +461,8 @@ def devig(probs: Dict[str, float]) -> Dict[str, float]:
     s = sum(v for v in probs.values() if v and v > 0)
     if s <= 0:
         return {}
-    return {k: (v / s) for k, v in probs.items() if v and v > 0}
+    scale = float(market_total) / s
+    return {k: (v * scale) for k, v in probs.items() if v and v > 0}
 
 
 def ev(prob: float, odds: float) -> float:
@@ -439,9 +488,7 @@ def enforce_ou_monotonicity(line_probs: List[Tuple[float, float]]) -> Dict[float
     must obey: P(Over line) is non-increasing as the line rises. Over 3.5 can
     never be more likely than Over 2.5 — it is a strict subset of it — but
     OU_2.5 and OU_3.5 are separate logistic heads with no such constraint
-    baked in, and in practice they do occasionally cross (train_models.py's
-    module docstring flags this as a known, deliberately-deferred gap: "three
-    unconstrained logistic heads can and do emit P(Over 3.5) > P(Over 2.5)").
+    baked in, and in practice they do occasionally cross.
 
     This is pool-adjacent-violators (isotonic regression) for a non-increasing
     sequence: the least-squares projection of the raw probabilities onto the
