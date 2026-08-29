@@ -19,75 +19,51 @@ WHAT CHANGED, AND WHY IT MATTERED
    system has ever produced came out of that leaky split.
 
 2. CALIBRATION IS NO LONGER FITTED ON THE EVALUATION SET.
-   The old code fitted Platt scaling on y_te, then reported Brier / accuracy /
-   precision / F1 on the same y_te, then picked the operating threshold on the
-   same y_te. Three uses of one dataset. There is now a three-way time split:
-   fit on TRAIN, calibrate and pick thresholds on CAL, report metrics on a
-   HOLDOUT that nothing has touched.
+   Three-way time split: fit on TRAIN, calibrate and pick thresholds on CAL,
+   report metrics on a HOLDOUT that nothing has touched.
 
-3. THE SPLIT IS GROUPED BY MATCH.
-   In-play training now uses ALL snapshots per match instead of only the latest
-   one (see #4), which means rows within a match are heavily correlated. Splits
-   are therefore made at the MATCH level so the same fixture can never appear on
-   both sides of a boundary.
+3. THE SPLIT IS GROUPED BY MATCH, so correlated in-play snapshots from one
+   fixture cannot straddle a boundary.
 
 4. IN-PLAY TRAINING USES EVERY SNAPSHOT, NOT JUST THE LAST ONE.
-   The old query took MAX(created_ts) per match. You harvest every ~3 minutes,
-   so ~96% of the data was discarded — and the surviving row was always the
-   latest, i.e. minute 80-90. The model learned "Over 2.5 when three goals are
-   already in at minute 88", which is trivially true and inflates test metrics,
-   while at serving time _candidate_is_sane() blocks exactly those states. The
-   model was deployed entirely outside its training distribution.
 
-5. THE SCALER IS BACK, AND IT SHIPS WITH THE MODEL.
-   Removing StandardScaler fixed train/serve parity but left LogisticRegression
-   applying L2 (C=1.0) to raw features spanning 0/1 flags up to ~1500-point ELO
-   ratings. L2 penalises in the units of the feature, so ELO coefficients were
-   penalised roughly 1500x harder than binary flags — the best prematch signal
-   was being regularized out of existence. Models are now fitted on standardized
-   features and the fitted mean/scale are PERSISTED in the model blob, which
-   main.py._linpred() applies before scoring. Parity is preserved because the
-   transform travels with the weights.
+5. THE SCALER IS BACK, AND IT SHIPS WITH THE MODEL (mean/scale persisted in the
+   blob, applied by main.py._linpred), so L2 is scale-fair at fit time without
+   breaking serving parity.
 
-6. C IS TUNED, class_weight IS NOT "balanced".
-   Balanced weighting reshapes the intercept so predictions reflect a 50/50
-   prior rather than the true base rate — a large upward bias for a ~20% market
-   like Over 3.5. You are optimising for calibrated probability, not recall on
-   a rare class. C is now selected on the calibration split by log loss.
+6. C IS TUNED on the calibration split; class_weight is NOT "balanced".
 
 7. LEAGUE BASE RATES ARE COMPUTED FROM TRAINING MATCHES ONLY.
-   _compute_league_rate_map() aggregated over ALL of match_results, so for any
-   league near the min_n threshold each test match's own result was inside its
-   own league_btts_rate feature. It now takes an explicit set of training
-   match_ids.
 
 8. FEATURE LISTS LIVE IN feature_spec.py, SHARED WITH main.py.
-   The duplicated derivation logic is gone, along with the ~20 exactly collinear
-   or duplicated columns and the ~65 constant-zero live features that used to
-   pad PRE_FEATURES. See feature_spec.py for the full removal list.
 
 9. SETTINGS WRITES ARE BUFFERED AND FLUSHED IN ONE TRANSACTION.
-   Previously each head wrote its model to `settings` the moment it fitted, so a
-   failure part-way through left a half-updated set of models live. All writes
-   now accumulate in memory and commit atomically at the end of a successful run.
 
 10. SAMPLE-SIZE FLOOR SCALES WITH FEATURE COUNT.
-    MIN_ROWS defaulted to 150 while PRE_FEATURES had ~130 columns — 112 training
-    rows for 130 parameters, which forces near-perfect separation and pins
-    probabilities at 0 and 1. The floor is now max(MIN_ROWS, rows_per_feature *
-    n_features), with a separate floor on distinct matches for the in-play set.
+
+11. EVERY THRESHOLD IS VERIFIED ON THE HOLDOUT BEFORE IT IS WRITTEN. A
+    threshold picked on the calibration split is the best of ~90 grid points and
+    is biased upward. If its lift does not survive on the holdout at
+    MIN_HOLDOUT_LIFT_SE standard errors over at least MIN_HOLDOUT_SELECTIONS
+    selections, the market is suppressed instead.
+
+12. DOUBLE CHANCE AND DRAW NO BET ARE NOW TRAINED AND VERIFIED, NOT DEFAULTED.
+    These are algebraic transforms of the 1X2 heads, so they need no new model —
+    but they previously had no threshold written at all, which meant main.py's
+    _get_market_threshold() fell through to CONF_THRESHOLD (70). That was a hole
+    straight through the suppression system: PRE 1X2 could be suppressed at 85
+    for failing its holdout while Double Chance, derived from the very same
+    heads, fired at 70 on any fixture with a decent home side. Both markets now
+    get a threshold picked on CAL and verified on the HOLDOUT exactly like every
+    other market, and are suppressed the same way when they fail.
 
 NOT DONE IN THIS PASS, DELIBERATELY
 -----------------------------------
-A bivariate-Poisson / Dixon-Coles goal model. Over 2.5, Over 3.5 and BTTS are
-three views of ONE goal distribution; three unconstrained logistic heads can and
-do emit P(Over 3.5) > P(Over 2.5). A joint goal model gives all three coherently
-from ~6 parameters and would largely dissolve the sample-size problem. That is a
-genuine modelling change, not a bug fix, and it deserves a deliberate decision
-rather than being folded into a repair pass. Same for using the de-vigged
-closing line as a model FEATURE (the strongest single predictor available):
-that needs market probabilities attached to historical snapshots first, which
-main.py only started capturing with this release.
+A bivariate-Poisson / Dixon-Coles goal model, and using the de-vigged closing
+line as a model FEATURE. Both are genuine modelling changes that deserve a
+deliberate decision rather than being folded into a repair pass. The closing
+line as a feature additionally needs market probabilities attached to historical
+snapshots, which main.py only started capturing recently.
 """
 
 from __future__ import annotations
@@ -111,7 +87,7 @@ from sklearn.metrics import (
 from feature_spec import (
     DEFAULT_LEAGUE_RATES, FEATURES, PRE_FEATURES,
     LEAGUE_RATE_FIELDS_INPLAY, LEAGUE_RATE_FIELDS_PREMATCH,
-    build_inplay_features,
+    build_inplay_features, derive_dc_dnb,
 )
 
 try:
@@ -128,6 +104,7 @@ PGConnection = psycopg2.extensions.connection
 EPS = 1e-6
 DEFAULT_LEAGUE_RATE_MIN_N = int(os.getenv("LEAGUE_RATE_MIN_N", "20"))
 C_GRID = [float(x) for x in os.getenv("TRAIN_C_GRID", "0.01,0.03,0.1,0.3,1.0,3.0").split(",")]
+FALLBACK_DRAW_PROB = float(os.getenv("FALLBACK_DRAW_PROB", "0.26"))
 
 
 # ─────────────────────── DB helpers ─────────────────────── #
@@ -167,9 +144,7 @@ def _as_int(v: Any, default: int = 0) -> int:
 
     never falls through to the next candidate — it hands np.nan straight to
     int(), which raises "cannot convert float NaN to integer" and aborts the
-    entire training run. Every pre-existing tip_snapshots and match_results row
-    has a NULL kickoff_ts (the column was added by ALTER TABLE and backfilled as
-    NULL), so this fired on the first row of the first load.
+    entire training run.
     """
     if v is None:
         return default
@@ -198,12 +173,8 @@ def _first_int(*candidates: Any, default: int = 0) -> int:
 class SettingsBuffer:
     """
     Accumulates every settings write for a training run and commits them in ONE
-    transaction at the end.
-
-    Previously each _train_binary_head() call wrote its model straight to
-    `settings` as soon as it fitted, so a failure during prematch training left
-    the in-play models updated and the prematch ones stale — a silently
-    inconsistent live configuration with no way to tell from the outside.
+    transaction at the end, so a mid-run failure leaves the previously deployed
+    (self-consistent) model set live rather than a half-updated one.
     """
 
     def __init__(self, conn: PGConnection):
@@ -240,8 +211,6 @@ class SettingsBuffer:
             self.skipped_locked.append(label)
             return
         self.set(f"conf_threshold:{label}", f"{thr_pct:.2f}")
-        # FIX: every threshold is now recorded in the summary. Previously only
-        # 1X2 was, so the Telegram training message reported one market of eight.
         summary.setdefault("thresholds", {})[label] = round(float(thr_pct), 2)
 
     def flush(self) -> int:
@@ -300,22 +269,15 @@ def _ensure_training_tables(conn: PGConnection) -> None:
 def _compute_league_rate_map(conn: PGConnection, train_match_ids: Sequence[int],
                              min_n: int = DEFAULT_LEAGUE_RATE_MIN_N) -> Dict[Any, Dict[str, float]]:
     """
-    Per-league BTTS / Over 2.5 / Over 3.5 base rates, computed ONLY over matches
-    in the training split.
-
-    The old version aggregated over all of match_results, which meant a test
-    match's own outcome was baked into its own league-rate feature whenever that
-    league sat near min_n. Small leak, but it inflated precisely the two markets
-    the feature was added to rescue.
+    Per-league BTTS / Over 2.5 / Over 3.5 base rates over TRAINING matches only,
+    so a test match's own outcome is never inside its own league-rate feature.
     """
     ids = [i for i in (_as_int(x, 0) for x in train_match_ids) if i]
     if not ids:
         return {"__GLOBAL__": dict(DEFAULT_LEAGUE_RATES)}
     # NOTE the ::float casts on ALL THREE aggregates. Postgres AVG() over a
     # numeric expression returns `numeric`, which psycopg2 hands back as
-    # decimal.Decimal — and Decimal / float raises TypeError. Only `btts` was
-    # cast before, so the two CASE-based averages came back as Decimal and blew
-    # up the weighted-global calculation below.
+    # decimal.Decimal — and Decimal / float raises TypeError.
     df = _read_sql(conn, """
         SELECT league_id,
                AVG(btts_yes)::float AS btts,
@@ -327,8 +289,6 @@ def _compute_league_rate_map(conn: PGConnection, train_match_ids: Sequence[int],
     if df.empty:
         return {"__GLOBAL__": dict(DEFAULT_LEAGUE_RATES)}
 
-    # Belt and braces: coerce regardless of what the driver returned, so a
-    # future schema or driver change cannot reintroduce a Decimal here.
     for col in ("btts", "ov25", "ov35"):
         df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
     df["n"] = pd.to_numeric(df["n"], errors="coerce").fillna(0).astype("int64")
@@ -361,10 +321,7 @@ def _lookup_league_rate(rate_map: Dict[Any, Dict[str, float]], league_id) -> Dic
 def _apply_league_rates(df: pd.DataFrame, rate_map: Dict[Any, Dict[str, float]],
                         fields: Dict[str, str]) -> pd.DataFrame:
     for kind, col in fields.items():
-        df[col] = [
-            _lookup_league_rate(rate_map, lid)[kind]
-            for lid in df["_league_id"].tolist()
-        ]
+        df[col] = [_lookup_league_rate(rate_map, lid)[kind] for lid in df["_league_id"].tolist()]
     return df
 
 
@@ -383,7 +340,7 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
     """
     Loads EVERY harvested snapshot, not just the latest per match.
 
-    Snapshots written before this release used a different payload shape
+    Snapshots written before the schema-2 release used a different payload shape
     ({"stat": {...}, "minute": ..., "gh": ..., "ga": ...}); those are read
     through a compatibility shim so historical harvest is not thrown away.
     """
@@ -407,7 +364,6 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
 
         raw = payload.get("raw")
         if raw is None:
-            # Legacy schema-1 snapshot.
             legacy += 1
             stat = payload.get("stat") or {}
             raw = dict(stat)
@@ -426,8 +382,6 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
         ga_f = _as_int(row["final_goals_a"])
         f["_match_id"] = _as_int(row["match_id"])
         f["_league_id"] = row["league_id"] if pd.notna(row["league_id"]) else None
-        # Prefer the fixture's kickoff; fall back to the row's insert time for
-        # legacy rows written before kickoff_ts existed.
         f["_ts"] = _first_int(row["kickoff_ts"], row["res_kickoff"], row["created_ts"])
         if not f["_ts"]:
             no_ts += 1
@@ -476,9 +430,8 @@ def load_prematch_data(conn: PGConnection) -> pd.DataFrame:
         ga_f = _as_int(row["final_goals_a"])
         f["_match_id"] = _as_int(row["match_id"])
         f["_league_id"] = row["league_id"] if pd.notna(row["league_id"]) else None
-        # FIX: kickoff, not insert time. Historical-backfill rows all carried
-        # time.time(), so once the split was repaired a 2023 fixture would have
-        # sorted AFTER last week's and landed in the holdout.
+        # Kickoff, not insert time: historical-backfill rows all carried
+        # time.time(), which would sort a 2023 fixture after last week's.
         f["_ts"] = _first_int(row["kickoff_ts"], row["res_kickoff"],
                               payload.get("kickoff_ts"), row["created_ts"])
         if not f["_ts"]:
@@ -504,11 +457,6 @@ def grouped_time_split(df: pd.DataFrame, cal_size: float, test_size: float,
                        embargo_groups: int = 0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Three-way chronological split at the MATCH level.
-
-    Groups (fixtures) are ordered by their kickoff timestamp and assigned whole
-    to train / calibration / holdout, so correlated snapshots from one match
-    cannot straddle a boundary. An optional embargo drops a number of fixtures
-    either side of each boundary.
 
     Returns boolean masks aligned to df's own row order — which is the bug the
     old implementation had: it built positional indices on a re-indexed sorted
@@ -562,9 +510,9 @@ def _standardize(X_tr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 def _fit_lr(X: np.ndarray, y: np.ndarray, C: float) -> Optional[LogisticRegression]:
     if len(np.unique(y)) < 2:
         return None
-    # FIX: no class_weight="balanced". It rebases the intercept toward a 50/50
-    # prior, which is a large systematic upward bias on low-prevalence markets
-    # like Over 3.5. The objective here is a calibrated probability.
+    # No class_weight="balanced": it rebases the intercept toward a 50/50 prior,
+    # a large systematic upward bias on low-prevalence markets. The objective
+    # here is a calibrated probability, not recall on a rare class.
     return LogisticRegression(max_iter=3000, solver="liblinear", C=C).fit(X, y)
 
 
@@ -604,11 +552,10 @@ def build_model_blob(model: LogisticRegression, features: List[str],
                      mean: np.ndarray, scale: np.ndarray,
                      cal: Tuple[float, float], C: float) -> Dict[str, Any]:
     """
-    The blob now carries its own scaler. main.py._linpred() applies
+    The blob carries its own scaler. main.py._linpred() applies
     (x - mean)/scale per feature before the dot product, so the model can be
     fitted on standardized features (making L2 scale-fair) without breaking
-    serving parity — which is what the original StandardScaler removal was
-    working around.
+    serving parity.
     """
     return {
         "intercept": float(model.intercept_.ravel()[0]),
@@ -656,26 +603,13 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
     Smallest threshold reaching the precision target with at least min_preds
     selections, evaluated on the CALIBRATION split only.
 
-    TWO CHANGES, both forced by what the first two live runs showed.
-
-    1. THE TARGET IS NOW RELATIVE TO THE BASE RATE.
-       A fixed TARGET_PRECISION of 0.60 is not a filter for a market whose base
-       rate is already 0.59 — Over 2.5 "hit its 60% target" at precision 0.6054
-       and 0.6015 on two consecutive runs, i.e. about one point above simply
-       betting Over on everything, which is noise on ~1,000 selections. The
-       target is now max(TARGET_PRECISION, base_rate + TARGET_PRECISION_MARGIN),
-       so a market has to demonstrate it beats its own base rate, not an
-       arbitrary constant that may sit below it.
-
-    2. FAILING TO FIND A THRESHOLD NOW SUPPRESSES THE MARKET.
-       The old fallback was "best F1". For any market with prevalence above 50%
-       that is degenerate: F1 is maximised by predicting the positive class
-       everywhere, so the fallback returned the LOWEST possible threshold.
-       PRE_BTTS_YES landed there on both runs (method "best_f1", F1 0.6997,
-       clipped up to MIN_THRESH) — meaning the market that demonstrably has zero
-       signal was handed the most permissive threshold in the system. Backwards.
-       A market that cannot show precision above its base rate should go quiet,
-       not open up. Set THRESHOLD_FALLBACK=best_f1 to restore the old behaviour.
+    1. THE TARGET IS RELATIVE TO THE BASE RATE. A fixed 0.60 is not a filter for
+       a market whose base rate is already 0.59. Effective target is
+       max(TARGET_PRECISION, base_rate + TARGET_PRECISION_MARGIN).
+    2. FAILING TO FIND A THRESHOLD SUPPRESSES THE MARKET. The old best-F1
+       fallback is degenerate above 50% prevalence (F1 is maximised by
+       predicting positive everywhere), so it returned the LOWEST threshold for
+       exactly the markets with no signal.
     """
     y = y_true.astype(int)
     p = np.asarray(p, dtype=float)
@@ -725,14 +659,13 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
 
     diag["method"] = "suppressed"
     logger.warning("[THRESHOLD] no threshold beat base rate %.3f by %.0fpp with >=%d selections "
-                   "(best was %.4f). SUPPRESSING this market at %.1f%% — it has not demonstrated "
-                   "an edge over simply always betting the majority side.",
+                   "(best was %s). SUPPRESSING this market at %.1f%%.",
                    base_rate, THRESHOLD_MARGIN * 100, min_preds,
-                   best_prec if best_prec >= 0 else float("nan"), max_thresh_pct)
+                   f"{best_prec:.4f}" if best_prec >= 0 else "n/a", max_thresh_pct)
     return float(max_thresh_pct) / 100.0, diag
 
 
-# ─────────────────────── Core fit ─────────────────────── #
+# ─────────────────────── Holdout verification ─────────────────────── #
 
 MIN_HOLDOUT_SELECTIONS = int(os.getenv("MIN_HOLDOUT_SELECTIONS", "30"))
 MIN_HOLDOUT_LIFT_SE = float(os.getenv("MIN_HOLDOUT_LIFT_SE", "2.5"))
@@ -742,21 +675,12 @@ def _threshold_on_holdout(y_te: np.ndarray, p_te: np.ndarray, thr_prob: float) -
     """
     Re-measure a chosen threshold on data that had no part in choosing it.
 
-    This is the number that decides whether a market is real. The calibration
-    split's precision_at_threshold is the best of ~90 grid points, so it is
-    biased upward; the holdout figure is not. A market whose calibration lift is
-    +4pp and whose holdout lift is +0.8pp did not find an edge, it found a
-    fluctuation.
-
     The standard error is computed under the NULL (the base rate), not from the
     observed precision. Using the observed precision collapses the SE to zero
-    whenever a threshold selects a handful of rows that all lose — PRE_OU_3.5
-    selected exactly one holdout row, got it wrong, and reported a lift of
-    -12424 standard errors. Under the null the SE stays finite and the statistic
-    stays interpretable.
+    whenever a threshold selects a handful of rows that all lose.
     """
     if y_te is None or p_te is None or len(y_te) == 0 or len(p_te) == 0:
-        return {"note": "no holdout available"}
+        return {"note": "no holdout available", "lift_in_std_errors": None}
     sel = np.asarray(p_te) >= float(thr_prob)
     n_sel = int(sel.sum())
     base = float(np.mean(y_te))
@@ -790,9 +714,9 @@ def _holdout_verdict(holdout: Dict[str, Any]) -> Tuple[bool, str]:
     HONEST CAVEAT: using the holdout to make this go/no-go call means it is no
     longer a pristine holdout for that decision. The justification is that this
     is a single conservative bit — trade or don't — rather than parameter
-    selection, and the downside of the two errors is wildly asymmetric: wrongly
-    suppressing a market costs nothing but time, wrongly opening one costs
-    money. The only genuinely clean confirmation is live closing-line value.
+    selection, and the two errors are wildly asymmetric: wrongly suppressing a
+    market costs nothing but time, wrongly opening one costs money. The only
+    genuinely clean confirmation is live closing-line value.
     """
     n = holdout.get("n_at_threshold")
     if not n:
@@ -807,6 +731,42 @@ def _holdout_verdict(holdout: Dict[str, Any]) -> Tuple[bool, str]:
                        f"errors (need {MIN_HOLDOUT_LIFT_SE}) — consistent with noise")
     return True, f"holdout lift {holdout.get('lift_over_base_pp')}pp at {se} standard errors"
 
+
+def _decide_threshold(y_ca, p_ca, y_te, p_te, label: str, buf: "SettingsBuffer",
+                      summary: Dict[str, Any], target_precision: float, min_preds: int,
+                      min_thresh: float, max_thresh: float, default_thr_prob: float,
+                      ctx: str, extra_diag: Optional[Dict[str, Any]] = None
+                      ) -> Tuple[float, Dict[str, Any], Dict[str, Any]]:
+    """
+    Pick on CAL, verify on HOLDOUT, write only if confirmed.
+
+    Shared by every market — the plain binary heads, 1X2, Double Chance and
+    Draw No Bet — so no market can acquire a threshold without passing the same
+    bar. That was the gap that let Double Chance run on an unvalidated default.
+    """
+    thr_prob, diag = _pick_threshold(y_ca, p_ca, target_precision, min_preds,
+                                     default_thr_prob, max_thresh_pct=max_thresh)
+    if extra_diag:
+        diag.update(extra_diag)
+    thr_pct = float(np.clip(thr_prob * 100.0, min_thresh, max_thresh))
+    holdout = _threshold_on_holdout(y_te, p_te, thr_pct / 100.0)
+
+    if diag.get("method") != "suppressed":
+        confirmed, why = _holdout_verdict(holdout)
+        holdout["verdict"] = why
+        if not confirmed:
+            thr_pct = float(max_thresh)
+            holdout["action"] = "SUPPRESSED — calibration lift did not survive the holdout"
+            logger.warning("[HOLDOUT] %s: %s. Calibration said %s. Suppressing at %.1f%%.",
+                           ctx, why, diag.get("lift_over_base_pp"), thr_pct)
+        else:
+            holdout["action"] = "confirmed — threshold kept"
+
+    buf.set_threshold(label, thr_pct, summary)
+    return thr_pct, diag, holdout
+
+
+# ─────────────────────── Core fit ─────────────────────── #
 
 def _train_binary_head(
     buf: SettingsBuffer,
@@ -825,7 +785,7 @@ def _train_binary_head(
     Returns (ok, metrics, p_on_cal, p_on_holdout).
 
     Pipeline: standardize on TRAIN -> select C on CAL -> fit -> Platt on CAL ->
-    threshold on CAL -> metrics on HOLDOUT. No dataset is used twice.
+    threshold on CAL -> verify on HOLDOUT -> metrics on HOLDOUT.
     """
     ctx = metrics_name or model_key
     if not _validate(X_all, y_all, feature_names, ctx):
@@ -889,7 +849,6 @@ def _train_binary_head(
             "confusion_matrix": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
             "metrics_source": "holdout (untouched by fitting, calibration or thresholding)",
         })
-        # Calibration gap on the holdout: the honest headline number.
         mets["mean_predicted"] = float(np.mean(p_te))
         mets["mean_actual"] = float(np.mean(y_te))
         mets["calibration_gap_pct"] = round(100.0 * (mets["mean_actual"] - mets["mean_predicted"]), 2)
@@ -899,28 +858,14 @@ def _train_binary_head(
     else:
         mets["metrics_source"] = "unavailable (empty or single-class holdout)"
 
-    # Top weights are only meaningful now that collinear duplicates are gone.
     mets["feature_importance"] = dict(sorted(
         zip(feature_names, m.coef_.ravel().tolist()), key=lambda x: abs(x[1]), reverse=True)[:10])
 
     if threshold_label:
-        thr_prob, diag = _pick_threshold(y_ca, p_ca, target_precision, min_preds,
-                                         default_thr_prob, max_thresh_pct=max_thresh_pct)
-        thr_pct = float(np.clip(thr_prob * 100.0, min_thresh_pct, max_thresh_pct))
-        holdout = _threshold_on_holdout(y_te, p_te, thr_pct / 100.0)
-
-        if diag.get("method") != "suppressed":
-            confirmed, why = _holdout_verdict(holdout)
-            holdout["verdict"] = why
-            if not confirmed:
-                thr_pct = float(max_thresh_pct)
-                holdout["action"] = "SUPPRESSED — calibration lift did not survive the holdout"
-                logger.warning("[HOLDOUT] %s: %s. Calibration said %s. Suppressing at %.1f%%.",
-                               ctx, why, diag.get("lift_over_base_pp"), thr_pct)
-            else:
-                holdout["action"] = "confirmed — threshold kept"
-
-        buf.set_threshold(threshold_label, thr_pct, summary)
+        thr_pct, diag, holdout = _decide_threshold(
+            y_ca, p_ca, y_te, p_te, threshold_label, buf, summary,
+            target_precision, min_preds, min_thresh_pct, max_thresh_pct,
+            default_thr_prob, ctx)
         mets["threshold_pct"] = round(thr_pct, 2)
         mets["threshold_selection"] = diag
         mets["holdout_at_threshold"] = holdout
@@ -930,12 +875,164 @@ def _train_binary_head(
 
 def _effective_min_rows(n_features: int, min_rows_env: int, rows_per_feature: int) -> int:
     """
-    FIX: MIN_ROWS defaulted to 150 against ~130 prematch features. Below roughly
-    10-20 events per parameter, logistic regression drives toward perfect
-    separation, probabilities collapse to 0/1, and everything clears threshold —
-    which is a complete explanation for chronic overconfidence on its own.
+    Below roughly 10-20 events per parameter, logistic regression drives toward
+    perfect separation, probabilities collapse to 0/1, and everything clears
+    threshold — a complete explanation for chronic overconfidence on its own.
     """
     return max(int(min_rows_env), int(rows_per_feature) * int(n_features))
+
+
+# ─────────────────── 1X2 and derived markets ─────────────────── #
+
+def _wld_triple(heads: Dict[str, Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]],
+                idx: int) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Normalised (p_home, p_draw, p_away) over Home+Draw+Away for the cal split
+    (idx=1) or holdout split (idx=2). Mirrors main.py._wld_probs exactly.
+    """
+    def _get(key):
+        ok, *arrs = heads.get(key, (False, None, None))
+        return ok, (arrs[idx - 1] if len(arrs) >= idx else None)
+
+    ok_h, p_h = _get("WLD_HOME")
+    ok_d, p_d = _get("WLD_DRAW")
+    ok_a, p_a = _get("WLD_AWAY")
+    if not (ok_h and ok_a) or p_h is None or p_a is None or len(p_h) == 0:
+        return None
+    p_hc = np.clip(p_h, EPS, 1 - EPS)
+    p_ac = np.clip(p_a, EPS, 1 - EPS)
+    if ok_d and p_d is not None and len(p_d) == len(p_hc):
+        p_dc = np.clip(p_d, EPS, 1 - EPS)
+    else:
+        p_dc = np.full_like(p_hc, FALLBACK_DRAW_PROB)
+    s = np.maximum(p_hc + p_dc + p_ac, EPS)
+    return p_hc / s, p_dc / s, p_ac / s
+
+
+def _fit_1x2_threshold(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray,
+                       buf: SettingsBuffer, summary: Dict[str, Any],
+                       label: str, target_precision: float, min_preds: int,
+                       min_thresh: float, max_thresh: float) -> None:
+    """
+    Pick the 1X2 threshold on EXACTLY the statistic serving compares against:
+    the 3-way normalised per-side probability, pooled over home and away.
+    """
+    tri_ca = _wld_triple(heads, idx=1)
+    if tri_ca is None:
+        logger.info("[1X2] %s: home/away heads unavailable — threshold not set", label)
+        return
+    phn_ca, _pdn_ca, pan_ca = tri_ca
+    gd_ca = gd[m_ca]
+    probs_ca = np.concatenate([phn_ca, pan_ca])
+    ys_ca = np.concatenate([(gd_ca > 0).astype(int), (gd_ca < 0).astype(int)])
+
+    probs_te = ys_te = np.array([])
+    tri_te = _wld_triple(heads, idx=2)
+    if tri_te is not None:
+        phn_te, _pdn_te, pan_te = tri_te
+        gd_te = gd[m_te]
+        if len(gd_te) == len(phn_te):
+            probs_te = np.concatenate([phn_te, pan_te])
+            ys_te = np.concatenate([(gd_te > 0).astype(int), (gd_te < 0).astype(int)])
+
+    caveat = {"base_rate_caveat": (
+        "pooled home-or-away win rate; a high lift here is mechanical (favourites win more "
+        "than an average side) and is not an edge. Benchmark against the de-vigged market "
+        "price instead.")}
+    thr_pct, diag, holdout = _decide_threshold(
+        ys_ca, probs_ca, ys_te, probs_te, label, buf, summary,
+        target_precision, min_preds, min_thresh, max_thresh, 0.45, label, extra_diag=caveat)
+
+    summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
+    summary["metrics"][f"{label}_holdout_at_threshold"] = holdout
+    logger.info("[1X2] %s threshold %.2f%% (%s); holdout lift %s",
+                label, thr_pct, diag.get("method"), holdout.get("lift_over_base_pp"))
+
+
+def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray,
+                                   buf: SettingsBuffer, summary: Dict[str, Any],
+                                   prefix: str, target_precision: float, min_preds: int,
+                                   min_thresh: float, max_thresh: float) -> None:
+    """
+    Double Chance and Draw No Bet, verified rather than defaulted.
+
+    THE BUG THIS CLOSES: these two markets are algebraic transforms of the 1X2
+    heads, and main.py serves them — but training never wrote a threshold for
+    either, so _get_market_threshold() fell through to CONF_THRESHOLD (70).
+    PRE 1X2 could therefore sit suppressed at 85 for failing its holdout while
+    Double Chance, built from those same failed heads, fired at 70 on any
+    fixture with a competent home side (DC 1X is ~0.72 for a mid favourite and
+    ~0.82 for a strong one). That was a hole straight through the suppression
+    system.
+
+    No new model is fitted. The probabilities are derived from the already
+    calibrated 1X2 triple via feature_spec.derive_dc_dnb — the same function
+    serving uses — and then put through the identical pick-on-CAL,
+    verify-on-HOLDOUT, suppress-on-failure path as everything else.
+
+    Draw No Bet voids on a draw, so drawn fixtures are excluded from its sample
+    rather than counted as losses; that matches how main.py grades it.
+    """
+    tri_ca = _wld_triple(heads, idx=1)
+    if tri_ca is None:
+        logger.info("[DERIVED] %sDouble Chance / Draw No Bet: 1X2 heads unavailable — "
+                    "no thresholds set", prefix)
+        return
+    tri_te = _wld_triple(heads, idx=2)
+
+    def _selections(tri, mask):
+        """Returns (dc_probs, dc_labels, dnb_probs, dnb_labels) for one split."""
+        if tri is None:
+            return None
+        ph, pd_, pa = tri
+        g = gd[mask]
+        if len(g) != len(ph):
+            return None
+        d = np.array([derive_dc_dnb(a, b, c) for a, b, c in zip(ph, pd_, pa)])
+        p_1x = np.array([x["1X"] for x in d])
+        p_x2 = np.array([x["X2"] for x in d])
+        p_12 = np.array([x["12"] for x in d])
+        p_dh = np.array([x["DNB_Home"] for x in d])
+        p_da = np.array([x["DNB_Away"] for x in d])
+        dc_p = np.concatenate([p_1x, p_x2, p_12])
+        dc_y = np.concatenate([(g >= 0).astype(int), (g <= 0).astype(int), (g != 0).astype(int)])
+        # Draw No Bet: drop draws entirely (stake returned, not a loss).
+        nd = g != 0
+        dnb_p = np.concatenate([p_dh[nd], p_da[nd]])
+        dnb_y = np.concatenate([(g[nd] > 0).astype(int), (g[nd] < 0).astype(int)])
+        return dc_p, dc_y, dnb_p, dnb_y
+
+    sel_ca = _selections(tri_ca, m_ca)
+    sel_te = _selections(tri_te, m_te)
+    if sel_ca is None:
+        return
+    dc_p_ca, dc_y_ca, dnb_p_ca, dnb_y_ca = sel_ca
+    if sel_te is None:
+        dc_p_te = dc_y_te = dnb_p_te = dnb_y_te = np.array([])
+    else:
+        dc_p_te, dc_y_te, dnb_p_te, dnb_y_te = sel_te
+
+    for name, p_ca, y_ca, p_te, y_te, note in (
+        ("Double Chance", dc_p_ca, dc_y_ca, dc_p_te, dc_y_te,
+         "pooled 1X/X2/12; base rate is ~2/3 because each selection covers two of three "
+         "outcomes. Derived from the 1X2 heads — no independent model."),
+        ("Draw No Bet", dnb_p_ca, dnb_y_ca, dnb_p_te, dnb_y_te,
+         "draws excluded (stake returned). Derived from the 1X2 heads — no independent model."),
+    ):
+        label = f"{prefix}{name}"
+        if len(y_ca) == 0 or len(np.unique(y_ca)) < 2:
+            logger.info("[DERIVED] %s: no usable calibration sample — suppressing at %.1f%%",
+                        label, max_thresh)
+            buf.set_threshold(label, float(max_thresh), summary)
+            continue
+        thr_pct, diag, holdout = _decide_threshold(
+            y_ca, p_ca, y_te, p_te, label, buf, summary,
+            target_precision, min_preds, min_thresh, max_thresh, 0.65, label,
+            extra_diag={"derived_from": f"{prefix}WLD_* heads", "note": note})
+        summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
+        summary["metrics"][f"{label}_holdout_at_threshold"] = holdout
+        logger.info("[DERIVED] %s threshold %.2f%% (%s); holdout lift %s",
+                    label, thr_pct, diag.get("method"), holdout.get("lift_over_base_pp"))
 
 
 # ─────────────────────── Entry point ─────────────────────── #
@@ -1036,6 +1133,8 @@ def train_models(
 
             _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "1X2",
                                target_precision, min_preds, min_thresh, max_thresh)
+            _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "",
+                                           target_precision, min_preds, min_thresh, max_thresh)
         else:
             reason = (f"have {n_ip} snapshots / {n_ip_matches} fixtures, "
                       f"need {need_ip} / {min_matches_inplay}")
@@ -1080,10 +1179,6 @@ def train_models(
 
             gd = df_pre["final_goals_diff"].to_numpy(dtype=int)
             heads = {}
-            # FIX (paired with main.py's 1X2 fix): PRE_WLD_DRAW is now trained.
-            # Serving needs a draw probability to build a real 1X2 denominator;
-            # without it the only options are a Draw-No-Bet probability priced
-            # against 1X2 odds (the old bug) or a hardcoded draw prior.
             for key, y in (("PRE_WLD_HOME", (gd > 0)), ("PRE_WLD_DRAW", (gd == 0)),
                            ("PRE_WLD_AWAY", (gd < 0))):
                 ok, mets, p_ca, p_te = _train_binary_head(
@@ -1097,6 +1192,8 @@ def train_models(
 
             _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "PRE 1X2",
                                target_precision, min_preds, min_thresh, max_thresh)
+            _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "PRE ",
+                                           target_precision, min_preds, min_thresh, max_thresh)
         else:
             reason = f"have {n_pre} rows, need {need_pre}"
             logger.info("Prematch: not enough data (%s).", reason)
@@ -1122,8 +1219,7 @@ def train_models(
         buf.set("model_metrics_latest", json.dumps(bundle))
         buf.set(f"model_metrics:{trained_at.strftime('%Y%m%dT%H%M%SZ')}", json.dumps(bundle))
 
-        # Nothing has been written to `settings` until this line. A failure
-        # anywhere above leaves the previous, self-consistent model set live.
+        # Nothing has been written to `settings` until this line.
         buf.flush()
 
         logger.info("Trained: %s", [k for k, v in summary["trained"].items() if v])
@@ -1139,94 +1235,6 @@ def train_models(
             conn.close()
         except Exception:
             pass
-
-
-def _normalise_1x2(heads, key_h="WLD_HOME", key_d="WLD_DRAW", key_a="WLD_AWAY", idx=1):
-    """Return (p_home_norm, p_away_norm) over Home+Draw+Away, or (None, None)."""
-    ok_h, *ph_arrs = heads.get(key_h, (False, None, None))
-    ok_d, *pd_arrs = heads.get(key_d, (False, None, None))
-    ok_a, *pa_arrs = heads.get(key_a, (False, None, None))
-    p_h, p_a = ph_arrs[idx - 1], pa_arrs[idx - 1]
-    p_d = pd_arrs[idx - 1] if ok_d else None
-    if not (ok_h and ok_a) or p_h is None or p_a is None or len(p_h) == 0:
-        return None, None
-    p_hc = np.clip(p_h, EPS, 1 - EPS)
-    p_ac = np.clip(p_a, EPS, 1 - EPS)
-    p_dc = np.clip(p_d, EPS, 1 - EPS) if p_d is not None and len(p_d) == len(p_hc) \
-        else np.full_like(p_hc, 0.26)
-    s = np.maximum(p_hc + p_dc + p_ac, EPS)
-    return p_hc / s, p_ac / s
-
-
-def _fit_1x2_threshold(heads: Dict[str, Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]],
-                       gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray,
-                       buf: SettingsBuffer, summary: Dict[str, Any],
-                       label: str, target_precision: float, min_preds: int,
-                       min_thresh: float, max_thresh: float) -> None:
-    """
-    Pick the 1X2 threshold on EXACTLY the statistic serving compares against.
-
-    The old code picked it from three-way argmax correctness against
-    max(p_home, p_draw, p_away), while serving applied it as a per-side cut on a
-    two-way renormalised probability. Different quantity, different denominator,
-    different definition of "correct" — the number carried no information.
-
-    Here: normalise home/draw/away over their sum (the same thing main.py's
-    _wld_candidates does), then pool (p_home, home_won) and (p_away, away_won)
-    and choose the cut that reaches target precision on that pooled set.
-    """
-    phn_ca, pan_ca = _normalise_1x2(heads, idx=1)
-    if phn_ca is None:
-        logger.info("[1X2] %s: home/away heads unavailable — threshold not set", label)
-        return
-
-    gd_ca = gd[m_ca]
-    probs = np.concatenate([phn_ca, pan_ca])
-    ys = np.concatenate([(gd_ca > 0).astype(int), (gd_ca < 0).astype(int)])
-    thr_prob, diag = _pick_threshold(ys, probs, target_precision, min_preds, 0.45,
-                                     max_thresh_pct=max_thresh)
-    thr_pct = float(np.clip(thr_prob * 100.0, min_thresh, max_thresh))
-    holdout = _threshold_on_holdout_1x2(heads, gd, m_te, thr_prob)
-
-    if diag.get("method") != "suppressed":
-        confirmed, why = _holdout_verdict(holdout)
-        holdout["verdict"] = why
-        if not confirmed:
-            thr_pct = float(max_thresh)
-            holdout["action"] = "SUPPRESSED — calibration lift did not survive the holdout"
-            logger.warning("[HOLDOUT] %s: %s. Suppressing at %.1f%%.", label, why, thr_pct)
-        else:
-            holdout["action"] = "confirmed — threshold kept"
-
-    buf.set_threshold(label, thr_pct, summary)
-
-    # IMPORTANT CAVEAT, recorded in the payload so it cannot be misread later:
-    # base_rate here is the POOLED rate of "a given side (home or away) wins",
-    # around 0.38. Thresholding at >=0.55 selects strong favourites, which win
-    # more often than a randomly chosen side by construction. So a large
-    # lift_over_base_pp on 1X2 is largely mechanical and is NOT evidence of an
-    # edge. The only meaningful 1X2 benchmark is the de-vigged market price,
-    # which is measured live by /admin/diagnostics/significance.
-    diag["base_rate_caveat"] = ("pooled home-or-away win rate; a high lift here is mechanical "
-                                "(favourites win more than an average side) and is not an edge. "
-                                "Benchmark against the de-vigged market price instead.")
-    summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
-    summary["metrics"][f"{label}_holdout_at_threshold"] = holdout
-    logger.info("[1X2] %s threshold %.2f%% (%s); holdout lift %s",
-                label, thr_pct, diag.get("method"), holdout.get("lift_over_base_pp"))
-
-
-def _threshold_on_holdout_1x2(heads, gd: np.ndarray, m_te: np.ndarray,
-                              thr_prob: float) -> Dict[str, Any]:
-    phn_te, pan_te = _normalise_1x2(heads, idx=2)
-    if phn_te is None:
-        return {"note": "no holdout available"}
-    gd_te = gd[m_te]
-    if len(gd_te) != len(phn_te):
-        return {"note": "holdout length mismatch"}
-    probs = np.concatenate([phn_te, pan_te])
-    ys = np.concatenate([(gd_te > 0).astype(int), (gd_te < 0).astype(int)])
-    return _threshold_on_holdout(ys, probs, thr_prob)
 
 
 # ─────────────────────── CLI ─────────────────────── #
