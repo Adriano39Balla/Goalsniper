@@ -605,12 +605,26 @@ _BLOCK_PATTERNS = ["u17", "u18", "u19", "u20", "u21", "u23", "youth", "junior",
 
 
 def _blocked_league(league_obj: dict) -> bool:
+    """
+    LEAGUE_ALLOW_IDS, when set, is a hard allowlist: only those league IDs are
+    scanned and everything else is blocked, _BLOCK_PATTERNS/LEAGUE_DENY_IDS
+    included. There is no reliable "division tier" signal to pattern-match a
+    league name against (naming conventions vary per country - "Championship"
+    is England's 2nd tier, "Segunda División" is Spain's, neither looks
+    "lower" by name), so an opt-in allowlist of leagues actually worth their
+    API cost is the only safe way to cut the rest. Unset (the default),
+    behaviour is unchanged: block by name pattern, then by LEAGUE_DENY_IDS.
+    """
     lg = league_obj or {}
+    league_id = str(lg.get("id") or "")
+    allow = [x.strip() for x in os.getenv("LEAGUE_ALLOW_IDS", "").split(",") if x.strip()]
+    if allow:
+        return league_id not in allow
     txt = f"{lg.get('country','')} {lg.get('name','')} {lg.get('type','')}".lower()
     if any(p in txt for p in _BLOCK_PATTERNS):
         return True
     deny = [x.strip() for x in os.getenv("LEAGUE_DENY_IDS", "").split(",") if x.strip()]
-    return str(lg.get("id") or "") in deny
+    return league_id in deny
 
 
 def _kickoff_ts_of(fx: dict) -> int:
