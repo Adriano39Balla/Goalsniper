@@ -555,14 +555,45 @@ def send_telegram(text: str) -> bool:
 
 
 # ───────── API ─────────
+# In-process, resets when the UTC calendar day rolls over. This is visibility
+# only (single gunicorn worker per railway.json, so one counter is accurate) -
+# 429s used to be logged at DEBUG, i.e. invisible under the default INFO
+# level, so a plan running over its daily request cap failed silently with no
+# symptom beyond fewer tips. See /admin/status -> api_usage.
+_api_call_lock = threading.Lock()
+_api_call_stats = {"day": None, "total": 0, "rate_limited": 0}
+
+
+def _track_api_call(status_code: Optional[int]) -> Dict[str, Any]:
+    today = datetime.now(TZ_UTC).strftime("%Y-%m-%d")
+    with _api_call_lock:
+        if _api_call_stats["day"] != today:
+            _api_call_stats.update(day=today, total=0, rate_limited=0)
+        _api_call_stats["total"] += 1
+        if status_code == 429:
+            _api_call_stats["rate_limited"] += 1
+        return dict(_api_call_stats)
+
+
+def _api_call_stats_snapshot() -> Dict[str, Any]:
+    with _api_call_lock:
+        return dict(_api_call_stats)
+
+
 def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY:
         return None
     try:
         r = session.get(url, headers=HEADERS, params=params, timeout=timeout)
         if r.ok:
+            _track_api_call(None)
             return r.json()
-        log.debug("[API] HTTP %s for %s — %s", r.status_code, url, r.text[:200])
+        stats = _track_api_call(r.status_code)
+        if r.status_code == 429:
+            log.warning("[API] 429 rate-limited on %s (today: %d calls, %d rate-limited)",
+                        url, stats["total"], stats["rate_limited"])
+        else:
+            log.debug("[API] HTTP %s for %s — %s", r.status_code, url, r.text[:200])
         return None
     except Exception as e:
         log.debug("[API] request raised for %s: %s", url, e)
@@ -2445,20 +2476,24 @@ def compute_market_significance(days: Optional[int] = None, min_n: int = 50) -> 
     cutoff = int(time.time()) - days * 86400 if days else 0
     with db_conn() as c:
         rows = c.execute("""
-            SELECT t.market, t.suggestion, t.odds, t.fair_prob,
+            SELECT t.market, t.suggestion, t.odds, t.fair_prob, t.is_prematch,
                    r.final_goals_h, r.final_goals_a, r.btts_yes
             FROM tips t JOIN match_results r ON r.match_id = t.match_id
             WHERE t.suggestion<>'HARVEST' AND t.odds IS NOT NULL AND t.created_ts >= %s
         """, (cutoff,)).fetchall()
 
     by: Dict[str, List[Tuple[float, int]]] = {}
-    skipped_no_fair = 0
-    for (mkt, sugg, odds, fair, gh, ga, btts) in rows:
+    skipped_no_fair_pre = 0
+    skipped_no_fair_live = 0
+    for (mkt, sugg, odds, fair, is_prematch, gh, ga, btts) in rows:
         outcome = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
         if outcome is None:
             continue
         if fair is None:
-            skipped_no_fair += 1
+            if is_prematch:
+                skipped_no_fair_pre += 1
+            else:
+                skipped_no_fair_live += 1
             continue
         by.setdefault(mkt or "?", []).append((float(fair), outcome))
 
@@ -2481,7 +2516,10 @@ def compute_market_significance(days: Optional[int] = None, min_n: int = 50) -> 
             "statistically_significant": bool(abs(z) > 1.96),
         }
     return {"by_market": out, "min_n_required": min_n,
-            "tips_without_fair_price_skipped": skipped_no_fair,
+            "tips_without_fair_price_skipped": {
+                "pre": skipped_no_fair_pre, "live": skipped_no_fair_live,
+                "total": skipped_no_fair_pre + skipped_no_fair_live,
+            },
             "note": "Benchmark is the de-vigged fair probability, not 1/odds."}
 
 
@@ -3138,6 +3176,7 @@ def http_status():
         "predictions_logged": int(n_preds),
         "dashboard_enabled": DASHBOARD_ENABLED,
         "last_training_run": metrics,
+        "api_usage": _api_call_stats_snapshot(),
     })
 
 
