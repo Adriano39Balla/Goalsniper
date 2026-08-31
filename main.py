@@ -75,7 +75,7 @@ from urllib3.util.retry import Retry
 
 from feature_spec import (
     ELO_DEFAULT, ELO_HOME_ADV, ELO_K,
-    DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, RAW_INPLAY_KEYS,
+    DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS, RAW_INPLAY_KEYS,
     assemble_prematch_features, build_inplay_features, derive_dc_dnb,
     devig, ev as _ev, fixture_ts as _fixture_ts, kelly_fraction,
     enforce_ou_monotonicity,
@@ -798,6 +798,8 @@ def extract_raw_inplay(m: dict) -> Dict[str, float]:
 def extract_features(m: dict) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Returns (raw, features). Features come from feature_spec, shared with training."""
     raw = extract_raw_inplay(m)
+    fid = int((m.get("fixture") or {}).get("id") or 0)
+    raw.update(_market_fair_priors(fid, live=True))
     league_id = ((m.get("league") or {}).get("id"))
     lr = get_league_rates(int(league_id) if league_id else None)
     return raw, build_inplay_features(raw, lr)
@@ -1147,6 +1149,37 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
         fair = {k: (sum(v) / len(v)) for k, v in (fair_acc.get(mkey) or {}).items() if v}
         out[mkey] = {"best": sels, "fair": fair, "n_books": len(books_seen.get(mkey, ()))}
     ODDS_CACHE.set(key, out)
+    return out
+
+
+def _market_fair_priors(fid: int, live: bool) -> Dict[str, float]:
+    """
+    De-vigged consensus market probabilities as a MODEL INPUT feature, not
+    just the post-hoc price/EV gate _price_gate() already uses them for.
+    Feeding the market's own read to every model head is one of the
+    best-established calibration aids in sports modeling, and this reuses
+    the exact same fetch_odds()/devig() machinery already paid for - the
+    only change is fetching it before scoring instead of only after a
+    candidate already cleared its confidence threshold.
+
+    Falls back to NEUTRAL_MARKET_PRIORS per-market wherever odds are
+    unavailable or too thin to devig (see that constant for why).
+    """
+    out = dict(NEUTRAL_MARKET_PRIORS)
+    if not fid:
+        return out
+    odds_map = fetch_odds(fid, live=live) if API_KEY else {}
+    wld = (odds_map.get("1X2") or {}).get("fair") or {}
+    if all(k in wld for k in ("Home", "Draw", "Away")):
+        out["market_fair_home"] = float(wld["Home"])
+        out["market_fair_draw"] = float(wld["Draw"])
+        out["market_fair_away"] = float(wld["Away"])
+    ou25 = (odds_map.get("OU_2.5") or {}).get("fair") or {}
+    if "Over" in ou25:
+        out["market_fair_over25"] = float(ou25["Over"])
+    btts = (odds_map.get("BTTS") or {}).get("fair") or {}
+    if "Yes" in btts:
+        out["market_fair_btts_yes"] = float(btts["Yes"])
     return out
 
 

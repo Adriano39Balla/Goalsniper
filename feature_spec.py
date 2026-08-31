@@ -37,7 +37,7 @@ coefficients (and therefore `feature_importance`) meaningless. Removed:
 Nonlinear derivations (ratios, products, indicators, absolute values) are kept:
 those carry information a linear model cannot recover from the components.
 
-Result: 51 in-play features and 25 prematch features, all of which vary and none
+Result: 56 in-play features and 25 prematch features, all of which vary and none
 of which is a linear function of the others.
 
 SCALING
@@ -66,6 +66,18 @@ MIN_XG_DENOM = 0.1
 FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
 DEFAULT_LEAGUE_RATES: Dict[str, float] = {"btts": 0.5, "ov25": 0.5, "ov35": 0.3}
+
+# Neutral priors for the market_fair_* raw keys below when odds were
+# unavailable at harvest time (including every snapshot recorded before this
+# feature existed at all). A missing market read must default to "unknown",
+# not to 0.0 - these are probabilities, so a literal 0.0 reads as "the market
+# says this is impossible", which is false and would teach a model the wrong
+# thing from every fixture (almost the entire historical dataset, at first)
+# where the market simply wasn't fetched.
+NEUTRAL_MARKET_PRIORS: Dict[str, float] = {
+    "market_fair_home": 1.0 / 3.0, "market_fair_draw": 1.0 / 3.0, "market_fair_away": 1.0 / 3.0,
+    "market_fair_over25": 0.5, "market_fair_btts_yes": 0.5,
+}
 
 # How much the true probabilities of a market's selections sum to.
 #
@@ -100,6 +112,8 @@ RAW_INPLAY_KEYS: List[str] = [
     "saves_h", "saves_a",
     "passes_h", "passes_a",
     "passes_acc_h", "passes_acc_a",
+    "market_fair_home", "market_fair_draw", "market_fair_away",
+    "market_fair_over25", "market_fair_btts_yes",
 ]
 
 FEATURES: List[str] = [
@@ -127,6 +141,8 @@ FEATURES: List[str] = [
     "yellow_sum", "yellow_diff",
     "save_rate_h", "save_rate_a",
     "pass_accuracy_h", "pass_accuracy_a",
+    "market_fair_home", "market_fair_draw", "market_fair_away",
+    "market_fair_over25", "market_fair_btts_yes",
     "league_btts_rate", "league_ov25_rate", "league_ov35_rate",
 ]
 
@@ -175,6 +191,12 @@ def build_inplay_features(raw: Dict[str, Any], league_rates: Dict[str, float]) -
     code, same numbers, by construction.
     """
     r = {k: _f(raw.get(k)) for k in RAW_INPLAY_KEYS}
+    # NEUTRAL_MARKET_PRIORS keys need "was this present at all" (a genuine
+    # neutral prior when absent), not _f()'s generic "missing/zero -> 0.0" -
+    # 0.0 would be a false "market says impossible" for a probability.
+    for k, default in NEUTRAL_MARKET_PRIORS.items():
+        if raw.get(k) is None:
+            r[k] = default
     f: Dict[str, float] = {}
 
     minute = r["minute"]
@@ -252,6 +274,14 @@ def build_inplay_features(raw: Dict[str, Any], league_rates: Dict[str, float]) -
 
     f["pass_accuracy_h"] = r["passes_acc_h"] / max(r["passes_h"], MIN_COUNT_DENOM)
     f["pass_accuracy_a"] = r["passes_acc_a"] / max(r["passes_a"], MIN_COUNT_DENOM)
+
+    # De-vigged consensus market probabilities, passed straight through:
+    # already well-scaled [0,1] probabilities, nothing to derive further.
+    f["market_fair_home"] = r["market_fair_home"]
+    f["market_fair_draw"] = r["market_fair_draw"]
+    f["market_fair_away"] = r["market_fair_away"]
+    f["market_fair_over25"] = r["market_fair_over25"]
+    f["market_fair_btts_yes"] = r["market_fair_btts_yes"]
 
     lr = league_rates or DEFAULT_LEAGUE_RATES
     f["league_btts_rate"] = float(lr.get("btts", DEFAULT_LEAGUE_RATES["btts"]))

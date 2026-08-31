@@ -42,8 +42,17 @@ def _stub_league_rates(monkeypatch):
     monkeypatch.setattr(main, "get_league_rates", lambda league_id: main.DEFAULT_LEAGUE_RATES)
 
 
+def _stub_odds(monkeypatch):
+    # extract_features() -> _market_fair_priors() -> fetch_odds() would
+    # otherwise attempt a real HTTPS call per test (slow, and pointless with
+    # a fake API key). Returning {} exercises the real neutral-prior fallback
+    # path rather than skipping it.
+    monkeypatch.setattr(main, "fetch_odds", lambda fid, live: {})
+
+
 def test_scores_a_covered_live_fixture(monkeypatch):
     _stub_league_rates(monkeypatch)
+    _stub_odds(monkeypatch)
     monkeypatch.setattr(main, "fetch_live_matches", lambda: [_match()])
     monkeypatch.setattr(main, "load_model_from_settings",
                          lambda name: {"intercept": 0.0, "weights": {}})
@@ -66,6 +75,7 @@ def test_scores_a_covered_live_fixture(monkeypatch):
 
 def test_never_writes_to_the_tips_table(monkeypatch):
     _stub_league_rates(monkeypatch)
+    _stub_odds(monkeypatch)
     monkeypatch.setattr(main, "fetch_live_matches", lambda: [_match()])
     monkeypatch.setattr(main, "load_model_from_settings",
                          lambda name: {"intercept": 0.0, "weights": {}})
@@ -100,6 +110,7 @@ def test_never_writes_to_the_tips_table(monkeypatch):
 
 def test_fixture_below_minimum_minute_is_excluded(monkeypatch):
     _stub_league_rates(monkeypatch)
+    _stub_odds(monkeypatch)
     monkeypatch.setattr(main, "fetch_live_matches", lambda: [_match(minute=3)])
     monkeypatch.setattr(main, "load_model_from_settings",
                          lambda name: {"intercept": 0.0, "weights": {}})
@@ -110,6 +121,7 @@ def test_fixture_below_minimum_minute_is_excluded(monkeypatch):
 
 def test_fixture_without_stat_coverage_is_excluded(monkeypatch):
     _stub_league_rates(monkeypatch)
+    _stub_odds(monkeypatch)
     empty_match = _match(home_sot=0, away_sot=0, cor=0, pos="0%")
     monkeypatch.setattr(main, "fetch_live_matches", lambda: [empty_match])
     monkeypatch.setattr(main, "load_model_from_settings",
@@ -121,6 +133,7 @@ def test_fixture_without_stat_coverage_is_excluded(monkeypatch):
 
 def test_one_bad_fixture_does_not_break_the_rest(monkeypatch):
     _stub_league_rates(monkeypatch)
+    _stub_odds(monkeypatch)
     broken = {"fixture": {"id": None}}  # missing everything -> fid resolves to 0
     good = _match(fid=777)
     monkeypatch.setattr(main, "fetch_live_matches", lambda: [broken, good])
