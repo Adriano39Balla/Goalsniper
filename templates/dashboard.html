@@ -120,9 +120,19 @@
 
     <div class="stats" id="stats"></div>
 
-    <div class="section-title" style="display:flex;align-items:center;gap:8px;">
+    <div class="section-title" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
       Live matches <span id="liveCount"></span><span class="stale" id="liveStale"></span>
-      <button id="liveRefreshBtn" type="button" style="margin-left:auto;background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:11.5px;cursor:pointer;">Refresh now</button>
+      <select id="liveSortSel" style="margin-left:auto;background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:11.5px;">
+        <option value="hits">Sort: Signals first</option>
+        <option value="prob">Sort: Highest probability</option>
+        <option value="league">Sort: League</option>
+        <option value="minute">Sort: Minute</option>
+      </select>
+      <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:normal;cursor:pointer;">
+        <input type="checkbox" id="autoRefreshChk">
+        Auto-rescan (60s)
+      </label>
+      <button id="liveRefreshBtn" type="button" style="background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:11.5px;cursor:pointer;">Refresh now</button>
     </div>
     <div class="tips" id="liveMatches"><div class="empty">Loading…</div></div>
 
@@ -146,6 +156,23 @@ const liveMatchesEl = document.getElementById('liveMatches');
 const liveCountEl = document.getElementById('liveCount');
 const liveStaleEl = document.getElementById('liveStale');
 const liveRefreshBtn = document.getElementById('liveRefreshBtn');
+const liveSortSel = document.getElementById('liveSortSel');
+const autoRefreshChk = document.getElementById('autoRefreshChk');
+
+// Per-viewer convenience only (which sort, whether auto-rescan is on) -
+// safe to lose if storage is unavailable (private window, cleared data).
+function loadPref(key, fallback) {
+  try { return localStorage.getItem(key) ?? fallback; } catch (e) { return fallback; }
+}
+function savePref(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) { /* ignore */ }
+}
+
+liveSortSel.value = loadPref('goalsniper.liveSort', 'hits');
+autoRefreshChk.checked = loadPref('goalsniper.autoRescan', '0') === '1';
+
+let lastLiveSnapshot = null;
+let autoRefreshTimer = null;
 
 function fmtMoney(n) {
   if (n === null || n === undefined) return '—';
@@ -193,12 +220,22 @@ function renderStats(pnl) {
   `;
 }
 
+function topProb(m) {
+  return (m.markets || []).reduce((max, mk) => Math.max(max, mk.prob_pct || 0), 0);
+}
+
+// Array.sort is stable, so ties within a mode keep the server's order.
+const LIVE_SORTERS = {
+  hits: (a, b) => (b.hits || 0) - (a.hits || 0),
+  prob: (a, b) => topProb(b) - topProb(a),
+  league: (a, b) => (a.league || '').localeCompare(b.league || ''),
+  minute: (a, b) => (b.minute || 0) - (a.minute || 0),
+};
+
 function renderLive(snapshot) {
-  // Matches with at least one market clearing its threshold first, so a
-  // quick glance surfaces what's worth opening without scrolling past
-  // everything else. Array.sort is stable, so ties keep the server's order.
-  const matches = [...((snapshot && snapshot.matches) || [])]
-    .sort((a, b) => (b.hits || 0) - (a.hits || 0));
+  lastLiveSnapshot = snapshot;
+  const sorter = LIVE_SORTERS[liveSortSel.value] || LIVE_SORTERS.hits;
+  const matches = [...((snapshot && snapshot.matches) || [])].sort(sorter);
   liveCountEl.textContent = matches.length ? `(${matches.length})` : '';
 
   if (snapshot && snapshot.updated_ts) {
@@ -338,7 +375,22 @@ async function refreshLiveNow() {
   }
 }
 
+function setAutoRefresh(on) {
+  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+  if (on) autoRefreshTimer = setInterval(refreshLiveNow, 60000);
+}
+
 liveRefreshBtn.addEventListener('click', refreshLiveNow);
+liveSortSel.addEventListener('change', () => {
+  savePref('goalsniper.liveSort', liveSortSel.value);
+  if (lastLiveSnapshot) renderLive(lastLiveSnapshot);
+});
+autoRefreshChk.addEventListener('change', () => {
+  savePref('goalsniper.autoRescan', autoRefreshChk.checked ? '1' : '0');
+  setAutoRefresh(autoRefreshChk.checked);
+});
+setAutoRefresh(autoRefreshChk.checked);
+
 daysSel.addEventListener('change', refresh);
 refresh();
 setInterval(refresh, REFRESH_MS);
