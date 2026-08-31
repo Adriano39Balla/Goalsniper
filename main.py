@@ -1923,6 +1923,10 @@ def production_scan() -> Tuple[int, int]:
     live_snapshot_matches: List[Dict[str, Any]] = []
     harvested = 0
     no_coverage = 0
+    # Tally of _price_gate() outcomes across the whole scan - saved=0 with a
+    # healthy live_seen count is otherwise unexplainable from this log line
+    # alone (was it no odds? too few books? edge implausible?).
+    gate_decisions: Dict[str, int] = {}
     last_snap: Dict[int, int] = {}
     if HARVEST_MODE:
         try:
@@ -2023,6 +2027,7 @@ def production_scan() -> Tuple[int, int]:
                         if extra < CORRELATED_EXTRA_EV_BPS:
                             pc["passed"] = False
                             pc["decision"] = "correlated_with_existing_tip"
+                    gate_decisions[pc["decision"]] = gate_decisions.get(pc["decision"], 0) + 1
 
                 if PREDICTION_LOG_ENABLE and (is_harvest_tick or pc["passed"]) and prob >= PREDICTION_LOG_MIN_PROB:
                     fixture_preds.append((fid, league_id, kickoff, base_now, "live", minute,
@@ -2075,6 +2080,8 @@ def production_scan() -> Tuple[int, int]:
     _set_live_snapshot(live_snapshot_matches)
     log.info("[PROD] saved=%d live_seen=%d candidates_logged=%d harvested=%d no_coverage=%d",
              saved, live_seen, len(pred_rows), harvested, no_coverage)
+    if gate_decisions:
+        log.info("[PROD] price_gate: %s", gate_decisions)
     if live_seen and no_coverage >= live_seen:
         # Every live fixture lacked usable statistics. Harvesting still runs, but
         # the rows are goals/minute only and nothing can be tipped. Usually means
