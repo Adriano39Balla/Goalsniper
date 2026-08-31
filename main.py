@@ -781,6 +781,14 @@ def extract_raw_inplay(m: dict) -> Dict[str, float]:
         "shots_inside_a": _num(sa.get("Shots insidebox", 0)),
         "fouls_h": _num(sh.get("Fouls", 0)),
         "fouls_a": _num(sa.get("Fouls", 0)),
+        "yellow_h": _num(sh.get("Yellow Cards", 0)),
+        "yellow_a": _num(sa.get("Yellow Cards", 0)),
+        "saves_h": _num(sh.get("Goalkeeper Saves", 0)),
+        "saves_a": _num(sa.get("Goalkeeper Saves", 0)),
+        "passes_h": _num(sh.get("Total passes", 0)),
+        "passes_a": _num(sa.get("Total passes", 0)),
+        "passes_acc_h": _num(sh.get("Passes accurate", 0)),
+        "passes_acc_a": _num(sa.get("Passes accurate", 0)),
     }
 
 

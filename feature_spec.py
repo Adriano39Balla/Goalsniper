@@ -37,7 +37,7 @@ coefficients (and therefore `feature_importance`) meaningless. Removed:
 Nonlinear derivations (ratios, products, indicators, absolute values) are kept:
 those carry information a linear model cannot recover from the components.
 
-Result: 45 in-play features and 25 prematch features, all of which vary and none
+Result: 51 in-play features and 25 prematch features, all of which vary and none
 of which is a linear function of the others.
 
 SCALING
@@ -96,6 +96,10 @@ RAW_INPLAY_KEYS: List[str] = [
     "total_shots_h", "total_shots_a",
     "shots_inside_h", "shots_inside_a",
     "fouls_h", "fouls_a",
+    "yellow_h", "yellow_a",
+    "saves_h", "saves_a",
+    "passes_h", "passes_a",
+    "passes_acc_h", "passes_acc_a",
 ]
 
 FEATURES: List[str] = [
@@ -120,6 +124,9 @@ FEATURES: List[str] = [
     "discipline_score_h", "discipline_score_a",
     "possession_xg_interaction_h", "possession_xg_interaction_a",
     "sot_xg_ratio_h", "sot_xg_ratio_a",
+    "yellow_sum", "yellow_diff",
+    "save_rate_h", "save_rate_a",
+    "pass_accuracy_h", "pass_accuracy_a",
     "league_btts_rate", "league_ov25_rate", "league_ov35_rate",
 ]
 
@@ -229,6 +236,22 @@ def build_inplay_features(raw: Dict[str, Any], league_rates: Dict[str, float]) -
     f["possession_xg_interaction_a"] = (r["pos_a"] / 100.0) * r["xg_a"]
     f["sot_xg_ratio_h"] = r["sot_h"] / max(r["xg_h"], MIN_XG_DENOM)
     f["sot_xg_ratio_a"] = r["sot_a"] / max(r["xg_a"], MIN_XG_DENOM)
+
+    # Yellow cards are tracked separately from discipline_score_h/a (which
+    # folds in fouls + red cards) rather than merged into it, so an existing
+    # trained feature's meaning doesn't silently shift underneath it.
+    f["yellow_sum"] = r["yellow_h"] + r["yellow_a"]
+    f["yellow_diff"] = r["yellow_h"] - r["yellow_a"]
+
+    # Save efficiency is keyed against the OPPONENT's shots on target (a save
+    # only happens in response to a shot faced), not the keeper's own side -
+    # that is what makes this a genuinely new signal rather than a rescaling
+    # of sot_h/sot_a.
+    f["save_rate_h"] = r["saves_h"] / max(r["sot_a"], MIN_COUNT_DENOM)
+    f["save_rate_a"] = r["saves_a"] / max(r["sot_h"], MIN_COUNT_DENOM)
+
+    f["pass_accuracy_h"] = r["passes_acc_h"] / max(r["passes_h"], MIN_COUNT_DENOM)
+    f["pass_accuracy_a"] = r["passes_acc_a"] / max(r["passes_a"], MIN_COUNT_DENOM)
 
     lr = league_rates or DEFAULT_LEAGUE_RATES
     f["league_btts_rate"] = float(lr.get("btts", DEFAULT_LEAGUE_RATES["btts"]))
