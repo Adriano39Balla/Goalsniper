@@ -226,7 +226,10 @@ MAX_STAKE_PCT = float(os.getenv("MAX_STAKE_PCT", "2.0"))
 
 CLV_ENABLE = _env_flag("CLV_ENABLE", "1")
 CLV_CAPTURE_EVERY_MIN = int(os.getenv("CLV_CAPTURE_EVERY_MIN", "5"))
-CLV_MAX_AGE_MIN = int(os.getenv("CLV_MAX_AGE_MIN", "90"))
+# How long before kickoff to start treating a fixture as "closing" - the
+# prematch market is still open in this window, unlike after kickoff. See
+# capture_closing_lines() for why this must be BEFORE kickoff, not after.
+CLV_CAPTURE_LEAD_MIN = int(os.getenv("CLV_CAPTURE_LEAD_MIN", "15"))
 
 PREDICTION_LOG_ENABLE = _env_flag("PREDICTION_LOG_ENABLE", "1")
 PREDICTION_LOG_MIN_PROB = float(os.getenv("PREDICTION_LOG_MIN_PROB", "0.35"))
@@ -1482,8 +1485,21 @@ def backfill_results_for_open_matches(max_rows: int = 400) -> int:
 # ───────── Closing line value ─────────
 def capture_closing_lines(limit: int = 200) -> int:
     """
-    Records, for every prematch tip, the best available price at (or just after)
-    kickoff, and stores tip_odds/closing_odds - 1.
+    Records, for every prematch tip approaching kickoff, the best available
+    price as the closing line, and stores tip_odds/closing_odds - 1.
+
+    FIX: this used to query AFTER kickoff (kickoff_ts <= now) and call
+    fetch_odds(mid, live=False) - the PREMATCH endpoint. Once a fixture goes
+    live its prematch market closes (live prices move to /odds/live instead,
+    per this file's own T0.4 note that /odds is prematch-only), so that query
+    was asking for a prematch price on a market that had already closed by
+    the time it asked. Across weeks of real tips this captured a closing
+    price for exactly zero of them. "Closing line" also just means the last
+    price BEFORE the event starts, industry-wide - fetching it after the fact
+    was never the right definition, independent of the API's behaviour.
+
+    Now queries fixtures approaching kickoff (within CLV_CAPTURE_LEAD_MIN)
+    while the prematch market is still open, so it can actually succeed.
 
     PREMATCH ONLY. An in-play bet has no well-defined closing line — the market
     for "Over 2.5 at minute 62" ceases to exist the moment the state changes.
@@ -1497,9 +1513,9 @@ def capture_closing_lines(limit: int = 200) -> int:
             FROM tips
             WHERE is_prematch=1 AND closing_odds IS NULL AND odds IS NOT NULL
               AND kickoff_ts IS NOT NULL
-              AND kickoff_ts <= %s AND kickoff_ts >= %s
-            ORDER BY kickoff_ts DESC LIMIT %s
-        """, (now, now - CLV_MAX_AGE_MIN * 60, limit)).fetchall()
+              AND kickoff_ts > %s AND kickoff_ts <= %s
+            ORDER BY kickoff_ts ASC LIMIT %s
+        """, (now, now + CLV_CAPTURE_LEAD_MIN * 60, limit)).fetchall()
 
     n = 0
     for (mid, cts, market, sugg, tip_odds) in rows:
