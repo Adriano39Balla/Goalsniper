@@ -224,6 +224,24 @@ function topProb(m) {
   return (m.markets || []).reduce((max, mk) => Math.max(max, mk.prob_pct || 0), 0);
 }
 
+// Mirrors the decision codes _price_gate() / _build_live_match_entry() can
+// set in main.py - keep in sync if a new decision code is added there.
+const DECISION_LABELS = {
+  below_threshold: 'Below threshold',
+  tipped: 'Tipped',
+  no_odds: 'No odds available',
+  odds_out_of_range: 'Odds out of range',
+  no_fair_price: 'No fair price yet',
+  too_few_books: 'Too few books quoting',
+  ev_below_min: 'EV too low',
+  fair_edge_below_min: 'Edge vs. market too small',
+  edge_implausible: 'Edge too large — suppressed',
+  correlated_with_existing_tip: 'Correlated with another tip',
+  per_match_cap: 'Per-match tip cap reached',
+  unmapped_market: 'Unmapped market',
+};
+function decisionLabel(code) { return DECISION_LABELS[code] || code || '—'; }
+
 // Array.sort is stable, so ties within a mode keep the server's order.
 const LIVE_SORTERS = {
   hits: (a, b) => (b.hits || 0) - (a.hits || 0),
@@ -255,8 +273,9 @@ function renderLive(snapshot) {
       <tr>
         <td>${mk.market}</td>
         <td>${mk.suggestion}</td>
-        <td class="num${mk.prob_pct >= mk.threshold_pct ? ' hit' : ''}">${mk.prob_pct.toFixed(1)}%</td>
+        <td class="num${mk.decision === 'tipped' ? ' hit' : ''}">${mk.prob_pct.toFixed(1)}%</td>
         <td class="num" style="color:var(--muted)">${mk.threshold_pct.toFixed(1)}%</td>
+        <td style="color:${mk.decision === 'tipped' ? 'var(--accent)' : 'var(--muted)'}">${decisionLabel(mk.decision)}${mk.odds ? ` @ ${mk.odds.toFixed(2)}` : ''}</td>
       </tr>`).join('');
     return `
       <div class="match-card">
@@ -271,8 +290,8 @@ function renderLive(snapshot) {
         </div>
         <div class="market-detail" id="live-detail-${i}" style="display:none">
           <table class="market-table">
-            <tr><th>Market</th><th>Selection</th><th class="num">Prob</th><th class="num">Threshold</th></tr>
-            ${marketRows || '<tr><td colspan="4" style="padding:14px;color:var(--muted)">No candidate markets this scan.</td></tr>'}
+            <tr><th>Market</th><th>Selection</th><th class="num">Prob</th><th class="num">Threshold</th><th>Status</th></tr>
+            ${marketRows || '<tr><td colspan="5" style="padding:14px;color:var(--muted)">No candidate markets this scan.</td></tr>'}
           </table>
         </div>
       </div>`;

@@ -1857,19 +1857,44 @@ _live_snapshot: Dict[str, Any] = {"updated_ts": 0, "matches": []}
 def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, away: str,
                             score: str, minute: int,
                             candidates: List[Tuple[str, str, float, float]]) -> Dict[str, Any]:
-    markets = [
-        {"market": mt, "suggestion": sg, "prob_pct": round(float(pr) * 100.0, 1),
-         "threshold_pct": round(float(thr), 1)}
-        for mt, sg, pr, thr in candidates
-    ]
+    # For every candidate that clears its own threshold, run it through the
+    # same _price_gate() production_scan() uses to decide whether it would
+    # actually get tipped, and surface *why* when it wouldn't - "high
+    # confidence, nothing on Telegram" is otherwise unexplainable from the
+    # dashboard alone. Candidates nowhere near threshold skip the gate
+    # entirely: no point spending a fetch_odds() call to explain a market
+    # nobody was going to look at.
+    #
+    # Known simplification: this evaluates each candidate in isolation, so it
+    # does not replicate _correlation_blocked() or the sequential
+    # PREDICTIONS_PER_MATCH/MAX_TIPS_PER_SCAN caps from the real tipping loop
+    # below. On a match with several qualifying candidates the displayed
+    # "tipped" status can therefore disagree with what actually got sent -
+    # but it is accurate for the odds/EV/fair-price/sanity gates that explain
+    # the overwhelming majority of "why wasn't this tipped" questions.
+    markets = []
+    for mt, sg, pr, thr in candidates:
+        prob_pct = round(float(pr) * 100.0, 1)
+        thr_pct = round(float(thr), 1)
+        row = {"market": mt, "suggestion": sg, "prob_pct": prob_pct, "threshold_pct": thr_pct}
+        if prob_pct >= thr_pct:
+            pc = _price_gate(mt, sg, fid, pr, live=True)
+            row["decision"] = pc["decision"]
+            row["odds"] = pc.get("odds")
+            row["ev_pct"] = pc.get("ev_pct")
+        else:
+            row["decision"] = "below_threshold"
+            row["odds"] = None
+            row["ev_pct"] = None
+        markets.append(row)
     return {
         "fixture_id": fid, "league": league, "league_id": league_id,
         "home": home, "away": away, "score": score, "minute": minute,
         "markets": markets,
-        # Count of candidates clearing their own threshold - lets the
-        # dashboard flag "worth a look" matches without re-deriving it from
-        # every row client-side.
-        "hits": sum(1 for m in markets if m["prob_pct"] >= m["threshold_pct"]),
+        # Count of candidates that would actually be tipped (passed the full
+        # price gate), not just candidates with high raw confidence - this is
+        # what "worth a look" should mean on the dashboard.
+        "hits": sum(1 for m in markets if m["decision"] == "tipped"),
     }
 
 

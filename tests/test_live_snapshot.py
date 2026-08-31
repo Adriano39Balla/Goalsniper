@@ -2,13 +2,32 @@
 _build_live_match_entry() and the _set/_get_live_snapshot() pair back
 GET /dashboard/live - the full per-market probability breakdown for every
 live match, independent of whether any candidate actually got tipped.
-production_scan() itself needs a live DB/API stack to exercise directly, so
-these tests cover the pure pieces it's built from.
+
+Any candidate clearing its own threshold is now run through the real
+_price_gate() so the dashboard can show *why* a high-confidence candidate
+wasn't tipped, not just its raw probability - so these tests monkeypatch
+main.fetch_odds even though they aren't testing _price_gate itself.
+production_scan() needs a live DB/API stack to exercise directly, so these
+tests cover the pure pieces it's built from.
 """
+import pytest
+
 import main
 
 
-def test_build_live_match_entry_maps_every_candidate_to_a_market_row():
+def _odds_map(mkey, sel, odds, book="Bet365", fair=None, n_books=5):
+    entry = {"best": {sel: {"odds": odds, "book": book}}, "n_books": n_books}
+    if fair is not None:
+        entry["fair"] = {sel: fair}
+    return {mkey: entry}
+
+
+def test_build_live_match_entry_maps_every_candidate_to_a_market_row(monkeypatch):
+    # BTTS clears every _price_gate() gate; Over/Under 2.5 has no odds quoted
+    # at all, so it's the "high confidence but nothing sent" case in miniature.
+    odds_map = _odds_map("BTTS", "Yes", odds=2.0, fair=0.55)
+    monkeypatch.setattr(main, "fetch_odds", lambda fid, live: odds_map)
+
     candidates = [
         ("BTTS", "BTTS: Yes", 0.62, 55.0),
         ("Over/Under 2.5", "Over 2.5 Goals", 0.58, 55.0),
@@ -21,11 +40,21 @@ def test_build_live_match_entry_maps_every_candidate_to_a_market_row():
     assert entry["home"] == "Bayern"
     assert entry["away"] == "Dortmund"
     assert entry["minute"] == 63
-    assert entry["markets"] == [
-        {"market": "BTTS", "suggestion": "BTTS: Yes", "prob_pct": 62.0, "threshold_pct": 55.0},
-        {"market": "Over/Under 2.5", "suggestion": "Over 2.5 Goals", "prob_pct": 58.0, "threshold_pct": 55.0},
-    ]
-    assert entry["hits"] == 2
+
+    btts, ou = entry["markets"]
+    assert btts["market"] == "BTTS" and btts["suggestion"] == "BTTS: Yes"
+    assert btts["prob_pct"] == 62.0 and btts["threshold_pct"] == 55.0
+    assert btts["decision"] == "tipped"
+    assert btts["odds"] == pytest.approx(2.0)
+    assert btts["ev_pct"] == pytest.approx(24.0)
+
+    assert ou["market"] == "Over/Under 2.5" and ou["suggestion"] == "Over 2.5 Goals"
+    assert ou["prob_pct"] == 58.0 and ou["threshold_pct"] == 55.0
+    assert ou["decision"] == "no_odds"
+    assert ou["odds"] is None
+
+    # Only the BTTS candidate actually clears the price gate.
+    assert entry["hits"] == 1
 
 
 def test_build_live_match_entry_handles_no_candidates():
@@ -36,25 +65,43 @@ def test_build_live_match_entry_handles_no_candidates():
     assert entry["hits"] == 0
 
 
-def test_build_live_match_entry_counts_only_candidates_clearing_threshold():
+def test_candidates_below_threshold_never_call_price_gate(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("_price_gate must not run for a below-threshold candidate")
+
+    monkeypatch.setattr(main, "_price_gate", _boom)
     candidates = [
-        ("BTTS", "BTTS: Yes", 0.62, 55.0),   # clears
+        ("BTTS", "BTTS: Yes", 0.40, 55.0),   # below
         ("1X2", "Home Win", 0.40, 55.0),      # below
-        ("Over/Under 2.5", "Over 2.5 Goals", 0.55, 55.0),  # exactly at threshold, clears
     ]
     entry = main._build_live_match_entry(
         fid=1, league="L", league_id=1, home="A", away="B",
         score="0-0", minute=10, candidates=candidates)
-    assert entry["hits"] == 2
+    assert [m["decision"] for m in entry["markets"]] == ["below_threshold", "below_threshold"]
+    assert entry["hits"] == 0
+
+
+def test_hits_counts_only_candidates_that_pass_the_price_gate(monkeypatch):
+    # One clears the price gate, one clears threshold but has no odds, one
+    # never clears threshold at all - only the first should count as a hit.
+    odds_map = _odds_map("BTTS", "Yes", odds=2.0, fair=0.55)
+    monkeypatch.setattr(main, "fetch_odds", lambda fid, live: odds_map)
+    candidates = [
+        ("BTTS", "BTTS: Yes", 0.62, 55.0),                    # tipped
+        ("Over/Under 2.5", "Over 2.5 Goals", 0.55, 55.0),     # clears threshold, no odds
+        ("1X2", "Home Win", 0.40, 55.0),                      # below threshold
+    ]
+    entry = main._build_live_match_entry(
+        fid=1, league="L", league_id=1, home="A", away="B",
+        score="0-0", minute=10, candidates=candidates)
+    assert entry["hits"] == 1
 
 
 def test_live_snapshot_round_trips_and_stamps_updated_ts(monkeypatch):
     monkeypatch.setattr(main.time, "time", lambda: 1_700_000_000.0)
     matches = [main._build_live_match_entry(1, "L", 1, "A", "B", "1-1", 40, [])]
-
     main._set_live_snapshot(matches)
     snap = main._get_live_snapshot()
-
     assert snap["updated_ts"] == 1_700_000_000
     assert snap["matches"] == matches
 
@@ -69,6 +116,5 @@ def test_get_live_snapshot_returns_a_copy_not_the_live_list():
 def test_empty_snapshot_after_no_live_matches():
     main._set_live_snapshot([main._build_live_match_entry(1, "L", 1, "A", "B", "0-0", 5, [])])
     assert main._get_live_snapshot()["matches"]
-
     main._set_live_snapshot([])
     assert main._get_live_snapshot()["matches"] == []
