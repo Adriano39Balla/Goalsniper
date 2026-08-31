@@ -25,6 +25,7 @@ def test_build_live_match_entry_maps_every_candidate_to_a_market_row():
         {"market": "BTTS", "suggestion": "BTTS: Yes", "prob_pct": 62.0, "threshold_pct": 55.0},
         {"market": "Over/Under 2.5", "suggestion": "Over 2.5 Goals", "prob_pct": 58.0, "threshold_pct": 55.0},
     ]
+    assert entry["hits"] == 2
 
 
 def test_build_live_match_entry_handles_no_candidates():
@@ -32,6 +33,19 @@ def test_build_live_match_entry_handles_no_candidates():
         fid=1, league="L", league_id=1, home="A", away="B",
         score="0-0", minute=10, candidates=[])
     assert entry["markets"] == []
+    assert entry["hits"] == 0
+
+
+def test_build_live_match_entry_counts_only_candidates_clearing_threshold():
+    candidates = [
+        ("BTTS", "BTTS: Yes", 0.62, 55.0),   # clears
+        ("1X2", "Home Win", 0.40, 55.0),      # below
+        ("Over/Under 2.5", "Over 2.5 Goals", 0.55, 55.0),  # exactly at threshold, clears
+    ]
+    entry = main._build_live_match_entry(
+        fid=1, league="L", league_id=1, home="A", away="B",
+        score="0-0", minute=10, candidates=candidates)
+    assert entry["hits"] == 2
 
 
 def test_live_snapshot_round_trips_and_stamps_updated_ts(monkeypatch):

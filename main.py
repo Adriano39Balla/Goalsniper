@@ -1808,14 +1808,19 @@ _live_snapshot: Dict[str, Any] = {"updated_ts": 0, "matches": []}
 def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, away: str,
                             score: str, minute: int,
                             candidates: List[Tuple[str, str, float, float]]) -> Dict[str, Any]:
+    markets = [
+        {"market": mt, "suggestion": sg, "prob_pct": round(float(pr) * 100.0, 1),
+         "threshold_pct": round(float(thr), 1)}
+        for mt, sg, pr, thr in candidates
+    ]
     return {
         "fixture_id": fid, "league": league, "league_id": league_id,
         "home": home, "away": away, "score": score, "minute": minute,
-        "markets": [
-            {"market": mt, "suggestion": sg, "prob_pct": round(float(pr) * 100.0, 1),
-             "threshold_pct": round(float(thr), 1)}
-            for mt, sg, pr, thr in candidates
-        ],
+        "markets": markets,
+        # Count of candidates clearing their own threshold - lets the
+        # dashboard flag "worth a look" matches without re-deriving it from
+        # every row client-side.
+        "hits": sum(1 for m in markets if m["prob_pct"] >= m["threshold_pct"]),
     }
 
 

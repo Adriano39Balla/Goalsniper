@@ -91,6 +91,11 @@
   .market-detail { border-top: 1px solid var(--border); }
   .market-detail table.market-table { font-size: 12px; }
   .market-detail td.hit { color: var(--accent); font-weight: 600; }
+  .hit-badge {
+    display: inline-flex; align-items: center; gap: 4px; margin-left: 8px;
+    font-size: 10px; font-weight: 700; color: var(--bg); background: var(--accent);
+    border-radius: 999px; padding: 2px 8px; vertical-align: middle;
+  }
 </style>
 </head>
 <body>
@@ -189,7 +194,11 @@ function renderStats(pnl) {
 }
 
 function renderLive(snapshot) {
-  const matches = (snapshot && snapshot.matches) || [];
+  // Matches with at least one market clearing its threshold first, so a
+  // quick glance surfaces what's worth opening without scrolling past
+  // everything else. Array.sort is stable, so ties keep the server's order.
+  const matches = [...((snapshot && snapshot.matches) || [])]
+    .sort((a, b) => (b.hits || 0) - (a.hits || 0));
   liveCountEl.textContent = matches.length ? `(${matches.length})` : '';
 
   if (snapshot && snapshot.updated_ts) {
@@ -216,7 +225,8 @@ function renderLive(snapshot) {
       <div class="match-card">
         <div class="match-row" data-idx="${i}">
           <div>
-            <div class="match">${m.home} vs ${m.away}</div>
+            <div class="match">${m.home} vs ${m.away}${m.hits > 0
+              ? `<span class="hit-badge">${m.hits} ${m.hits === 1 ? 'signal' : 'signals'}</span>` : ''}</div>
             <div class="league">${m.league || ''}</div>
           </div>
           <div class="conf">${m.score || ''}<span class="pct">${m.minute}'</span></div>
