@@ -2006,6 +2006,52 @@ def production_scan() -> Tuple[int, int]:
     return saved, live_seen
 
 
+def score_live_matches_now() -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Read-only, on-demand equivalent of production_scan()'s live-scoring step:
+    fetches whatever is live RIGHT NOW and scores every market for every
+    fixture with usable stats coverage. Deliberately does NOT write to
+    tips/predictions, harvest snapshots, or send Telegram - it exists purely
+    to answer "what does the model see right now" for a human looking at the
+    dashboard, e.g. via /dashboard/live/refresh.
+
+    Deliberately duplicates production_scan()'s candidate-building step
+    rather than sharing it, so a bug in this read-only path can never affect
+    what the live tipping bot actually does.
+    """
+    matches = fetch_live_matches()
+    live_seen = len(matches)
+    out: List[Dict[str, Any]] = []
+    for m in matches:
+        try:
+            fid = int((m.get("fixture", {}) or {}).get("id") or 0)
+            if not fid:
+                continue
+            raw, feat = extract_features(m)
+            minute = int(feat.get("minute", 0))
+            if minute < TIP_MIN_MINUTE or not stats_coverage_ok(raw, minute):
+                continue
+
+            league_id, league = _league_name(m)
+            home, away = _teams(m)
+            score = _pretty_score(m)
+
+            candidates = (_ou_candidates(feat, "", _get_market_threshold)
+                          + _btts_candidates(feat, "", _get_market_threshold)
+                          + _wld_candidates(feat, "", _get_market_threshold)
+                          + _dc_dnb_candidates(feat, "", _get_market_threshold))
+            candidates = [c for c in candidates
+                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)]
+            candidates.sort(key=lambda x: x[2], reverse=True)
+
+            out.append(_build_live_match_entry(fid, league, league_id, home, away, score,
+                                               minute, candidates))
+        except Exception as e:
+            log.warning("[LIVE-SCORE] failed for a fixture: %s", e)
+            continue
+    return out, live_seen
+
+
 # ───────── Prematch data ─────────
 def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
     key = ("last", team_id, n)
@@ -3393,6 +3439,24 @@ def dashboard_live():
     if not _dashboard_authed():
         abort(401)
     return jsonify({"ok": True, **_get_live_snapshot(), "server_ts": int(time.time())})
+
+
+@app.route("/dashboard/live/refresh", methods=["POST"])
+def dashboard_live_refresh():
+    """
+    On-demand version of the same snapshot: scores whatever is live RIGHT NOW
+    instead of waiting for the next scheduled scan (up to SCAN_INTERVAL_SEC
+    away). Costs real API-Football requests each time it's called - this is
+    for a human clicking "refresh now", not something to poll automatically.
+    """
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
+    if not _dashboard_authed():
+        abort(401)
+    matches, live_seen = score_live_matches_now()
+    _set_live_snapshot(matches)
+    return jsonify({"ok": True, **_get_live_snapshot(), "live_seen": live_seen,
+                    "server_ts": int(time.time())})
 
 
 @app.route("/tips/latest")
