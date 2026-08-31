@@ -1795,16 +1795,53 @@ def _last_snapshot_ts_bulk(fids: List[int]) -> Dict[int, int]:
         return {}
 
 
+# In-memory snapshot of every live match's FULL market breakdown (every
+# candidate production_scan() evaluates, not just the ones that clear the
+# tipping bar). production_scan() already computes this every 5 minutes for
+# every live fixture regardless of whether anything gets tipped, so exposing
+# it costs zero extra API calls - it's the same numbers the tipping logic
+# already has, just not thrown away. Backs GET /dashboard/live.
+_live_snapshot_lock = threading.Lock()
+_live_snapshot: Dict[str, Any] = {"updated_ts": 0, "matches": []}
+
+
+def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, away: str,
+                            score: str, minute: int,
+                            candidates: List[Tuple[str, str, float, float]]) -> Dict[str, Any]:
+    return {
+        "fixture_id": fid, "league": league, "league_id": league_id,
+        "home": home, "away": away, "score": score, "minute": minute,
+        "markets": [
+            {"market": mt, "suggestion": sg, "prob_pct": round(float(pr) * 100.0, 1),
+             "threshold_pct": round(float(thr), 1)}
+            for mt, sg, pr, thr in candidates
+        ],
+    }
+
+
+def _set_live_snapshot(matches: List[Dict[str, Any]]) -> None:
+    with _live_snapshot_lock:
+        _live_snapshot["updated_ts"] = int(time.time())
+        _live_snapshot["matches"] = matches
+
+
+def _get_live_snapshot() -> Dict[str, Any]:
+    with _live_snapshot_lock:
+        return {"updated_ts": _live_snapshot["updated_ts"], "matches": list(_live_snapshot["matches"])}
+
+
 def production_scan() -> Tuple[int, int]:
     matches = fetch_live_matches()
     live_seen = len(matches)
     if live_seen == 0:
         log.info("[PROD] no live")
+        _set_live_snapshot([])
         return 0, 0
 
     saved = 0
     now_ts = int(time.time())
     pred_rows: List[tuple] = []
+    live_snapshot_matches: List[Dict[str, Any]] = []
     harvested = 0
     no_coverage = 0
     last_snap: Dict[int, int] = {}
@@ -1885,6 +1922,11 @@ def production_scan() -> Tuple[int, int]:
                           if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)]
             candidates.sort(key=lambda x: x[2], reverse=True)
 
+            # Full breakdown for the dashboard, independent of whether any of
+            # these candidates go on to clear a threshold or the price gate.
+            live_snapshot_matches.append(_build_live_match_entry(
+                fid, league, league_id, home, away, score, minute, candidates))
+
             per_match = 0
             taken: List[str] = []
             base_now = int(time.time())
@@ -1951,6 +1993,7 @@ def production_scan() -> Tuple[int, int]:
             continue
 
     _log_predictions(pred_rows)
+    _set_live_snapshot(live_snapshot_matches)
     log.info("[PROD] saved=%d live_seen=%d candidates_logged=%d harvested=%d no_coverage=%d",
              saved, live_seen, len(pred_rows), harvested, no_coverage)
     if live_seen and no_coverage >= live_seen:
@@ -3334,6 +3377,22 @@ def dashboard_data():
         log.warning("[DASHBOARD] pnl computation failed: %s", e)
         pnl = {"error": str(e)}
     return jsonify({"ok": True, "tips": tips, "pnl": pnl, "server_ts": int(time.time())})
+
+
+@app.route("/dashboard/live")
+def dashboard_live():
+    """
+    Every currently-live match with usable stats, and the FULL set of market
+    probabilities production_scan() computed for it - not just whichever
+    candidate cleared the tipping threshold and price gate. Backed by an
+    in-memory snapshot refreshed on every scan (see _set_live_snapshot),
+    so this costs zero extra API-Football requests.
+    """
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
+    if not _dashboard_authed():
+        abort(401)
+    return jsonify({"ok": True, **_get_live_snapshot(), "server_ts": int(time.time())})
 
 
 @app.route("/tips/latest")

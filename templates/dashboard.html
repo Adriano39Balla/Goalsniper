@@ -75,6 +75,19 @@
   table.market-table th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
   table.market-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .market-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+
+  .section-title .stale { font-weight: 400; text-transform: none; letter-spacing: normal; color: var(--warn); margin-left: 8px; }
+  .match-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .match-row {
+    display: grid; grid-template-columns: 1fr auto auto; gap: 4px 12px; align-items: center;
+    padding: 12px 14px; cursor: pointer; user-select: none;
+  }
+  .match-row:hover { background: var(--panel2); }
+  .match-row .caret { color: var(--muted); font-size: 11px; transition: transform 0.15s ease; }
+  .match-row.open .caret { transform: rotate(90deg); }
+  .market-detail { border-top: 1px solid var(--border); }
+  .market-detail table.market-table { font-size: 12px; }
+  .market-detail td.hit { color: var(--accent); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -99,6 +112,9 @@
 
     <div class="stats" id="stats"></div>
 
+    <div class="section-title">Live matches <span id="liveCount"></span><span class="stale" id="liveStale"></span></div>
+    <div class="tips" id="liveMatches"><div class="empty">Loading…</div></div>
+
     <div class="section-title">By market</div>
     <div class="market-wrap"><table class="market-table" id="marketTable"></table></div>
 
@@ -115,6 +131,9 @@ const statsEl = document.getElementById('stats');
 const marketTableEl = document.getElementById('marketTable');
 const tipsEl = document.getElementById('tips');
 const daysSel = document.getElementById('daysSel');
+const liveMatchesEl = document.getElementById('liveMatches');
+const liveCountEl = document.getElementById('liveCount');
+const liveStaleEl = document.getElementById('liveStale');
 
 function fmtMoney(n) {
   if (n === null || n === undefined) return '—';
@@ -162,6 +181,59 @@ function renderStats(pnl) {
   `;
 }
 
+function renderLive(snapshot) {
+  const matches = (snapshot && snapshot.matches) || [];
+  liveCountEl.textContent = matches.length ? `(${matches.length})` : '';
+
+  if (snapshot && snapshot.updated_ts) {
+    const ageSec = (Date.now() / 1000) - snapshot.updated_ts;
+    liveStaleEl.textContent = ageSec > 600
+      ? `· last scan ${Math.round(ageSec / 60)} min ago — scheduler may be stuck`
+      : '';
+  }
+
+  if (!matches.length) {
+    liveMatchesEl.innerHTML = '<div class="empty">No live matches with usable stats right now.</div>';
+    return;
+  }
+
+  liveMatchesEl.innerHTML = matches.map((m, i) => {
+    const marketRows = (m.markets || []).map(mk => `
+      <tr>
+        <td>${mk.market}</td>
+        <td>${mk.suggestion}</td>
+        <td class="num${mk.prob_pct >= mk.threshold_pct ? ' hit' : ''}">${mk.prob_pct.toFixed(1)}%</td>
+        <td class="num" style="color:var(--muted)">${mk.threshold_pct.toFixed(1)}%</td>
+      </tr>`).join('');
+    return `
+      <div class="match-card">
+        <div class="match-row" data-idx="${i}">
+          <div>
+            <div class="match">${m.home} vs ${m.away}</div>
+            <div class="league">${m.league || ''}</div>
+          </div>
+          <div class="conf">${m.score || ''}<span class="pct">${m.minute}'</span></div>
+          <div class="caret">&#9656;</div>
+        </div>
+        <div class="market-detail" id="live-detail-${i}" style="display:none">
+          <table class="market-table">
+            <tr><th>Market</th><th>Selection</th><th class="num">Prob</th><th class="num">Threshold</th></tr>
+            ${marketRows || '<tr><td colspan="4" style="padding:14px;color:var(--muted)">No candidate markets this scan.</td></tr>'}
+          </table>
+        </div>
+      </div>`;
+  }).join('');
+
+  liveMatchesEl.querySelectorAll('.match-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const detail = document.getElementById('live-detail-' + row.dataset.idx);
+      const open = detail.style.display !== 'none';
+      detail.style.display = open ? 'none' : 'block';
+      row.classList.toggle('open', !open);
+    });
+  });
+}
+
 function renderTips(tips) {
   if (!tips || !tips.length) {
     tipsEl.innerHTML = '<div class="empty">No tips yet in this window.</div>';
@@ -199,14 +271,25 @@ function renderTips(tips) {
 
 async function refresh() {
   const days = daysSel.value;
-  const url = '{{ url_for("dashboard_data") }}?limit=50' + (days ? '&days=' + days : '');
+  const dataUrl = '{{ url_for("dashboard_data") }}?limit=50' + (days ? '&days=' + days : '');
+  const liveUrl = '{{ url_for("dashboard_live") }}';
   try {
-    const r = await fetch(url, { credentials: 'same-origin' });
-    if (r.status === 401) { window.location.href = '{{ url_for("dashboard_login") }}'; return; }
-    const data = await r.json();
+    const [dataRes, liveRes] = await Promise.all([
+      fetch(dataUrl, { credentials: 'same-origin' }),
+      fetch(liveUrl, { credentials: 'same-origin' }),
+    ]);
+    if (dataRes.status === 401 || liveRes.status === 401) {
+      window.location.href = '{{ url_for("dashboard_login") }}';
+      return;
+    }
+    const data = await dataRes.json();
     if (!data.ok) throw new Error(data.error || 'unknown error');
     renderStats(data.pnl);
     renderTips(data.tips);
+
+    const live = await liveRes.json();
+    if (live.ok) renderLive(live);
+
     dot.classList.add('live');
     statusText.textContent = 'live';
     updated.textContent = 'Updated ' + new Date().toLocaleTimeString();
