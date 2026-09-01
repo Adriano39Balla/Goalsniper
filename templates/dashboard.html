@@ -540,6 +540,29 @@ function overviewForTip(t) {
     </div>`;
 }
 
+// An empty feed has several very different causes and the old catch-all
+// message covered all of them equally badly. Say which one it is.
+function emptyReason(dayItems) {
+  if (dayItems.length) {
+    return 'No picks match the current market / strength filter — '
+         + `${dayItems.length} hidden. Try "All".`;
+  }
+  if (selectedDayOffset !== 0) {
+    return 'No tips were sent on this day. (Live matches only appear on Today.)';
+  }
+  const seen = lastLive && lastLive.live_seen;
+  const uncovered = lastLive && lastLive.no_coverage;
+  if (seen === 0) return 'No matches are being played right now.';
+  if (seen > 0) {
+    const why = uncovered
+      ? `${uncovered} of them have no usable stats feed yet`
+      : 'none of them have usable stats yet';
+    return `${seen} live ${seen === 1 ? 'match' : 'matches'} in progress, but ${why} — `
+         + 'nothing can be scored until the stats feed fills in (usually a few minutes in).';
+  }
+  return 'No live matches scored yet. If this persists, the scan may not have run since the last restart.';
+}
+
 function renderFeed() {
   const dayItems = buildDayItems(selectedDayOffset);
   renderStrengthTabs(dayItems);
@@ -549,7 +572,7 @@ function renderFeed() {
   if (selectedStrength !== 'all') items = items.filter(it => itemStrength(it) === selectedStrength);
 
   if (!items.length) {
-    feedEl.innerHTML = '<div class="empty">Nothing to show for this day / market / strength combination.</div>';
+    feedEl.innerHTML = `<div class="empty">${emptyReason(dayItems)}</div>`;
     return;
   }
 

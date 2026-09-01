@@ -134,6 +134,23 @@ def test_get_live_snapshot_returns_a_copy_not_the_live_list():
     assert main._get_live_snapshot()["matches"] != snap["matches"]
 
 
+def test_snapshot_carries_scan_counts_so_an_empty_feed_can_explain_itself():
+    # "no matches are being played" and "plenty are, none with usable stats"
+    # are the same empty list - the counts are what tells them apart.
+    main._set_live_snapshot([], live_seen=12, no_coverage=12)
+    snap = main._get_live_snapshot()
+    assert snap["matches"] == []
+    assert snap["live_seen"] == 12
+    assert snap["no_coverage"] == 12
+
+
+def test_scan_counts_default_to_none_when_the_caller_does_not_know():
+    main._set_live_snapshot([])
+    snap = main._get_live_snapshot()
+    assert snap["live_seen"] is None
+    assert snap["no_coverage"] is None
+
+
 def test_empty_snapshot_after_no_live_matches():
     main._set_live_snapshot([main._build_live_match_entry(1, "L", 1, "A", "B", "0-0", 5, [])])
     assert main._get_live_snapshot()["matches"]

@@ -1978,15 +1978,24 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
     }
 
 
-def _set_live_snapshot(matches: List[Dict[str, Any]]) -> None:
+def _set_live_snapshot(matches: List[Dict[str, Any]], live_seen: Optional[int] = None,
+                       no_coverage: Optional[int] = None) -> None:
+    # live_seen/no_coverage travel with the matches so the dashboard can tell
+    # "nothing is being played right now" apart from "plenty is being played,
+    # none of it has usable stats yet" - an empty list on its own can't.
     with _live_snapshot_lock:
         _live_snapshot["updated_ts"] = int(time.time())
         _live_snapshot["matches"] = matches
+        _live_snapshot["live_seen"] = live_seen
+        _live_snapshot["no_coverage"] = no_coverage
 
 
 def _get_live_snapshot() -> Dict[str, Any]:
     with _live_snapshot_lock:
-        return {"updated_ts": _live_snapshot["updated_ts"], "matches": list(_live_snapshot["matches"])}
+        return {"updated_ts": _live_snapshot["updated_ts"],
+                "matches": list(_live_snapshot["matches"]),
+                "live_seen": _live_snapshot.get("live_seen"),
+                "no_coverage": _live_snapshot.get("no_coverage")}
 
 
 def production_scan() -> Tuple[int, int]:
@@ -1994,7 +2003,7 @@ def production_scan() -> Tuple[int, int]:
     live_seen = len(matches)
     if live_seen == 0:
         log.info("[PROD] no live")
-        _set_live_snapshot([])
+        _set_live_snapshot([], live_seen=0, no_coverage=0)
         return 0, 0
 
     saved = 0
@@ -2063,14 +2072,20 @@ def production_scan() -> Tuple[int, int]:
                 no_coverage += 1
                 continue
 
+            # The cooldown stops a fixture being TIPPED twice in quick
+            # succession. It is not a reason to hide the match from the
+            # dashboard: doing that made every fixture disappear from the
+            # live view for DUP_COOLDOWN_MIN minutes starting the moment it
+            # produced a tip - i.e. the matches most worth looking at were
+            # exactly the ones missing. Same split as the harvest block
+            # above: this decides tipping, not what gets displayed.
+            cooling_down = False
             if DUP_COOLDOWN_MIN > 0:
                 with db_conn() as c:
-                    dup = c.execute(
+                    cooling_down = bool(c.execute(
                         "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s "
                         "AND suggestion<>'HARVEST' LIMIT 1",
-                        (fid, now_ts - DUP_COOLDOWN_MIN * 60)).fetchone()
-                if dup:
-                    continue
+                        (fid, now_ts - DUP_COOLDOWN_MIN * 60)).fetchone())
 
             league_id, league = _league_name(m)
             home, away = _teams(m)
@@ -2091,6 +2106,10 @@ def production_scan() -> Tuple[int, int]:
             live_snapshot_matches.append(_build_live_match_entry(
                 fid, league, league_id, home, away, score, minute, candidates,
                 kickoff_ts=kickoff, raw=raw, home_id=home_id, away_id=away_id))
+
+            # Displayed above, just not re-tipped yet.
+            if cooling_down:
+                continue
 
             per_match = 0
             taken: List[str] = []
@@ -2159,7 +2178,7 @@ def production_scan() -> Tuple[int, int]:
             continue
 
     _log_predictions(pred_rows)
-    _set_live_snapshot(live_snapshot_matches)
+    _set_live_snapshot(live_snapshot_matches, live_seen=live_seen, no_coverage=no_coverage)
     log.info("[PROD] saved=%d live_seen=%d candidates_logged=%d harvested=%d no_coverage=%d",
              saved, live_seen, len(pred_rows), harvested, no_coverage)
     if gate_decisions:
@@ -3717,7 +3736,7 @@ def dashboard_live_refresh():
     if not _dashboard_authed():
         abort(401)
     matches, live_seen = score_live_matches_now()
-    _set_live_snapshot(matches)
+    _set_live_snapshot(matches, live_seen=live_seen)
     return jsonify({"ok": True, **_get_live_snapshot(), "live_seen": live_seen,
                     "server_ts": int(time.time())})
 
