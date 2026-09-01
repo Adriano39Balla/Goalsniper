@@ -136,3 +136,67 @@ def test_only_the_match_market_counts_toward_book_depth(monkeypatch):
     main.ODDS_CACHE.invalidate()
 
     assert main.fetch_odds(4245, live=False)["OU_2.5"]["n_books"] == 1
+
+
+# ───────── the same hole in every other family ─────────
+#
+# Over/Under was where it showed up in the P&L, but the substring matching
+# had nothing to do with goals: a half-time, extra-time or shootout variant
+# mapped onto the full-match market in every family. Half-time prices are
+# systematically longer than full-time ones, and fetch_odds keeps the best
+# price, so they hijacked the recorded price the same way team totals did.
+
+@pytest.mark.parametrize("name,family", [
+    ("Both Teams To Score - First Half", "BTTS"),
+    ("Both Teams To Score in Both Halves", "BTTS"),
+    ("First Half Winner", "1X2"),
+    ("Second Half Winner", "1X2"),
+    ("Winner - Extra Time", "1X2"),
+    ("Penalty Shootout Winner", "1X2"),
+    ("Double Chance - First Half", "DC"),
+    ("Draw No Bet (1st Half)", "DNB"),
+])
+def test_part_match_variants_never_map_to_the_full_match_family(name, family):
+    assert main._market_name_normalize(name) != family
+
+
+@pytest.mark.parametrize("name,family", [
+    ("Match Winner", "1X2"),
+    ("1X2", "1X2"),
+    ("Both Teams To Score", "BTTS"),
+    ("Double Chance", "DC"),
+    ("Draw No Bet", "DNB"),
+    ("Goals Over/Under", "OU"),
+])
+def test_full_match_markets_still_map(name, family):
+    assert main._market_name_normalize(name) == family
+
+
+def test_half_time_price_no_longer_hijacks_the_full_time_home_price(monkeypatch):
+    payload = _book(
+        {"name": "Match Winner",
+         "values": [{"value": "Home", "odd": "1.80"}, {"value": "Draw", "odd": "3.60"},
+                    {"value": "Away", "odd": "4.20"}]},
+        {"name": "First Half Winner",
+         "values": [{"value": "Home", "odd": "2.60"}, {"value": "Draw", "odd": "2.10"},
+                    {"value": "Away", "odd": "6.00"}]},
+    )
+    monkeypatch.setattr(main, "_api_get", lambda url, params, timeout=15: payload)
+    main.ODDS_CACHE.invalidate()
+
+    best = main.fetch_odds(4246, live=False)["1X2"]["best"]
+    assert best["Home"]["odds"] == pytest.approx(1.80)
+    assert best["Draw"]["odds"] == pytest.approx(3.60)
+
+
+def test_half_time_btts_no_longer_hijacks_full_time_btts(monkeypatch):
+    payload = _book(
+        {"name": "Both Teams To Score",
+         "values": [{"value": "Yes", "odd": "1.90"}, {"value": "No", "odd": "1.90"}]},
+        {"name": "Both Teams To Score - First Half",
+         "values": [{"value": "Yes", "odd": "3.60"}, {"value": "No", "odd": "1.28"}]},
+    )
+    monkeypatch.setattr(main, "_api_get", lambda url, params, timeout=15: payload)
+    main.ODDS_CACHE.invalidate()
+
+    assert main.fetch_odds(4247, live=False)["BTTS"]["best"]["Yes"]["odds"] == pytest.approx(1.90)

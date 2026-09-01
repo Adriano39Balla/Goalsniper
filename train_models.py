@@ -335,6 +335,38 @@ def _clean_feature_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 
 # ─────────────────────── Data loading ─────────────────────── #
 
+# Snapshots harvested before this instant carry market_fair_* values derived
+# from contaminated odds: _market_name_normalize() folded team totals, half
+# markets and other non-full-match bets into the same market keys, and
+# fetch_odds keeps the BEST price per selection, so the wrong (longer) price
+# won and the de-vigged "consensus" was not the market's read at all.
+#
+# Training on those teaches the model a market prior that never existed. They
+# are dropped rather than kept, which routes them through
+# build_inplay_features' NEUTRAL_MARKET_PRIORS path - the same treatment as
+# every snapshot harvested before the feature existed at all. Everything else
+# in those snapshots (goals, shots, corners, cards) came from the statistics
+# feed and is unaffected, so the rows themselves stay.
+#
+# Override with MARKET_FAIR_TRUSTED_FROM_TS once the contaminated window has
+# aged out of the training set entirely.
+MARKET_FAIR_TRUSTED_FROM_TS = int(os.getenv("MARKET_FAIR_TRUSTED_FROM_TS", "1788307200"))
+
+_MARKET_FAIR_KEYS = ("market_fair_home", "market_fair_draw", "market_fair_away",
+                     "market_fair_over25", "market_fair_btts_yes")
+
+
+def _drop_untrusted_market_fair(raw: Dict[str, Any], created_ts: Optional[int]) -> int:
+    """Strip market_fair_* from a snapshot harvested before the odds fix."""
+    if created_ts is None or created_ts >= MARKET_FAIR_TRUSTED_FROM_TS:
+        return 0
+    dropped = 0
+    for k in _MARKET_FAIR_KEYS:
+        if raw.pop(k, None) is not None:
+            dropped = 1
+    return dropped
+
+
 def load_inplay_data(conn: PGConnection, min_minute: int = 15,
                      max_minute: int = 90) -> pd.DataFrame:
     """
@@ -356,6 +388,7 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
     feats: List[Dict[str, Any]] = []
     legacy = 0
     no_ts = 0
+    untrusted_fair = 0
     for _, row in rows.iterrows():
         try:
             payload = json.loads(row["payload"]) or {}
@@ -375,6 +408,8 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
         if not (min_minute <= minute <= max_minute):
             continue
 
+        untrusted_fair += _drop_untrusted_market_fair(raw, _as_int(row["created_ts"]))
+
         # League rates are injected after the split; a neutral placeholder here.
         f = build_inplay_features(raw, DEFAULT_LEAGUE_RATES)
 
@@ -392,6 +427,11 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
 
     if legacy:
         logger.info("[LOAD] %d legacy-schema in-play snapshots read via compatibility shim", legacy)
+    if untrusted_fair:
+        logger.warning("[LOAD] %d in-play snapshots harvested before the odds fix — their "
+                       "market_fair_* values came from contaminated prices and were dropped "
+                       "to the neutral prior. Everything else in those rows is kept. This "
+                       "count falls to 0 as the window ages out.", untrusted_fair)
     if no_ts:
         logger.warning("[LOAD] %d in-play snapshots have no usable timestamp — they sort to the "
                        "front of the chronological split (i.e. into TRAIN). Harmless for legacy "

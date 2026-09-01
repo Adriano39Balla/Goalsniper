@@ -971,8 +971,11 @@ def _score_prob(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
     if cal:
         try:
             p = _calibrate(p, cal)
-        except Exception:
-            pass
+        except Exception as e:
+            # Falling back to the UNCALIBRATED probability changes what the
+            # number means while it still gets compared against the same
+            # threshold, so leave a trace rather than swallowing it whole.
+            log.debug("[SCORE] calibration failed (%s) — using uncalibrated %.4f", e, p)
     return max(0.0, min(1.0, float(p)))
 
 
@@ -1034,16 +1037,41 @@ def _txt(v: Any) -> str:
 # Asian/handicap lines are excluded deliberately too: their quarter lines
 # (2.25, 2.75) settle half-win/half-loss, and _tip_outcome_for_result grades
 # a straight win or loss, so pricing off them would misgrade the bet.
-_OU_NOT_MATCH_TOTAL = (
+# Scope qualifiers that make a bet something other than the FULL-MATCH
+# market, whichever family it otherwise names. This is not an Over/Under
+# quirk - every family had the same hole:
+#
+#   "Both Teams To Score - First Half"  -> BTTS
+#   "First Half Winner"                 -> 1X2
+#   "Double Chance - First Half"        -> DC
+#   "Draw No Bet (1st Half)"            -> DNB
+#
+# A half is a shorter sample than a match, so its decisive outcomes always
+# price LONGER than the full-time equivalent (half-time BTTS ~3.5 against
+# ~1.9, half-time home ~2.5 against ~1.8). fetch_odds keeps the BEST price
+# per selection, so the half price won every comparison and became the
+# recorded price for a full-match bet - inflating EV, the tip decision, and
+# the P&L, in every market rather than just Over/Under.
+_NOT_FULL_MATCH_SCOPE = (
+    "half", "halves", "1st", "2nd", "first", "second", "quarter", "period",
+    "minute", "extra", "overtime", "incl", "penalt", "shootout",
     "corner", "card", "booking", "offside", "foul", "shot", "save",
-    "half", "1st", "2nd", "quarter", "period", "minute",
-    "home", "away", "team", "player",
-    "exact", "odd", "even", "handicap", "asian",
+    "player", "exact", "odd", "even", "handicap", "asian",
 )
+
+# Additionally for the goals total: a TEAM's total is not the MATCH total.
+# "Total - Home" quotes a plain "Over 2.5" priced ~4.0-9.0 (that team
+# scoring 3+) against ~1.9 for the match. Kept separate from the list above
+# because "Both Teams To Score" legitimately contains "team".
+_OU_NOT_MATCH_TOTAL = ("home", "away", "team")
 
 
 def _market_name_normalize(s: Any) -> str:
     s = _txt(s).lower()
+    # Returning the raw name leaves it unmapped, so _parse_book_market skips
+    # it rather than pricing one market's selection off another's.
+    if any(bad in s for bad in _NOT_FULL_MATCH_SCOPE):
+        return s
     if "both teams" in s or "btts" in s:
         return "BTTS"
     if "double chance" in s:
@@ -1053,8 +1081,6 @@ def _market_name_normalize(s: Any) -> str:
     if "match winner" in s or "winner" in s or "1x2" in s:
         return "1X2"
     if "over/under" in s or "total" in s or "goals" in s:
-        # Returning the raw name leaves it unmapped, so _parse_book_market
-        # skips it rather than pricing a different market's selection.
         if any(bad in s for bad in _OU_NOT_MATCH_TOTAL):
             return s
         return "OU"
