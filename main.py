@@ -378,15 +378,41 @@ class PooledConn:
         self.cur = None
 
     def __enter__(self):
+        """
+        A connection handed out here but never bound into a completed __enter__
+        is invisible to __exit__, because __exit__ does not run when __enter__
+        raises. It therefore has to be given back inside this loop or the pool
+        loses that slot permanently.
+
+        This matters because getconn() happily returns a connection the server
+        has since closed (Postgres restart, idle timeout, network blip); the
+        failure then surfaces on `.autocommit =` or `.cursor()` as
+        InterfaceError/OperationalError, neither of which the retry previously
+        caught. So a dead connection both failed its caller AND leaked a slot,
+        and ~DB_POOL_MAX of them left the app unable to reach the database at
+        all until it was restarted.
+        """
         last_err = None
         for attempt in range(5):
+            conn = None
             try:
-                self.conn = self.pool.getconn()
-                self.conn.autocommit = True
-                self.cur = self.conn.cursor()
+                conn = self.pool.getconn()
+                conn.autocommit = True
+                self.cur = conn.cursor()
+                self.conn = conn
                 return self
-            except psycopg2.pool.PoolError as e:
+            except (psycopg2.pool.PoolError, psycopg2.OperationalError,
+                    psycopg2.InterfaceError) as e:
                 last_err = e
+                if conn is not None:
+                    # close=True: this connection is suspect, don't recycle it.
+                    try:
+                        self.pool.putconn(conn, close=True)
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
                 time.sleep(0.2 * (attempt + 1))
         raise last_err
 
