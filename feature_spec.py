@@ -91,6 +91,21 @@ def elo_update(rating_h: float, rating_a: float,
             float(rating_a) + ELO_K * ((1.0 - score_h) - (1.0 - exp_h)))
 
 
+# The instant recorded odds became trustworthy.
+#
+# Before it, _market_name_normalize() folded team totals, half markets and
+# other non-full-match bets into the full-match market keys, and fetch_odds
+# keeps the BEST price per selection - so the wrong, longer price won and was
+# recorded as the price of a bet nobody could have placed. Everything derived
+# from those prices is fiction: the EV that opened the position, the P&L that
+# graded it, and the de-vigged consensus harvested as market_fair_*.
+#
+# Both the serving side (P&L) and the training side (snapshot features) need
+# to agree on where that line falls, so it is defined once here rather than
+# copied into each. Set slightly after the fix deployed, which discards a
+# little clean data in exchange for admitting no dirty data.
+ODDS_TRUSTED_FROM_TS = int(os.getenv("ODDS_TRUSTED_FROM_TS", "1788307200"))  # 2026-09-02 00:00 UTC
+
 MIN_COUNT_DENOM = 1.0
 MIN_XG_DENOM = 0.1
 FINISHED_STATUSES = {"FT", "AET", "PEN"}

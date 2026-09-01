@@ -85,6 +85,7 @@ from sklearn.metrics import (
 )
 
 from feature_spec import (
+    ODDS_TRUSTED_FROM_TS,
     DEFAULT_LEAGUE_RATES, FEATURES, PRE_FEATURES,
     LEAGUE_RATE_FIELDS_INPLAY, LEAGUE_RATE_FIELDS_PREMATCH,
     build_inplay_features, derive_dc_dnb,
@@ -348,9 +349,10 @@ def _clean_feature_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 # in those snapshots (goals, shots, corners, cards) came from the statistics
 # feed and is unaffected, so the rows themselves stay.
 #
-# Override with MARKET_FAIR_TRUSTED_FROM_TS once the contaminated window has
-# aged out of the training set entirely.
-MARKET_FAIR_TRUSTED_FROM_TS = int(os.getenv("MARKET_FAIR_TRUSTED_FROM_TS", "1788307200"))
+# The boundary itself lives in feature_spec, shared with main.py's P&L: both
+# sides have to agree on when recorded odds became trustworthy, and a second
+# copy here would be one more pair of constants to drift apart.
+MARKET_FAIR_TRUSTED_FROM_TS = ODDS_TRUSTED_FROM_TS
 
 _MARKET_FAIR_KEYS = ("market_fair_home", "market_fair_draw", "market_fair_away",
                      "market_fair_over25", "market_fair_btts_yes")

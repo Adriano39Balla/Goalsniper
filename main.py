@@ -75,7 +75,8 @@ from urllib3.util.retry import Retry
 
 from feature_spec import (
     ELO_DEFAULT,
-    DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS, RAW_INPLAY_KEYS,
+    DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS,
+    ODDS_TRUSTED_FROM_TS, RAW_INPLAY_KEYS,
     assemble_prematch_features, build_inplay_features, derive_dc_dnb,
     devig, elo_update, ev as _ev, fixture_ts as _fixture_ts, kelly_fraction,
     enforce_ou_monotonicity, venue_form_stats,
@@ -2736,6 +2737,11 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
     equity: List[Dict[str, Any]] = []
     running = 0.0
     clvs: List[float] = []
+    # Bets whose recorded price came from the contaminated market mapping.
+    # They are graded the same way and reported separately, never mixed into
+    # the headline: their prices were never available for the selection, so
+    # counting them as a track record reports fiction as edge.
+    stale = {"n_bets": 0, "n_wins": 0, "staked": 0.0, "profit": 0.0}
 
     for (mkt, sugg, odds, cts, stake_units, clv, gh, ga, btts) in rows:
         outcome = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
@@ -2745,9 +2751,17 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
         s = float(stake_units) if (use_kelly and stake_units) else float(stake)
         if s <= 0:
             continue
+        profit = s * (float(odds) - 1.0) if outcome == 1 else -s
+
+        if int(cts or 0) < ODDS_TRUSTED_FROM_TS:
+            stale["n_bets"] += 1
+            stale["n_wins"] += 1 if outcome == 1 else 0
+            stale["staked"] += s
+            stale["profit"] += profit
+            continue
+
         n_bets += 1
         total_staked += s
-        profit = s * (float(odds) - 1.0) if outcome == 1 else -s
         if outcome == 1:
             n_wins += 1
         total_profit += profit
@@ -2778,10 +2792,26 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
         "mean_clv_pct": round(sum(clvs) / len(clvs), 2) if clvs else None,
         "by_market": market_summary,
         "equity_curve": equity,
+        "odds_trusted_from_ts": ODDS_TRUSTED_FROM_TS,
+        "excluded_unreliable_pricing": {
+            "n_bets": stale["n_bets"],
+            "win_rate_pct": (round(100.0 * stale["n_wins"] / stale["n_bets"], 1)
+                             if stale["n_bets"] else 0.0),
+            "total_profit": round(stale["profit"], 2),
+            "roi_pct": (round(stale["profit"] / stale["staked"] * 100.0, 2)
+                        if stale["staked"] > 0 else 0.0),
+            "note": ("Graded at prices that were never available for the selection: team "
+                     "totals and half markets were being folded into the full-match markets, "
+                     "and the best price across that mix won. Reported for completeness, "
+                     "excluded from every figure above. Not recoverable — the true price at "
+                     "tip time was never recorded."),
+        },
         "note": ("Real odds captured at tip time, never synthetic. Tips sent without odds are "
                  "excluded — there is no price to grade them against. Draw No Bet pushes on a "
                  "draw and is excluded rather than counted as a loss. If mean_clv_pct is "
-                 "negative while roi_pct is positive, treat the ROI as variance, not edge."),
+                 "negative while roi_pct is positive, treat the ROI as variance, not edge. "
+                 "Figures cover bets priced after the market-mapping fix only; see "
+                 "excluded_unreliable_pricing for what came before."),
     }
 
 

@@ -72,6 +72,11 @@
   .stat .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
   .stat .value.pos { color: var(--accent); }
   .stat .value.neg { color: var(--danger); }
+  .pnl-caveat {
+    font-size: 11.5px; color: var(--muted); background: var(--panel); border: 1px solid var(--border);
+    border-left: 3px solid var(--warn); border-radius: 8px; padding: 10px 12px; margin: -6px 0 16px;
+  }
+  .pnl-caveat b { color: var(--warn); font-weight: 600; }
 
   .section-title { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin: 24px 0 10px; }
   .section-title .stale { font-weight: 400; text-transform: none; letter-spacing: normal; color: var(--warn); margin-left: 8px; }
@@ -190,6 +195,7 @@
     <div class="hscroll chip-row" id="chipRow"></div>
 
     <div class="stats" id="stats"></div>
+    <div class="pnl-caveat" id="pnlCaveat" style="display:none"></div>
     <div class="section-title">Performance by market</div>
     <div class="market-wrap"><table class="market-table" id="marketTable"></table></div>
 
@@ -214,6 +220,7 @@ const statusText = document.getElementById('statusText');
 const buildEl = document.getElementById('build');
 const updated = document.getElementById('updated');
 const statsEl = document.getElementById('stats');
+const caveatEl = document.getElementById('pnlCaveat');
 const marketTableEl = document.getElementById('marketTable');
 const dayTabsEl = document.getElementById('dayTabs');
 const chipRowEl = document.getElementById('chipRow');
@@ -259,6 +266,8 @@ function renderStats(pnl) {
   if (!pnl || pnl.error) {
     statsEl.innerHTML = '<div class="stat"><div class="label">P&amp;L</div><div class="value">unavailable</div></div>';
     marketTableEl.innerHTML = '';
+    // Don't leave a caveat standing next to numbers that aren't there.
+    caveatEl.style.display = 'none';
     return;
   }
   const cards = [
@@ -271,6 +280,19 @@ function renderStats(pnl) {
   statsEl.innerHTML = cards.map(([label, value, c]) =>
     `<div class="stat"><div class="label">${label}</div><div class="value ${c}">${value}</div></div>`
   ).join('');
+
+  // Say why the record looks short, rather than leaving a near-empty P&L
+  // looking like a bug. The excluded bets were graded at prices that were
+  // never available for the selection, so they are not a track record.
+  const stale = pnl.excluded_unreliable_pricing;
+  caveatEl.innerHTML = (stale && stale.n_bets)
+    ? `<b>${stale.n_bets} earlier bets excluded.</b> They were priced off contaminated market
+       data (team totals and half markets folded into the full-match markets), which is where
+       the old ${fmtPct(stale.roi_pct)} ROI / ${fmtMoney(stale.total_profit)} came from. Those
+       prices were never available for the selection, so they are not a track record. The
+       figures above cover bets priced since the fix.`
+    : '';
+  caveatEl.style.display = (stale && stale.n_bets) ? 'block' : 'none';
 
   const rows = Object.entries(pnl.by_market || {});
   if (!rows.length) {
