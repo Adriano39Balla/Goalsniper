@@ -1017,6 +1017,31 @@ def _txt(v: Any) -> str:
     return v if isinstance(v, str) else str(v)
 
 
+# Bet names that mention "total"/"goals" but are NOT the match over/under.
+# API-Football's catalogue also carries team totals ("Total - Home"), halves
+# ("Goals Over/Under First Half"), corners, cards, exact-score and odd/even
+# markets - and every one of them quotes a plain "Over 2.5" label, so they
+# used to be folded into OU_2.5 alongside the real match total.
+#
+# That was not cosmetic. fetch_odds keeps the BEST price per selection, and a
+# single team scoring 3+ prices around 4.0-9.0 against ~1.9 for the match
+# total, so the wrong price won the comparison every time. The inflated price
+# then flowed into the EV gate (tipping bets whose real price never existed)
+# and into P&L - which is what produced a 116.8% ROI on 310 PRE Over/Under
+# 2.5 bets at a 52.9% win rate, implying average winning odds of ~4.1 on a
+# market that trades between about 1.4 and 3.0.
+#
+# Asian/handicap lines are excluded deliberately too: their quarter lines
+# (2.25, 2.75) settle half-win/half-loss, and _tip_outcome_for_result grades
+# a straight win or loss, so pricing off them would misgrade the bet.
+_OU_NOT_MATCH_TOTAL = (
+    "corner", "card", "booking", "offside", "foul", "shot", "save",
+    "half", "1st", "2nd", "quarter", "period", "minute",
+    "home", "away", "team", "player",
+    "exact", "odd", "even", "handicap", "asian",
+)
+
+
 def _market_name_normalize(s: Any) -> str:
     s = _txt(s).lower()
     if "both teams" in s or "btts" in s:
@@ -1028,6 +1053,10 @@ def _market_name_normalize(s: Any) -> str:
     if "match winner" in s or "winner" in s or "1x2" in s:
         return "1X2"
     if "over/under" in s or "total" in s or "goals" in s:
+        # Returning the raw name leaves it unmapped, so _parse_book_market
+        # skips it rather than pricing a different market's selection.
+        if any(bad in s for bad in _OU_NOT_MATCH_TOTAL):
+            return s
         return "OU"
     return s
 
