@@ -65,6 +65,27 @@ def test_build_live_match_entry_handles_no_candidates():
     assert entry["hits"] == 0
 
 
+def test_kickoff_ts_and_stats_default_when_not_supplied():
+    # Older call sites (or tests) that don't pass kickoff_ts/raw shouldn't
+    # break - kickoff_ts falls back to 0, stats to None rather than a
+    # half-filled dict.
+    entry = main._build_live_match_entry(
+        fid=1, league="L", league_id=1, home="A", away="B",
+        score="0-0", minute=10, candidates=[])
+    assert entry["kickoff_ts"] == 0
+    assert entry["stats"] is None
+
+
+def test_kickoff_ts_and_stats_pass_through_when_supplied():
+    raw = {"sot_h": 4.0, "sot_a": 2.0, "cor_h": 5.0, "cor_a": 3.0,
+           "pos_h": 55.0, "pos_a": 45.0, "yellow_h": 1.0, "yellow_a": 2.0}
+    entry = main._build_live_match_entry(
+        fid=1, league="L", league_id=1, home="A", away="B",
+        score="0-0", minute=10, candidates=[], kickoff_ts=1_700_000_000, raw=raw)
+    assert entry["kickoff_ts"] == 1_700_000_000
+    assert entry["stats"] == raw
+
+
 def test_candidates_below_threshold_never_call_price_gate(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("_price_gate must not run for a below-threshold candidate")

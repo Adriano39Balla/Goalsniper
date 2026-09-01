@@ -1856,7 +1856,8 @@ _live_snapshot: Dict[str, Any] = {"updated_ts": 0, "matches": []}
 
 def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, away: str,
                             score: str, minute: int,
-                            candidates: List[Tuple[str, str, float, float]]) -> Dict[str, Any]:
+                            candidates: List[Tuple[str, str, float, float]],
+                            kickoff_ts: int = 0, raw: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     # For every candidate that clears its own threshold, run it through the
     # same _price_gate() production_scan() uses to decide whether it would
     # actually get tipped, and surface *why* when it wouldn't - "high
@@ -1887,9 +1888,23 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
             row["odds"] = None
             row["ev_pct"] = None
         markets.append(row)
+
+    # A few of the raw in-play numbers we already fetched, for the dashboard's
+    # per-match overview panel - not new API cost, just surfacing what
+    # extract_features() already pulled out of /fixtures/statistics.
+    stats = None
+    if raw:
+        stats = {
+            "sot_h": raw.get("sot_h", 0.0), "sot_a": raw.get("sot_a", 0.0),
+            "cor_h": raw.get("cor_h", 0.0), "cor_a": raw.get("cor_a", 0.0),
+            "pos_h": raw.get("pos_h", 0.0), "pos_a": raw.get("pos_a", 0.0),
+            "yellow_h": raw.get("yellow_h", 0.0), "yellow_a": raw.get("yellow_a", 0.0),
+        }
+
     return {
         "fixture_id": fid, "league": league, "league_id": league_id,
         "home": home, "away": away, "score": score, "minute": minute,
+        "kickoff_ts": int(kickoff_ts or 0), "stats": stats,
         "markets": markets,
         # Count of candidates that would actually be tipped (passed the full
         # price gate), not just candidates with high raw confidence - this is
@@ -2008,7 +2023,8 @@ def production_scan() -> Tuple[int, int]:
             # Full breakdown for the dashboard, independent of whether any of
             # these candidates go on to clear a threshold or the price gate.
             live_snapshot_matches.append(_build_live_match_entry(
-                fid, league, league_id, home, away, score, minute, candidates))
+                fid, league, league_id, home, away, score, minute, candidates,
+                kickoff_ts=kickoff, raw=raw))
 
             per_match = 0
             taken: List[str] = []
@@ -2121,6 +2137,7 @@ def score_live_matches_now() -> Tuple[List[Dict[str, Any]], int]:
             league_id, league = _league_name(m)
             home, away = _teams(m)
             score = _pretty_score(m)
+            kickoff = _kickoff_ts_of(m)
 
             candidates = (_ou_candidates(feat, "", _get_market_threshold)
                           + _btts_candidates(feat, "", _get_market_threshold)
@@ -2131,7 +2148,7 @@ def score_live_matches_now() -> Tuple[List[Dict[str, Any]], int]:
             candidates.sort(key=lambda x: x[2], reverse=True)
 
             out.append(_build_live_match_entry(fid, league, league_id, home, away, score,
-                                               minute, candidates))
+                                               minute, candidates, kickoff_ts=kickoff, raw=raw))
         except Exception as e:
             log.warning("[LIVE-SCORE] failed for a fixture: %s", e)
             continue
