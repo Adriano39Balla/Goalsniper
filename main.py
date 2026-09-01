@@ -3188,8 +3188,29 @@ def retry_unsent_tips(minutes: int = 120, limit: int = 200) -> int:
 
 
 # ───────── Scheduler ─────────
+_PROCESS_STARTED_TS = int(time.time())
 _SCHED: Optional[BackgroundScheduler] = None
 _scheduler_started = False
+
+
+def build_info() -> Dict[str, Any]:
+    """
+    Which commit is actually running.
+
+    "Did my push deploy?" is otherwise unanswerable from outside the Railway
+    dashboard, and answering it wrongly wastes real time - a push can sit
+    undeployed while the previous build keeps serving, which is
+    indistinguishable from the change not working. Railway injects these for
+    a GitHub-connected service; they are absent when running locally.
+    """
+    sha = os.getenv("RAILWAY_GIT_COMMIT_SHA") or ""
+    return {
+        "commit": sha[:7] or "unknown",
+        "commit_full": sha or None,
+        "branch": os.getenv("RAILWAY_GIT_BRANCH") or None,
+        "deployed_at": os.getenv("RAILWAY_DEPLOYMENT_CREATED_AT") or None,
+        "started_ts": _PROCESS_STARTED_TS,
+    }
 
 
 def _run_with_pg_lock(lock_key: int, fn, *a, **k):
@@ -3542,6 +3563,7 @@ def http_status():
     snap_ratio = (float(n_tip_snap) / n_snap_matches) if n_snap_matches else 0.0
     return jsonify({
         "ok": True,
+        "build": build_info(),
         "harvest": {"tip_snapshots": int(n_tip_snap), "distinct_matches_snapshotted": int(n_snap_matches),
                     "snapshots_per_match": round(snap_ratio, 2),
                     "prematch_snapshots": int(n_pre_snap), "match_results_resolved": int(n_results),
@@ -3686,7 +3708,8 @@ def dashboard_data():
     except Exception as e:
         log.warning("[DASHBOARD] pnl computation failed: %s", e)
         pnl = {"error": str(e)}
-    return jsonify({"ok": True, "tips": tips, "pnl": pnl, "server_ts": int(time.time())})
+    return jsonify({"ok": True, "tips": tips, "pnl": pnl, "build": build_info(),
+                    "server_ts": int(time.time())})
 
 
 # How many recent fixtures to pull per team. The window is split by venue

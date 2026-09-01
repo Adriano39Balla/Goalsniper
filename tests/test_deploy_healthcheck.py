@@ -55,3 +55,37 @@ def test_dashboard_routes_the_frontend_calls_are_registered():
     for path in ("/dashboard", "/dashboard/data", "/dashboard/live",
                  "/dashboard/live/refresh", "/dashboard/match/<int:fid>/form"):
         assert path in rules, f"{path} is not registered"
+
+
+# ───────── which commit is actually running ─────────
+#
+# "Did my push deploy?" was unanswerable from outside the Railway dashboard,
+# and getting it wrong wastes real time: a push that never deployed looks
+# exactly like a change that didn't work.
+
+def test_build_info_reports_the_deployed_commit(monkeypatch):
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "1a8aa03fcb2cb3ffb0e6297c4959bebfb6cce9bd")
+    monkeypatch.setenv("RAILWAY_GIT_BRANCH", "main")
+    info = main.build_info()
+    assert info["commit"] == "1a8aa03"
+    assert info["commit_full"].startswith("1a8aa03")
+    assert info["branch"] == "main"
+
+
+def test_build_info_degrades_when_not_running_on_railway(monkeypatch):
+    monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+    monkeypatch.delenv("RAILWAY_GIT_BRANCH", raising=False)
+    info = main.build_info()
+    assert info["commit"] == "unknown"
+    assert info["commit_full"] is None
+    assert info["started_ts"] > 0
+
+
+def test_dashboard_payload_carries_the_build(monkeypatch):
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "deadbeefcafe")
+    monkeypatch.setattr(main, "_dashboard_authed", lambda: True)
+    monkeypatch.setattr(main, "DASHBOARD_ENABLED", True)
+    monkeypatch.setattr(main, "compute_pnl", lambda **k: {"n_bets": 0})
+    r = main.app.test_client().get("/dashboard/data")
+    assert r.status_code == 200
+    assert r.get_json()["build"]["commit"] == "deadbee"

@@ -25,6 +25,8 @@
   header .logo { font-size: 20px; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .status { font-size: 12px; color: var(--muted); margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  header .build { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+                  color: var(--muted); border: 1px solid var(--border); border-radius: 5px; padding: 2px 6px; }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
   .dot.live { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
   header a.logout { color: var(--muted); font-size: 12px; text-decoration: none; border: 1px solid var(--border); padding: 5px 10px; border-radius: 6px; }
@@ -176,7 +178,10 @@
   <header>
     <div class="logo">⚽️</div>
     <h1>goalsniper</h1>
-    <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting…</span></div>
+    <div class="status">
+      <span class="build" id="build" title="Commit currently running"></span>
+      <span class="dot" id="dot"></span><span id="statusText">connecting…</span>
+    </div>
     <a class="logout" href="{{ url_for('dashboard_logout') }}"
        onclick="return confirm('Sign out?')">Sign out</a>
   </header>
@@ -206,6 +211,7 @@
 const REFRESH_MS = {{ refresh_sec }} * 1000;
 const dot = document.getElementById('dot');
 const statusText = document.getElementById('statusText');
+const buildEl = document.getElementById('build');
 const updated = document.getElementById('updated');
 const statsEl = document.getElementById('stats');
 const marketTableEl = document.getElementById('marketTable');
@@ -735,6 +741,13 @@ async function refresh() {
     if (!data.ok) throw new Error(data.error || 'unknown error');
     renderStats(data.pnl);
     lastTips = data.tips || [];
+    // Which commit is actually serving this page - a push that never
+    // deployed looks exactly like a change that didn't work.
+    if (data.build) {
+      buildEl.textContent = data.build.commit || 'unknown';
+      buildEl.title = 'Running commit ' + (data.build.commit_full || 'unknown')
+        + (data.build.branch ? ' on ' + data.build.branch : '');
+    }
 
     const live = await liveRes.json();
     if (live.ok) {
