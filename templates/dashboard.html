@@ -91,6 +91,25 @@
   .strength-tab .n { font-weight: 400; opacity: 0.75; margin-left: 3px; }
 
   /* ---- league groups / feed cards ---- */
+  .feed-section { margin-bottom: 26px; }
+  .feed-section-head {
+    display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.05em; color: var(--text);
+    padding-bottom: 8px; margin-bottom: 10px; border-bottom: 1px solid var(--border);
+  }
+  .feed-section-head .n {
+    font-weight: 700; font-size: 11px; color: var(--bg); background: var(--muted);
+    border-radius: 999px; padding: 1px 8px; letter-spacing: 0;
+  }
+  .live-pip {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+    box-shadow: 0 0 7px var(--accent); flex: 0 0 auto;
+  }
+  .section-note {
+    color: var(--muted); font-size: 12.5px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px;
+  }
+
   .league-group { margin-bottom: 18px; }
   .league-header { display: flex; align-items: center; gap: 8px; padding: 6px 2px; }
   .league-header .icon {
@@ -319,6 +338,12 @@ function renderDayTabs() {
       renderFeed();
     });
   });
+  // Today sits at the right-hand end, which on a phone is off-screen in the
+  // scroll strip - so the selected day wasn't visible at all. Bring it in.
+  const active = dayTabsEl.querySelector('.day-tab.active');
+  if (active && active.scrollIntoView) {
+    active.scrollIntoView({ block: 'nearest', inline: 'center' });
+  }
 }
 
 // ---- feed items: a live match or a historical tip, normalised just enough
@@ -563,77 +588,60 @@ function emptyReason(dayItems) {
   return 'No live matches scored yet. If this persists, the scan may not have run since the last restart.';
 }
 
-function renderFeed() {
-  const dayItems = buildDayItems(selectedDayOffset);
-  renderStrengthTabs(dayItems);
+// Keys are derived from the item itself, not its position, so an open panel
+// survives the periodic redraw instead of snapping shut while it's read.
+function itemKey(it) {
+  return it.type === 'live'
+    ? 'live-' + it.data.fixture_id
+    : 'tip-' + it.data.match_id + '-' + it.data.created_ts;
+}
 
-  let items = dayItems;
-  if (selectedMarket !== 'All') items = items.filter(it => itemMarkets(it).includes(selectedMarket));
-  if (selectedStrength !== 'all') items = items.filter(it => itemStrength(it) === selectedStrength);
-
-  if (!items.length) {
-    feedEl.innerHTML = `<div class="empty">${emptyReason(dayItems)}</div>`;
-    return;
+function cardHtml(it) {
+  const key = itemKey(it);
+  const id = 'detail-' + key;
+  if (it.type === 'live') {
+    const m = it.data;
+    const tag = m.hits > 0 ? '<span class="tag strong">Strong</span>'
+      : (itemStrength(it) === 'leans' ? '<span class="tag leans">Leans+</span>' : '');
+    return `
+      <div class="feed-card">
+        <div class="feed-row" data-id="${id}" data-key="${key}" data-fid="${m.fixture_id}">
+          <div class="kotime live-now"><span class="ko-label">Live</span>${m.minute}'</div>
+          <div>
+            <div class="match">${tag}${m.home} vs ${m.away}</div>
+            <div class="sub">${m.score || ''}</div>
+          </div>
+          <div class="conf">${topProb(m).toFixed(0)}%<span class="pct">top pick</span></div>
+          <div class="caret">&#9656;</div>
+        </div>
+        <div id="${id}" style="display:none">${overviewForLive(m)}</div>
+      </div>`;
   }
+  const t = it.data;
+  const ko = t.created_ts ? fmtClock(t.created_ts) : '—';
+  return `
+    <div class="feed-card">
+      <div class="feed-row" data-id="${id}" data-key="${key}">
+        <div class="kotime"><span class="ko-label">Sent</span>${ko}</div>
+        <div>
+          <div class="match"><span class="tag strong">Strong</span>${t.home} vs ${t.away}</div>
+          <div class="sub"><span class="pick">${t.suggestion}</span> · ${t.market}</div>
+        </div>
+        <div class="conf">${t.confidence != null ? t.confidence.toFixed(0) : '—'}%<span class="pct">confidence</span></div>
+        <div class="caret">&#9656;</div>
+      </div>
+      <div id="${id}" style="display:none">${overviewForTip(t)}</div>
+    </div>`;
+}
 
-  // Live cards first (soonest kickoff first), then historical tips (most
-  // recent first) - "grouped by strength" is the tab above, this is the
-  // ordering within whichever tab is selected.
-  items.sort((a, b) => {
-    if (a.type !== b.type) return a.type === 'live' ? -1 : 1;
-    return a.type === 'live' ? (a.sortTs || Infinity) - (b.sortTs || Infinity) : b.sortTs - a.sortTs;
-  });
-
+function leagueGroupsHtml(items) {
   const groups = new Map();
   items.forEach(it => {
     if (!groups.has(it.league)) groups.set(it.league, []);
     groups.get(it.league).push(it);
   });
-
-  const html = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([league, groupItems]) => {
+  return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([league, groupItems]) => {
     const [country, name] = league.includes(' - ') ? league.split(' - ') : ['', league];
-    const cards = groupItems.map(it => {
-      // Keys are derived from the item itself, not its position, so an open
-      // panel survives the periodic redraw instead of snapping shut while
-      // it's being read.
-      const key = it.type === 'live'
-        ? 'live-' + it.data.fixture_id
-        : 'tip-' + it.data.match_id + '-' + it.data.created_ts;
-      const id = 'detail-' + key;
-      if (it.type === 'live') {
-        const m = it.data;
-        const tag = m.hits > 0 ? '<span class="tag strong">Strong</span>'
-          : (itemStrength(it) === 'leans' ? '<span class="tag leans">Leans+</span>' : '');
-        return `
-          <div class="feed-card">
-            <div class="feed-row" data-id="${id}" data-key="${key}" data-fid="${m.fixture_id}">
-              <div class="kotime live-now"><span class="ko-label">Live</span>${m.minute}'</div>
-              <div>
-                <div class="match">${tag}${m.home} vs ${m.away}</div>
-                <div class="sub">${m.score || ''}</div>
-              </div>
-              <div class="conf">${topProb(m).toFixed(0)}%<span class="pct">top pick</span></div>
-              <div class="caret">&#9656;</div>
-            </div>
-            <div id="${id}" style="display:none">${overviewForLive(m)}</div>
-          </div>`;
-      }
-      const t = it.data;
-      const ko = t.created_ts ? fmtClock(t.created_ts) : '—';
-      return `
-        <div class="feed-card">
-          <div class="feed-row" data-id="${id}" data-key="${key}">
-            <div class="kotime"><span class="ko-label">Sent</span>${ko}</div>
-            <div>
-              <div class="match"><span class="tag strong">Strong</span>${t.home} vs ${t.away}</div>
-              <div class="sub"><span class="pick">${t.suggestion}</span> · ${t.market}</div>
-            </div>
-            <div class="conf">${t.confidence != null ? t.confidence.toFixed(0) : '—'}%<span class="pct">confidence</span></div>
-            <div class="caret">&#9656;</div>
-          </div>
-          <div id="${id}" style="display:none">${overviewForTip(t)}</div>
-        </div>`;
-    }).join('');
     return `
       <div class="league-group">
         <div class="league-header">
@@ -643,11 +651,51 @@ function renderFeed() {
             ${country ? `<div class="country">${country}</div>` : ''}
           </div>
         </div>
-        <div class="feed">${cards}</div>
+        <div class="feed">${groupItems.map(cardHtml).join('')}</div>
       </div>`;
   }).join('');
+}
 
-  feedEl.innerHTML = html;
+function renderFeed() {
+  const dayItems = buildDayItems(selectedDayOffset);
+  renderStrengthTabs(dayItems);
+
+  let items = dayItems;
+  if (selectedMarket !== 'All') items = items.filter(it => itemMarkets(it).includes(selectedMarket));
+  if (selectedStrength !== 'all') items = items.filter(it => itemStrength(it) === selectedStrength);
+
+  // Live and sent are separate sections, NOT one alphabetical list. Merging
+  // them meant a single in-play match sat somewhere inside 55 prematch tips
+  // sorted by country - present, but invisible, which reads as "live is
+  // missing". In-play is the thing being watched: it goes first, always
+  // shown with its own count, and says so even when the count is zero.
+  const live = items.filter(it => it.type === 'live')
+                    .sort((a, b) => (a.sortTs || Infinity) - (b.sortTs || Infinity));
+  const sent = items.filter(it => it.type === 'tip')
+                    .sort((a, b) => b.sortTs - a.sortTs);
+
+  const liveSection = selectedDayOffset !== 0 ? '' : `
+    <div class="feed-section">
+      <div class="feed-section-head">
+        <span class="live-pip"></span>Live now
+        <span class="n">${live.length}</span>
+      </div>
+      ${live.length ? leagueGroupsHtml(live)
+                    : `<div class="section-note">${emptyReason(dayItems.filter(it => it.type === 'live'))}</div>`}
+    </div>`;
+
+  const sentSection = sent.length ? `
+    <div class="feed-section">
+      <div class="feed-section-head">Sent tips <span class="n">${sent.length}</span></div>
+      ${leagueGroupsHtml(sent)}
+    </div>` : '';
+
+  if (!liveSection && !sentSection) {
+    feedEl.innerHTML = `<div class="empty">${emptyReason(dayItems)}</div>`;
+    return;
+  }
+
+  feedEl.innerHTML = liveSection + sentSection;
   feedEl.querySelectorAll('.feed-row').forEach(row => {
     // Reopen whatever was open before this redraw. Form comes from
     // formCache here, so restoring costs no API call.
