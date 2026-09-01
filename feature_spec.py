@@ -362,6 +362,28 @@ def team_form_stats(team_id: int, games: List[dict]) -> Dict[str, Any]:
             "draw": draw / total_w, "played": played, "last_ts": last_ts}
 
 
+def venue_form_stats(team_id: int, games: List[dict], venue: str) -> Dict[str, Any]:
+    """
+    team_form_stats() restricted to the games a team played at one venue.
+
+    A last-N window mixes home and away fixtures, and the two say different
+    things about the same team: "wins 60% at home" next to "wins 0% away" is
+    the split a human actually reads a fixture with. Filtering here and
+    delegating keeps ONE implementation of the recency-weighted win/goals
+    maths - the weights are recomputed over the filtered window, so the most
+    recent game AT THAT VENUE gets weight 1.0 rather than inheriting a
+    decayed weight from its position in the mixed list.
+
+    Note the sample this leaves: filtering 10 mixed fixtures typically leaves
+    4-6 at either venue, so callers must surface `played` alongside `win` -
+    a 0% win rate off two games is not the same claim as one off six.
+    """
+    side = "home" if venue == "home" else "away"
+    at_venue = [g for g in games
+                if ((g.get("teams") or {}).get(side) or {}).get("id") == team_id]
+    return team_form_stats(team_id, at_venue)
+
+
 def rate_totals(games: List[dict]) -> Tuple[float, float, float]:
     """Recency-weighted Over 2.5 / Over 3.5 / BTTS rates for a fixture window."""
     w_map = decay_weights(games)

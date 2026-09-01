@@ -78,7 +78,7 @@ from feature_spec import (
     DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS, RAW_INPLAY_KEYS,
     assemble_prematch_features, build_inplay_features, derive_dc_dnb,
     devig, ev as _ev, fixture_ts as _fixture_ts, kelly_fraction,
-    enforce_ou_monotonicity,
+    enforce_ou_monotonicity, venue_form_stats,
 )
 
 try:
@@ -732,6 +732,60 @@ def get_league_rates(league_id: Optional[int]) -> Dict[str, float]:
     return out
 
 
+# Only used when match_results holds too little to say anything about a
+# league - the long-run cross-league split of home wins / away wins. Kept
+# here rather than in feature_spec because nothing trains on it: it is a
+# presentation baseline for the dashboard's form cards, not a model input.
+DEFAULT_VENUE_RATES: Dict[str, float] = {"home_win": 0.45, "away_win": 0.29}
+
+
+def _global_venue_rates() -> Dict[str, float]:
+    cached = _LEAGUE_RATE_CACHE.get("V__GLOBAL__", _MISS)
+    if cached is not _MISS:
+        return cached
+    with db_conn() as c:
+        row = c.execute("""
+            SELECT AVG(CASE WHEN final_goals_h>final_goals_a THEN 1.0 ELSE 0.0 END)::float,
+                   AVG(CASE WHEN final_goals_a>final_goals_h THEN 1.0 ELSE 0.0 END)::float,
+                   COUNT(*)::bigint
+            FROM match_results""").fetchone()
+    n = int((row[2] if row else 0) or 0)
+    out = {"home_win": float(row[0]) if n and row[0] is not None else DEFAULT_VENUE_RATES["home_win"],
+           "away_win": float(row[1]) if n and row[1] is not None else DEFAULT_VENUE_RATES["away_win"],
+           "n": n}
+    _LEAGUE_RATE_CACHE.set("V__GLOBAL__", out)
+    return out
+
+
+def get_league_venue_rates(league_id: Optional[int]) -> Dict[str, float]:
+    """
+    How often the home side and the away side actually win in this league -
+    the baseline a team's own venue form is judged against ("above the
+    league's usual"). Same shape and same thin-sample fallback as
+    get_league_rates(): under LEAGUE_RATE_MIN_N finished matches the league
+    tells us nothing, so the global split is used instead.
+    """
+    if not league_id:
+        return _global_venue_rates()
+    key = f"VL{league_id}"
+    cached = _LEAGUE_RATE_CACHE.get(key, _MISS)
+    if cached is not _MISS:
+        return cached
+    with db_conn() as c:
+        row = c.execute("""
+            SELECT AVG(CASE WHEN final_goals_h>final_goals_a THEN 1.0 ELSE 0.0 END)::float,
+                   AVG(CASE WHEN final_goals_a>final_goals_h THEN 1.0 ELSE 0.0 END)::float,
+                   COUNT(*)::bigint
+            FROM match_results WHERE league_id=%s""", (league_id,)).fetchone()
+    n = int((row[2] if row else 0) or 0)
+    out = _global_venue_rates() if n < LEAGUE_RATE_MIN_N else {
+        "home_win": float(row[0]) if row[0] is not None else DEFAULT_VENUE_RATES["home_win"],
+        "away_win": float(row[1]) if row[1] is not None else DEFAULT_VENUE_RATES["away_win"],
+        "n": n}
+    _LEAGUE_RATE_CACHE.set(key, out)
+    return out
+
+
 # ───────── Raw in-play extraction ─────────
 def _num(v) -> float:
     try:
@@ -827,6 +881,13 @@ def _league_name(m: dict) -> Tuple[int, str]:
 def _teams(m: dict) -> Tuple[str, str]:
     t = (m.get("teams") or {}) or {}
     return t.get("home", {}).get("name", ""), t.get("away", {}).get("name", "")
+
+
+def _team_ids(m: dict) -> Tuple[int, int]:
+    """(home_id, away_id), 0 where the feed didn't carry one."""
+    t = (m.get("teams") or {}) or {}
+    return (int((t.get("home") or {}).get("id") or 0),
+            int((t.get("away") or {}).get("id") or 0))
 
 
 def _pretty_score(m: dict) -> str:
@@ -1857,7 +1918,8 @@ _live_snapshot: Dict[str, Any] = {"updated_ts": 0, "matches": []}
 def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, away: str,
                             score: str, minute: int,
                             candidates: List[Tuple[str, str, float, float]],
-                            kickoff_ts: int = 0, raw: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+                            kickoff_ts: int = 0, raw: Optional[Dict[str, float]] = None,
+                            home_id: int = 0, away_id: int = 0) -> Dict[str, Any]:
     # For every candidate that clears its own threshold, run it through the
     # same _price_gate() production_scan() uses to decide whether it would
     # actually get tipped, and surface *why* when it wouldn't - "high
@@ -1904,6 +1966,9 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
     return {
         "fixture_id": fid, "league": league, "league_id": league_id,
         "home": home, "away": away, "score": score, "minute": minute,
+        # Team ids let /dashboard/match/<fid>/form resolve who to look up
+        # from the snapshot, instead of trusting ids from the query string.
+        "home_id": int(home_id or 0), "away_id": int(away_id or 0),
         "kickoff_ts": int(kickoff_ts or 0), "stats": stats,
         "markets": markets,
         # Count of candidates that would actually be tipped (passed the full
@@ -2022,9 +2087,10 @@ def production_scan() -> Tuple[int, int]:
 
             # Full breakdown for the dashboard, independent of whether any of
             # these candidates go on to clear a threshold or the price gate.
+            home_id, away_id = _team_ids(m)
             live_snapshot_matches.append(_build_live_match_entry(
                 fid, league, league_id, home, away, score, minute, candidates,
-                kickoff_ts=kickoff, raw=raw))
+                kickoff_ts=kickoff, raw=raw, home_id=home_id, away_id=away_id))
 
             per_match = 0
             taken: List[str] = []
@@ -2147,8 +2213,10 @@ def score_live_matches_now() -> Tuple[List[Dict[str, Any]], int]:
                           if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)]
             candidates.sort(key=lambda x: x[2], reverse=True)
 
+            home_id, away_id = _team_ids(m)
             out.append(_build_live_match_entry(fid, league, league_id, home, away, score,
-                                               minute, candidates, kickoff_ts=kickoff, raw=raw))
+                                               minute, candidates, kickoff_ts=kickoff, raw=raw,
+                                               home_id=home_id, away_id=away_id))
         except Exception as e:
             log.warning("[LIVE-SCORE] failed for a fixture: %s", e)
             continue
@@ -3526,6 +3594,98 @@ def dashboard_data():
         log.warning("[DASHBOARD] pnl computation failed: %s", e)
         pnl = {"error": str(e)}
     return jsonify({"ok": True, "tips": tips, "pnl": pnl, "server_ts": int(time.time())})
+
+
+# How many recent fixtures to pull per team. The window is split by venue
+# afterwards, so 10 mixed games is what leaves a usable home-only or
+# away-only sample; it costs exactly the same one API call as asking for 5.
+FORM_WINDOW_GAMES = 10
+# Below this many games AT THE VENUE there is nothing to compare - the card
+# still shows the number, it just doesn't dress one or two matches up as a
+# trend by calling the team "well below the league's usual".
+VENUE_FORM_MIN_GAMES = 3
+
+
+def _venue_verdict(team_rate: float, league_rate: float, played: int) -> Optional[Dict[str, str]]:
+    """Where a team's venue win rate sits against its league's, in pp."""
+    if played < VENUE_FORM_MIN_GAMES:
+        return None
+    gap_pp = (team_rate - league_rate) * 100.0
+    if gap_pp >= 15.0:
+        return {"text": "well above the league's usual", "tone": "good"}
+    if gap_pp >= 5.0:
+        return {"text": "above the league's usual", "tone": "good"}
+    if gap_pp <= -15.0:
+        return {"text": "well below the league's usual", "tone": "bad"}
+    if gap_pp <= -5.0:
+        return {"text": "below the league's usual", "tone": "bad"}
+    return {"text": "about the league's usual", "tone": "neutral"}
+
+
+def _team_form_card(team_id: int, team_name: str, venue: str, league_rate: float) -> Dict[str, Any]:
+    # win/gf/ga come back recency-weighted (feature_spec.decay_weights), so
+    # the most recent game at this venue counts for more than the oldest -
+    # the frontend says "recency-weighted" next to the sample size rather
+    # than passing this off as a plain count.
+    games = _api_last_fixtures(team_id, FORM_WINDOW_GAMES)
+    st = venue_form_stats(team_id, games, venue)
+    played = int(st.get("played") or 0)
+    win_rate = float(st.get("win") or 0.0)
+    return {
+        "team": team_name, "venue": venue, "played": played,
+        "win_pct": round(win_rate * 100.0, 1),
+        "goals_for": round(float(st.get("gf") or 0.0), 2),
+        "goals_against": round(float(st.get("ga") or 0.0), 2),
+        "league_win_pct": round(league_rate * 100.0, 1),
+        "verdict": _venue_verdict(win_rate, league_rate, played),
+    }
+
+
+def build_match_form(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Home side's home form and away side's away form, each judged against how
+    often that league's home/away teams actually win.
+
+    Costs two /fixtures?last= calls per fixture on a cold TEAM_FORM_CACHE,
+    which is why nothing calls this during a scan - it runs only when a human
+    opens a specific match on the dashboard.
+    """
+    home_id = int(entry.get("home_id") or 0)
+    away_id = int(entry.get("away_id") or 0)
+    if not home_id or not away_id:
+        return {"available": False, "reason": "this fixture's feed carried no team ids"}
+    lvr = get_league_venue_rates(entry.get("league_id"))
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_h = ex.submit(_team_form_card, home_id, entry.get("home") or "", "home", lvr["home_win"])
+        f_a = ex.submit(_team_form_card, away_id, entry.get("away") or "", "away", lvr["away_win"])
+        home_card, away_card = f_h.result(), f_a.result()
+    return {"available": True, "home": home_card, "away": away_card,
+            "league_sample": int(lvr.get("n") or 0)}
+
+
+@app.route("/dashboard/match/<int:fid>/form")
+def dashboard_match_form(fid: int):
+    """
+    Form & momentum for one live fixture, fetched on demand.
+
+    The fixture must be in the current live snapshot: the team ids come from
+    there rather than the query string, so this can't be pointed at arbitrary
+    teams to burn API quota.
+    """
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
+    if not _dashboard_authed():
+        abort(401)
+    entry = next((m for m in _get_live_snapshot()["matches"]
+                  if int(m.get("fixture_id") or 0) == fid), None)
+    if not entry:
+        return jsonify({"ok": False, "error": "fixture is not in the current live snapshot"}), 404
+    try:
+        form = build_match_form(entry)
+    except Exception as e:
+        log.warning("[FORM] lookup failed for fixture %s: %s", fid, e)
+        return jsonify({"ok": False, "error": "form lookup failed"}), 502
+    return jsonify({"ok": True, "fixture_id": fid, **form})
 
 
 @app.route("/dashboard/live")

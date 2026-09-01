@@ -131,6 +131,17 @@
   .stat-grid td { padding: 5px 4px; border-bottom: 1px solid var(--border); }
   .stat-grid td.num { text-align: right; font-variant-numeric: tabular-nums; width: 30%; }
   .stat-grid td.label { text-align: center; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .form-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; margin-bottom: 10px; }
+  .form-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .form-card .head { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .form-card .headline { font-size: 13px; font-weight: 600; margin-top: 5px; line-height: 1.35; }
+  .form-card .verdict { font-size: 11.5px; margin-top: 5px; }
+  .form-card .verdict.good { color: var(--accent); }
+  .form-card .verdict.bad { color: var(--warn); }
+  .form-card .verdict.neutral { color: var(--muted); }
+  .form-card .detail { font-size: 11px; color: var(--muted); margin-top: 5px; }
+  .form-loading { font-size: 11.5px; color: var(--muted); margin-bottom: 10px; }
+
   .trust-line {
     display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text);
     background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; margin-top: 10px;
@@ -204,6 +215,9 @@ let selectedDayOffset = 0;      // 0 = today, 1 = yesterday, ... 6 = six days ag
 let selectedMarket = 'All';
 let selectedStrength = 'all';   // all | strong | leans
 let autoRefreshTimer = null;
+// Which match panels are expanded, by stable item key - survives the
+// periodic redraw so a panel doesn't collapse mid-read.
+const openKeys = new Set();
 
 function fmtMoney(n) {
   if (n === null || n === undefined) return '—';
@@ -384,6 +398,68 @@ function renderStrengthTabs(dayItems) {
   });
 }
 
+// ---- form & momentum (lazy: costs two API-Football calls per uncached
+// fixture, so it's fetched only when a match is actually opened, and kept
+// in formCache so re-opening it - including after an auto-refresh redraw -
+// is free) ----
+const formCache = new Map();
+
+function formCard(c) {
+  if (!c) return '';
+  const venueWord = c.venue === 'home' ? 'home' : 'away';
+  if (!c.played) {
+    return `<div class="form-card">
+        <div class="head">Form &amp; momentum</div>
+        <div class="headline">${c.team}</div>
+        <div class="verdict neutral">no recent ${venueWord} games on record</div>
+      </div>`;
+  }
+  const verdict = c.verdict
+    ? `<div class="verdict ${c.verdict.tone}">${c.verdict.text}</div>`
+    : `<div class="verdict neutral">too few ${venueWord} games to compare</div>`;
+  return `<div class="form-card">
+      <div class="head">Form &amp; momentum</div>
+      <div class="headline">${c.team} win ${c.win_pct.toFixed(0)}% of their ${venueWord} games</div>
+      ${verdict}
+      <div class="detail">last ${c.played} ${venueWord} (recency-weighted) ·
+        ${c.goals_for.toFixed(1)} scored / ${c.goals_against.toFixed(1)} conceded ·
+        league average ${c.league_win_pct.toFixed(0)}%</div>
+    </div>`;
+}
+
+function renderFormInto(host, data) {
+  if (!data || !data.available) {
+    host.innerHTML = `<div class="form-loading">Form unavailable${data && data.reason ? ' — ' + data.reason : ''}.</div>`;
+    return;
+  }
+  host.innerHTML = `<div class="form-cards">${formCard(data.home)}${formCard(data.away)}</div>`;
+}
+
+const FORM_URL_TEMPLATE = '{{ url_for("dashboard_match_form", fid=0) }}';
+function formUrl(fid) { return FORM_URL_TEMPLATE.replace('/0/', '/' + fid + '/'); }
+
+async function loadForm(fid, detailId) {
+  const host = document.querySelector('#' + detailId + ' .form-slot');
+  if (!host || host.dataset.loaded === '1') return;
+  if (formCache.has(fid)) {
+    host.dataset.loaded = '1';
+    renderFormInto(host, formCache.get(fid));
+    return;
+  }
+  host.innerHTML = '<div class="form-loading">Loading form…</div>';
+  try {
+    const r = await fetch(formUrl(fid), { credentials: 'same-origin' });
+    if (r.status === 401) { window.location.href = '{{ url_for("dashboard_login") }}'; return; }
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'form lookup failed');
+    formCache.set(fid, data);
+    host.dataset.loaded = '1';
+    renderFormInto(host, data);
+  } catch (e) {
+    host.innerHTML = `<div class="form-loading">Form unavailable — ${e.message}</div>`;
+  }
+}
+
 function fmtClock(ts) {
   if (!ts) return null;
   return new Date(ts * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
@@ -427,6 +503,7 @@ function overviewForLive(m) {
   return `
     <div class="overview">
       <div class="meta-line">${ko}Score ${m.score || '0-0'} · ${m.minute}' played</div>
+      <div class="form-slot"></div>
       ${statsGrid}
       <table class="market-table">
         <tr><th>Market</th><th>Selection</th><th class="num">Prob</th><th class="num">Threshold</th><th>Status</th></tr>
@@ -490,18 +567,23 @@ function renderFeed() {
     groups.get(it.league).push(it);
   });
 
-  let uid = 0;
   const html = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([league, groupItems]) => {
     const [country, name] = league.includes(' - ') ? league.split(' - ') : ['', league];
     const cards = groupItems.map(it => {
-      const id = 'feed-' + (uid++);
+      // Keys are derived from the item itself, not its position, so an open
+      // panel survives the periodic redraw instead of snapping shut while
+      // it's being read.
+      const key = it.type === 'live'
+        ? 'live-' + it.data.fixture_id
+        : 'tip-' + it.data.match_id + '-' + it.data.created_ts;
+      const id = 'detail-' + key;
       if (it.type === 'live') {
         const m = it.data;
         const tag = m.hits > 0 ? '<span class="tag strong">Strong</span>'
           : (itemStrength(it) === 'leans' ? '<span class="tag leans">Leans+</span>' : '');
         return `
           <div class="feed-card">
-            <div class="feed-row" data-id="${id}">
+            <div class="feed-row" data-id="${id}" data-key="${key}" data-fid="${m.fixture_id}">
               <div class="kotime live-now"><span class="ko-label">Live</span>${m.minute}'</div>
               <div>
                 <div class="match">${tag}${m.home} vs ${m.away}</div>
@@ -517,7 +599,7 @@ function renderFeed() {
       const ko = t.created_ts ? fmtClock(t.created_ts) : '—';
       return `
         <div class="feed-card">
-          <div class="feed-row" data-id="${id}">
+          <div class="feed-row" data-id="${id}" data-key="${key}">
             <div class="kotime"><span class="ko-label">Sent</span>${ko}</div>
             <div>
               <div class="match"><span class="tag strong">Strong</span>${t.home} vs ${t.away}</div>
@@ -544,11 +626,24 @@ function renderFeed() {
 
   feedEl.innerHTML = html;
   feedEl.querySelectorAll('.feed-row').forEach(row => {
+    // Reopen whatever was open before this redraw. Form comes from
+    // formCache here, so restoring costs no API call.
+    if (openKeys.has(row.dataset.key)) {
+      document.getElementById(row.dataset.id).style.display = 'block';
+      row.classList.add('open');
+      if (row.dataset.fid) loadForm(row.dataset.fid, row.dataset.id);
+    }
     row.addEventListener('click', () => {
       const detail = document.getElementById(row.dataset.id);
       const open = detail.style.display !== 'none';
       detail.style.display = open ? 'none' : 'block';
       row.classList.toggle('open', !open);
+      if (open) {
+        openKeys.delete(row.dataset.key);
+      } else {
+        openKeys.add(row.dataset.key);
+        if (row.dataset.fid) loadForm(row.dataset.fid, row.dataset.id);
+      }
     });
   });
 }
