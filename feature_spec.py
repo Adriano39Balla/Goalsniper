@@ -61,6 +61,36 @@ ELO_K = float(os.getenv("ELO_K", "20.0"))
 ELO_HOME_ADV = float(os.getenv("ELO_HOME_ADV", "60.0"))
 FORM_DECAY_RATE = float(os.getenv("FORM_DECAY_RATE", "0.8"))
 
+
+def elo_expected_home(rating_h: float, rating_a: float) -> float:
+    """
+    The home side's expected score, with home advantage folded into its
+    rating rather than applied afterwards.
+    """
+    return 1.0 / (1.0 + 10 ** ((float(rating_a) - (float(rating_h) + ELO_HOME_ADV)) / 400.0))
+
+
+def elo_update(rating_h: float, rating_a: float,
+               goals_h: int, goals_a: int) -> Tuple[float, float]:
+    """
+    Post-match (home, away) ratings. Pure: no I/O, no persistence.
+
+    This lives here, next to the constants it uses, because it had been
+    written out twice in main.py - once for the live result path and once
+    for the historical backfill - with no mechanism keeping them in step.
+    Two hand-maintained copies of the same update rule is exactly the drift
+    this module exists to make impossible: a K-factor or home-advantage
+    change applied to one copy would have left ratings depending on which
+    path happened to observe a match first, and nothing would have failed
+    loudly. Callers keep their own persistence, which genuinely differs
+    (one upsert per match vs. a batch with a staleness guard).
+    """
+    exp_h = elo_expected_home(rating_h, rating_a)
+    score_h = 1.0 if goals_h > goals_a else (0.5 if goals_h == goals_a else 0.0)
+    return (float(rating_h) + ELO_K * (score_h - exp_h),
+            float(rating_a) + ELO_K * ((1.0 - score_h) - (1.0 - exp_h)))
+
+
 MIN_COUNT_DENOM = 1.0
 MIN_XG_DENOM = 0.1
 FINISHED_STATUSES = {"FT", "AET", "PEN"}

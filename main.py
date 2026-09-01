@@ -74,10 +74,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from feature_spec import (
-    ELO_DEFAULT, ELO_HOME_ADV, ELO_K,
+    ELO_DEFAULT,
     DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS, RAW_INPLAY_KEYS,
     assemble_prematch_features, build_inplay_features, derive_dc_dnb,
-    devig, ev as _ev, fixture_ts as _fixture_ts, kelly_fraction,
+    devig, elo_update, ev as _ev, fixture_ts as _fixture_ts, kelly_fraction,
     enforce_ou_monotonicity, venue_form_stats,
 )
 
@@ -1497,12 +1497,8 @@ def update_team_ratings(home_id: int, away_id: int, gh: int, ga: int) -> None:
     if not home_id or not away_id:
         return
     ratings = get_team_ratings_bulk([home_id, away_id])
-    rh = ratings.get(home_id, ELO_DEFAULT)
-    ra = ratings.get(away_id, ELO_DEFAULT)
-    exp_h = 1.0 / (1.0 + 10 ** ((ra - (rh + ELO_HOME_ADV)) / 400.0))
-    score_h = 1.0 if gh > ga else (0.5 if gh == ga else 0.0)
-    new_rh = rh + ELO_K * (score_h - exp_h)
-    new_ra = ra + ELO_K * ((1.0 - score_h) - (1.0 - exp_h))
+    new_rh, new_ra = elo_update(ratings.get(home_id, ELO_DEFAULT),
+                                ratings.get(away_id, ELO_DEFAULT), gh, ga)
     now = int(time.time())
     with db_conn() as c:
         c.executemany(
@@ -2702,10 +2698,7 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
         except Exception as e:
             log.warning("[HIST-PRE] result save failed for %s: %s", fid, e)
 
-        exp_h = 1.0 / (1.0 + 10 ** ((rating_a - (rating_h + ELO_HOME_ADV)) / 400.0))
-        score_h = 1.0 if gh > ga else (0.5 if gh == ga else 0.0)
-        elo_local[th] = rating_h + ELO_K * (score_h - exp_h)
-        elo_local[ta] = rating_a + ELO_K * ((1.0 - score_h) - (1.0 - exp_h))
+        elo_local[th], elo_local[ta] = elo_update(rating_h, rating_a, gh, ga)
 
     with db_conn() as c:
         for tid, rating in elo_local.items():
