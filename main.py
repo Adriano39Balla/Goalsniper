@@ -231,6 +231,9 @@ CLV_CAPTURE_EVERY_MIN = int(os.getenv("CLV_CAPTURE_EVERY_MIN", "5"))
 # prematch market is still open in this window, unlike after kickoff. See
 # capture_closing_lines() for why this must be BEFORE kickoff, not after.
 CLV_CAPTURE_LEAD_MIN = int(os.getenv("CLV_CAPTURE_LEAD_MIN", "15"))
+# Below this many captured closing prices, a CLV figure is noise dressed as a
+# verdict - "beat close 0% of the time" means nothing at n=3.
+CLV_MIN_SAMPLE_FOR_VERDICT = int(os.getenv("CLV_MIN_SAMPLE_FOR_VERDICT", "100"))
 
 PREDICTION_LOG_ENABLE = _env_flag("PREDICTION_LOG_ENABLE", "1")
 PREDICTION_LOG_MIN_PROB = float(os.getenv("PREDICTION_LOG_MIN_PROB", "0.35"))
@@ -1233,6 +1236,7 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     js = _api_get(ODDS_LIVE_URL if live else ODDS_PREMATCH_URL, params) or {}
 
     best: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    by_book: Dict[str, Dict[str, Dict[str, float]]] = {}
     fair_acc: Dict[str, Dict[str, List[float]]] = {}
     books_seen: Dict[str, set] = {}
     parse_errors = 0
@@ -1271,6 +1275,12 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
                         cur = best.setdefault(mkey, {}).get(name)
                         if cur is None or o > cur["odds"]:
                             best[mkey][name] = {"odds": float(o), "book": book_name}
+                        # Per-book prices, so a price can be compared against
+                        # the SAME book later. "best" is a maximum over
+                        # whichever books happened to be quoting, and that set
+                        # grows towards kickoff - comparing one max against a
+                        # larger max measures book coverage, not line movement.
+                        by_book.setdefault(mkey, {}).setdefault(name, {})[book_name] = float(o)
                     # Only de-vig a COMPLETE market, and normalise to the total
                     # that market's true probabilities actually sum to.
                     needed = _MARKET_SELECTION_COUNT.get(mkey, 2)
@@ -1290,7 +1300,8 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for mkey, sels in best.items():
         fair = {k: (sum(v) / len(v)) for k, v in (fair_acc.get(mkey) or {}).items() if v}
-        out[mkey] = {"best": sels, "fair": fair, "n_books": len(books_seen.get(mkey, ()))}
+        out[mkey] = {"best": sels, "fair": fair, "n_books": len(books_seen.get(mkey, ())),
+                     "by_book": by_book.get(mkey, {})}
     ODDS_CACHE.set(key, out)
     return out
 
@@ -1681,7 +1692,7 @@ def capture_closing_lines(limit: int = 200) -> int:
     now = int(time.time())
     with db_conn() as c:
         rows = c.execute("""
-            SELECT match_id, created_ts, market, suggestion, odds
+            SELECT match_id, created_ts, market, suggestion, odds, book
             FROM tips
             WHERE is_prematch=1 AND closing_odds IS NULL AND odds IS NOT NULL
               AND kickoff_ts IS NOT NULL
@@ -1690,13 +1701,27 @@ def capture_closing_lines(limit: int = 200) -> int:
         """, (now, now + CLV_CAPTURE_LEAD_MIN * 60, limit)).fetchall()
 
     n = 0
-    for (mid, cts, market, sugg, tip_odds) in rows:
+    no_same_book = 0
+    for (mid, cts, market, sugg, tip_odds, book) in rows:
         odds_map = fetch_odds(int(mid), live=False)
         mkey, sel = _market_key_and_selection(market or "", sugg or "")
-        best = ((odds_map.get(mkey) or {}).get("best") or {}).get(sel) if mkey else None
-        if not best:
+        if not mkey or not book:
             continue
-        closing = float(best["odds"])
+        # SAME BOOK, both ends. The tip price is a maximum across whichever
+        # books were quoting at the time, and that set grows towards kickoff -
+        # so comparing it against a closing maximum over MORE books measures
+        # book coverage, not line movement, and is biased negative by
+        # construction. That is what produced "beat close 0% of the time":
+        # a larger maximum is almost always the bigger number, whatever the
+        # market did. Comparing one book against itself removes the bias.
+        closing_prices = ((odds_map.get(mkey) or {}).get("by_book") or {}).get(sel) or {}
+        same = closing_prices.get(book)
+        if same is None:
+            # Better a smaller honest sample than a large biased one: this is
+            # the metric that decides whether the edge is real.
+            no_same_book += 1
+            continue
+        closing = float(same)
         if closing <= 1.0:
             continue
         clv = (float(tip_odds) / closing - 1.0) * 100.0
@@ -1704,8 +1729,9 @@ def capture_closing_lines(limit: int = 200) -> int:
             c2.execute("UPDATE tips SET closing_odds=%s, clv_pct=%s WHERE match_id=%s AND created_ts=%s",
                        (closing, round(clv, 3), mid, cts))
         n += 1
-    if n:
-        log.info("[CLV] captured closing prices for %d tips", n)
+    if n or no_same_book:
+        log.info("[CLV] captured %d closing prices (%d skipped: the book that priced the tip "
+                 "was not quoting at close)", n, no_same_book)
     return n
 
 
@@ -3097,8 +3123,15 @@ def daily_accuracy_digest() -> Optional[str]:
             clv = compute_clv(days=7)
             ov = clv.get("overall")
             if ov:
-                lines.append(f"📉 CLV (7d, prematch): {ov['mean_clv_pct']:+.2f}%  •  "
-                             f"beat close {ov['beat_close_pct']:.0f}% of the time")
+                # Always with n. "beat close 0% of the time" reads as a damning
+                # verdict and as noise depending entirely on whether it is 3
+                # bets or 300, and the percentage alone cannot be told apart.
+                n_clv = int(ov.get("n") or 0)
+                line = (f"📉 CLV (7d, prematch, n={n_clv}): {ov['mean_clv_pct']:+.2f}%  •  "
+                        f"beat close {ov['beat_close_pct']:.0f}% of the time")
+                if n_clv < CLV_MIN_SAMPLE_FOR_VERDICT:
+                    line += f"\n   ⚠️ too few to read as edge (need ~{CLV_MIN_SAMPLE_FOR_VERDICT})"
+                lines.append(line)
         except Exception:
             pass
         msg = "\n".join(lines)

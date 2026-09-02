@@ -63,12 +63,14 @@ def test_queries_a_window_before_kickoff_not_after(monkeypatch):
 
 def test_successful_capture_computes_clv_and_writes_it(monkeypatch):
     monkeypatch.setattr(main, "CLV_ENABLE", True)
-    select_cursor = _FakeCursor(rows=[(555, 12345, "BTTS", "BTTS: Yes", 2.0)])
+    select_cursor = _FakeCursor(rows=[(555, 12345, "BTTS", "BTTS: Yes", 2.0, "Bet365")])
     update_cursor = _FakeCursor()
     conns = iter([_FakeConn(select_cursor), _FakeConn(update_cursor)])
     monkeypatch.setattr(main, "db_conn", lambda: next(conns))
     monkeypatch.setattr(main, "fetch_odds", lambda fid, live: {
-        "BTTS": {"best": {"Yes": {"odds": 1.8, "book": "Bet365"}}, "n_books": 3},
+        "BTTS": {"best": {"Yes": {"odds": 1.9, "book": "OtherBook"}},
+                 "by_book": {"Yes": {"Bet365": 1.8, "OtherBook": 1.9}},
+                 "n_books": 3},
     })
 
     n = main.capture_closing_lines()
@@ -77,8 +79,10 @@ def test_successful_capture_computes_clv_and_writes_it(monkeypatch):
     sql, params = update_cursor.executed[0]
     assert "UPDATE tips SET closing_odds" in sql
     closing_odds, clv_pct, mid, cts = params
+    # 1.8 is Bet365's close (the book that priced the tip), NOT the 1.9
+    # best-across-books - that superset maximum is the bias being avoided.
     assert closing_odds == 1.8
-    # (tip_odds / closing - 1) * 100 = (2.0 / 1.8 - 1) * 100
+    # (tip_odds / same_book_closing - 1) * 100 = (2.0 / 1.8 - 1) * 100
     assert clv_pct == round((2.0 / 1.8 - 1.0) * 100.0, 3)
     assert mid == 555
     assert cts == 12345
@@ -86,7 +90,7 @@ def test_successful_capture_computes_clv_and_writes_it(monkeypatch):
 
 def test_no_matching_odds_skips_without_writing(monkeypatch):
     monkeypatch.setattr(main, "CLV_ENABLE", True)
-    select_cursor = _FakeCursor(rows=[(555, 12345, "BTTS", "BTTS: Yes", 2.0)])
+    select_cursor = _FakeCursor(rows=[(555, 12345, "BTTS", "BTTS: Yes", 2.0, "Bet365")])
     update_cursor = _FakeCursor()
     conns = iter([_FakeConn(select_cursor), _FakeConn(update_cursor)])
     monkeypatch.setattr(main, "db_conn", lambda: next(conns))
