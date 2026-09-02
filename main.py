@@ -243,6 +243,10 @@ CLV_CAPTURE_LEAD_MIN = int(os.getenv("CLV_CAPTURE_LEAD_MIN", "15"))
 # Below this many captured closing prices, a CLV figure is noise dressed as a
 # verdict - "beat close 0% of the time" means nothing at n=3.
 CLV_MIN_SAMPLE_FOR_VERDICT = int(os.getenv("CLV_MIN_SAMPLE_FOR_VERDICT", "100"))
+# Holdout |predicted - actual|, in percentage points, past which a head's
+# probabilities are called out. EV is computed directly from those
+# probabilities, so the gap propagates into every EV the gate evaluates.
+CALIBRATION_GAP_WARN_PP = float(os.getenv("CALIBRATION_GAP_WARN_PP", "3.0"))
 
 PREDICTION_LOG_ENABLE = _env_flag("PREDICTION_LOG_ENABLE", "1")
 PREDICTION_LOG_MIN_PROB = float(os.getenv("PREDICTION_LOG_MIN_PROB", "0.35"))
@@ -3284,6 +3288,31 @@ def auto_train_job():
         ds = res.get("data_stats") or {}
         lines.append(f"• Rows: in-play {ds.get('inplay_rows', 0)} "
                      f"({ds.get('inplay_matches', 0)} matches), prematch {ds.get('prematch_rows', 0)}")
+
+        # Calibration is what makes a probability mean anything, and EV is
+        # computed straight from it - so a head that runs N points
+        # overconfident overstates every EV it produces by roughly N x odds
+        # points. At a live price of 2.0 an 8pp gap is a 16pp phantom edge
+        # against an EDGE_MIN_BPS of 3pp: the gate would be measuring the
+        # model's error, not the market's. Surfaced here because it was
+        # otherwise buried in a metrics blob nobody reads nightly.
+        drifted = []
+        for name, m in sorted((res.get("metrics") or {}).items()):
+            if not isinstance(m, dict):
+                continue
+            gap = m.get("calibration_gap_pct")
+            if gap is not None and abs(float(gap)) >= CALIBRATION_GAP_WARN_PP:
+                drifted.append((name, float(gap)))
+        if drifted:
+            lines.append("⚠️ <b>Miscalibrated heads</b> (holdout predicted − actual):")
+            for name, gap in sorted(drifted, key=lambda kv: abs(kv[1]), reverse=True):
+                direction = "over" if gap > 0 else "under"
+                lines.append(f"   • {escape(name)}: {gap:+.1f}pp {direction}confident "
+                             f"→ EV overstated ~{abs(gap) * 2:.0f}pp at odds 2.0"
+                             if gap > 0 else
+                             f"   • {escape(name)}: {gap:+.1f}pp {direction}confident")
+            lines.append("   Treat their EV as unproven until the gap closes.")
+
         send_telegram("\n".join(lines))
     except Exception as e:
         log.exception("[TRAIN] job failed: %s", e)
