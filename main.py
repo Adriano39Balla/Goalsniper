@@ -1347,10 +1347,22 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
         # A response arrived but nothing priced. Say what shape it had: the
         # in-play feed going unparsed for its entire history cost a long hunt
         # that one line of this would have ended immediately.
+        # Name the markets that were on offer, not just the envelope. The
+        # shape question is settled; what matters now is whether the feed
+        # only quoted markets we deliberately refuse (asian/quarter lines,
+        # halves, corners) or whether the exclusion list is over-rejecting
+        # something that is genuinely the full-match market.
+        offered = []
+        for r in response[:3]:
+            if not isinstance(r, dict):
+                continue
+            for _bk_name, _bets in _iter_price_sources(r):
+                offered += [_txt(b.get("name")) for b in _bets if isinstance(b, dict)]
         log.warning("[ODDS] fixture %s (live=%s): %d response item(s) but no usable markets. "
-                    "Top-level keys seen: %s",
+                    "Top-level keys: %s. Markets offered: %s",
                     fid, live, len(response),
-                    sorted(response[0].keys()) if isinstance(response[0], dict) else type(response[0]))
+                    sorted(response[0].keys()) if isinstance(response[0], dict) else type(response[0]),
+                    sorted(set(offered)) or "none")
 
     out: Dict[str, Any] = {}
     for mkey, sels in best.items():

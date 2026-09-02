@@ -127,3 +127,20 @@ def test_live_defaults_to_the_strict_value_so_nothing_loosens_silently():
     import importlib, os as _os
     assert "MIN_BOOKS_FOR_FAIR_LIVE" not in _os.environ
     assert main.MIN_BOOKS_FOR_FAIR_LIVE == main.MIN_BOOKS_FOR_FAIR
+
+
+def test_the_diagnostic_names_the_markets_that_were_on_offer(monkeypatch, caplog):
+    # Knowing the shape was right but nothing parsed is only half an answer:
+    # the next question is whether the feed offered only markets we refuse on
+    # purpose, or whether the exclusion list is rejecting a real full-match
+    # market. Naming them settles it without another round trip.
+    only_refused = {"response": [{
+        "fixture": {"id": 7}, "league": {}, "teams": {}, "status": {}, "update": "",
+        "odds": [{"name": "Asian Handicap", "values": [{"value": "Home -0.5", "odd": "1.90"}]},
+                 {"name": "Corners Over Under", "values": [{"value": "Over 9.5", "odd": "1.85"}]}],
+    }]}
+    with caplog.at_level("WARNING"):
+        out = _fetch(monkeypatch, only_refused, live=True)
+    assert out == {}
+    msg = " ".join(str(r.args) for r in caplog.records)
+    assert "Asian Handicap" in msg and "Corners Over Under" in msg
