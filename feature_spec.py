@@ -235,6 +235,79 @@ FEATURES: List[str] = [
     "league_btts_rate", "league_ov25_rate", "league_ov35_rate",
 ]
 
+# ───────── The reduced in-play feature set ─────────
+#
+# FEATURES has 56 columns fitted against ~1,700 independent fixtures - roughly
+# 15 events per feature, the bottom of the range where a logistic fit is stable
+# at all. Worse, many of the 55 are algebraic transforms of one another, and
+# collinear features do not add information: they add VARIANCE. The fit splits
+# weight between them close to arbitrarily, the split moves on every retrain,
+# and that movement is exactly the wide deviation-from-market the price gate
+# selects the profitable tail of.
+#
+# Every drop below is a fact about build_inplay_features(), not a guess:
+#
+#   score_margin, is_leading_h, is_leading_a, is_goalfest
+#       Deterministic functions of (goals_sum, goals_diff), both kept. Four
+#       columns restating two. is_goalfest is additionally "Over 2.5 has
+#       already happened" - a settled-question flag, not a prediction.
+#
+#   goals_per_minute, shots_per_minute, fouls_per_minute
+#       X/minute where X and minute are both kept. Five such rates expressed
+#       one idea (intensity so far); xg_per_minute and sot_per_minute are kept
+#       as the quality and the robust-count version of it, the rest dropped.
+#
+#   sot_xg_ratio_h, sot_xg_ratio_a
+#       sot / max(xg, MIN_XG_DENOM). When the xG feed is absent - which we now
+#       know happens, and silently, since a missing xG arrives as 0.0 - this
+#       explodes to sot/1e-6 scale. A feature whose value is unbounded exactly
+#       when the data is missing is a noise injector.
+#
+#   conversion_rate_h/a, discipline_score_h/a
+#       Ratios on small counts (goals/sot, 1/(fouls+10*red)), unbounded as the
+#       denominator approaches zero, and both numerator and denominator are
+#       already present as their own columns.
+#
+#   possession_xg_interaction_h/a
+#       game_control_h/a contains 0.4*(pos/100)*xg as one of its three terms,
+#       so these are a subset of a kept feature. The broader one survives.
+#
+#   pass_accuracy_h/a, save_rate_h/a, shot_accuracy_h/a, shot_quality_h/a
+#       Eight per-side ratio columns whose components (sot, total_shots,
+#       shots_inside) are all kept as sum and diff. On the symmetric markets
+#       (Over/Under, BTTS) the per-side split is mostly noise.
+#
+#   is_second_half
+#       1[minute > 45] correlates ~0.9 with a linear minute term over the
+#       15-90 range this model ever sees. is_final_15 is kept because the last
+#       quarter-hour is a genuinely different regime (chasing, fatigue), not a
+#       rescaling of the clock.
+#
+#   cor_diff, yellow_diff
+#       Weak directional signals whose sums are kept.
+#
+# This is a hypothesis, not a conclusion. train_models compares it against the
+# full set on the CALIBRATION split every night and uses whichever generalises
+# better, so a wrong cut costs nothing but a line in the digest.
+CORE_FEATURES: List[str] = [
+    "minute", "is_final_15",
+    "goals_sum", "goals_diff",
+    "xg_sum", "xg_diff",
+    "sot_sum", "sot_diff",
+    "total_shots_sum", "total_shots_diff",
+    "shots_inside_sum", "shots_inside_diff",
+    "cor_sum",
+    "pos_diff",
+    "red_sum", "red_diff",
+    "yellow_sum",
+    "fouls_sum",
+    "xg_per_minute", "sot_per_minute",
+    "game_control_h", "game_control_a",
+    "market_fair_home", "market_fair_draw", "market_fair_away",
+    "market_fair_over25", "market_fair_btts_yes",
+    "league_btts_rate", "league_ov25_rate", "league_ov35_rate",
+]
+
 PRE_FEATURES: List[str] = [
     "pm_gf_h", "pm_ga_h", "pm_gf_a", "pm_ga_a",
     "pm_win_h", "pm_draw_h", "pm_win_a", "pm_draw_a",

@@ -86,7 +86,7 @@ from sklearn.metrics import (
 
 from feature_spec import (
     ODDS_TRUSTED_FROM_TS,
-    DEFAULT_LEAGUE_RATES, FEATURES, PRE_FEATURES,
+    DEFAULT_LEAGUE_RATES, FEATURES, CORE_FEATURES, PRE_FEATURES,
     LEAGUE_RATE_FIELDS_INPLAY, LEAGUE_RATE_FIELDS_PREMATCH,
     MARKET_ANCHOR, anchor_logit,
     build_inplay_features, derive_dc_dnb,
@@ -630,20 +630,82 @@ def grouped_time_split(df: pd.DataFrame, cal_size: float, test_size: float,
 
 # ─────────────────────── Model utilities ─────────────────────── #
 
-def _standardize(X_tr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    mean = X_tr.mean(axis=0)
-    scale = X_tr.std(axis=0)
+def _standardize(X_tr: np.ndarray,
+                 sw: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Feature mean/scale, weighted the same way the fit is.
+
+    An unweighted scaler is set by whichever fixtures happened to be harvested
+    longest. Since L2 penalises on the standardised scale, that would make the
+    penalty itself depend on snapshot counts.
+    """
+    if sw is None:
+        mean, scale = X_tr.mean(axis=0), X_tr.std(axis=0)
+    else:
+        w = np.asarray(sw, dtype=float)
+        tot = w.sum()
+        if tot <= 0:
+            mean, scale = X_tr.mean(axis=0), X_tr.std(axis=0)
+        else:
+            mean = (w[:, None] * X_tr).sum(axis=0) / tot
+            var = (w[:, None] * (X_tr - mean) ** 2).sum(axis=0) / tot
+            scale = np.sqrt(np.maximum(var, 0.0))
+    scale = np.asarray(scale, dtype=float).copy()
     scale[scale < 1e-9] = 1.0  # constant column -> leave as (x - mean)
-    return mean, scale
+    return np.asarray(mean, dtype=float), scale
 
 
-def _fit_lr(X: np.ndarray, y: np.ndarray, C: float) -> Optional[LogisticRegression]:
+def match_weights(match_ids: np.ndarray) -> np.ndarray:
+    """
+    One match, one observation.
+
+    Nine snapshots of the same fixture share a single outcome. They are not
+    nine independent observations, but the fit counted them as such, so the
+    objective saw an effective sample ~9x larger than the data contains and
+    selected C as if regularisation mattered ~9x less than it does. Systematic
+    under-regularisation is precisely how a model acquires the wide, noisy
+    deviation from the market that the price gate then selects the profitable
+    tail of.
+
+    Each row is weighted 1/(snapshots for its match), and the weights are
+    rescaled to sum to the MATCH count. That keeps C's meaning "per
+    observation" while making an observation a match rather than a snapshot,
+    so the existing C_GRID still spans the useful range.
+
+    It also removes a second, quieter bias: a fixture harvested for 70 minutes
+    contributed twice the weight of one harvested for 35, for no reason
+    connected to how much either tells us.
+    """
+    ids = np.asarray(match_ids)
+    _, inverse, counts = np.unique(ids, return_inverse=True, return_counts=True)
+    w = 1.0 / counts[inverse].astype(float)
+    total = w.sum()
+    return w * (len(counts) / total) if total > 0 else w
+
+
+def effective_n(match_ids: Optional[np.ndarray], n_rows: int) -> int:
+    """
+    How many independent observations a split really holds.
+
+    Not the Kish effective sample size: Kish measures the efficiency loss from
+    UNEQUAL weights among rows and is blind to clustering, so on 21 rows across
+    3 fixtures it reports 16.2 — a number that reads as sample size and is not.
+    Every row of a fixture shares one outcome, so the count of fixtures is the
+    answer.
+    """
+    if match_ids is None:
+        return int(n_rows)
+    return int(len(np.unique(np.asarray(match_ids))))
+
+
+def _fit_lr(X: np.ndarray, y: np.ndarray, C: float,
+            sw: Optional[np.ndarray] = None) -> Optional[LogisticRegression]:
     if len(np.unique(y)) < 2:
         return None
     # No class_weight="balanced": it rebases the intercept toward a 50/50 prior,
     # a large systematic upward bias on low-prevalence markets. The objective
     # here is a calibrated probability, not recall on a rare class.
-    return LogisticRegression(max_iter=3000, solver="liblinear", C=C).fit(X, y)
+    return LogisticRegression(max_iter=3000, solver="liblinear", C=C).fit(X, y, sample_weight=sw)
 
 
 class OffsetLogit:
@@ -673,21 +735,24 @@ class OffsetLogit:
         self.coef_: Optional[np.ndarray] = None
         self.intercept_: Optional[np.ndarray] = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray, offset: np.ndarray) -> "OffsetLogit":
+    def fit(self, X: np.ndarray, y: np.ndarray, offset: np.ndarray,
+            sample_weight: Optional[np.ndarray] = None) -> "OffsetLogit":
         from scipy.optimize import minimize
 
         X = np.asarray(X, dtype=float)
         y = np.asarray(y, dtype=float)
         off = np.asarray(offset, dtype=float)
         n, d = X.shape
+        sw = (np.ones(n) if sample_weight is None
+              else np.asarray(sample_weight, dtype=float))
 
         def obj(theta: np.ndarray) -> Tuple[float, np.ndarray]:
             w, c = theta[:d], theta[d]
             z = off + c + X @ w
             # log(1 + exp(z)) without overflow.
-            ll = float(np.sum(np.logaddexp(0.0, z) - y * z))
+            ll = float(np.sum(sw * (np.logaddexp(0.0, z) - y * z)))
             loss = 0.5 * float(w @ w) + self.C * ll
-            resid = 1.0 / (1.0 + np.exp(-z)) - y
+            resid = sw * (1.0 / (1.0 + np.exp(-z)) - y)
             grad = np.empty(d + 1)
             grad[:d] = w + self.C * (X.T @ resid)
             grad[d] = self.C * float(np.sum(resid))
@@ -708,12 +773,19 @@ class OffsetLogit:
 
 def _select_C(X_tr, y_tr, X_ca, y_ca,
               off_tr: Optional[np.ndarray] = None,
-              off_ca: Optional[np.ndarray] = None):
+              off_ca: Optional[np.ndarray] = None,
+              sw_tr: Optional[np.ndarray] = None,
+              sw_ca: Optional[np.ndarray] = None):
     """
     Pick the regularization strength by log loss on the calibration split.
 
     With an offset supplied the anchored fit is used; the selection criterion
     is identical either way, so the two paths remain directly comparable.
+
+    The calibration loss is weighted the same way the fit is. Selecting C
+    against an UNWEIGHTED cal loss would pick the C that best serves whichever
+    fixtures happen to have the most snapshots, undoing on the selection step
+    what the weights fix on the fitting step.
     """
     anchored = off_tr is not None and off_ca is not None
     best_m, best_C, best_ll = None, C_GRID[-1], float("inf")
@@ -722,13 +794,13 @@ def _select_C(X_tr, y_tr, X_ca, y_ca,
             if len(np.unique(y_tr)) < 2:
                 return None, C_GRID[-1]
             try:
-                m = OffsetLogit(C).fit(X_tr, y_tr, off_tr)
+                m = OffsetLogit(C).fit(X_tr, y_tr, off_tr, sample_weight=sw_tr)
                 p = m.predict_proba_off(X_ca, off_ca)
             except Exception as e:
                 logger.warning("[ANCHOR] offset fit failed at C=%g: %s", C, e)
                 continue
         else:
-            m = _fit_lr(X_tr, y_tr, C)
+            m = _fit_lr(X_tr, y_tr, C, sw=sw_tr)
             if m is None:
                 continue
             try:
@@ -736,7 +808,8 @@ def _select_C(X_tr, y_tr, X_ca, y_ca,
             except Exception:
                 continue
         try:
-            ll = log_loss(y_ca, np.clip(p, EPS, 1 - EPS), labels=[0, 1])
+            ll = log_loss(y_ca, np.clip(p, EPS, 1 - EPS), labels=[0, 1],
+                          sample_weight=sw_ca)
         except Exception:
             continue
         if ll < best_ll:
@@ -749,9 +822,11 @@ def _logit_vec(p: np.ndarray) -> np.ndarray:
     return np.log(p / (1 - p))
 
 
-def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
+def fit_platt(y_true: np.ndarray, p_raw: np.ndarray,
+              sw: Optional[np.ndarray] = None) -> Tuple[float, float]:
     z = _logit_vec(p_raw).reshape(-1, 1)
-    lr = LogisticRegression(max_iter=1000, solver="lbfgs").fit(z, y_true.astype(int))
+    lr = LogisticRegression(max_iter=1000, solver="lbfgs").fit(
+        z, y_true.astype(int), sample_weight=sw)
     return float(lr.coef_.ravel()[0]), float(lr.intercept_.ravel()[0])
 
 
@@ -759,14 +834,10 @@ def _apply_platt(p_raw: np.ndarray, a: float, b: float) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-(a * _logit_vec(p_raw) + b)))
 
 
-# How many standard errors a calibration parameter must clear before it is
-# believed. See fit_platt_anchored() for why an anchored head needs this and an
-# ordinary one does not.
-CAL_MIN_SE = float(os.getenv("CAL_MIN_SE", "2.0"))
-
-
 def fit_platt_anchored(y_true: np.ndarray, dev: np.ndarray,
-                       offset: np.ndarray) -> Tuple[float, float, Dict[str, Any]]:
+                       offset: np.ndarray,
+                       sw: Optional[np.ndarray] = None
+                       ) -> Tuple[float, float, Dict[str, Any]]:
     """
     Platt scaling for a market-anchored head, applied to the DEVIATION only:
 
@@ -797,44 +868,82 @@ def fit_platt_anchored(y_true: np.ndarray, dev: np.ndarray,
     dev = np.asarray(dev, dtype=float)
     off = np.asarray(offset, dtype=float)
     y = np.asarray(y_true, dtype=float)
-    m = OffsetLogit(1e6).fit(dev.reshape(-1, 1), y, off)
+    m = OffsetLogit(1e6).fit(dev.reshape(-1, 1), y, off, sample_weight=sw)
     a, b = float(m.coef_.ravel()[0]), float(m.intercept_.ravel()[0])
 
     diag: Dict[str, Any] = {"a_fitted": round(a, 4), "b_fitted": round(b, 4)}
     try:
         p = 1.0 / (1.0 + np.exp(-(off + a * dev + b)))
+        # Weighted Fisher information: the guard asks "is this distinguishable
+        # from the null", and the answer depends on how many INDEPENDENT
+        # observations there are. Unweighted standard errors here would be
+        # computed against ~9x the real sample and would wave through exactly
+        # the sampling noise the guard exists to catch.
         w = np.clip(p * (1.0 - p), 1e-9, None)
+        if sw is not None:
+            w = w * np.asarray(sw, dtype=float)
         D = np.column_stack([dev, np.ones_like(dev)])
         cov = np.linalg.pinv(D.T @ (w[:, None] * D))
         se_a, se_b = float(np.sqrt(max(cov[0, 0], 0.0))), float(np.sqrt(max(cov[1, 1], 0.0)))
     except Exception as e:
         logger.warning("[CAL] standard errors unavailable (%s) — holding calibration at "
                        "its null values rather than trusting an unchecked fit", e)
-        return 1.0, 0.0, {**diag, "held": "both", "reason": "standard errors unavailable"}
+        # No standard errors means no way to know how much to trust either
+        # parameter, so neither is applied: the head predicts the market.
+        return 0.0, 0.0, {**diag, "a": 0.0, "b": 0.0,
+                          "reason": "standard errors unavailable — collapsed to the market"}
 
-    diag.update({"se_a": round(se_a, 4), "se_b": round(se_b, 4), "min_se": CAL_MIN_SE})
-    held = []
-    if not (se_a > 0 and abs(a - 1.0) >= CAL_MIN_SE * se_a):
-        a, held = 1.0, held + ["a"]
-    elif a < 0.0:
-        # A negative slope says the head is ANTI-predictive: apply it and the
-        # model bets against its own signal. On a calibration split this is
-        # noise essentially every time - a genuinely inverted feature set would
-        # be a bug to fix, not an edge to trade. Collapsing to 0 makes the head
-        # predict the market exactly, which is the honest null for "no usable
-        # signal here". Observed on a synthetic head whose labels were pure
-        # noise: a came out at -0.32 and cleared its own standard error.
-        a, held = 0.0, held + ["a(negative)"]
-        logger.info("[CAL] anchored head: slope came out negative (%.3f) — treated as no "
-                    "signal and collapsed to the market price", diag["a_fitted"])
-    if not (se_b > 0 and abs(b) >= CAL_MIN_SE * se_b):
-        b, held = 0.0, held + ["b"]
-    if held:
-        diag["held"] = "+".join(held)
-        logger.info("[CAL] anchored head: held %s at null (a=%.3f b=%.3f vs se %.3f/%.3f) — "
-                    "not distinguishable from the market at %.1f SE",
-                    diag["held"], diag["a_fitted"], diag["b_fitted"], se_a, se_b, CAL_MIN_SE)
-    return a, b, diag
+    diag.update({"se_a": round(se_a, 4), "se_b": round(se_b, 4)})
+
+    # Both parameters are SHRUNK TOWARD ZERO by how well they are measured,
+    # rather than kept or discarded on a significance test.
+    #
+    # Zero is the conservative direction for both, and this is the part worth
+    # being careful about. For `b` that is obvious - a nonzero constant is a
+    # permanent shift off the market. For `a` it is the opposite of the
+    # intuitive answer: a=1 means "trust the model's own scale completely",
+    # which is the LEAST conservative setting, while a=0 collapses the head
+    # onto the market price. An earlier version of this held `a` at 1.0 when it
+    # was not significantly different from 1.0, and that measurably increased
+    # the deviation the price gate sells as edge: the unguarded fit had been
+    # supplying useful shrinkage (a~0.4) and the guard removed it.
+    #
+    # The factor is t^2/(1+t^2) with t the parameter's own t-statistic - the
+    # standard reliability weight. A well-measured slope passes through intact;
+    # one measured at t~1 is halved; noise collapses to the market. Continuous,
+    # so there is no threshold to sit on the wrong side of.
+    # The denominator k encodes how strong a prior each parameter faces: the
+    # weight is t^2/(k + t^2), so a parameter reaches half its fitted value at
+    # t = sqrt(k).
+    #
+    # They get different priors because they make different claims. `a` says
+    # "the model's signal is real at roughly the scale fitted" - an ordinary
+    # claim, so k=1 (half weight at t=1). `b` says "the de-vigged market is
+    # systematically wrong by a constant, on every fixture" - a strong claim,
+    # and the only two things it can be are a real market-wide bias, which
+    # would show up loudly given data, or noise. It also applies to every bet
+    # forever rather than varying by fixture, so it gets k=4 (half weight at
+    # t=2). At t=1.3, which is ordinary sampling noise, that is the difference
+    # between a 2.3pp permanent shift and a 1.1pp one.
+    def _shrink(v: float, se: float, k: float) -> float:
+        if not (se > 0) or not np.isfinite(v):
+            return 0.0
+        t2 = (v / se) ** 2
+        return float(v * t2 / (k + t2))
+
+    a_s, b_s = _shrink(a, se_a, CAL_PRIOR_K_SLOPE), _shrink(b, se_b, CAL_PRIOR_K_SHIFT)
+    # A negative slope says the head is ANTI-predictive: apply it and the model
+    # bets against its own signal. On a calibration split that is noise
+    # essentially every time - a genuinely inverted feature set would be a bug
+    # to fix, not an edge to trade - so it floors at the market.
+    if a_s < 0.0:
+        a_s = 0.0
+        diag["slope_was_negative"] = True
+    diag.update({"a": round(a_s, 4), "b": round(b_s, 4),
+                 "shrinkage_a": round(a_s / a, 3) if a else None})
+    logger.info("[CAL] anchored head: a %.3f -> %.3f (se %.3f), b %.3f -> %.3f (se %.3f)",
+                a, a_s, se_a, b, b_s, se_b)
+    return a_s, b_s, diag
 
 
 def _apply_platt_anchored(dev: np.ndarray, offset: np.ndarray,
@@ -1084,6 +1193,8 @@ def _train_binary_head(
     metrics_name: Optional[str] = None,
     offset_all: Optional[np.ndarray] = None,
     anchor_name: Optional[str] = None,
+    weight_all: Optional[np.ndarray] = None,
+    match_ids: Optional[np.ndarray] = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Returns (ok, metrics, p_on_cal, p_on_holdout).
@@ -1108,6 +1219,10 @@ def _train_binary_head(
         off_tr, off_ca, off_te = offset_all[m_tr], offset_all[m_ca], offset_all[m_te]
     else:
         off_tr = off_ca = off_te = None
+    if weight_all is not None:
+        sw_tr, sw_ca = weight_all[m_tr], weight_all[m_ca]
+    else:
+        sw_tr = sw_ca = None
 
     if min(len(y_tr), len(y_ca), len(y_te)) < 20:
         logger.info("[SKIP] %s: split too small (train=%d cal=%d holdout=%d)",
@@ -1122,12 +1237,12 @@ def _train_binary_head(
                 float(y_tr.mean()), float(y_ca.mean()),
                 float(y_te.mean()) if len(y_te) else 0.0)
 
-    mean, scale = _standardize(X_tr)
+    mean, scale = _standardize(X_tr, sw_tr)
     Z_tr = (X_tr - mean) / scale
     Z_ca = (X_ca - mean) / scale
     Z_te = (X_te - mean) / scale
 
-    m, C = _select_C(Z_tr, y_tr, Z_ca, y_ca, off_tr, off_ca)
+    m, C = _select_C(Z_tr, y_tr, Z_ca, y_ca, off_tr, off_ca, sw_tr, sw_ca)
     if m is None:
         return False, {}, None, None
 
@@ -1138,13 +1253,13 @@ def _train_binary_head(
         # splits the two the same way.
         dev_ca = m.decision_function(Z_ca, np.zeros(len(y_ca)))
         dev_te = m.decision_function(Z_te, np.zeros(len(y_te))) if len(y_te) else np.array([])
-        a, b, cal_diag = fit_platt_anchored(y_ca, dev_ca, off_ca)
+        a, b, cal_diag = fit_platt_anchored(y_ca, dev_ca, off_ca, sw=sw_ca)
         p_ca = _apply_platt_anchored(dev_ca, off_ca, a, b)
         p_te = (_apply_platt_anchored(dev_te, off_te, a, b) if len(y_te) else np.array([]))
     else:
         p_ca_raw = m.predict_proba(Z_ca)[:, 1]
         p_te_raw = m.predict_proba(Z_te)[:, 1] if len(y_te) else np.array([])
-        a, b = fit_platt(y_ca, p_ca_raw)
+        a, b = fit_platt(y_ca, p_ca_raw, sw=sw_ca)
         p_ca = _apply_platt(p_ca_raw, a, b)
         p_te = _apply_platt(p_te_raw, a, b) if len(y_te) else np.array([])
 
@@ -1156,7 +1271,14 @@ def _train_binary_head(
     mets: Dict[str, Any] = {"C": C, "n_train": int(len(y_tr)), "n_cal": int(len(y_ca)),
                             "n_holdout": int(len(y_te)), "prevalence": float(y_all.mean()),
                             "n_features": len(feature_names),
-                            "market_anchored": bool(anchored)}
+                            "market_anchored": bool(anchored),
+                            "row_weighting": "per_match" if weight_all is not None else "per_row"}
+    if match_ids is not None:
+        # What the fit actually has to work with. n_train counts snapshots,
+        # which is ~9x larger and reads as sample size without being it.
+        mets["n_train_matches"] = effective_n(match_ids[m_tr], int(m_tr.sum()))
+        mets["n_cal_matches"] = effective_n(match_ids[m_ca], int(m_ca.sum()))
+        mets["n_holdout_matches"] = effective_n(match_ids[m_te], int(m_te.sum()))
     if anchored:
         mets["anchor_feature"] = anchor_name
         mets["calibration_fit"] = cal_diag
@@ -1270,6 +1392,134 @@ def frame_anchor_report(df: pd.DataFrame) -> Dict[str, Any]:
                          f"before the market-name fix are not counted, so this number starts "
                          f"near zero and grows as clean snapshots accumulate.")
     return out
+
+
+# Shrinkage priors for the anchored head's calibration. See fit_platt_anchored().
+CAL_PRIOR_K_SLOPE = float(os.getenv("CAL_PRIOR_K_SLOPE", "1.0"))
+CAL_PRIOR_K_SHIFT = float(os.getenv("CAL_PRIOR_K_SHIFT", "4.0"))
+
+# Which in-play feature set to fit on: "auto" compares them on the calibration
+# split every night, "core" or "full" force one. See feature_spec.CORE_FEATURES
+# for what the reduced set drops and why.
+FEATURE_SET = (os.getenv("FEATURE_SET", "auto") or "auto").strip().lower()
+
+# "per_match" weights each row 1/(snapshots for its fixture); "per_row" is the
+# old behaviour. See match_weights() for the argument, and note that the
+# argument is statistical rather than empirical: synthetic data could not
+# settle it either way, so this is switchable and reported.
+ROW_WEIGHTING = (os.getenv("ROW_WEIGHTING", "per_match") or "per_match").strip().lower()
+
+
+def collinearity_report(df: pd.DataFrame, cols: List[str],
+                        high: float = 0.95, top: int = 5) -> Dict[str, Any]:
+    """
+    How much of a feature set restates itself, measured on the real data.
+
+    CORE_FEATURES is a hypothesis about which columns are algebraic
+    restatements of others. This checks that hypothesis against what is
+    actually in the database rather than against an argument about the code,
+    and it is the number to look at before trusting - or discarding - the
+    reduced set.
+    """
+    usable = [c for c in cols if c in df.columns]
+    if len(usable) < 2:
+        return {}
+    X = df[usable].to_numpy(dtype=float)
+    keep = X.std(axis=0) > 1e-12
+    names = [n for n, k in zip(usable, keep) if k]
+    if len(names) < 2:
+        return {"n_features": len(usable), "note": "no varying columns"}
+    C = np.corrcoef(X[:, keep], rowvar=False)
+    iu = np.triu_indices(len(names), k=1)
+    vals = np.abs(C[iu])
+    order = np.argsort(vals)[::-1][:top]
+    return {
+        "n_features": len(usable),
+        "pairs_above_%.2f" % high: int((vals >= high).sum()),
+        "max_abs_corr": round(float(vals.max()), 3),
+        "most_collinear": [
+            {"a": names[iu[0][i]], "b": names[iu[1][i]], "r": round(float(vals[i]), 3)}
+            for i in order],
+    }
+
+
+def _cal_loss_for(X: np.ndarray, y: np.ndarray, m_tr, m_ca,
+                  offset: Optional[np.ndarray],
+                  weights: Optional[np.ndarray]) -> Optional[float]:
+    """Weighted calibration-split log loss for one candidate feature matrix."""
+    X_tr, X_ca = X[m_tr], X[m_ca]
+    y_tr, y_ca = y[m_tr], y[m_ca]
+    if len(np.unique(y_tr)) < 2 or len(np.unique(y_ca)) < 2:
+        return None
+    sw_tr = weights[m_tr] if weights is not None else None
+    sw_ca = weights[m_ca] if weights is not None else None
+    off_tr = offset[m_tr] if offset is not None else None
+    off_ca = offset[m_ca] if offset is not None else None
+    mean, scale = _standardize(X_tr, sw_tr)
+    m, _C = _select_C((X_tr - mean) / scale, y_tr, (X_ca - mean) / scale, y_ca,
+                      off_tr, off_ca, sw_tr, sw_ca)
+    if m is None:
+        return None
+    Z_ca = (X_ca - mean) / scale
+    p = (m.predict_proba_off(Z_ca, off_ca) if isinstance(m, OffsetLogit)
+         else m.predict_proba(Z_ca)[:, 1])
+    try:
+        return float(log_loss(y_ca, np.clip(p, EPS, 1 - EPS), labels=[0, 1],
+                              sample_weight=sw_ca))
+    except Exception:
+        return None
+
+
+def select_feature_set(df: pd.DataFrame, y: np.ndarray, m_tr, m_ca,
+                       candidates: Dict[str, List[str]],
+                       offset: Optional[np.ndarray] = None,
+                       weights: Optional[np.ndarray] = None,
+                       ) -> Tuple[str, List[str], Dict[str, Any]]:
+    """
+    Choose between the full and reduced feature sets on the CALIBRATION split.
+
+    The reduced set is a hypothesis about which of the 56 columns are
+    collinear restatements of each other (see feature_spec.CORE_FEATURES). It
+    should not be trusted on the strength of that argument alone, and it does
+    not have to be: cal is already the model-selection split - it is where C is
+    chosen - so asking it one more question is the same kind of decision, not a
+    new kind.
+
+    Ties and failures fall back to the full set: the reduced one has to EARN
+    the swap, so a bug here degrades to today's behaviour rather than to a
+    quietly different model.
+
+    Caveat worth stating: this adds one more binary choice made on a small
+    split, so a little of the cal loss improvement will be selection noise.
+    The holdout numbers in the digest are the ones to believe.
+    """
+    scores: Dict[str, Optional[float]] = {}
+    for name, cols in candidates.items():
+        usable = [c for c in cols if c in df.columns]
+        if len(usable) != len(cols):
+            scores[name] = None
+            continue
+        scores[name] = _cal_loss_for(df[cols].to_numpy(dtype=float), y,
+                                     m_tr, m_ca, offset, weights)
+
+    diag: Dict[str, Any] = {
+        "cal_logloss": {k: (round(v, 5) if v is not None else None) for k, v in scores.items()},
+        "n_features": {k: len(v) for k, v in candidates.items()},
+    }
+    ranked = [(v, k) for k, v in scores.items() if v is not None]
+    if not ranked:
+        diag["chosen"] = "full"
+        diag["reason"] = "no candidate produced a usable calibration loss"
+        return "full", candidates["full"], diag
+
+    best_loss, best = min(ranked)
+    full_loss = scores.get("full")
+    if best != "full" and full_loss is not None and not (best_loss < full_loss):
+        best, best_loss = "full", full_loss
+    diag["chosen"] = best
+    if full_loss is not None and best_loss is not None:
+        diag["improvement_vs_full"] = round(full_loss - best_loss, 5)
+    return best, candidates[best], diag
 
 
 def _effective_min_rows(n_features: int, min_rows_env: int, rows_per_feature: int) -> int:
@@ -1561,8 +1811,30 @@ def train_models(
             rate_map = _compute_league_rate_map(conn, df_ip.loc[m_tr, "_match_id"].unique())
             df_ip = _apply_league_rates(df_ip, rate_map, LEAGUE_RATE_FIELDS_INPLAY)
 
+            # ── One match, one observation ──
+            # Nine snapshots of a fixture share a single outcome, so counting
+            # them as nine independent rows told the fit it had ~9x the sample
+            # it has, and C was selected as if regularisation mattered ~9x
+            # less. Under-regularisation is how the model acquires the wide
+            # deviation from the market that the gate selects the tail of.
+            ip_match_ids = df_ip["_match_id"].to_numpy()
+            ip_weights = (match_weights(ip_match_ids)
+                          if ROW_WEIGHTING == "per_match" else None)
+            summary["data_stats"]["inplay_row_weighting"] = ROW_WEIGHTING
+            logger.info("[WEIGHTS] in-play: %d rows across %d fixtures, weighting=%s%s",
+                        len(df_ip), len(np.unique(ip_match_ids)), ROW_WEIGHTING,
+                        " — the fit sees %d observations, not %d" % (
+                            len(np.unique(ip_match_ids)), len(df_ip))
+                        if ip_weights is not None else "")
+
             X = df_ip[FEATURES].to_numpy(dtype=float)
             summary["feature_counts"]["inplay"] = len(FEATURES)
+            summary["feature_selection"] = {}
+            # Measured on the real data, not argued from the code.
+            summary["collinearity"] = {
+                "full": collinearity_report(df_ip, FEATURES),
+                "core": collinearity_report(df_ip, CORE_FEATURES),
+            }
 
             def _anchored_head(head: str, y: np.ndarray, threshold_label, default_thr,
                                metrics_name: str):
@@ -1581,16 +1853,38 @@ def train_models(
                 behaviour being removed.
                 """
                 feat = MARKET_ANCHOR.get(head) if anchor_rep["anchored"] else None
-                if feat and feat in df_ip.columns:
-                    cols = [c for c in FEATURES if c != feat]
-                    Xa = df_ip[cols].to_numpy(dtype=float)
-                    off = np.array([anchor_logit(v)
-                                    for v in df_ip[feat].to_numpy(dtype=float)])
+                off = (np.array([anchor_logit(v)
+                                 for v in df_ip[feat].to_numpy(dtype=float)])
+                       if feat and feat in df_ip.columns else None)
+
+                # An anchored head drops its own anchor from the feature
+                # matrix. Leaving it in would let the fit put a second,
+                # penalised weight on the same signal and partially unpin the
+                # offset, which is the behaviour being removed.
+                def _without_anchor(cols: List[str]) -> List[str]:
+                    return [c for c in cols if c != feat] if feat else list(cols)
+
+                candidates = {"full": _without_anchor(FEATURES),
+                              "core": _without_anchor(CORE_FEATURES)}
+                if FEATURE_SET in candidates:
+                    chosen, cols = FEATURE_SET, candidates[FEATURE_SET]
+                    fs_diag = {"chosen": chosen, "forced_by": "FEATURE_SET"}
+                else:
+                    chosen, cols, fs_diag = select_feature_set(
+                        df_ip, y, m_tr, m_ca, candidates, offset=off, weights=ip_weights)
+                summary["feature_selection"][head] = fs_diag
+                logger.info("[FEATURES] %s: %s set (%d columns)%s", head, chosen, len(cols),
+                            f", cal logloss {fs_diag.get('cal_logloss')}"
+                            if fs_diag.get("cal_logloss") else "")
+
+                Xh = df_ip[cols].to_numpy(dtype=float)
+                if off is not None:
                     res = _train_binary_head(
-                        buf, Xa, y, m_tr, m_ca, m_te, cols,
+                        buf, Xh, y, m_tr, m_ca, m_te, cols,
                         head, threshold_label, summary, target_precision, min_preds,
                         min_thresh, max_thresh, default_thr, metrics_name,
-                        offset_all=off, anchor_name=feat)
+                        offset_all=off, anchor_name=feat,
+                        weight_all=ip_weights, match_ids=ip_match_ids)
                     if res[0]:
                         return res
                     # Never silent: a fallback looks exactly like an anchored
@@ -1599,9 +1893,10 @@ def train_models(
                                    "the unanchored model", head)
                     summary.setdefault("anchor_fallbacks", []).append(head)
                 return _train_binary_head(
-                    buf, X, y, m_tr, m_ca, m_te, FEATURES,
+                    buf, Xh, y, m_tr, m_ca, m_te, cols,
                     head, threshold_label, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, default_thr, metrics_name)
+                    min_thresh, max_thresh, default_thr, metrics_name,
+                    weight_all=ip_weights, match_ids=ip_match_ids)
 
             ok, mets, _, _ = _anchored_head(
                 "BTTS_YES", df_ip["label_btts"].to_numpy(dtype=int), "BTTS", 0.65, "BTTS_YES")

@@ -280,18 +280,22 @@ def _platt(y, dev, off):
                               np.asarray(off, float))
 
 
-def test_a_constant_shift_from_sampling_noise_is_held_at_zero():
+def test_a_constant_shift_from_sampling_noise_is_shrunk_to_near_zero():
     # b is a free constant that absorbs whatever the calibration split's base
     # rate happened to be. On an anchored head that becomes a permanent edge
-    # over the market on every future prediction.
+    # over the market on every future prediction. Poorly measured, it collapses.
     rng = np.random.default_rng(2)
     n = 400
     off = rng.normal(0, 1.0, n)
     dev = rng.normal(0, 0.05, n)
     y = (rng.random(n) < 1 / (1 + np.exp(-off))).astype(int)
     a, b, diag = _platt(y, dev, off)
-    assert b == 0.0
-    assert "b" in diag["held"]
+    # Judged against the bar that matters: FAIR_EDGE_MIN_BPS is 2pp, and near
+    # even money a log-odds shift of x is roughly x/4 in probability. The raw
+    # fit here is -0.146 (a 3.6pp permanent shift, past the gate on its own);
+    # shrunk it must land well inside it.
+    assert abs(b) / 4 < 0.015, f"a {abs(b)/4*100:.1f}pp permanent shift is too much"
+    assert abs(b) < 0.5 * abs(diag["b_fitted"]), "noise must lose most of its weight"
 
 
 def test_a_large_well_evidenced_shift_survives():
@@ -318,7 +322,55 @@ def test_an_anti_predictive_slope_collapses_to_the_market():
     y = (rng.random(n) < 1 / (1 + np.exp(-(off - 1.2 * dev)))).astype(int)
     a, b, diag = _platt(y, dev, off)
     assert a == 0.0, "an inverted head must predict the market, not the inverse"
-    assert "a(negative)" in diag["held"]
+    assert diag["slope_was_negative"] is True
+
+
+def test_the_slope_shrinks_toward_the_market_not_toward_full_trust():
+    # THE CORRECTION THIS ENCODES. a=1 means "trust the model's own scale
+    # completely" and is the LEAST conservative setting; a=0 collapses onto the
+    # market. An earlier version held a at 1.0 whenever it was not significantly
+    # different from 1.0, which measurably RAISED the deviation the price gate
+    # sells as edge — the unguarded fit had been supplying useful shrinkage and
+    # the guard removed it.
+    rng = np.random.default_rng(12)
+    n = 250
+    off = rng.normal(0, 1.0, n)
+    dev = rng.normal(0, 0.3, n)
+    y = (rng.random(n) < 1 / (1 + np.exp(-off))).astype(int)
+    a, b, diag = _platt(y, dev, off)
+    assert 0.0 <= a < 0.5, "a barely-measured slope must move toward the market"
+
+
+def test_shrinkage_is_continuous_in_the_evidence():
+    # No threshold to sit on the wrong side of. Asserted on the shrinkage
+    # FACTOR rather than on the slope itself: the fitted slope has its own
+    # sampling noise, so the product need not be monotone even when the
+    # evidence weight is.
+    factors, last = [], None
+    for n in (300, 1200, 5000, 20000):
+        rng = np.random.default_rng(3)
+        off = rng.normal(0, 1.0, n)
+        dev = rng.normal(0, 1.0, n)
+        y = (rng.random(n) < 1 / (1 + np.exp(-(off + 1.0 * dev)))).astype(int)
+        a, _b, d = _platt(y, dev, off)
+        factors.append(round(a / d["a_fitted"], 6))
+        last = a
+    assert factors == sorted(factors), f"evidence weight must rise with n: {factors}"
+    assert factors[0] < 0.99 < factors[-1]
+    assert last == pytest.approx(1.0, abs=0.15), "and it ends at the fitted value"
+
+
+def test_the_constant_shift_faces_a_tighter_prior_than_the_slope():
+    # b claims the de-vigged market is wrong by a constant on EVERY fixture,
+    # forever. a only claims the model's own signal is real at the scale
+    # fitted. The stronger claim is held to more evidence.
+    from train_models import CAL_PRIOR_K_SHIFT, CAL_PRIOR_K_SLOPE
+    assert CAL_PRIOR_K_SHIFT > CAL_PRIOR_K_SLOPE
+    # At the same t-statistic the shift keeps strictly less of its fitted value.
+    for t in (0.5, 1.0, 1.5, 2.0, 3.0):
+        fa = t ** 2 / (CAL_PRIOR_K_SLOPE + t ** 2)
+        fb = t ** 2 / (CAL_PRIOR_K_SHIFT + t ** 2)
+        assert fb < fa
 
 
 def test_a_real_signal_keeps_its_slope():
@@ -337,5 +389,5 @@ def test_the_guard_reports_what_it_did_rather_than_acting_silently():
     n = 300
     off = rng.normal(0, 1.0, n)
     _, _, diag = _platt((rng.random(n) < 0.5).astype(int), rng.normal(0, 0.05, n), off)
-    for k in ("a_fitted", "b_fitted", "se_a", "se_b", "min_se"):
+    for k in ("a_fitted", "b_fitted", "se_a", "se_b", "a", "b"):
         assert k in diag, f"{k} must be visible for the operator to judge the fit"

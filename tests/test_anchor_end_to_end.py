@@ -141,7 +141,7 @@ def test_the_calibration_intercept_is_not_allowed_to_invent_a_constant_edge():
     assert ok
     cal = mets["calibration_fit"]
     assert abs(cal["b_fitted"]) > 0.02, "the unguarded fit really does drift"
-    assert "b" in (cal.get("held") or ""), "and it must be held at zero"
+    assert abs(cal["b"]) < abs(cal["b_fitted"]), "and shrinkage must pull it back"
     assert max(abs(v) for v in mets["feature_importance"].values()) < 0.2, \
         "weights were already near zero — b was the entire phantom edge"
 
@@ -162,8 +162,15 @@ def test_a_real_calibration_error_still_gets_corrected():
         0.6, 5, 50.0, 90.0, 0.65, "OU_2.5", offset_all=off,
         anchor_name="market_fair_over25")
     assert ok
-    assert "b" not in (mets["calibration_fit"].get("held") or ""), \
-        "a real, well-evidenced offset must survive the significance guard"
+    # The guard must not be a blanket refusal to calibrate. Asserted on the
+    # surviving magnitude, not on closeness to the raw fit: the raw fit
+    # overshoots here (0.98 against a true 0.5, because the anchored model's
+    # own free intercept has already absorbed part of the offset), and
+    # shrinkage lands it at ~0.50 — nearer the truth than the number it
+    # shrank from.
+    cal = mets["calibration_fit"]
+    assert cal["b"] > 0.3, "a real, well-evidenced offset must survive"
+    assert cal["b"] == pytest.approx(0.5, abs=0.25)
 
 
 # ───────── the decision the driver makes ─────────

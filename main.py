@@ -3594,6 +3594,30 @@ def auto_train_job():
                                  "model noise before they are edge.")
             else:
                 lines.append(f"⚓ <b>Not market-anchored</b> — {escape(str(anc.get('reason', '')))}")
+        # Which feature set each head was fitted on, and whether the reduced
+        # one earned the swap. CORE_FEATURES is a hypothesis about which
+        # columns are collinear restatements; this is where it gets judged.
+        fsel = res.get("feature_selection") or {}
+        picks = [(h, d) for h, d in sorted(fsel.items()) if isinstance(d, dict)]
+        if picks:
+            core = [h for h, d in picks if d.get("chosen") == "core"]
+            lines.append(f"🧮 <b>Feature set</b>: reduced on {len(core)}/{len(picks)} heads"
+                         + (f" ({', '.join(escape(h) for h in core)})" if core else ""))
+            gains = [(h, d["improvement_vs_full"]) for h, d in picks
+                     if d.get("improvement_vs_full")]
+            if gains:
+                best = max(gains, key=lambda kv: kv[1])
+                lines.append(f"   Best cal-logloss gain: {escape(best[0])} "
+                             f"{best[1]:+.4f} (selected on cal, so believe the holdout)")
+        col = (res.get("collinearity") or {}).get("full") or {}
+        if col.get("pairs_above_0.95") is not None:
+            lines.append(f"   Collinear pairs (|r| ≥ 0.95) in the full set: "
+                         f"{col['pairs_above_0.95']}, worst |r| {col.get('max_abs_corr')}")
+        rw = (res.get("data_stats") or {}).get("inplay_row_weighting")
+        if rw and rw != "per_row":
+            lines.append("⚖️ <b>Row weighting</b>: one fixture, one observation "
+                         "(snapshots share an outcome, so counting them as independent "
+                         "told the fit it had ~9× the sample it has).")
         if res.get("anchor_fallbacks"):
             lines.append("⚠️ Anchored fit failed, fell back for: "
                          + ", ".join(escape(str(h)) for h in res["anchor_fallbacks"]))
