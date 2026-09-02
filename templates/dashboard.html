@@ -331,6 +331,11 @@ const DECISION_LABELS = {
   correlated_with_existing_tip: 'Correlated with another tip',
   per_match_cap: 'Per-match tip cap reached',
   unmapped_market: 'Unmapped market',
+  overround_too_wide: 'Market too wide to trust',
+  // inplay_data_gate() - not enough real observation to bet on yet.
+  too_early: 'Too early to bet',
+  xg_feed_dead: 'xG feed missing — not bettable',
+  no_shot_data: 'No shot data — feed looks dead',
 };
 function decisionLabel(code) { return DECISION_LABELS[code] || code || '—'; }
 

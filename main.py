@@ -141,6 +141,24 @@ TRAIN_ENABLE = _env_flag("TRAIN_ENABLE", "1")
 TRAIN_HOUR_UTC = int(os.getenv("TRAIN_HOUR_UTC", "2"))
 TRAIN_MINUTE_UTC = int(os.getenv("TRAIN_MINUTE_UTC", "12"))
 TRAIN_MIN_MINUTE = int(os.getenv("TRAIN_MIN_MINUTE", "15"))
+
+# ───────── Minimum information before a live tip ─────────
+# TIP_MIN_MINUTE governs when a fixture becomes ELIGIBLE - it also gates
+# harvesting, so lowering it feeds the training set. These three govern when a
+# fixture is worth BETTING, which is a stricter question, and they deliberately
+# do not touch data collection.
+#
+# 1. Do not tip a game state the model was never trained on. Snapshots are
+#    harvested from TRAIN_MIN_MINUTE onward, so scoring at minute 8 asks the
+#    model to extrapolate outside its own training distribution. Defaulting to
+#    TRAIN_MIN_MINUTE ties the two together rather than picking a number.
+LIVE_TIP_MIN_MINUTE = int(os.getenv("LIVE_TIP_MIN_MINUTE", str(TRAIN_MIN_MINUTE)))
+# 2. A match with no shot recorded at all by this minute is a dead statistics
+#    feed, not a cagey game. Real football produces a shot long before this.
+SHOT_DATA_MIN_MINUTE = int(os.getenv("SHOT_DATA_MIN_MINUTE", "25"))
+# 3. The xG channel specifically. See _xg_feed_is_dead() for why a zero here
+#    is worse than a missing value.
+REQUIRE_XG_FEED = _env_flag("REQUIRE_XG_FEED", "1")
 HARVEST_EVERY_MINUTES = int(os.getenv("HARVEST_EVERY_MINUTES", "3"))
 
 BACKFILL_EVERY_MIN = int(os.getenv("BACKFILL_EVERY_MIN", "15"))
@@ -227,6 +245,34 @@ MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
 # full knowledge that a single source's overround is not a consensus.
 MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE",
                                         str(MIN_BOOKS_FOR_FAIR)))
+# ───────── Market width (overround) ─────────
+# The overround is what the book's prices sum to above 100%: quote Yes at 1.53
+# and No at 2.28 and the implied probabilities total 109.3%, so the overround
+# is 9.3%. devig() strips it by scaling every selection down PROPORTIONALLY,
+# and that is where the danger sits.
+#
+# Books do not load vig proportionally. Favourite-longshot bias means the
+# longshot side carries more of the margin than its share of probability, so
+# proportional de-vig takes too much off the FAVOURITE and leaves it with a
+# fair probability that is too low - i.e. a fair price that looks too long,
+# i.e. an edge on the favourite side that is partly de-vig method error rather
+# than a market mistake. The wider the overround, the larger that error, and
+# the more of any measured "edge over fair" is our own arithmetic.
+#
+# So a wide market is not merely expensive, it makes the fair price we gate on
+# untrustworthy. Above the cap the candidate is refused rather than priced.
+# Three-way markets carry a mechanically larger margin than two-way ones (the
+# book prices one more outcome), hence the separate cap - a single number would
+# either wave 1X2 through or strangle BTTS.
+#
+# These defaults reject clearly untrustworthy quotes rather than merely
+# expensive ones; the in-play feed has been running around 9% on two-way
+# markets, so expect this to bind rarely at first. The number is on every tip
+# message now - tighten it once you can see the distribution you actually get.
+# Set either to 0 to disable that cap.
+MAX_OVERROUND_BPS = int(os.getenv("MAX_OVERROUND_BPS", "1200"))
+MAX_OVERROUND_BPS_3WAY = int(os.getenv("MAX_OVERROUND_BPS_3WAY", "1800"))
+
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")
 ALLOW_TIPS_WITHOUT_ODDS = _env_flag("ALLOW_TIPS_WITHOUT_ODDS", "0")
 
@@ -916,6 +962,56 @@ def stats_coverage_ok(raw: Dict[str, float], minute: int) -> bool:
     return sum(1 for v in fields if (v or 0) > 0) >= max(0, require_fields)
 
 
+def _xg_feed_is_dead(raw: Dict[str, float]) -> bool:
+    """
+    A shot on target ALWAYS carries positive expected goals. There is no
+    football state in which SOT > 0 and total xG is exactly 0.00, so that
+    combination is proof the xG channel is absent - not proof that no chances
+    were created.
+
+    This matters more than an ordinary missing feature because the model cannot
+    tell the difference. extract_raw_inplay() defaults a missing "Expected
+    Goals" to 0.0, so an absent feed and a genuinely chanceless half arrive at
+    build_inplay_features() as the same vector. The model reads 0.00-0.00 as
+    strong evidence that neither side is threatening and prices the unders and
+    the No side accordingly - confidently, off a fact that was never observed.
+
+    Total shots are checked as well as shots on target so a feed that carries
+    shot counts but no xG is caught either way.
+    """
+    if (raw.get("xg_h", 0) or 0) + (raw.get("xg_a", 0) or 0) > 0:
+        return False
+    shots = ((raw.get("sot_h", 0) or 0) + (raw.get("sot_a", 0) or 0)
+             + (raw.get("total_shots_h", 0) or 0) + (raw.get("total_shots_a", 0) or 0))
+    return shots > 0
+
+
+def inplay_data_gate(raw: Dict[str, float], minute: int) -> Optional[str]:
+    """
+    Is there enough real observation here to BET on, as opposed to enough to
+    record? Returns None when the fixture is bettable, else the reason.
+
+    stats_coverage_ok() answers "did any statistics arrive at all" and is
+    deliberately coarse. This is the stricter question, and it is separate for
+    two reasons: it must not block harvesting, and a fixture it blocks must
+    still appear on the dashboard with the reason attached - a gate you cannot
+    see is indistinguishable from a bug.
+    """
+    if minute < LIVE_TIP_MIN_MINUTE:
+        return "too_early"
+    if REQUIRE_XG_FEED and _xg_feed_is_dead(raw):
+        return "xg_feed_dead"
+    if minute >= SHOT_DATA_MIN_MINUTE:
+        shots = ((raw.get("sot_h", 0) or 0) + (raw.get("sot_a", 0) or 0)
+                 + (raw.get("total_shots_h", 0) or 0) + (raw.get("total_shots_a", 0) or 0))
+        if shots <= 0:
+            # Possession and corners alone pass stats_coverage_ok() while the
+            # entire shot channel is missing. Possession is nonzero from the
+            # first minute of every match, so it is close to a free pass.
+            return "no_shot_data"
+    return None
+
+
 def _league_name(m: dict) -> Tuple[int, str]:
     lg = (m.get("league") or {}) or {}
     return int(lg.get("id") or 0), f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
@@ -1284,6 +1380,11 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     best: Dict[str, Dict[str, Dict[str, Any]]] = {}
     by_book: Dict[str, Dict[str, Dict[str, float]]] = {}
     fair_acc: Dict[str, Dict[str, List[float]]] = {}
+    # Per-book market width, averaged the same way the fair price is. Measured
+    # per book on a COMPLETE market, never across the best-of-many-books
+    # prices - those sum to less than the truth and would report a negative
+    # overround, i.e. the book paying you to bet.
+    overround_acc: Dict[str, List[float]] = {}
     books_seen: Dict[str, set] = {}
     parse_errors = 0
 
@@ -1333,6 +1434,12 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
                     if len(sel) >= needed:
                         total = MARKET_PROBABILITY_TOTAL.get(mkey, 1.0)
                         implied = {k: 1.0 / v for k, v in sel.items() if v > 1.0}
+                        book_sum = sum(implied.values())
+                        if book_sum > 0:
+                            # Relative to what this market's true probabilities
+                            # sum to, so Double Chance (total 2.0) is not
+                            # reported as a 100% margin.
+                            overround_acc.setdefault(mkey, []).append(book_sum / total - 1.0)
                         for k, p in devig(implied, market_total=total).items():
                             fair_acc.setdefault(mkey, {}).setdefault(k, []).append(p)
                 except Exception as e:
@@ -1367,7 +1474,9 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for mkey, sels in best.items():
         fair = {k: (sum(v) / len(v)) for k, v in (fair_acc.get(mkey) or {}).items() if v}
+        ovr = overround_acc.get(mkey) or []
         out[mkey] = {"best": sels, "fair": fair, "n_books": len(books_seen.get(mkey, ())),
+                     "overround": (sum(ovr) / len(ovr)) if ovr else None,
                      "by_book": by_book.get(mkey, {})}
     ODDS_CACHE.set(key, out)
     return out
@@ -1441,6 +1550,12 @@ class PriceCheck(dict):
     """Result of _price_gate. Dict so it serialises straight into the log row."""
 
 
+def _max_overround_bps(mkey: str) -> int:
+    """Width cap for this market, in basis points. See MAX_OVERROUND_BPS."""
+    return (MAX_OVERROUND_BPS_3WAY if _MARKET_SELECTION_COUNT.get(mkey, 2) >= 3
+            else MAX_OVERROUND_BPS)
+
+
 def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: bool) -> PriceCheck:
     """
     Single place where a candidate meets the market.
@@ -1449,6 +1564,7 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
       1. odds exist (unless ALLOW_TIPS_WITHOUT_ODDS)
       2. odds within [min_for_market, MAX_ODDS_ALL]
       3. a de-vigged fair price is computable (unless REQUIRE_FAIR_PRICE=0)
+      3b. the market is not so wide that its fair price is untrustworthy
       4. EV at the available price >= EDGE_MIN_BPS
       5. edge over the fair price >= FAIR_EDGE_MIN_BPS
       6. edge over the fair price <= MAX_MODEL_EDGE_BPS  (model-sanity cap)
@@ -1490,6 +1606,20 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
             return res
     else:
         res["fair_prob"] = float(fair)
+
+    # Market width. Reported on every candidate that has a complete market,
+    # whether or not it gates - a number you can see for a week is worth more
+    # than a threshold picked before seeing any.
+    overround = entry.get("overround")
+    if overround is not None:
+        res["overround_pct"] = round(float(overround) * 100.0, 2)
+        cap = _max_overround_bps(mkey)
+        if fair is not None and cap > 0 and int(round(float(overround) * 10000)) > cap:
+            # Refused BEFORE measuring edge, because at this width the fair
+            # price is the thing in doubt. Measuring an edge against it would
+            # be quantifying our own de-vig error. See MAX_OVERROUND_BPS.
+            res["decision"] = "overround_too_wide"
+            return res
 
     edge_ev = _ev(prob, odds)
     res["ev_pct"] = round(edge_ev * 100.0, 2)
@@ -1902,7 +2032,7 @@ def compute_clv(days: Optional[int] = None) -> Dict[str, Any]:
 # ───────── Message formatting ─────────
 def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct,
                         raw=None, odds=None, book=None, ev_pct=None, fair_prob=None,
-                        stake=None, kickoff_txt=None, prematch=False):
+                        stake=None, kickoff_txt=None, prematch=False, overround_pct=None):
     raw = raw or {}
     stat = ""
     if not prematch and any(raw.get(k, 0) for k in ("xg_h", "xg_a", "sot_h", "sot_a", "cor_h", "cor_a",
@@ -1922,6 +2052,13 @@ def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct,
             money += f"  •  <b>Fair:</b> {1.0/max(fair_prob,1e-9):.2f} ({fair_prob*100:.1f}%)"
         if ev_pct is not None:
             money += f"\n📐 <b>EV:</b> {ev_pct:+.1f}%"
+        if overround_pct is not None:
+            # The width of the market the fair price above was derived from.
+            # Read it as a confidence interval on that fair price, not as a
+            # cost: proportional de-vig flatters the favourite by roughly the
+            # margin it has to redistribute, so a wide market means part of
+            # the EV shown is arithmetic rather than edge.
+            money += f"  •  <b>Overround:</b> {overround_pct:.1f}%"
         if stake:
             money += f"  •  <b>Stake:</b> {stake:.2f}u"
 
@@ -2158,7 +2295,8 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
                             score: str, minute: int,
                             candidates: List[Tuple[str, str, float, float]],
                             kickoff_ts: int = 0, raw: Optional[Dict[str, float]] = None,
-                            home_id: int = 0, away_id: int = 0) -> Dict[str, Any]:
+                            home_id: int = 0, away_id: int = 0,
+                            data_block: Optional[str] = None) -> Dict[str, Any]:
     # For every candidate that clears its own threshold, run it through the
     # same _price_gate() production_scan() uses to decide whether it would
     # actually get tipped, and surface *why* when it wouldn't - "high
@@ -2179,11 +2317,21 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
         prob_pct = round(float(pr) * 100.0, 1)
         thr_pct = round(float(thr), 1)
         row = {"market": mt, "suggestion": sg, "prob_pct": prob_pct, "threshold_pct": thr_pct}
-        if prob_pct >= thr_pct:
+        if prob_pct >= thr_pct and data_block:
+            # The fixture is not bettable at all, so no market on it is. Said
+            # once per market rather than silently: "68% confidence, nothing
+            # sent" is exactly the question the dashboard exists to answer.
+            # Also skips the fetch_odds() call, which would be spent explaining
+            # a price we were never going to take.
+            row["decision"] = data_block
+            row["odds"] = None
+            row["ev_pct"] = None
+        elif prob_pct >= thr_pct:
             pc = _price_gate(mt, sg, fid, pr, live=True)
             row["decision"] = pc["decision"]
             row["odds"] = pc.get("odds")
             row["ev_pct"] = pc.get("ev_pct")
+            row["overround_pct"] = pc.get("overround_pct")
         else:
             row["decision"] = "below_threshold"
             row["odds"] = None
@@ -2209,6 +2357,8 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
         # from the snapshot, instead of trusting ids from the query string.
         "home_id": int(home_id or 0), "away_id": int(away_id or 0),
         "kickoff_ts": int(kickoff_ts or 0), "stats": stats,
+        # Why nothing on this fixture is bettable yet, or None when it is.
+        "data_block": data_block,
         "markets": markets,
         # Count of candidates that would actually be tipped (passed the full
         # price gate), not just candidates with high raw confidence - this is
@@ -2255,6 +2405,10 @@ def production_scan() -> Tuple[int, int]:
     # healthy live_seen count is otherwise unexplainable from this log line
     # alone (was it no odds? too few books? edge implausible?).
     gate_decisions: Dict[str, int] = {}
+    # Tally of the information gate, kept apart from the price gate: "nothing
+    # was tipped" has two completely different causes and one number cannot
+    # tell them apart.
+    data_gate: Dict[str, int] = {}
     last_snap: Dict[int, int] = {}
     if HARVEST_MODE:
         try:
@@ -2326,6 +2480,15 @@ def production_scan() -> Tuple[int, int]:
                         "AND suggestion<>'HARVEST' LIMIT 1",
                         (fid, now_ts - DUP_COOLDOWN_MIN * 60)).fetchone())
 
+            # Is there enough real observation to bet on? Evaluated here, and
+            # carried as a flag rather than a `continue`, for the same reason
+            # the cooldown is: a fixture we refuse to bet is still a fixture
+            # worth SEEING, with the refusal shown next to it. Blocking the
+            # snapshot instead would hide exactly the matches being asked about.
+            data_block = inplay_data_gate(raw, minute)
+            if data_block:
+                data_gate[data_block] = data_gate.get(data_block, 0) + 1
+
             league_id, league = _league_name(m)
             home, away = _teams(m)
             score = _pretty_score(m)
@@ -2344,10 +2507,11 @@ def production_scan() -> Tuple[int, int]:
             home_id, away_id = _team_ids(m)
             live_snapshot_matches.append(_build_live_match_entry(
                 fid, league, league_id, home, away, score, minute, candidates,
-                kickoff_ts=kickoff, raw=raw, home_id=home_id, away_id=away_id))
+                kickoff_ts=kickoff, raw=raw, home_id=home_id, away_id=away_id,
+                data_block=data_block))
 
             # Displayed above, just not re-tipped yet.
-            if cooling_down:
+            if cooling_down or data_block:
                 continue
 
             per_match = 0
@@ -2396,7 +2560,8 @@ def production_scan() -> Tuple[int, int]:
 
                 sent = send_telegram(_format_tip_message(
                     home, away, league, minute, score, suggestion, prob_pct, raw,
-                    pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"), stake))
+                    pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"), stake,
+                    overround_pct=pc.get("overround_pct")))
                 if sent:
                     with db_conn() as c:
                         c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
@@ -2422,6 +2587,15 @@ def production_scan() -> Tuple[int, int]:
              saved, live_seen, len(pred_rows), harvested, no_coverage)
     if gate_decisions:
         log.info("[PROD] price_gate: %s", gate_decisions)
+    if data_gate:
+        log.info("[PROD] data_gate: %s", data_gate)
+    if data_gate.get("xg_feed_dead"):
+        # Worth its own line: this one is provable (shots recorded, xG exactly
+        # zero) and it silently poisons every model head that reads xG.
+        log.warning("[PROD] xG feed absent on %d fixture(s) that had shots recorded — "
+                    "those fixtures were scored but not tipped. If this is every "
+                    "fixture, the API plan's statistics feed is not carrying "
+                    "Expected Goals.", data_gate["xg_feed_dead"])
     if live_seen and no_coverage >= live_seen:
         # Every live fixture lacked usable statistics. Harvesting still runs, but
         # the rows are goals/minute only and nothing can be tipped. Usually means
@@ -2474,7 +2648,8 @@ def score_live_matches_now() -> Tuple[List[Dict[str, Any]], int]:
             home_id, away_id = _team_ids(m)
             out.append(_build_live_match_entry(fid, league, league_id, home, away, score,
                                                minute, candidates, kickoff_ts=kickoff, raw=raw,
-                                               home_id=home_id, away_id=away_id))
+                                               home_id=home_id, away_id=away_id,
+                                               data_block=inplay_data_gate(raw, minute)))
         except Exception as e:
             log.warning("[LIVE-SCORE] failed for a fixture: %s", e)
             continue
@@ -2687,7 +2862,8 @@ def prematch_scan_save() -> int:
             sent = send_telegram(_format_tip_message(
                 home, away, league, 0, "", sug, pct, None,
                 pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"),
-                stake, kickoff_txt=kickoff_txt, prematch=True))
+                stake, kickoff_txt=kickoff_txt, prematch=True,
+                overround_pct=pc.get("overround_pct")))
             if sent:
                 with db_conn() as c2:
                     c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
@@ -2753,15 +2929,17 @@ def send_match_of_the_day() -> bool:
                 (teams.get("away") or {}).get("name", ""),
                 f"{lg.get('country','')} - {lg.get('name','')}".strip(" -"),
                 _kickoff_berlin(fixture.get("date")), pc.get("odds"), pc.get("book"),
-                pc.get("ev_pct"), pc.get("fair_prob"), _stake_units(prob, pc.get("odds")))
+                pc.get("ev_pct"), pc.get("fair_prob"), _stake_units(prob, pc.get("odds")),
+                pc.get("overround_pct"))
         if best is None or item[0] > best[0]:
             best = item
 
     if not best:
         return send_telegram("🏅 Match of the Day: no prematch pick met thresholds.")
-    pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct, fair, stake = best
+    pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct, fair, stake, ovr = best
     msg = _format_tip_message(home, away, league, 0, "", sug, pct, None, odds, book,
-                              ev_pct, fair, stake, kickoff_txt=kickoff_txt, prematch=True)
+                              ev_pct, fair, stake, kickoff_txt=kickoff_txt, prematch=True,
+                              overround_pct=ovr)
     return send_telegram(msg.replace("🏅 <b>Prematch Tip</b>", "🏅 <b>Match of the Day</b>"))
 
 
@@ -3521,10 +3699,15 @@ def _start_scheduler_once():
         # until you infer it from behaviour hours later.
         log.info("[CONFIG] price gate: min_books=%d (live=%d) require_fair=%s "
                  "allow_no_odds=%s edge_min=%dbps fair_edge_min=%dbps max_edge=%dbps "
-                 "odds_book_filter=%s",
+                 "max_overround=%dbps (3way=%dbps) odds_book_filter=%s",
                  MIN_BOOKS_FOR_FAIR, MIN_BOOKS_FOR_FAIR_LIVE, bool(REQUIRE_FAIR_PRICE),
                  bool(ALLOW_TIPS_WITHOUT_ODDS), EDGE_MIN_BPS, FAIR_EDGE_MIN_BPS,
-                 MAX_MODEL_EDGE_BPS, ODDS_BOOKMAKER_ID or "none")
+                 MAX_MODEL_EDGE_BPS, MAX_OVERROUND_BPS, MAX_OVERROUND_BPS_3WAY,
+                 ODDS_BOOKMAKER_ID or "none")
+        log.info("[CONFIG] live data gate: min_minute=%d (tip_min=%d, train_min=%d) "
+                 "shot_data_from=%d require_xg=%s",
+                 LIVE_TIP_MIN_MINUTE, TIP_MIN_MINUTE, TRAIN_MIN_MINUTE,
+                 SHOT_DATA_MIN_MINUTE, bool(REQUIRE_XG_FEED))
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
