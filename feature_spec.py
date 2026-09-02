@@ -51,6 +51,7 @@ automatically would be.
 """
 from __future__ import annotations
 
+import math
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -123,6 +124,49 @@ NEUTRAL_MARKET_PRIORS: Dict[str, float] = {
     "market_fair_home": 1.0 / 3.0, "market_fair_draw": 1.0 / 3.0, "market_fair_away": 1.0 / 3.0,
     "market_fair_over25": 0.5, "market_fair_btts_yes": 0.5,
 }
+
+# ───────── Market anchoring ─────────
+#
+# Which de-vigged market probability each model head is ANCHORED to.
+#
+# Without this, market_fair_over25 is one of 55 features and the L2 penalty
+# shrinks it like any other, so the model is free to wander away from the
+# market's price and call the distance an edge. The gate then selects
+# whichever candidates wandered furthest in the profitable direction - i.e.
+# it selects the model's own largest errors. A model with no skill at all,
+# just noise around the market, produces tips claiming 8-12pp of edge that
+# way, and nothing in the tip's own numbers distinguishes that from skill.
+#
+# Anchoring changes what the model is asked to learn. The market's log-odds
+# enter the linear predictor with a coefficient FIXED at 1.0 (an "offset"),
+# and the anchor is removed from the feature matrix so it cannot also be
+# fitted. The model's weights can then only express a DEVIATION from the
+# market price. A head with nothing to say converges to the market instead
+# of to noise, and its stated edge is exactly the deviation it learned.
+#
+# Heads absent from this map have no corresponding market and are fitted the
+# old way - OU_3.5, for instance, because only the 2.5 line is quoted in the
+# features. That is stated rather than approximated: anchoring Over 3.5 to
+# the Over 2.5 price would be a different and wrong question.
+MARKET_ANCHOR: Dict[str, str] = {
+    "OU_2.5": "market_fair_over25",
+    "BTTS_YES": "market_fair_btts_yes",
+    "WLD_HOME": "market_fair_home",
+    "WLD_DRAW": "market_fair_draw",
+    "WLD_AWAY": "market_fair_away",
+}
+
+# Clip applied before taking the anchor's log-odds. Shared so training and
+# serving cannot produce different offsets for the same market price - the
+# entire point of this module.
+ANCHOR_CLIP = 1e-6
+
+
+def anchor_logit(p: Any) -> float:
+    """Log-odds of a market probability, for use as a fixed model offset."""
+    v = min(max(float(p), ANCHOR_CLIP), 1.0 - ANCHOR_CLIP)
+    return math.log(v / (1.0 - v))
+
 
 # How much the true probabilities of a market's selections sum to.
 #

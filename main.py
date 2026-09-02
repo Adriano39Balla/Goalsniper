@@ -76,6 +76,7 @@ from urllib3.util.retry import Retry
 from feature_spec import (
     ELO_DEFAULT,
     DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS,
+    MARKET_ANCHOR, anchor_logit,
     ODDS_TRUSTED_FROM_TS, RAW_INPLAY_KEYS,
     assemble_prematch_features, build_inplay_features, derive_dc_dnb,
     devig, elo_update, ev as _ev, fixture_ts as _fixture_ts, kelly_fraction,
@@ -1104,18 +1105,50 @@ def _calibrate(p: float, cal: Dict[str, Any]) -> float:
     return _sigmoid(a * _logit(p) + b)
 
 
+def _anchor_offset(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
+    """
+    The market's log-odds for a market-anchored model, 0.0 for an ordinary one.
+
+    Reproduced here exactly as training built it - same feature, same clip -
+    via the shared feature_spec.anchor_logit(). A second copy of that clip
+    would be one more pair of constants to drift apart.
+
+    A missing market falls back to the NEUTRAL prior rather than to 0.0:
+    anchor_logit(0.0) is -13.8, which would read as "the market says
+    impossible" and drag every prediction to the floor.
+    """
+    anchor = mdl.get("market_anchor")
+    if not anchor:
+        return 0.0
+    return anchor_logit(feat.get(anchor, NEUTRAL_MARKET_PRIORS.get(anchor, 0.5)))
+
+
 def _score_prob(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
-    p = _sigmoid(_linpred(feat, mdl))
+    """
+    logit(p) = market_offset + a * (intercept + w.x) + b
+
+    Platt scaling is applied to the model's DEVIATION only, never to the
+    market offset. Calibrating the sum would multiply the market's log-odds by
+    `a` as well, which un-pins the very coefficient anchoring exists to fix -
+    an a of 1.1 would quietly restore the market as a fitted feature, and a
+    noisy `b` would shift every prediction off the market by a constant.
+
+    For an unanchored model the offset is 0 and this reduces to exactly the
+    previous sigmoid(a * linpred + b), since logit(sigmoid(z)) == z.
+    """
+    dev = _linpred(feat, mdl)
+    offset = _anchor_offset(feat, mdl)
     cal = mdl.get("calibration") or {}
-    if cal:
-        try:
-            p = _calibrate(p, cal)
-        except Exception as e:
-            # Falling back to the UNCALIBRATED probability changes what the
-            # number means while it still gets compared against the same
-            # threshold, so leave a trace rather than swallowing it whole.
-            log.debug("[SCORE] calibration failed (%s) — using uncalibrated %.4f", e, p)
-    return max(0.0, min(1.0, float(p)))
+    try:
+        a = float(cal.get("a", 1.0)) if cal else 1.0
+        b = float(cal.get("b", 0.0)) if cal else 0.0
+    except Exception as e:
+        # Falling back to the UNCALIBRATED probability changes what the number
+        # means while it still gets compared against the same threshold, so
+        # leave a trace rather than swallowing it whole.
+        log.debug("[SCORE] calibration unusable (%s) — scoring uncalibrated", e)
+        a, b = 1.0, 0.0
+    return max(0.0, min(1.0, _sigmoid(offset + a * dev + b)))
 
 
 def _load_ou_model_for_line(line: float, prefix: str = "") -> Optional[Dict[str, Any]]:
@@ -3476,8 +3509,16 @@ def auto_train_job():
             lines.append("• Thresholds: " + "  |  ".join(
                 f"{escape(str(k))}: {float(v):.1f}%" for k, v in sorted(thr.items())))
         ds = res.get("data_stats") or {}
-        lines.append(f"• Rows: in-play {ds.get('inplay_rows', 0)} "
-                     f"({ds.get('inplay_matches', 0)} matches), prematch {ds.get('prematch_rows', 0)}")
+        rows_line = (f"• Rows: in-play {ds.get('inplay_rows', 0)} "
+                     f"({ds.get('inplay_matches', 0)} matches), "
+                     f"prematch {ds.get('prematch_rows', 0)}")
+        # An anchored run trains on the subset carrying real market prices, so
+        # the harvested total is not what the model saw.
+        trained = ds.get("inplay_rows_trained")
+        if trained is not None and trained != ds.get("inplay_rows"):
+            rows_line += (f"\n   ↳ in-play trained on {trained} rows "
+                          f"({ds.get('inplay_matches_trained', 0)} matches)")
+        lines.append(rows_line)
 
         # Calibration is what makes a probability mean anything, and EV is
         # computed straight from it - so a head that runs N points
@@ -3522,6 +3563,40 @@ def auto_train_job():
                              if gap > 0 else
                              f"   • {escape(name)}: {gap:+.1f}pp {direction}confident")
             lines.append("   Treat their EV as unproven until the gap closes.")
+
+        # Whether the in-play heads are anchored to the market, and if not, how
+        # far off that is. An unanchored model is free to wander away from the
+        # market price and call the distance an edge - and the price gate then
+        # selects whichever candidates wandered furthest in the profitable
+        # direction, i.e. the model's own largest errors. This line says which
+        # regime tonight's models are in.
+        anc = res.get("market_anchoring") or {}
+        if anc:
+            if anc.get("anchored"):
+                lines.append(f"⚓ <b>Market-anchored</b>: {anc.get('anchored_rows', 0)} rows / "
+                             f"{anc.get('anchored_matches', 0)} fixtures "
+                             f"({anc.get('anchored_share_pct', 0):.0f}% of the set). "
+                             f"Heads predict deviation FROM the market price.")
+                devs = []
+                for name, m in sorted((res.get("metrics") or {}).items()):
+                    if not isinstance(m, dict):
+                        continue
+                    d = m.get("deviation_from_market")
+                    if isinstance(d, dict) and d.get("mean_abs_pp") is not None:
+                        devs.append((name, d))
+                if devs:
+                    lines.append("   Deviation from market on holdout (mean / p95):")
+                    for name, d in sorted(devs, key=lambda kv: kv[1]["mean_abs_pp"],
+                                          reverse=True):
+                        lines.append(f"   • {escape(name)}: {d['mean_abs_pp']:.1f}pp / "
+                                     f"{d['p95_abs_pp']:.1f}pp")
+                    lines.append("   This is what the price gate trades on. Large values are "
+                                 "model noise before they are edge.")
+            else:
+                lines.append(f"⚓ <b>Not market-anchored</b> — {escape(str(anc.get('reason', '')))}")
+        if res.get("anchor_fallbacks"):
+            lines.append("⚠️ Anchored fit failed, fell back for: "
+                         + ", ".join(escape(str(h)) for h in res["anchor_fallbacks"]))
 
         send_telegram("\n".join(lines))
     except Exception as e:

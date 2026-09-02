@@ -88,6 +88,7 @@ from feature_spec import (
     ODDS_TRUSTED_FROM_TS,
     DEFAULT_LEAGUE_RATES, FEATURES, PRE_FEATURES,
     LEAGUE_RATE_FIELDS_INPLAY, LEAGUE_RATE_FIELDS_PREMATCH,
+    MARKET_ANCHOR, anchor_logit,
     build_inplay_features, derive_dc_dnb,
 )
 
@@ -485,8 +486,22 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
 
         untrusted_fair += _drop_untrusted_market_fair(raw, _as_int(row["created_ts"]))
 
+        # Did this snapshot carry a REAL de-vigged market price, or is it about
+        # to be filled with a neutral prior? build_inplay_features() substitutes
+        # NEUTRAL_MARKET_PRIORS for anything missing, after which the two are
+        # indistinguishable in the feature vector - so the question has to be
+        # asked here, while the raw payload still knows.
+        #
+        # It matters because a market-anchored head is learning "where is the
+        # market wrong". A row with no market has nothing to be wrong about;
+        # training on it with a neutral offset teaches deviation from 0.5,
+        # which is a different question and pure noise for this one.
+        has_market = {k: (raw.get(k) is not None) for k in _MARKET_FAIR_KEYS}
+
         # League rates are injected after the split; a neutral placeholder here.
         f = build_inplay_features(raw, DEFAULT_LEAGUE_RATES)
+        for k, present in has_market.items():
+            f[f"_has_{k}"] = 1 if present else 0
 
         gh_f = _as_int(row["final_goals_h"])
         ga_f = _as_int(row["final_goals_a"])
@@ -631,15 +646,96 @@ def _fit_lr(X: np.ndarray, y: np.ndarray, C: float) -> Optional[LogisticRegressi
     return LogisticRegression(max_iter=3000, solver="liblinear", C=C).fit(X, y)
 
 
-def _select_C(X_tr, y_tr, X_ca, y_ca) -> Tuple[Optional[LogisticRegression], float]:
-    """Pick the regularization strength by log loss on the calibration split."""
+class OffsetLogit:
+    """
+    L2-penalised logistic regression with a per-row OFFSET whose coefficient is
+    fixed at 1.0:
+
+        logit(p_i) = offset_i + intercept + w . x_i
+
+    scikit-learn has no offset support, so this is fitted directly. The
+    objective matches LogisticRegression's lbfgs solver exactly - 0.5*||w||^2
+    penalised, intercept unpenalised, C scaling the data term - so C_GRID keeps
+    the same meaning across anchored and unanchored heads and the two paths
+    stay comparable.
+
+    The offset is the market's log-odds (see feature_spec.MARKET_ANCHOR). Fixing
+    its coefficient at 1.0 is what makes the fitted weights a DEVIATION from the
+    market rather than a competing opinion about the outcome. Let the fit choose
+    that coefficient and it shrinks under the penalty, which is exactly the
+    behaviour being removed.
+
+    Exposes coef_/intercept_ so it drops into build_model_blob() unchanged.
+    """
+
+    def __init__(self, C: float):
+        self.C = float(C)
+        self.coef_: Optional[np.ndarray] = None
+        self.intercept_: Optional[np.ndarray] = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray, offset: np.ndarray) -> "OffsetLogit":
+        from scipy.optimize import minimize
+
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        off = np.asarray(offset, dtype=float)
+        n, d = X.shape
+
+        def obj(theta: np.ndarray) -> Tuple[float, np.ndarray]:
+            w, c = theta[:d], theta[d]
+            z = off + c + X @ w
+            # log(1 + exp(z)) without overflow.
+            ll = float(np.sum(np.logaddexp(0.0, z) - y * z))
+            loss = 0.5 * float(w @ w) + self.C * ll
+            resid = 1.0 / (1.0 + np.exp(-z)) - y
+            grad = np.empty(d + 1)
+            grad[:d] = w + self.C * (X.T @ resid)
+            grad[d] = self.C * float(np.sum(resid))
+            return loss, grad
+
+        res = minimize(obj, np.zeros(d + 1), jac=True, method="L-BFGS-B",
+                       options={"maxiter": 3000})
+        self.coef_ = res.x[:d].reshape(1, -1)
+        self.intercept_ = np.array([res.x[d]])
+        return self
+
+    def decision_function(self, X: np.ndarray, offset: np.ndarray) -> np.ndarray:
+        return np.asarray(offset, dtype=float) + float(self.intercept_[0]) + X @ self.coef_.ravel()
+
+    def predict_proba_off(self, X: np.ndarray, offset: np.ndarray) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-self.decision_function(X, offset)))
+
+
+def _select_C(X_tr, y_tr, X_ca, y_ca,
+              off_tr: Optional[np.ndarray] = None,
+              off_ca: Optional[np.ndarray] = None):
+    """
+    Pick the regularization strength by log loss on the calibration split.
+
+    With an offset supplied the anchored fit is used; the selection criterion
+    is identical either way, so the two paths remain directly comparable.
+    """
+    anchored = off_tr is not None and off_ca is not None
     best_m, best_C, best_ll = None, C_GRID[-1], float("inf")
     for C in C_GRID:
-        m = _fit_lr(X_tr, y_tr, C)
-        if m is None:
-            continue
+        if anchored:
+            if len(np.unique(y_tr)) < 2:
+                return None, C_GRID[-1]
+            try:
+                m = OffsetLogit(C).fit(X_tr, y_tr, off_tr)
+                p = m.predict_proba_off(X_ca, off_ca)
+            except Exception as e:
+                logger.warning("[ANCHOR] offset fit failed at C=%g: %s", C, e)
+                continue
+        else:
+            m = _fit_lr(X_tr, y_tr, C)
+            if m is None:
+                continue
+            try:
+                p = m.predict_proba(X_ca)[:, 1]
+            except Exception:
+                continue
         try:
-            p = m.predict_proba(X_ca)[:, 1]
             ll = log_loss(y_ca, np.clip(p, EPS, 1 - EPS), labels=[0, 1])
         except Exception:
             continue
@@ -663,16 +759,104 @@ def _apply_platt(p_raw: np.ndarray, a: float, b: float) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-(a * _logit_vec(p_raw) + b)))
 
 
-def build_model_blob(model: LogisticRegression, features: List[str],
+# How many standard errors a calibration parameter must clear before it is
+# believed. See fit_platt_anchored() for why an anchored head needs this and an
+# ordinary one does not.
+CAL_MIN_SE = float(os.getenv("CAL_MIN_SE", "2.0"))
+
+
+def fit_platt_anchored(y_true: np.ndarray, dev: np.ndarray,
+                       offset: np.ndarray) -> Tuple[float, float, Dict[str, Any]]:
+    """
+    Platt scaling for a market-anchored head, applied to the DEVIATION only:
+
+        logit(p) = offset + a * dev + b
+
+    Calibrating the sum instead would multiply the market's log-odds by `a`,
+    un-pinning the coefficient anchoring exists to fix.
+
+    `b` needs a second guard that an unanchored head does not. It is a free
+    constant, and it soaks up whatever the calibration split's base rate
+    happened to be. On a 360-row split the standard error of that base rate is
+    ~2.6pp, so a couple of points of pure sampling noise land in `b` routinely
+    - and for an anchored model that becomes a CONSTANT edge over the market on
+    every future prediction. Measured on synthetic data with no signal at all:
+    the model's own weights came out negligible (max 0.07, anchoring working),
+    yet `b` alone put 43% of holdout rows more than 2pp above the market,
+    against a FAIR_EDGE_MIN_BPS of exactly 2pp. That is a model that would tip
+    constantly while knowing nothing.
+
+    An unanchored head hides this because its own scatter dwarfs it. An
+    anchored head is supposed to sit on the market unless it has something to
+    say, so a constant shift is the whole failure mode.
+
+    So both parameters are held at their null values (a=1, b=0) unless they
+    clear CAL_MIN_SE standard errors. A genuinely mis-scaled market still gets
+    corrected once there is enough data to show it; noise does not.
+    """
+    dev = np.asarray(dev, dtype=float)
+    off = np.asarray(offset, dtype=float)
+    y = np.asarray(y_true, dtype=float)
+    m = OffsetLogit(1e6).fit(dev.reshape(-1, 1), y, off)
+    a, b = float(m.coef_.ravel()[0]), float(m.intercept_.ravel()[0])
+
+    diag: Dict[str, Any] = {"a_fitted": round(a, 4), "b_fitted": round(b, 4)}
+    try:
+        p = 1.0 / (1.0 + np.exp(-(off + a * dev + b)))
+        w = np.clip(p * (1.0 - p), 1e-9, None)
+        D = np.column_stack([dev, np.ones_like(dev)])
+        cov = np.linalg.pinv(D.T @ (w[:, None] * D))
+        se_a, se_b = float(np.sqrt(max(cov[0, 0], 0.0))), float(np.sqrt(max(cov[1, 1], 0.0)))
+    except Exception as e:
+        logger.warning("[CAL] standard errors unavailable (%s) — holding calibration at "
+                       "its null values rather than trusting an unchecked fit", e)
+        return 1.0, 0.0, {**diag, "held": "both", "reason": "standard errors unavailable"}
+
+    diag.update({"se_a": round(se_a, 4), "se_b": round(se_b, 4), "min_se": CAL_MIN_SE})
+    held = []
+    if not (se_a > 0 and abs(a - 1.0) >= CAL_MIN_SE * se_a):
+        a, held = 1.0, held + ["a"]
+    elif a < 0.0:
+        # A negative slope says the head is ANTI-predictive: apply it and the
+        # model bets against its own signal. On a calibration split this is
+        # noise essentially every time - a genuinely inverted feature set would
+        # be a bug to fix, not an edge to trade. Collapsing to 0 makes the head
+        # predict the market exactly, which is the honest null for "no usable
+        # signal here". Observed on a synthetic head whose labels were pure
+        # noise: a came out at -0.32 and cleared its own standard error.
+        a, held = 0.0, held + ["a(negative)"]
+        logger.info("[CAL] anchored head: slope came out negative (%.3f) — treated as no "
+                    "signal and collapsed to the market price", diag["a_fitted"])
+    if not (se_b > 0 and abs(b) >= CAL_MIN_SE * se_b):
+        b, held = 0.0, held + ["b"]
+    if held:
+        diag["held"] = "+".join(held)
+        logger.info("[CAL] anchored head: held %s at null (a=%.3f b=%.3f vs se %.3f/%.3f) — "
+                    "not distinguishable from the market at %.1f SE",
+                    diag["held"], diag["a_fitted"], diag["b_fitted"], se_a, se_b, CAL_MIN_SE)
+    return a, b, diag
+
+
+def _apply_platt_anchored(dev: np.ndarray, offset: np.ndarray,
+                          a: float, b: float) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-(offset + a * np.asarray(dev, dtype=float) + b)))
+
+
+def build_model_blob(model, features: List[str],
                      mean: np.ndarray, scale: np.ndarray,
-                     cal: Tuple[float, float], C: float) -> Dict[str, Any]:
+                     cal: Tuple[float, float], C: float,
+                     market_anchor: Optional[str] = None) -> Dict[str, Any]:
     """
     The blob carries its own scaler. main.py._linpred() applies
     (x - mean)/scale per feature before the dot product, so the model can be
     fitted on standardized features (making L2 scale-fair) without breaking
     serving parity.
+
+    market_anchor names the feature whose log-odds serving must ADD to the
+    linear predictor with a coefficient of 1.0. Its absence means an ordinary
+    unanchored model, so old blobs keep serving unchanged.
     """
-    return {
+    blob: Dict[str, Any] = {
         "intercept": float(model.intercept_.ravel()[0]),
         "weights": {name: float(w) for name, w in zip(features, model.coef_.ravel().tolist())},
         "scaler": {"mean": {n: float(m) for n, m in zip(features, mean.tolist())},
@@ -681,6 +865,9 @@ def build_model_blob(model: LogisticRegression, features: List[str],
         "C": float(C),
         "n_features": len(features),
     }
+    if market_anchor:
+        blob["market_anchor"] = market_anchor
+    return blob
 
 
 def _fmt_line(line: float) -> str:
@@ -895,12 +1082,20 @@ def _train_binary_head(
     min_thresh_pct: float, max_thresh_pct: float,
     default_thr_prob: float,
     metrics_name: Optional[str] = None,
+    offset_all: Optional[np.ndarray] = None,
+    anchor_name: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Returns (ok, metrics, p_on_cal, p_on_holdout).
 
     Pipeline: standardize on TRAIN -> select C on CAL -> fit -> Platt on CAL ->
     threshold on CAL -> verify on HOLDOUT -> metrics on HOLDOUT.
+
+    When offset_all is supplied the head is MARKET-ANCHORED: the market's
+    log-odds enter the linear predictor with a coefficient fixed at 1.0 and the
+    weights express only a deviation from it. See feature_spec.MARKET_ANCHOR.
+    Callers pass the offset for the same rows as X_all, or None to fit the
+    ordinary way.
     """
     ctx = metrics_name or model_key
     if not _validate(X_all, y_all, feature_names, ctx):
@@ -909,6 +1104,10 @@ def _train_binary_head(
     X_tr, y_tr = X_all[m_tr], y_all[m_tr]
     X_ca, y_ca = X_all[m_ca], y_all[m_ca]
     X_te, y_te = X_all[m_te], y_all[m_te]
+    if offset_all is not None:
+        off_tr, off_ca, off_te = offset_all[m_tr], offset_all[m_ca], offset_all[m_te]
+    else:
+        off_tr = off_ca = off_te = None
 
     if min(len(y_tr), len(y_ca), len(y_te)) < 20:
         logger.info("[SKIP] %s: split too small (train=%d cal=%d holdout=%d)",
@@ -928,22 +1127,51 @@ def _train_binary_head(
     Z_ca = (X_ca - mean) / scale
     Z_te = (X_te - mean) / scale
 
-    m, C = _select_C(Z_tr, y_tr, Z_ca, y_ca)
+    m, C = _select_C(Z_tr, y_tr, Z_ca, y_ca, off_tr, off_ca)
     if m is None:
         return False, {}, None, None
 
-    p_ca_raw = m.predict_proba(Z_ca)[:, 1]
-    a, b = fit_platt(y_ca, p_ca_raw)
-    p_ca = _apply_platt(p_ca_raw, a, b)
-    p_te = _apply_platt(m.predict_proba(Z_te)[:, 1], a, b) if len(y_te) else np.array([])
+    anchored = isinstance(m, OffsetLogit)
+    if anchored:
+        # The model's own contribution, with the market offset held out:
+        # decision_function(X, 0) == intercept + w.x. main.py._score_prob()
+        # splits the two the same way.
+        dev_ca = m.decision_function(Z_ca, np.zeros(len(y_ca)))
+        dev_te = m.decision_function(Z_te, np.zeros(len(y_te))) if len(y_te) else np.array([])
+        a, b, cal_diag = fit_platt_anchored(y_ca, dev_ca, off_ca)
+        p_ca = _apply_platt_anchored(dev_ca, off_ca, a, b)
+        p_te = (_apply_platt_anchored(dev_te, off_te, a, b) if len(y_te) else np.array([]))
+    else:
+        p_ca_raw = m.predict_proba(Z_ca)[:, 1]
+        p_te_raw = m.predict_proba(Z_te)[:, 1] if len(y_te) else np.array([])
+        a, b = fit_platt(y_ca, p_ca_raw)
+        p_ca = _apply_platt(p_ca_raw, a, b)
+        p_te = _apply_platt(p_te_raw, a, b) if len(y_te) else np.array([])
 
-    blob = build_model_blob(m, feature_names, mean, scale, (a, b), C)
+    blob = build_model_blob(m, feature_names, mean, scale, (a, b), C,
+                            market_anchor=anchor_name if anchored else None)
     for k in (f"model_latest:{model_key}", f"model:{model_key}"):
         buf.set(k, json.dumps(blob))
 
     mets: Dict[str, Any] = {"C": C, "n_train": int(len(y_tr)), "n_cal": int(len(y_ca)),
                             "n_holdout": int(len(y_te)), "prevalence": float(y_all.mean()),
-                            "n_features": len(feature_names)}
+                            "n_features": len(feature_names),
+                            "market_anchored": bool(anchored)}
+    if anchored:
+        mets["anchor_feature"] = anchor_name
+        mets["calibration_fit"] = cal_diag
+        # How far the model moves off the market on unseen rows. This is the
+        # number the price gate is really trading on, and it is also the noise
+        # the gate selects the upper tail of - so it belongs in the metrics
+        # rather than being inferred from tips after the fact.
+        if len(y_te):
+            market_te = 1.0 / (1.0 + np.exp(-off_te))
+            dev = p_te - market_te
+            mets["deviation_from_market"] = {
+                "mean_abs_pp": round(float(np.mean(np.abs(dev)) * 100), 2),
+                "p95_abs_pp": round(float(np.percentile(np.abs(dev), 95) * 100), 2),
+                "max_abs_pp": round(float(np.max(np.abs(dev)) * 100), 2),
+            }
 
     if len(y_te) and len(np.unique(y_te)) > 1:
         pred = (p_te >= 0.5).astype(int)
@@ -986,6 +1214,62 @@ def _train_binary_head(
         mets["holdout_at_threshold"] = holdout
 
     return True, mets, p_ca, p_te
+
+
+# A market-anchored head is fitted ONLY on rows that carried a real de-vigged
+# market price. Rows without one have nothing for the model to deviate FROM.
+# Below this many such rows the anchored fit is not attempted and the head
+# falls back to the ordinary one - loudly, in the digest, never silently.
+MIN_ANCHORED_ROWS = int(os.getenv("MIN_ANCHORED_ROWS", "1500"))
+MIN_ANCHORED_MATCHES = int(os.getenv("MIN_ANCHORED_MATCHES", "200"))
+
+
+def frame_anchor_mask(df: pd.DataFrame) -> Optional[np.ndarray]:
+    """
+    Rows whose snapshot carried a REAL de-vigged market price for every market
+    the anchored heads need, or None when the frame cannot answer the question.
+
+    It is not enough that the columns are populated: build_inplay_features()
+    fills anything missing with NEUTRAL_MARKET_PRIORS, and a neutral 0.5 is
+    indistinguishable from a genuine 50/50 quote once it reaches the matrix.
+    load_inplay_data() therefore records presence at load time, in `_has_*`.
+    Its absence here (prematch frames, legacy loaders) means "unknown", which
+    must read as not anchored - treating it as "all anchored" would anchor the
+    model to neutral priors, the one outcome worth avoiding.
+
+    All the anchored heads are required together because they are fitted on one
+    shared row set; see the caller for why.
+    """
+    flags = [f"_has_{f}" for f in set(MARKET_ANCHOR.values())]
+    if any(f not in df.columns for f in flags):
+        return None
+    mask = np.ones(len(df), dtype=bool)
+    for f in flags:
+        mask &= df[f].to_numpy(dtype=int) == 1
+    return mask
+
+
+def frame_anchor_report(df: pd.DataFrame) -> Dict[str, Any]:
+    """Whether the in-play block can be market-anchored, in numbers, for the digest."""
+    mask = frame_anchor_mask(df)
+    if mask is None:
+        return {"anchored": False,
+                "reason": "snapshots do not record whether a real market price was present"}
+    n = int(mask.sum())
+    matches = int(df.loc[mask, "_match_id"].nunique()) if n else 0
+    ok = n >= MIN_ANCHORED_ROWS and matches >= MIN_ANCHORED_MATCHES
+    out: Dict[str, Any] = {
+        "anchored": ok, "anchored_rows": n, "anchored_matches": matches,
+        "rows_required": MIN_ANCHORED_ROWS, "matches_required": MIN_ANCHORED_MATCHES,
+        "anchored_share_pct": round(100.0 * n / max(1, len(df)), 1),
+        "_mask": mask,
+    }
+    if not ok:
+        out["reason"] = (f"only {n} rows / {matches} fixtures carry a real market price "
+                         f"(need {MIN_ANCHORED_ROWS} / {MIN_ANCHORED_MATCHES}). Odds recorded "
+                         f"before the market-name fix are not counted, so this number starts "
+                         f"near zero and grows as clean snapshots accumulate.")
+    return out
 
 
 def _effective_min_rows(n_features: int, min_rows_env: int, rows_per_feature: int) -> int:
@@ -1246,6 +1530,32 @@ def train_models(
         if n_ip >= need_ip and n_ip_matches >= min_matches_inplay:
             logger.info("In-play: %d snapshots across %d fixtures, %d features",
                         n_ip, n_ip_matches, len(FEATURES))
+
+            # ── Market anchoring, decided ONCE for the whole in-play block ──
+            # Not per head. The three WLD heads feed a shared 1X2 threshold
+            # fitter that compares their probabilities row-for-row against the
+            # same goal-difference array, so heads fitted on different row
+            # subsets would misalign. Restricting the frame before the split
+            # keeps every downstream array on the same rows, and it is the
+            # more defensible choice anyway: all heads should see the same
+            # data.
+            anchor_rep = frame_anchor_report(df_ip)
+            summary["market_anchoring"] = anchor_rep
+            if anchor_rep["anchored"]:
+                df_ip = df_ip.loc[anchor_rep["_mask"]].reset_index(drop=True)
+                logger.info("[ANCHOR] in-play heads anchored to the market: %d rows / "
+                            "%d fixtures carry a real de-vigged price (%.1f%% of the set)",
+                            anchor_rep["anchored_rows"], anchor_rep["anchored_matches"],
+                            anchor_rep["anchored_share_pct"])
+            else:
+                logger.info("[ANCHOR] in-play heads NOT anchored: %s", anchor_rep.get("reason"))
+            anchor_rep.pop("_mask", None)
+            # The digest reports what was TRAINED ON. Leaving the pre-subset
+            # counts here would show 15,806 rows next to a model fitted on a
+            # fraction of them, which is the kind of number that gets trusted.
+            summary["data_stats"]["inplay_rows_trained"] = int(len(df_ip))
+            summary["data_stats"]["inplay_matches_trained"] = int(df_ip["_match_id"].nunique())
+
             m_tr, m_ca, m_te = grouped_time_split(df_ip, cal_size, test_size, embargo_groups)
 
             rate_map = _compute_league_rate_map(conn, df_ip.loc[m_tr, "_match_id"].unique())
@@ -1254,10 +1564,47 @@ def train_models(
             X = df_ip[FEATURES].to_numpy(dtype=float)
             summary["feature_counts"]["inplay"] = len(FEATURES)
 
-            ok, mets, _, _ = _train_binary_head(
-                buf, X, df_ip["label_btts"].to_numpy(dtype=int), m_tr, m_ca, m_te, FEATURES,
-                "BTTS_YES", "BTTS", summary, target_precision, min_preds,
-                min_thresh, max_thresh, 0.65, "BTTS_YES")
+            def _anchored_head(head: str, y: np.ndarray, threshold_label, default_thr,
+                               metrics_name: str):
+                """
+                Fit one head, anchored to its own market where it has one.
+
+                Every head here is fitted on the same rows; the only per-head
+                difference is WHICH market it is anchored to, and whether it has
+                one at all. OU_3.5 does not - only the 2.5 line is quoted in the
+                features - so it is fitted the ordinary way rather than being
+                anchored to a price for a different question.
+
+                An anchored head drops its own anchor from the feature matrix.
+                Leaving it in would let the fit put a second, penalised weight
+                on the same signal and partially unpin the offset, which is the
+                behaviour being removed.
+                """
+                feat = MARKET_ANCHOR.get(head) if anchor_rep["anchored"] else None
+                if feat and feat in df_ip.columns:
+                    cols = [c for c in FEATURES if c != feat]
+                    Xa = df_ip[cols].to_numpy(dtype=float)
+                    off = np.array([anchor_logit(v)
+                                    for v in df_ip[feat].to_numpy(dtype=float)])
+                    res = _train_binary_head(
+                        buf, Xa, y, m_tr, m_ca, m_te, cols,
+                        head, threshold_label, summary, target_precision, min_preds,
+                        min_thresh, max_thresh, default_thr, metrics_name,
+                        offset_all=off, anchor_name=feat)
+                    if res[0]:
+                        return res
+                    # Never silent: a fallback looks exactly like an anchored
+                    # model that learned nothing, and the two need different fixes.
+                    logger.warning("[ANCHOR] %s: anchored fit failed, falling back to "
+                                   "the unanchored model", head)
+                    summary.setdefault("anchor_fallbacks", []).append(head)
+                return _train_binary_head(
+                    buf, X, y, m_tr, m_ca, m_te, FEATURES,
+                    head, threshold_label, summary, target_precision, min_preds,
+                    min_thresh, max_thresh, default_thr, metrics_name)
+
+            ok, mets, _, _ = _anchored_head(
+                "BTTS_YES", df_ip["label_btts"].to_numpy(dtype=int), "BTTS", 0.65, "BTTS_YES")
             summary["trained"]["BTTS_YES"] = ok
             if ok:
                 summary["metrics"]["BTTS_YES"] = mets
@@ -1273,10 +1620,9 @@ def train_models(
             totals = df_ip["final_goals_sum"].to_numpy(dtype=int)
             for line in ou_lines:
                 name = f"OU_{_fmt_line(line)}"
-                ok, mets, _, _ = _train_binary_head(
-                    buf, X, (totals > line).astype(int), m_tr, m_ca, m_te, FEATURES,
-                    name, f"Over/Under {_fmt_line(line)}", summary, target_precision, min_preds,
-                    min_thresh, max_thresh, 0.65, name)
+                ok, mets, _, _ = _anchored_head(
+                    name, (totals > line).astype(int),
+                    f"Over/Under {_fmt_line(line)}", 0.65, name)
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
@@ -1296,10 +1642,7 @@ def train_models(
             gd = df_ip["final_goals_diff"].to_numpy(dtype=int)
             heads = {}
             for key, y in (("WLD_HOME", (gd > 0)), ("WLD_DRAW", (gd == 0)), ("WLD_AWAY", (gd < 0))):
-                ok, mets, p_ca, p_te = _train_binary_head(
-                    buf, X, y.astype(int), m_tr, m_ca, m_te, FEATURES,
-                    key, None, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, 0.45, key)
+                ok, mets, p_ca, p_te = _anchored_head(key, y.astype(int), None, 0.45, key)
                 summary["trained"][key] = ok
                 if ok:
                     summary["metrics"][key] = mets

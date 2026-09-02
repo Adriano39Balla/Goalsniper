@@ -105,3 +105,71 @@ def test_heads_are_listed_worst_first(monkeypatch):
         "OU_2.5": {"already_decided": {"decided_share_pct": 31.4, "base_rate_all": 0.50,
                                        "base_rate_undecided": 0.33}}})
     assert msg.index("OU_2.5") < msg.index("BTTS_YES")
+
+
+# ───────── market anchoring ─────────
+# Which regime tonight's models are in is not a detail. An unanchored head can
+# wander from the market and call the distance edge; the operator has to be
+# able to tell that apart from a head that is anchored and genuinely quiet.
+
+def _run_anchor(monkeypatch, anchoring, metrics=None, fallbacks=None):
+    res = _train_result(metrics or {})
+    res["market_anchoring"] = anchoring
+    if fallbacks:
+        res["anchor_fallbacks"] = fallbacks
+    sent = []
+    monkeypatch.setattr(main, "TRAIN_ENABLE", True)
+    monkeypatch.setattr(main, "train_models", lambda: res)
+    monkeypatch.setattr(main, "send_telegram", lambda msg: sent.append(msg) or True)
+    monkeypatch.setattr(main._MODELS_CACHE, "invalidate", lambda: None)
+    monkeypatch.setattr(main._SETTINGS_CACHE, "invalidate", lambda: None)
+    main.auto_train_job()
+    return sent[-1]
+
+
+def test_an_anchored_run_says_so_with_its_coverage(monkeypatch):
+    msg = _run_anchor(monkeypatch, {"anchored": True, "anchored_rows": 4200,
+                                    "anchored_matches": 460, "anchored_share_pct": 62.0})
+    assert "Market-anchored" in msg
+    assert "4200" in msg and "460" in msg and "62%" in msg
+
+
+def test_an_unanchored_run_says_why_not(monkeypatch):
+    # Silence here reads as "anchoring is on and found nothing", which is a
+    # completely different situation from "not enough data yet".
+    msg = _run_anchor(monkeypatch, {"anchored": False,
+                                    "reason": "only 12 rows / 3 fixtures carry a real market price"})
+    assert "Not market-anchored" in msg
+    assert "only 12 rows" in msg
+
+
+def test_the_deviation_from_market_is_reported(monkeypatch):
+    # This is the number the price gate actually trades on, and it is also the
+    # noise whose upper tail the gate selects.
+    msg = _run_anchor(monkeypatch,
+                      {"anchored": True, "anchored_rows": 5000, "anchored_matches": 500,
+                       "anchored_share_pct": 70.0},
+                      metrics={"OU_2.5": {"deviation_from_market":
+                                          {"mean_abs_pp": 2.4, "p95_abs_pp": 6.1, "max_abs_pp": 9.0}},
+                               "BTTS_YES": {"deviation_from_market":
+                                            {"mean_abs_pp": 5.8, "p95_abs_pp": 12.2, "max_abs_pp": 18.0}}})
+    assert "Deviation from market" in msg
+    assert "2.4pp" in msg and "6.1pp" in msg
+    # Scoped to the section: head names also appear in the "Trained:" line above.
+    section = msg[msg.index("Deviation from market"):]
+    assert section.index("BTTS_YES") < section.index("OU_2.5"), "the noisiest head must lead"
+
+
+def test_a_silent_fallback_is_impossible(monkeypatch):
+    # An anchored fit that failed and fell back looks exactly like an anchored
+    # model that learned nothing, and the two need different fixes.
+    msg = _run_anchor(monkeypatch,
+                      {"anchored": True, "anchored_rows": 5000, "anchored_matches": 500,
+                       "anchored_share_pct": 70.0},
+                      fallbacks=["WLD_DRAW"])
+    assert "Anchored fit failed" in msg and "WLD_DRAW" in msg
+
+
+def test_a_run_with_no_anchoring_information_adds_nothing(monkeypatch):
+    msg = _run_anchor(monkeypatch, {})
+    assert "anchor" not in msg.lower()

@@ -15,6 +15,10 @@ requests==2.31.0
 # wheel-available versions match whatever Python Railway builds with.
 numpy>=1.26.3,<3.0
 scikit-learn>=1.4.0,<2.0
+# Pinned explicitly rather than relied on as a scikit-learn transitive: the
+# market-anchored fit (train_models.OffsetLogit) imports scipy.optimize
+# directly, and a direct import deserves a direct declaration.
+scipy>=1.11,<2.0
 pandas>=2.2.3,<3.0
 
 # Scheduling & time
