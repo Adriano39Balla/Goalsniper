@@ -1735,6 +1735,74 @@ def capture_closing_lines(limit: int = 200) -> int:
     return n
 
 
+def compute_price_gate_breakdown(days: Optional[int] = None,
+                                 phase: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Why candidates are not becoming tips, read from the `predictions` table
+    rather than scraped out of a log buffer.
+
+    Every candidate that reaches _price_gate() has its decision recorded per
+    row, so the same question the per-scan "[PROD] price_gate:" line answers
+    is answerable over days, filterable, and after the fact.
+
+    SAMPLING, because these counts are not a census: a live candidate is
+    logged only on a harvest tick or when it passed, prematch only when it
+    was scored, both only above PREDICTION_LOG_MIN_PROB, and then trimmed to
+    PREDICTION_LOG_MAX_PER_FIXTURE rows per fixture with every tipped
+    candidate kept. So "tipped" is over-represented relative to reality and
+    the absolute numbers understate volume. The MIX of rejection reasons is
+    what this is for - that is not distorted by keeping extra winners.
+    """
+    cutoff = int(time.time()) - days * 86400 if days else 0
+    sql = "SELECT phase, decision, COUNT(*) FROM predictions WHERE created_ts >= %s"
+    params: List[Any] = [cutoff]
+    if phase:
+        sql += " AND phase = %s"
+        params.append(phase)
+    sql += " GROUP BY phase, decision"
+    with db_conn() as c:
+        rows = c.execute(sql, tuple(params)).fetchall()
+
+    by_phase: Dict[str, Dict[str, int]] = {}
+    for ph, decision, n in rows:
+        by_phase.setdefault(ph or "?", {})[decision or "?"] = int(n)
+
+    # These two are set before the gate runs, so they are not gate outcomes:
+    # they mean the candidate never got that far.
+    not_gate_outcomes = {"below_threshold", "per_match_cap"}
+    summary: Dict[str, Any] = {}
+    for ph, counts in by_phase.items():
+        gate = {k: v for k, v in counts.items() if k not in not_gate_outcomes}
+        reached = sum(gate.values())
+        blockers = sorted(((k, v) for k, v in gate.items() if k != "tipped"),
+                          key=lambda kv: kv[1], reverse=True)
+        summary[ph] = {
+            "reached_price_gate": reached,
+            "tipped": gate.get("tipped", 0),
+            "tipped_pct": round(100.0 * gate.get("tipped", 0) / reached, 1) if reached else 0.0,
+            "blocked_by": [{"reason": k, "n": v,
+                            "pct_of_gated": round(100.0 * v / reached, 1) if reached else 0.0}
+                           for k, v in blockers],
+            "never_reached_gate": {k: counts.get(k, 0) for k in not_gate_outcomes
+                                   if counts.get(k)},
+        }
+
+    return {
+        "window_days": days,
+        "by_phase": summary,
+        "sampling_note": ("Not a census. Live candidates are logged on harvest ticks or when "
+                          "they passed, prematch when scored, both only above "
+                          f"PREDICTION_LOG_MIN_PROB={PREDICTION_LOG_MIN_PROB}, then trimmed to "
+                          f"{PREDICTION_LOG_MAX_PER_FIXTURE}/fixture keeping every tipped one. "
+                          "Read the MIX of blocked_by reasons, not the absolute counts, and "
+                          "treat tipped_pct as an upper bound."),
+        "reading_note": ("no_odds / too_few_books dominating means the market has no usable "
+                         "depth for these fixtures — the answer is league scope, not looser "
+                         "EV gates. ev_below_min / fair_edge_below_min dominating means the "
+                         "model agrees with the market and there is genuinely no edge to bet."),
+    }
+
+
 def compute_clv(days: Optional[int] = None) -> Dict[str, Any]:
     cutoff = int(time.time()) - days * 86400 if days else 0
     with db_conn() as c:
@@ -3539,6 +3607,15 @@ def http_pnl():
 def http_clv():
     _require_admin()
     return jsonify({"ok": True, "clv": compute_clv(days=_arg_int("days"))})
+
+
+@app.route("/admin/diagnostics/price-gate", methods=["GET"])
+def http_price_gate():
+    """Why candidates are not becoming tips, over a window rather than per scan."""
+    _require_admin()
+    return jsonify({"ok": True,
+                    "price_gate": compute_price_gate_breakdown(
+                        days=_arg_int("days", 7), phase=request.args.get("phase"))})
 
 
 @app.route("/admin/diagnostics/calibration", methods=["GET"])
