@@ -3453,6 +3453,17 @@ def _start_scheduler_once():
         _scheduler_started = True
         send_telegram("🚀 goalsniper started (market-aware pricing, CLV tracking on).")
         log.info("[SCHED] started (scan=%ss)", SCAN_INTERVAL_SEC)
+        # The gates that decide whether anything gets tipped, as this process
+        # actually resolved them. A setting changed in the wrong place - a
+        # local .env, which is gitignored and never reaches the container,
+        # rather than the platform's own variables - is otherwise invisible
+        # until you infer it from behaviour hours later.
+        log.info("[CONFIG] price gate: min_books=%d (live=%d) require_fair=%s "
+                 "allow_no_odds=%s edge_min=%dbps fair_edge_min=%dbps max_edge=%dbps "
+                 "odds_book_filter=%s",
+                 MIN_BOOKS_FOR_FAIR, MIN_BOOKS_FOR_FAIR_LIVE, bool(REQUIRE_FAIR_PRICE),
+                 bool(ALLOW_TIPS_WITHOUT_ODDS), EDGE_MIN_BPS, FAIR_EDGE_MIN_BPS,
+                 MAX_MODEL_EDGE_BPS, ODDS_BOOKMAKER_ID or "none")
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 

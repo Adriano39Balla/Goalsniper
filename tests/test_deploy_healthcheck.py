@@ -89,3 +89,28 @@ def test_dashboard_payload_carries_the_build(monkeypatch):
     r = main.app.test_client().get("/dashboard/data")
     assert r.status_code == 200
     assert r.get_json()["build"]["commit"] == "deadbee"
+
+
+def test_effective_gate_config_is_logged_at_startup(caplog, monkeypatch):
+    # A setting put in the wrong place (a gitignored local .env rather than
+    # the platform's variables) is otherwise only detectable by inferring it
+    # from behaviour hours later.
+    monkeypatch.setattr(main, "RUN_SCHEDULER", True)
+    monkeypatch.setattr(main, "_scheduler_started", False)
+    monkeypatch.setattr(main, "send_telegram", lambda *a, **k: True)
+    monkeypatch.setattr(main, "MIN_BOOKS_FOR_FAIR_LIVE", 1)
+
+    class _Sched:
+        def add_job(self, *a, **k):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(main, "BackgroundScheduler", lambda **k: _Sched())
+    with caplog.at_level("INFO"):
+        main._start_scheduler_once()
+
+    cfg = [r.getMessage() for r in caplog.records if "[CONFIG] price gate" in r.getMessage()]
+    assert cfg, "startup must state the gate configuration it resolved"
+    assert "live=1" in cfg[0]
