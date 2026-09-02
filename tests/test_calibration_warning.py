@@ -80,3 +80,28 @@ def test_the_normal_summary_is_still_sent(monkeypatch):
     assert "Model training OK" in msg
     assert "Trained:" in msg
     assert "in-play 15806" in msg
+
+
+def test_settled_row_share_is_reported_in_the_summary(monkeypatch):
+    # The measurement is useless if it only lives in a metrics blob.
+    msg = _run(monkeypatch, {"OU_2.5": {"already_decided": {
+        "decided_share_pct": 31.4, "base_rate_all": 0.5042,
+        "base_rate_undecided": 0.3310}}})
+    assert "Already-settled rows" in msg
+    assert "OU_2.5" in msg and "31%" in msg
+    assert "0.50" in msg and "0.33" in msg
+
+
+def test_a_head_with_no_settled_rows_is_not_listed(monkeypatch):
+    msg = _run(monkeypatch, {"OU_2.5": {"already_decided": {
+        "decided_share_pct": 0.0, "base_rate_all": 0.5, "base_rate_undecided": 0.5}}})
+    assert "Already-settled rows" not in msg
+
+
+def test_heads_are_listed_worst_first(monkeypatch):
+    msg = _run(monkeypatch, {
+        "BTTS_YES": {"already_decided": {"decided_share_pct": 12.0, "base_rate_all": 0.52,
+                                         "base_rate_undecided": 0.45}},
+        "OU_2.5": {"already_decided": {"decided_share_pct": 31.4, "base_rate_all": 0.50,
+                                       "base_rate_undecided": 0.33}}})
+    assert msg.index("OU_2.5") < msg.index("BTTS_YES")

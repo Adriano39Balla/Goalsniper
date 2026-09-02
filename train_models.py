@@ -369,6 +369,79 @@ def _drop_untrusted_market_fair(raw: Dict[str, Any], created_ts: Optional[int]) 
     return dropped
 
 
+def already_decided_mask(df: pd.DataFrame, head: str) -> Optional[np.ndarray]:
+    """
+    Rows whose outcome was ALREADY SETTLED at the moment they were harvested.
+
+    An in-play snapshot at 2-1 has already answered "Over 2.5?" and "both
+    teams to score?". Those rows are not predictions - the label is a fact
+    about the scoreline the features already contain, so the model gets them
+    right for free. They inflate accuracy and precision, they dominate
+    calibration, and none of them is bettable: nobody prices a market that
+    has resolved.
+
+    Their fingerprint is visible in the fitted weights - OU_2.5's two
+    strongest features are goals_sum and is_goalfest (goals_sum >= 3, i.e.
+    "Over 2.5 has already happened"), and BTTS_YES leans on goals_sum harder
+    than on anything else.
+
+    Returns None for heads that cannot be settled early: a side can always
+    score, so 1X2/DNB/DC are mathematically open until full time however
+    lopsided the scoreline is.
+    """
+    if "goals_sum" not in df.columns:
+        return None
+    goals_sum = df["goals_sum"].to_numpy(dtype=float)
+
+    if head.startswith("OU_"):
+        try:
+            line = float(head.split("_", 1)[1])
+        except (ValueError, IndexError):
+            return None
+        # Over is settled once the line is cleared; Under never settles early.
+        return goals_sum > line
+
+    if head == "BTTS_YES":
+        if "score_margin" not in df.columns:
+            return None
+        # min(home, away) = (sum - |diff|) / 2; both have scored when that is >= 1.
+        return (goals_sum - df["score_margin"].to_numpy(dtype=float)) >= 2.0
+
+    return None
+
+
+def decided_diagnostics(df: pd.DataFrame, head: str, y: np.ndarray) -> Optional[Dict[str, Any]]:
+    """
+    How much of a head's apparent skill is answering settled questions.
+
+    base_rate_undecided is the number that matters: the rate the model is
+    actually up against once the free rows are removed. A head whose overall
+    base rate is 0.50 but whose undecided base rate is 0.35 has been graded
+    on a much easier problem than the one it is asked to bet on.
+    """
+    mask = already_decided_mask(df, head)
+    if mask is None or len(mask) == 0:
+        return None
+    n = int(len(mask))
+    n_decided = int(mask.sum())
+    y = np.asarray(y, dtype=int)
+    n_pos = int(y.sum())
+    undecided = ~mask
+    n_undecided = int(undecided.sum())
+    return {
+        "n_rows": n,
+        "n_already_decided": n_decided,
+        "decided_share_pct": round(100.0 * n_decided / n, 1) if n else 0.0,
+        "share_of_positives_pct": (round(100.0 * int((mask & (y == 1)).sum()) / n_pos, 1)
+                                   if n_pos else 0.0),
+        "base_rate_all": round(float(y.mean()), 4) if n else 0.0,
+        "base_rate_undecided": (round(float(y[undecided].mean()), 4) if n_undecided else None),
+        "note": ("Rows whose outcome was already settled by the scoreline when harvested. "
+                 "They are free accuracy and cannot be bet. base_rate_undecided is the "
+                 "honest benchmark for this head."),
+    }
+
+
 def load_inplay_data(conn: PGConnection, min_minute: int = 15,
                      max_minute: int = 90) -> pd.DataFrame:
     """
@@ -1188,6 +1261,14 @@ def train_models(
             summary["trained"]["BTTS_YES"] = ok
             if ok:
                 summary["metrics"]["BTTS_YES"] = mets
+                _dd = decided_diagnostics(df_ip, "BTTS_YES",
+                                          df_ip["label_btts"].to_numpy(dtype=int))
+                if _dd:
+                    mets["already_decided"] = _dd
+                    logger.info("[DECIDED] BTTS_YES: %.1f%% of rows already settled when "
+                                "harvested; base rate %.3f overall vs %s undecided",
+                                _dd["decided_share_pct"], _dd["base_rate_all"],
+                                _dd["base_rate_undecided"])
 
             totals = df_ip["final_goals_sum"].to_numpy(dtype=int)
             for line in ou_lines:
@@ -1199,6 +1280,13 @@ def train_models(
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
+                    _dd = decided_diagnostics(df_ip, name, (totals > line).astype(int))
+                    if _dd:
+                        mets["already_decided"] = _dd
+                        logger.info("[DECIDED] %s: %.1f%% of rows already settled when "
+                                    "harvested; base rate %.3f overall vs %s undecided",
+                                    name, _dd["decided_share_pct"], _dd["base_rate_all"],
+                                    _dd["base_rate_undecided"])
                     if abs(line - 2.5) < 1e-6:
                         blob = buf.get_json(f"model_latest:{name}")
                         if blob is not None:

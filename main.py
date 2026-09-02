@@ -3308,6 +3308,26 @@ def auto_train_job():
         # against an EDGE_MIN_BPS of 3pp: the gate would be measuring the
         # model's error, not the market's. Surfaced here because it was
         # otherwise buried in a metrics blob nobody reads nightly.
+        # How much of each head's apparent skill is answering questions the
+        # scoreline had already settled. Those rows are free accuracy and
+        # cannot be bet, so a high share means the headline precision is
+        # measuring an easier problem than the one being staked.
+        settled = []
+        for name, m in sorted((res.get("metrics") or {}).items()):
+            if not isinstance(m, dict):
+                continue
+            dd = m.get("already_decided")
+            if isinstance(dd, dict) and dd.get("decided_share_pct"):
+                settled.append((name, dd))
+        if settled:
+            lines.append("📐 <b>Already-settled rows</b> (free accuracy, not bettable):")
+            for name, dd in sorted(settled, key=lambda kv: kv[1]["decided_share_pct"],
+                                   reverse=True):
+                und = dd.get("base_rate_undecided")
+                lines.append(f"   • {escape(name)}: {dd['decided_share_pct']:.0f}% of rows"
+                             + (f" · base rate {dd['base_rate_all']:.2f} → {und:.2f} undecided"
+                                if und is not None else ""))
+
         drifted = []
         for name, m in sorted((res.get("metrics") or {}).items()):
             if not isinstance(m, dict):
