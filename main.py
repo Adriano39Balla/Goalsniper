@@ -218,6 +218,15 @@ REQUIRE_FAIR_PRICE = _env_flag("REQUIRE_FAIR_PRICE", "1")
 # Best price is still taken across every book; this governs whether the FAIR side
 # is trustworthy enough to bet against.
 MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
+# The in-play feed is ONE aggregated source, not a panel of books, so it can
+# never reach MIN_BOOKS_FOR_FAIR - live candidates would sit at
+# too_few_books forever. This is a separate knob rather than a lower global
+# value because prematch genuinely does have multiple books and should keep
+# demanding a consensus. Defaults to the strict value so nothing loosens by
+# itself: set it to 1 to accept the in-play feed's own de-vigged price, in
+# full knowledge that a single source's overround is not a consensus.
+MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE",
+                                        str(MIN_BOOKS_FOR_FAIR)))
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")
 ALLOW_TIPS_WITHOUT_ODDS = _env_flag("ALLOW_TIPS_WITHOUT_ODDS", "0")
 
@@ -1117,9 +1126,42 @@ def _market_name_normalize(s: Any) -> str:
     return s
 
 
+# The in-play feed is one aggregated source rather than a panel of books, so
+# it gets a stable name of its own: n_books is then honestly 1 for live,
+# instead of borrowing the credibility of a multi-book consensus.
+LIVE_FEED_BOOK = "API-Football (in-play)"
+
+
+def _iter_price_sources(r: dict) -> List[Tuple[str, List[dict]]]:
+    """
+    (book_name, bets) pairs, for BOTH shapes the odds API returns.
+
+    /odds (prematch) nests markets under a list of "bookmakers".
+    /odds/live returns a single aggregated in-play feed with the markets
+    directly under "odds" and no bookmaker layer at all.
+
+    Only the first was handled, so every live fixture parsed to zero markets
+    no matter what the feed contained - which is why in-play candidates came
+    back no_odds 100% of the time, on every scan, while prematch priced
+    normally off the same code. Nothing downstream was wrong; the prices
+    never arrived.
+    """
+    books = r.get("bookmakers")
+    if isinstance(books, list) and books:
+        return [(_txt(bk.get("name")) or "Book", bk.get("bets") or []) for bk in books]
+    live_odds = r.get("odds")
+    if isinstance(live_odds, list) and live_odds:
+        return [(LIVE_FEED_BOOK, live_odds)]
+    return []
+
+
 def _odd_value(v: dict) -> float:
     """Parse a price, tolerating strings, commas and nulls. 0.0 means unusable."""
     try:
+        # In-play selections carry a suspended flag while the market is
+        # frozen. A suspended price cannot be taken, so it is not a price.
+        if v.get("suspended") is True:
+            return 0.0
         raw = v.get("odd")
         if raw is None:
             return 0.0
@@ -1247,11 +1289,11 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     # all markets, all books. That is why 530 parse failures produced zero
     # priced candidates rather than merely degraded ones. Failures are now
     # isolated to the market that caused them; everything else survives.
-    for r in (js.get("response", []) if isinstance(js, dict) else []):
-        for bk in (r.get("bookmakers") or []):
-            book_name = _txt(bk.get("name")) or "Book"
+    response = js.get("response", []) if isinstance(js, dict) else []
+    for r in response:
+        for book_name, bets in _iter_price_sources(r):
             per_market: Dict[str, Dict[str, float]] = {}
-            for mkt in (bk.get("bets") or []):
+            for mkt in bets:
                 try:
                     parsed = _parse_book_market(mkt)
                 except Exception as e:
@@ -1296,6 +1338,15 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     if parse_errors:
         log.debug("[ODDS] fixture %s (live=%s): %d market(s) unparseable, %d market(s) usable",
                   fid, live, parse_errors, len(best))
+
+    if response and not best:
+        # A response arrived but nothing priced. Say what shape it had: the
+        # in-play feed going unparsed for its entire history cost a long hunt
+        # that one line of this would have ended immediately.
+        log.warning("[ODDS] fixture %s (live=%s): %d response item(s) but no usable markets. "
+                    "Top-level keys seen: %s",
+                    fid, live, len(response),
+                    sorted(response[0].keys()) if isinstance(response[0], dict) else type(response[0]))
 
     out: Dict[str, Any] = {}
     for mkey, sels in best.items():
@@ -1416,7 +1467,7 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
         res["decision"] = "no_fair_price"
         if REQUIRE_FAIR_PRICE:
             return res
-    elif res["n_books"] < MIN_BOOKS_FOR_FAIR:
+    elif res["n_books"] < (MIN_BOOKS_FOR_FAIR_LIVE if live else MIN_BOOKS_FOR_FAIR):
         res["decision"] = "too_few_books"
         res["fair_prob"] = float(fair)
         if REQUIRE_FAIR_PRICE:
