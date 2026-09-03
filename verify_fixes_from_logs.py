@@ -43,18 +43,27 @@ def parse_training_logs(log_file: str) -> Dict:
         return results
 
     # Parse training lines
+    last_phase_line = ""
     for line in lines:
-        # Training start
+        # Training start. grouped_time_split() logs one "[SPLIT] fixtures:"
+        # line per phase ("In-play: ..." vs "Prematch: ..." on the preceding
+        # log line names which), so the phase is read from context rather
+        # than matching a fixture count from one past run - "8717" was this
+        # script's own training set size the day it was written and matches
+        # nothing on any other run, silently breaking this section forever
+        # after.
         if "[SPLIT] fixtures:" in line:
-            if "8717" in line:  # Prematch data
-                results["training_started"] = True
-                match = re.search(r"train=(\d+) cal=(\d+) holdout=(\d+)", line)
-                if match:
-                    results["prematch_metrics"]["fixtures"] = {
-                        "train": int(match.group(1)),
-                        "cal": int(match.group(2)),
-                        "holdout": int(match.group(3)),
-                    }
+            results["training_started"] = True
+            match = re.search(r"train=(\d+) cal=(\d+) holdout=(\d+)", line)
+            if match and "prematch" in last_phase_line.lower():
+                results["prematch_metrics"]["fixtures"] = {
+                    "train": int(match.group(1)),
+                    "cal": int(match.group(2)),
+                    "holdout": int(match.group(3)),
+                }
+
+        if "Prematch:" in line or "In-play:" in line:
+            last_phase_line = line
 
         # Calibration gaps
         if "[METRICS]" in line and "calib_gap=" in line:
@@ -65,9 +74,18 @@ def parse_training_logs(log_file: str) -> Dict:
                 gap_val = float(gap)
                 results["calibration_gaps"].append((head, gap_val))
 
-        # Threshold suppression
+        # Threshold suppression. `[THRESHOLD]` here is the literal tag, not a
+        # character class - an earlier version of this pattern used
+        # `[THRESHOLD]` unescaped, which regex reads as "one character from
+        # the set T,H,R,E,S,O,L,D", not the four-character literal string. It
+        # matched *something* on every suppression line (there is no shortage
+        # of those letters), so this silently captured wrong text (e.g. the
+        # tail of "...SUPPRESSING this market") as if it were the market name,
+        # rather than failing loudly. train_models.py's `_pick_threshold` now
+        # names the head right after the tag: "[THRESHOLD] <label>: no
+        # threshold beat...".
         if "[THRESHOLD]" in line and ("SUPPRESSING" in line or "no threshold beat" in line):
-            match = re.search(r"[THRESHOLD].*?(\w+[\w\s]*?)(?:\sat|$)", line)
+            match = re.search(r"\[THRESHOLD\]\s+(\S.*?):", line)
             if match:
                 market = match.group(1).strip()
                 if "PRE" in market:
@@ -288,8 +306,13 @@ def analyze_results(results: Dict) -> None:
 
 
 def main():
-    # Default log location
-    log_file = Path("/root/.claude/uploads/d7caef2c-5fa3-5094-af7c-4f45f0edfeac/878a679b-logs.1788430710824.log")
+    # A log file passed on the command line always wins; the hardcoded path
+    # below is this script's own dev-session default and matches nothing on
+    # anyone else's machine.
+    if len(sys.argv) > 1:
+        log_file = Path(sys.argv[1])
+    else:
+        log_file = Path("/root/.claude/uploads/d7caef2c-5fa3-5094-af7c-4f45f0edfeac/878a679b-logs.1788430710824.log")
 
     if not log_file.exists():
         print(f"Log file not found at: {log_file}")
