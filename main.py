@@ -2675,6 +2675,12 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
             "cor_h": raw.get("cor_h", 0.0), "cor_a": raw.get("cor_a", 0.0),
             "pos_h": raw.get("pos_h", 0.0), "pos_a": raw.get("pos_a", 0.0),
             "yellow_h": raw.get("yellow_h", 0.0), "yellow_a": raw.get("yellow_a", 0.0),
+            # Carried so the xG-feed diagnostic can answer "is the channel
+            # alive, and where" from the snapshot the scan already built,
+            # without spending a single extra API call.
+            "xg_h": raw.get("xg_h", 0.0), "xg_a": raw.get("xg_a", 0.0),
+            "total_shots_h": raw.get("total_shots_h", 0.0),
+            "total_shots_a": raw.get("total_shots_a", 0.0),
         }
 
     return {
@@ -4347,6 +4353,113 @@ def http_clv():
     return jsonify({"ok": True, "clv": compute_clv(days=_arg_int("days"))})
 
 
+def xg_feed_report(matches: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Is the Expected Goals channel actually arriving, and where is it not?
+
+    A shot on target always carries positive xG, so `shots recorded AND total
+    xG exactly 0.00` is proof the channel is absent rather than proof the game
+    is quiet. That single test is what separates "nothing is happening" from
+    "we are blind", and it is the difference between a model reading a real
+    goalless grind and one reading a false one.
+
+    Broken down by league because coverage is a per-competition property of the
+    data plan: a handful of dead leagues is a filtering decision, every league
+    dead is an account-level fault worth more than any model change.
+    """
+    total = live = dead = no_shots_yet = 0
+    by_league: Dict[str, Dict[str, int]] = {}
+    dead_examples: List[Dict[str, Any]] = []
+    for m in matches or []:
+        st = m.get("stats") or {}
+        xg = float(st.get("xg_h") or 0) + float(st.get("xg_a") or 0)
+        shots = (float(st.get("sot_h") or 0) + float(st.get("sot_a") or 0)
+                 + float(st.get("total_shots_h") or 0) + float(st.get("total_shots_a") or 0))
+        total += 1
+        lg = _txt(m.get("league")) or "unknown"
+        b = by_league.setdefault(lg, {"fixtures": 0, "xg_live": 0, "xg_dead": 0,
+                                      "no_shots_yet": 0})
+        b["fixtures"] += 1
+        if xg > 0:
+            live += 1
+            b["xg_live"] += 1
+        elif shots > 0:
+            dead += 1
+            b["xg_dead"] += 1
+            if len(dead_examples) < 10:
+                dead_examples.append({
+                    "fixture_id": m.get("fixture_id"), "league": lg,
+                    "match": f"{m.get('home')} vs {m.get('away')}",
+                    "minute": m.get("minute"), "shots": shots, "xg": xg})
+        else:
+            # No shots and no xG is consistent and is real football.
+            no_shots_yet += 1
+            b["no_shots_yet"] += 1
+
+    decided = total - no_shots_yet
+    pct = round(100.0 * live / decided, 1) if decided else None
+    if not total:
+        verdict = "No live fixtures in the snapshot — nothing to judge yet."
+    elif decided == 0:
+        verdict = ("Every live fixture is still shotless, so the xG channel cannot "
+                   "be judged yet. Re-check when matches are further along.")
+    elif dead == 0:
+        verdict = "xG is arriving on every fixture that has had a shot."
+    elif live == 0:
+        verdict = ("xG is absent on EVERY fixture that has had a shot. This is an "
+                   "account-level fault, not a per-league gap: the API plan is not "
+                   "carrying Expected Goals. No live tip can fire while this holds, "
+                   "and fixing it is worth more than any model change.")
+    else:
+        verdict = (f"xG is arriving on {pct}% of fixtures that have had a shot. "
+                   f"The dead ones are listed by league below — if they cluster in "
+                   f"a few competitions, that is a coverage gap and those leagues "
+                   f"are candidates for LEAGUE_DENY_IDS.")
+
+    return {
+        "fixtures_in_snapshot": total,
+        "xg_live": live,
+        "xg_dead_but_shots_recorded": dead,
+        "no_shots_yet_undecidable": no_shots_yet,
+        "xg_coverage_pct_of_decidable": pct,
+        "verdict": verdict,
+        "by_league": dict(sorted(by_league.items(),
+                                 key=lambda kv: kv[1]["xg_dead"], reverse=True)),
+        "dead_examples": dead_examples,
+        "method": "A shot on target always carries positive xG, so shots > 0 with "
+                  "total xG exactly 0.00 proves the channel is absent rather than "
+                  "the game being quiet.",
+    }
+
+
+@app.route("/admin/diagnostics/xg-feed", methods=["GET"])
+def http_xg_feed():
+    """
+    Whether Expected Goals is actually arriving, and on which leagues.
+
+    Reads the in-memory snapshot the scan already built, so it costs NO API
+    calls and reflects the most recent scan. Pass ?live=1 to force a fresh
+    scoring pass instead, which does spend calls.
+    """
+    _require_admin()
+    if _arg_int("live", 0):
+        matches, live_seen = score_live_matches_now()
+        rep = xg_feed_report(matches)
+        rep["source"] = f"fresh scan ({live_seen} live fixtures)"
+        return jsonify({"ok": True, "xg_feed": rep})
+    snap = _get_live_snapshot()
+    rep = xg_feed_report(snap.get("matches") or [])
+    rep["source"] = "last scan snapshot"
+    rep["snapshot_age_sec"] = max(0, int(time.time()) - int(snap.get("updated_ts") or 0))
+    rep["live_seen_last_scan"] = snap.get("live_seen")
+    rep["blocked_from_betting"] = {}
+    for m in (snap.get("matches") or []):
+        if m.get("data_block"):
+            rep["blocked_from_betting"][m["data_block"]] = \
+                rep["blocked_from_betting"].get(m["data_block"], 0) + 1
+    return jsonify({"ok": True, "xg_feed": rep})
+
+
 @app.route("/admin/repair/fulltime-results", methods=["POST"])
 def http_repair_fulltime_results():
     """
@@ -4365,6 +4478,7 @@ def http_repair_fulltime_results():
     """
     _require_admin()
     limit = max(1, min(_arg_int("limit", 100) or 100, 500))
+    dry_run = bool(_arg_int("dry_run", 0))
     with db_conn() as c:
         rows = c.execute(
             "SELECT match_id, final_goals_h, final_goals_a FROM match_results "
@@ -4383,16 +4497,19 @@ def http_repair_fulltime_results():
         gh, ga = fulltime_goals(fx)
         if (gh, ga) == (int(old_h or 0), int(old_a or 0)):
             continue
-        with db_conn() as c2:
-            c2.execute(
-                "UPDATE match_results SET final_goals_h=%s, final_goals_a=%s, btts_yes=%s, "
-                "updated_ts=%s WHERE match_id=%s",
-                (gh, ga, 1 if (gh > 0 and ga > 0) else 0, int(time.time()), int(mid)))
+        if not dry_run:
+            with db_conn() as c2:
+                c2.execute(
+                    "UPDATE match_results SET final_goals_h=%s, final_goals_a=%s, btts_yes=%s, "
+                    "updated_ts=%s WHERE match_id=%s",
+                    (gh, ga, 1 if (gh > 0 and ga > 0) else 0, int(time.time()), int(mid)))
         fixed += 1
         changes.append({"match_id": int(mid), "was": f"{old_h}-{old_a}",
                         "now": f"{gh}-{ga}", "status": st})
-    log.info("[REPAIR] full-time results: checked=%d fixed=%d", checked, fixed)
-    return jsonify({"ok": True, "checked": checked, "fixed": fixed,
+    log.info("[REPAIR] full-time results: checked=%d %s=%d",
+             checked, "would_fix" if dry_run else "fixed", fixed)
+    return jsonify({"ok": True, "dry_run": dry_run, "checked": checked,
+                    "would_fix" if dry_run else "fixed": fixed,
                     "changes": changes[:50],
                     "note": "Re-run until fixed=0. Retrain afterwards so the corrected "
                             "labels reach the models."})

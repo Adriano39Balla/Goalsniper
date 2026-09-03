@@ -83,7 +83,21 @@ def test_kickoff_ts_and_stats_pass_through_when_supplied():
         fid=1, league="L", league_id=1, home="A", away="B",
         score="0-0", minute=10, candidates=[], kickoff_ts=1_700_000_000, raw=raw)
     assert entry["kickoff_ts"] == 1_700_000_000
-    assert entry["stats"] == raw
+    # Every supplied value passes through. Asserted as a subset rather than by
+    # equality so adding a field to the panel is not a test failure — the
+    # contract is "what was given is carried", not "exactly these keys".
+    assert raw.items() <= entry["stats"].items()
+
+
+def test_the_snapshot_carries_what_the_xg_diagnostic_needs():
+    # /admin/diagnostics/xg-feed answers "is the xG channel alive" from this
+    # snapshot rather than by re-fetching, so these keys have to be here.
+    entry = main._build_live_match_entry(
+        fid=1, league="L", league_id=1, home="A", away="B", score="0-0", minute=30,
+        candidates=[], raw={"xg_h": 0.4, "xg_a": 0.1, "sot_h": 3.0, "sot_a": 1.0,
+                            "total_shots_h": 7.0, "total_shots_a": 3.0})
+    for k in ("xg_h", "xg_a", "sot_h", "sot_a", "total_shots_h", "total_shots_a"):
+        assert k in entry["stats"], k
 
 
 def test_candidates_below_threshold_never_call_price_gate(monkeypatch):
