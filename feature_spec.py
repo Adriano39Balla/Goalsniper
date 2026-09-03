@@ -319,6 +319,12 @@ PRE_FEATURES: List[str] = [
     "pm_rest_diff",
     "pm_attack_defense_ratio",
     "pm_league_btts_rate", "pm_league_ov25_rate", "pm_league_ov35_rate",
+    # Form momentum: Recent performance is not in market prices
+    "pm_form_momentum_h", "pm_form_momentum_a",       # Wins in recent window (0-1)
+    "pm_goals_momentum_h", "pm_goals_momentum_a",     # Goals per game in recent window
+    "pm_recent_gf_h", "pm_recent_ga_h",               # Last 5 games averages
+    "pm_recent_gf_a", "pm_recent_ga_a",
+    "pm_home_form_h", "pm_away_form_a",               # Venue-specific form
 ]
 
 # Which feature holds each league base rate, per phase. Used by the training
@@ -546,6 +552,58 @@ def venue_form_stats(team_id: int, games: List[dict], venue: str) -> Dict[str, A
     return team_form_stats(team_id, at_venue)
 
 
+def recent_form_momentum(team_id: int, games: List[dict], window_size: int = 5) -> Dict[str, float]:
+    """
+    Extract form momentum from recent games (NOT in current features).
+
+    Computes unweighted stats from the most recent N games to capture
+    short-term form trends that market prices haven't fully adjusted to.
+    Unlike team_form_stats, this uses NO decay weighting - recent games
+    get equal weight so a 2-game sample counts as much as a 5-game sample.
+
+    Returns:
+    - momentum: win rate in recent window (0-1)
+    - goals_for: average goals per game
+    - goals_against: average goals against per game
+    - played: number of finished games found (may be < window_size)
+    """
+    finished = [g for g in games if _is_finished(g)]
+    if not finished:
+        return {"momentum": 0.0, "goals_for": 0.0, "goals_against": 0.0, "played": 0}
+
+    recent = finished[-window_size:]  # Last N games, most recent last
+    gf = ga = wins = 0.0
+
+    for g in recent:
+        th = ((g.get("teams") or {}).get("home") or {}).get("id")
+        ta = ((g.get("teams") or {}).get("away") or {}).get("id")
+        gh = int((g.get("goals") or {}).get("home") or 0)
+        ga_ = int((g.get("goals") or {}).get("away") or 0)
+
+        if team_id == th:
+            my, opp = gh, ga_
+        elif team_id == ta:
+            my, opp = ga_, gh
+        else:
+            continue
+
+        gf += my
+        ga += opp
+        if my > opp:
+            wins += 1
+
+    played = len(recent)
+    if played == 0:
+        return {"momentum": 0.0, "goals_for": 0.0, "goals_against": 0.0, "played": 0}
+
+    return {
+        "momentum": wins / played,
+        "goals_for": gf / played,
+        "goals_against": ga / played,
+        "played": played,
+    }
+
+
 def rate_totals(games: List[dict]) -> Tuple[float, float, float]:
     """Recency-weighted Over 2.5 / Over 3.5 / BTTS rates for a fixture window."""
     w_map = decay_weights(games)
@@ -618,6 +676,12 @@ def assemble_prematch_features(
     form_h = team_form_stats(home_id, last_h)
     form_a = team_form_stats(away_id, last_a)
 
+    # NEW: Form momentum features (recent performance, not in market prices yet)
+    momentum_h = recent_form_momentum(home_id, last_h, window_size=5)
+    momentum_a = recent_form_momentum(away_id, last_a, window_size=5)
+    home_venue_form = venue_form_stats(home_id, last_h, venue="home")
+    away_venue_form = venue_form_stats(away_id, last_a, venue="away")
+
     rest_h = rest_a = 3.0  # neutral default when the last fixture date is unknown
     if form_h["last_ts"]:
         rest_h = max(0.0, (kickoff_ts - form_h["last_ts"]) / 86400.0)
@@ -645,6 +709,18 @@ def assemble_prematch_features(
         "pm_league_btts_rate": float(lr.get("btts", DEFAULT_LEAGUE_RATES["btts"])),
         "pm_league_ov25_rate": float(lr.get("ov25", DEFAULT_LEAGUE_RATES["ov25"])),
         "pm_league_ov35_rate": float(lr.get("ov35", DEFAULT_LEAGUE_RATES["ov35"])),
+        # NEW: Form momentum (recent games only, captures short-term trends)
+        "pm_form_momentum_h": float(momentum_h.get("momentum", 0.0)),
+        "pm_form_momentum_a": float(momentum_a.get("momentum", 0.0)),
+        "pm_goals_momentum_h": float(momentum_h.get("goals_for", 0.0)),
+        "pm_goals_momentum_a": float(momentum_a.get("goals_for", 0.0)),
+        "pm_recent_gf_h": float(momentum_h.get("goals_for", 0.0)),
+        "pm_recent_ga_h": float(momentum_h.get("goals_against", 0.0)),
+        "pm_recent_gf_a": float(momentum_a.get("goals_for", 0.0)),
+        "pm_recent_ga_a": float(momentum_a.get("goals_against", 0.0)),
+        # Venue-specific form: home team's home record, away team's away record
+        "pm_home_form_h": float(home_venue_form.get("win", 0.0)),
+        "pm_away_form_a": float(away_venue_form.get("win", 0.0)),
     }
     return {k: float(f.get(k, 0.0)) for k in PRE_FEATURES}
 
