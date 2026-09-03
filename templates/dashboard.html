@@ -251,6 +251,19 @@ let autoRefreshTimer = null;
 // periodic redraw so a panel doesn't collapse mid-read.
 const openKeys = new Set();
 
+// Team names, league/country names and bookmaker names come from
+// API-Football, not from us, and every card below builds its HTML with
+// template literals assigned via innerHTML - so an unescaped one is a stored
+// XSS hole the moment a feed ever carries a hostile string. main.py already
+// treats these same fields as untrusted (see the escape() calls around
+// _format_tip_message's home/away/league/suggestion before they reach
+// Telegram's HTML parse mode); the dashboard needs the same guard.
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, c => HTML_ESCAPES[c]);
+}
+
 function fmtMoney(n) {
   if (n === null || n === undefined) return '—';
   const s = n >= 0 ? '+' : '';
@@ -303,7 +316,7 @@ function renderStats(pnl) {
     <tr><th>Market</th><th class="num">Bets</th><th class="num">Win %</th><th class="num">ROI</th><th class="num">Profit</th></tr>
     ${rows.map(([mkt, d]) => `
       <tr>
-        <td>${mkt}</td>
+        <td>${escapeHtml(mkt)}</td>
         <td class="num">${d.bets}</td>
         <td class="num">${fmtPct(d.win_rate_pct)}</td>
         <td class="num" style="color:var(--${d.roi_pct >= 0 ? 'accent' : 'danger'})">${fmtPct(d.roi_pct)}</td>
@@ -471,16 +484,16 @@ function formCard(c) {
   if (!c.played) {
     return `<div class="form-card">
         <div class="head">Form &amp; momentum</div>
-        <div class="headline">${c.team}</div>
+        <div class="headline">${escapeHtml(c.team)}</div>
         <div class="verdict neutral">no recent ${venueWord} games on record</div>
       </div>`;
   }
   const verdict = c.verdict
-    ? `<div class="verdict ${c.verdict.tone}">${c.verdict.text}</div>`
+    ? `<div class="verdict ${c.verdict.tone}">${escapeHtml(c.verdict.text)}</div>`
     : `<div class="verdict neutral">too few ${venueWord} games to compare</div>`;
   return `<div class="form-card">
       <div class="head">Form &amp; momentum</div>
-      <div class="headline">${c.team} win ${c.win_pct.toFixed(0)}% of their ${venueWord} games</div>
+      <div class="headline">${escapeHtml(c.team)} win ${c.win_pct.toFixed(0)}% of their ${venueWord} games</div>
       ${verdict}
       <div class="detail">last ${c.played} ${venueWord} (recency-weighted) ·
         ${c.goals_for.toFixed(1)} scored / ${c.goals_against.toFixed(1)} conceded ·
@@ -537,8 +550,8 @@ function overviewForLive(m) {
       : (mk.prob_pct >= mk.threshold_pct ? '<span class="tag leans">Leans+</span>' : '');
     return `
       <tr>
-        <td>${tag}${mk.market}</td>
-        <td>${mk.suggestion}</td>
+        <td>${tag}${escapeHtml(mk.market)}</td>
+        <td>${escapeHtml(mk.suggestion)}</td>
         <td class="num${mk.decision === 'tipped' ? ' hit' : ''}">${mk.prob_pct.toFixed(1)}%</td>
         <td class="num" style="color:var(--muted)">${mk.threshold_pct.toFixed(1)}%</td>
         <td style="color:${mk.decision === 'tipped' ? 'var(--accent)' : 'var(--muted)'}">${decisionLabel(mk.decision)}${mk.odds ? ` @ ${mk.odds.toFixed(2)}` : ''}</td>
@@ -563,7 +576,7 @@ function overviewForLive(m) {
 
   return `
     <div class="overview">
-      <div class="meta-line">${ko}Score ${m.score || '0-0'} · ${m.minute}' played</div>
+      <div class="meta-line">${ko}Score ${escapeHtml(m.score || '0-0')} · ${m.minute}' played</div>
       <div class="form-slot"></div>
       ${statsGrid}
       <table class="market-table">
@@ -579,7 +592,7 @@ function overviewForTip(t) {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
   });
   const badge = t.is_prematch ? 'PREMATCH' : `LIVE ${t.minute ?? ''}'`;
-  const odds = t.odds ? `@ ${t.odds.toFixed(2)}${t.book ? ' (' + t.book + ')' : ''}` : 'no price';
+  const odds = t.odds ? `@ ${t.odds.toFixed(2)}${t.book ? ' (' + escapeHtml(t.book) + ')' : ''}` : 'no price';
   const ev = t.ev_pct != null ? `EV ${t.ev_pct > 0 ? '+' : ''}${t.ev_pct.toFixed(1)}%` : '—';
   const fair = t.fair_prob != null ? fmtPct(t.fair_prob * 100) : '—';
   const stake = t.stake_units ? `${t.stake_units.toFixed(2)}u` : '—';
@@ -588,7 +601,7 @@ function overviewForTip(t) {
 
   return `
     <div class="overview">
-      <div class="meta-line">${badge} · ${when} · score at tip ${t.score_at_tip || '—'}</div>
+      <div class="meta-line">${badge} · ${when} · score at tip ${escapeHtml(t.score_at_tip || '—')}</div>
       <table class="stat-grid">
         <tr><td>Odds</td><td class="num">${odds}</td></tr>
         <tr><td>EV</td><td class="num">${ev}</td></tr>
@@ -644,8 +657,8 @@ function cardHtml(it) {
         <div class="feed-row" data-id="${id}" data-key="${key}" data-fid="${m.fixture_id}">
           <div class="kotime live-now"><span class="ko-label">Live</span>${m.minute}'</div>
           <div>
-            <div class="match">${tag}${m.home} vs ${m.away}</div>
-            <div class="sub">${m.score || ''}</div>
+            <div class="match">${tag}${escapeHtml(m.home)} vs ${escapeHtml(m.away)}</div>
+            <div class="sub">${escapeHtml(m.score || '')}</div>
           </div>
           <div class="conf">${topProb(m).toFixed(0)}%<span class="pct">top pick</span></div>
           <div class="caret">&#9656;</div>
@@ -660,8 +673,8 @@ function cardHtml(it) {
       <div class="feed-row" data-id="${id}" data-key="${key}">
         <div class="kotime"><span class="ko-label">Sent</span>${ko}</div>
         <div>
-          <div class="match"><span class="tag strong">Strong</span>${t.home} vs ${t.away}</div>
-          <div class="sub"><span class="pick">${t.suggestion}</span> · ${t.market}</div>
+          <div class="match"><span class="tag strong">Strong</span>${escapeHtml(t.home)} vs ${escapeHtml(t.away)}</div>
+          <div class="sub"><span class="pick">${escapeHtml(t.suggestion)}</span> · ${escapeHtml(t.market)}</div>
         </div>
         <div class="conf">${t.confidence != null ? t.confidence.toFixed(0) : '—'}%<span class="pct">confidence</span></div>
         <div class="caret">&#9656;</div>
@@ -683,8 +696,8 @@ function leagueGroupsHtml(items) {
         <div class="league-header">
           <div class="icon">⚽</div>
           <div>
-            <div class="name">${name}</div>
-            ${country ? `<div class="country">${country}</div>` : ''}
+            <div class="name">${escapeHtml(name)}</div>
+            ${country ? `<div class="country">${escapeHtml(country)}</div>` : ''}
           </div>
         </div>
         <div class="feed">${groupItems.map(cardHtml).join('')}</div>

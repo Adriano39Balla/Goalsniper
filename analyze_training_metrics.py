@@ -210,33 +210,53 @@ def analyze_metrics() -> None:
         logger.info("")
 
         # ──────────────── MODEL PARITY GOLDEN SAMPLES ──────────────
-        logger.info("MODEL PARITY VERIFICATION (Golden Samples)")
+        # THE BUG THIS FIXES: golden_samples and a "parity_verified" flag were
+        # read off `data` here, i.e. off `metrics[head]` from the
+        # model_metrics_latest bundle this function already loaded. But
+        # train_models._train_binary_head() writes golden_samples into a
+        # SEPARATE settings key, `model_health:{head}` - never into the
+        # metrics bundle - and no code anywhere ever writes a
+        # "parity_verified" key at all: the actual parity check
+        # (main.verify_model_parity()) runs live at SERVE time, re-scoring
+        # golden_samples through whichever model is currently deployed, and
+        # its result is cached in-process rather than persisted back to the
+        # database. So `data.get("golden_samples")` was always None and
+        # `data.get("parity_verified")` was always None too - the loop never
+        # found a sample count to print, `parity_issues` could never be
+        # populated, and "✓ Model parity checks passed (or not yet run)"
+        # printed unconditionally regardless of whether anything had actually
+        # been checked. Reading model_health:{head} (where the samples truly
+        # live) fixes the sample count; the pass/fail claim is removed rather
+        # than faked, since only main.py's serving process can compute it.
+        logger.info("MODEL PARITY (Golden Samples recorded for serve-time verification)")
         logger.info("-" * 80)
 
-        parity_issues = []
-        for head in sorted(metrics.keys()):
-            if head.startswith(("_", "trained", "features", "thresholds", "validation", "data")):
+        heads_with_metrics = [h for h in sorted(metrics.keys())
+                              if isinstance(metrics.get(h), dict) and "n_train" in metrics[h]]
+        any_samples = False
+        for head in heads_with_metrics:
+            health_raw = get_setting(conn, f"model_health:{head}")
+            if not health_raw:
+                logger.warning(f"  {head:20s} | no model_health record found")
                 continue
-
-            data = metrics.get(head, {})
-            if not isinstance(data, dict):
+            try:
+                health = json.loads(health_raw)
+            except json.JSONDecodeError:
+                logger.warning(f"  {head:20s} | model_health record is not valid JSON")
                 continue
-
-            golden_samples = data.get("golden_samples")
+            golden_samples = health.get("golden_samples") or []
             if golden_samples:
-                logger.info(f"{head}: {len(golden_samples)} golden samples recorded")
+                any_samples = True
+                logger.info(f"  ✓ {head:20s} | {len(golden_samples)} golden sample(s) recorded")
+            else:
+                logger.warning(f"  {head:20s} | no golden samples recorded — "
+                               "train/serve parity cannot be checked for this head")
 
-            parity_ok = data.get("parity_verified")
-            if parity_ok is False:
-                parity_issues.append(head)
-                logger.error(f"  ✗ Parity verification failed")
-            elif parity_ok is True:
-                logger.info(f"  ✓ Parity verified")
-
-        if parity_issues:
-            logger.error(f"⚠ {len(parity_issues)} heads failed parity verification: {parity_issues}")
-        else:
-            logger.info("✓ Model parity checks passed (or not yet run)")
+        if not any_samples:
+            logger.warning("⚠ No head has golden samples recorded")
+        logger.info("Note: this only confirms samples EXIST to check against. Whether the "
+                   "currently deployed model actually agrees with them is verified live, on "
+                   "every prediction, by main.verify_model_parity() — not by this script.")
 
         logger.info("")
 
@@ -266,11 +286,12 @@ def analyze_metrics() -> None:
         logger.info("SUMMARY")
         logger.info("=" * 80)
 
-        issues = bool(calib_issues or parity_issues or skill_issues)
+        issues = bool(calib_issues or skill_issues)
         logger.info(f"Calibration sign issues: {len(calib_issues)}")
-        logger.info(f"Parity check failures: {len(parity_issues)}")
         logger.info(f"Skill check failures: {len(skill_issues)}")
         logger.info(f"Critical validation failures: {n_critical}")
+        logger.info(f"Heads with golden samples for parity checking: "
+                   f"{'yes' if any_samples else 'NONE'}")
 
         if not issues and n_critical == 0:
             logger.info("")

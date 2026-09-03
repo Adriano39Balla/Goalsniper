@@ -4912,9 +4912,21 @@ def http_repair_fulltime_results():
     Over 2.5 = yes: a wrong training label and a wrong P&L grade from one line.
 
     Writing is fixed; these are the rows written before it. Only fixtures whose
-    90-minute score actually differs are touched, so this is safe to re-run and
-    reports 0 once clean. Bounded by `limit` because each row costs one API
+    90-minute score actually differs are corrected, so this is safe to re-run
+    and reports 0 once clean. Bounded by `limit` because each row costs one API
     call, and ordered oldest-first so repeated runs make progress.
+
+    FIX: a row found ALREADY CORRECT used to be left untouched, `updated_ts`
+    included. Since the query is `ORDER BY updated_ts ASC`, that row stayed at
+    the front of the queue forever — every subsequent call re-selected the
+    exact same oldest rows (spending an API call to re-verify each one) and
+    could never advance to the rows after `limit`. On a table where only a
+    small minority of fixtures actually went to extra time, this meant the scan
+    was pinned to its first `limit` rows indefinitely and the rest of the table
+    was never checked, silently contradicting "ordered oldest-first so repeated
+    runs make progress". A verified-correct row now has its `updated_ts`
+    touched too (skipped in dry_run, which must not write), so it moves to the
+    back of the queue exactly like a fixed one and the next call sees fresh rows.
     """
     _require_admin()
     limit = max(1, min(_arg_int("limit", 100) or 100, 500))
@@ -4936,6 +4948,10 @@ def http_repair_fulltime_results():
         checked += 1
         gh, ga = fulltime_goals(fx)
         if (gh, ga) == (int(old_h or 0), int(old_a or 0)):
+            if not dry_run:
+                with db_conn() as c2:
+                    c2.execute("UPDATE match_results SET updated_ts=%s WHERE match_id=%s",
+                              (int(time.time()), int(mid)))
             continue
         if not dry_run:
             with db_conn() as c2:
