@@ -1037,7 +1037,7 @@ THRESHOLD_FALLBACK = os.getenv("THRESHOLD_FALLBACK", "suppress").strip().lower()
 
 def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
                     min_preds: int, default_threshold: float,
-                    max_thresh_pct: float = 85.0) -> Tuple[float, Dict[str, Any]]:
+                    max_thresh_pct: float = 85.0, label: str = "?") -> Tuple[float, Dict[str, Any]]:
     """
     Smallest threshold reaching the precision target with at least min_preds
     selections, evaluated on the CALIBRATION split only.
@@ -1049,6 +1049,11 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
        fallback is degenerate above 50% prevalence (F1 is maximised by
        predicting positive everywhere), so it returned the LOWEST threshold for
        exactly the markets with no signal.
+
+    `label` (the market/head this call is for) is only for the suppression log
+    line below — this function otherwise has no idea which head called it, and
+    the operator reading logs otherwise cannot tell which market was suppressed
+    from that line alone.
     """
     y = y_true.astype(int)
     p = np.asarray(p, dtype=float)
@@ -1097,9 +1102,9 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
             return b_t, diag
 
     diag["method"] = "suppressed"
-    logger.warning("[THRESHOLD] no threshold beat base rate %.3f by %.0fpp with >=%d selections "
-                   "(best was %s). SUPPRESSING this market at %.1f%%.",
-                   base_rate, THRESHOLD_MARGIN * 100, min_preds,
+    logger.warning("[THRESHOLD] %s: no threshold beat base rate %.3f by %.0fpp with >=%d "
+                   "selections (best was %s). SUPPRESSING this market at %.1f%%.",
+                   label, base_rate, THRESHOLD_MARGIN * 100, min_preds,
                    f"{best_prec:.4f}" if best_prec >= 0 else "n/a", max_thresh_pct)
     return float(max_thresh_pct) / 100.0, diag
 
@@ -1184,7 +1189,7 @@ def _decide_threshold(y_ca, p_ca, y_te, p_te, label: str, buf: "SettingsBuffer",
     bar. That was the gap that let Double Chance run on an unvalidated default.
     """
     thr_prob, diag = _pick_threshold(y_ca, p_ca, target_precision, min_preds,
-                                     default_thr_prob, max_thresh_pct=max_thresh)
+                                     default_thr_prob, max_thresh_pct=max_thresh, label=ctx)
     if extra_diag:
         diag.update(extra_diag)
     thr_pct = float(np.clip(thr_prob * 100.0, min_thresh, max_thresh))
