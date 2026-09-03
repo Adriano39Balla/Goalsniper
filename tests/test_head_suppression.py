@@ -144,6 +144,79 @@ def test_an_unrecognised_market_is_not_blocked_by_this(monkeypatch):
     assert main.candidate_head_blocked("Corners", "Over 9.5") is None
 
 
+# ───────── the prematch head gates the prematch candidate ─────────
+#
+# Prematch is scored by SEPARATE heads — _btts_candidates(feat, "PRE_", ...)
+# loads PRE_BTTS_YES — and train_models.py writes each its own
+# model_health:PRE_* record. Without a prefix the gate read the LIVE head's
+# record for a prematch candidate, so every PRE_* record training writes went
+# unread by the gate that exists to act on it.
+
+def test_an_unfit_prematch_head_may_not_bet(monkeypatch):
+    # The live head is in perfect health; the prematch one failed validation.
+    _health(monkeypatch, **{
+        "OU_2.5": {"calibration_gap_pct": 0.2, "n_train_matches": 900},
+        "PRE_OU_2.5": {"validation_failed": "single-class prediction",
+                       "n_train_matches": 900},
+    })
+    why = main.candidate_head_blocked("Over/Under 2.5", "Over 2.5 Goals", prefix="PRE_")
+    assert why is not None, "a prematch head that failed validation must not bet"
+    assert "single-class prediction" in why
+
+
+def test_a_skill_less_prematch_head_may_not_bet(monkeypatch):
+    # The exact case head_fit_to_bet() exists to catch, on the prematch side.
+    _health(monkeypatch, **{
+        "BTTS_YES": {"calibration_gap_pct": 0.2, "n_train_matches": 900},
+        "PRE_BTTS_YES": {"calibration_gap_pct": 0.2, "n_train_matches": 900,
+                         "brier_skill": -0.004},
+    })
+    why = main.candidate_head_blocked("BTTS", "BTTS: Yes", prefix="PRE_")
+    assert why is not None and "learned nothing" in why
+
+
+def test_the_prematch_scan_reaches_the_prematch_head(monkeypatch):
+    """
+    prematch_scan_save() calls _price_gate(mk, ...) with the market text
+    UNPREFIXED — it adds "PRE " only when writing the tip row — so the gate
+    cannot infer the phase from the market and takes it from live=False.
+    """
+    _health(monkeypatch, **{
+        "OU_2.5": {"calibration_gap_pct": 0.2, "n_train_matches": 900},
+        "PRE_OU_2.5": {"validation_failed": "no skill", "n_train_matches": 900},
+    })
+    monkeypatch.setattr(main, "fetch_odds", lambda fid, live: {
+        "OU_2.5": {"best": {"Over": {"odds": 2.0, "book": "B"}},
+                   "fair": {"Over": 0.58}, "overround": 0.05, "n_books": 5}})
+    res = main._price_gate("Over/Under 2.5", "Over 2.5 Goals",
+                           fid=1, prob=0.62, live=False)
+    assert res["decision"] == "head_suppressed"
+    assert "no skill" in res["suppressed_reason"]
+
+
+def test_a_healthy_prematch_head_still_reaches_a_price(monkeypatch):
+    _health(monkeypatch, **{
+        "OU_2.5": {"calibration_gap_pct": 0.2, "n_train_matches": 900},
+        "PRE_OU_2.5": {"calibration_gap_pct": 0.3, "n_train_matches": 900,
+                       "brier_skill": 0.02},
+    })
+    monkeypatch.setattr(main, "fetch_odds", lambda fid, live: {
+        "OU_2.5": {"best": {"Over": {"odds": 2.0, "book": "B"}},
+                   "fair": {"Over": 0.58}, "overround": 0.05, "n_books": 5}})
+    res = main._price_gate("Over/Under 2.5", "Over 2.5 Goals",
+                           fid=1, prob=0.62, live=False)
+    assert res["decision"] == "tipped"
+
+
+def test_the_live_scan_is_unaffected_by_prematch_health(monkeypatch):
+    # A broken PRE_ head must not stop the in-play side betting.
+    _health(monkeypatch, **{
+        "OU_2.5": {"calibration_gap_pct": 0.2, "n_train_matches": 900},
+        "PRE_OU_2.5": {"validation_failed": "no skill", "n_train_matches": 900},
+    })
+    assert main.candidate_head_blocked("Over/Under 2.5", "Over 2.5 Goals") is None
+
+
 # ───────── skill against the best possible constant ─────────
 # The most basic test there is, and accuracy hides it completely: a head that
 # calls every fixture Over on a 60% base rate reports 60% accuracy and has no

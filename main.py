@@ -2071,14 +2071,37 @@ def head_for_candidate(market_text: str, suggestion: str) -> Optional[str]:
     return None
 
 
-def candidate_head_blocked(market_text: str, suggestion: str) -> Optional[str]:
-    """The reason this candidate's head may not bet, or None."""
+def candidate_head_blocked(market_text: str, suggestion: str,
+                           prefix: str = "") -> Optional[str]:
+    """
+    The reason this candidate's head may not bet, or None.
+
+    `prefix` is "PRE_" for a prematch candidate. It matters because prematch is
+    scored by SEPARATE heads — _btts_candidates(feat, "PRE_", ...) loads
+    PRE_BTTS_YES, not BTTS_YES — and train_models.py writes each one its own
+    model_health:PRE_* record, carrying that head's own holdout: its Brier
+    skill, its calibration gap, its golden samples for the parity check.
+
+    Without the prefix this looked up the LIVE head's record for a prematch
+    candidate, so every PRE_* health record training writes was never read by
+    the gate that exists to act on it. A prematch head that failed its own
+    post-training validation, or that head_fit_to_bet() would refuse for having
+    "learned nothing a single number could not do", still reached a price.
+
+    The live head is still checked as well. These are independently trained
+    models and the live one's holdout says nothing about the prematch one, so
+    consulting it is over-cautious rather than correct — but it is the
+    behaviour that has been shipping, it can only ever withhold a bet, and
+    tightening a betting gate is the safe direction to be wrong in.
+    """
     head = head_for_candidate(market_text, suggestion)
     if not head:
         return None
     heads = (["WLD_HOME", "WLD_DRAW", "WLD_AWAY"]
              if head == "WLD_HOME" and market_text.replace("PRE ", "") != "BTTS"
              else [head])
+    if prefix:
+        heads = [f"{prefix}{h}" for h in heads] + heads
     for h in heads:
         ok, why = head_fit_to_bet(h)
         if not ok:
@@ -2121,7 +2144,13 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
     # then reporting "EV too low" invites tuning EDGE_MIN_BPS when the problem
     # is the model. Every tipping path runs through here, so this is the one
     # place that cannot be bypassed.
-    blocked = candidate_head_blocked(market_text, suggestion)
+    # Which family of heads scored this candidate. The prematch scan passes the
+    # market WITHOUT the "PRE " prefix (it adds that only when writing the tip
+    # row), so the market text alone cannot answer this and `live` has to: every
+    # live=False caller here is a prematch one, and it is what already selects
+    # the prematch odds feed a line below.
+    prefix = "" if live else "PRE_"
+    blocked = candidate_head_blocked(market_text, suggestion, prefix=prefix)
     if blocked:
         res["decision"] = "head_suppressed"
         res["suppressed_reason"] = blocked
