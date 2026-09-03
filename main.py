@@ -157,6 +157,9 @@ LIVE_TIP_MIN_MINUTE = int(os.getenv("LIVE_TIP_MIN_MINUTE", str(TRAIN_MIN_MINUTE)
 # 2. A match with no shot recorded at all by this minute is a dead statistics
 #    feed, not a cagey game. Real football produces a shot long before this.
 SHOT_DATA_MIN_MINUTE = int(os.getenv("SHOT_DATA_MIN_MINUTE", "25"))
+# The top of the training range. load_inplay_data() harvests minute 15-90, so
+# a fixture scored at minute 95 is being asked of a model that never saw one.
+LIVE_TIP_MAX_MINUTE = int(os.getenv("LIVE_TIP_MAX_MINUTE", "90"))
 # 3. The xG channel specifically. See _xg_feed_is_dead() for why a zero here
 #    is worse than a missing value.
 REQUIRE_XG_FEED = _env_flag("REQUIRE_XG_FEED", "1")
@@ -336,6 +339,13 @@ ODDS_PREMATCH_URL = f"{BASE_URL}/odds"
 ODDS_LIVE_URL = f"{BASE_URL}/odds/live"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES = {"1H", "HT", "2H", "ET", "BT", "P"}
+# Statuses in which a FULL-TIME market is still open. Every market Goalsniper
+# prices settles on 90 minutes plus stoppage, so once a tie reaches extra time
+# (ET), the break before it (BT) or a shootout (P), the bet has already been
+# decided - scoring those fixtures is pricing a settled question, and doing it
+# off a scoreline that now includes extra-time goals. Harvesting still sees the
+# wider set; this governs betting.
+FULLTIME_MARKET_OPEN_STATUSES = {"1H", "HT", "2H"}
 FINAL_STATUSES = {"FT", "AET", "PEN"}
 
 session = requests.Session()
@@ -877,6 +887,18 @@ def get_league_venue_rates(league_id: Optional[int]) -> Dict[str, float]:
 
 
 # ───────── Raw in-play extraction ─────────
+def _possession(sh: Dict[str, Any], sa: Dict[str, Any]) -> Dict[str, float]:
+    ph, pa = _num(sh.get("Ball Possession", 0)), _num(sa.get("Ball Possession", 0))
+    if ph <= 0 and pa <= 0:
+        return {"pos_h": 50.0, "pos_a": 50.0}
+    # One side quoted is enough: the other is its complement.
+    if ph <= 0:
+        ph = max(0.0, 100.0 - pa)
+    elif pa <= 0:
+        pa = max(0.0, 100.0 - ph)
+    return {"pos_h": ph, "pos_a": pa}
+
+
 def _num(v) -> float:
     try:
         if isinstance(v, str) and v.strip().endswith("%"):
@@ -886,27 +908,63 @@ def _num(v) -> float:
         return 0.0
 
 
+def _side_of(team: Any, home_id: int, away_id: int, home: str, away: str) -> Optional[str]:
+    """
+    Which side an API team object refers to: "h", "a", or None.
+
+    Matches on ID first. /fixtures, /fixtures/statistics and /fixtures/events
+    all carry team.id, and it is the field that cannot drift - a name arrives
+    as free text and differs between endpoints often enough to matter
+    (punctuation, accents, "FC" prefixes, a mid-season rename cached on one
+    endpoint and not the other). A name mismatch does not raise: it silently
+    yields an EMPTY statistics dict for that side, which then reads as a
+    genuine 0 for every shot, corner and card the team has. Name matching is
+    kept only as a fallback for feeds that omit the id.
+    """
+    t = team or {}
+    tid = t.get("id")
+    if tid is not None:
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            tid = None
+        if tid is not None and (tid == home_id or tid == away_id):
+            return "h" if tid == home_id else "a"
+        if tid is not None:
+            return None
+    name = _txt(t.get("name"))
+    if name and name == home:
+        return "h"
+    if name and name == away:
+        return "a"
+    return None
+
+
 def extract_raw_inplay(m: dict) -> Dict[str, float]:
     """Pull the RAW_INPLAY_KEYS out of an API fixture object. Nothing derived."""
-    home = m["teams"]["home"]["name"]
-    away = m["teams"]["away"]["name"]
-    stats: Dict[str, Dict[str, Any]] = {}
+    teams = (m.get("teams") or {})
+    home = _txt((teams.get("home") or {}).get("name"))
+    away = _txt((teams.get("away") or {}).get("name"))
+    home_id, away_id = _team_ids(m)
+
+    sh: Dict[str, Any] = {}
+    sa: Dict[str, Any] = {}
     for s in (m.get("statistics") or []):
-        t = (s.get("team") or {}).get("name")
-        if t:
-            stats[t] = {(i.get("type") or ""): i.get("value") for i in (s.get("statistics") or [])}
-    sh = stats.get(home, {}) or {}
-    sa = stats.get(away, {}) or {}
+        side = _side_of(s.get("team"), home_id, away_id, home, away)
+        if side is None:
+            continue
+        parsed = {(i.get("type") or ""): i.get("value") for i in (s.get("statistics") or [])}
+        (sh if side == "h" else sa).update(parsed)
 
     red_h = red_a = 0
     for ev_ in (m.get("events") or []):
         if (ev_.get("type", "") or "").lower() == "card":
             d = (ev_.get("detail", "") or "").lower()
             if "red" in d or "second yellow" in d:
-                t = (ev_.get("team") or {}).get("name") or ""
-                if t == home:
+                side = _side_of(ev_.get("team"), home_id, away_id, home, away)
+                if side == "h":
                     red_h += 1
-                elif t == away:
+                elif side == "a":
                     red_a += 1
 
     return {
@@ -919,8 +977,12 @@ def extract_raw_inplay(m: dict) -> Dict[str, float]:
         "sot_a": _num(sa.get("Shots on Goal", 0)),
         "cor_h": _num(sh.get("Corner Kicks", 0)),
         "cor_a": _num(sa.get("Corner Kicks", 0)),
-        "pos_h": _num(sh.get("Ball Possession", 0)),
-        "pos_a": _num(sa.get("Ball Possession", 0)),
+        # Possession is the one statistic whose absence is NOT plausibly zero:
+        # the two sides always sum to 100. A missing feed therefore arrives as
+        # 0/0, which is not merely uninformative - it zeroes game_control_h/a
+        # (both are possession-weighted) and hands the model a false "neither
+        # side had the ball". Substituting an even split says "unknown".
+        **_possession(sh, sa),
         "red_h": float(red_h), "red_a": float(red_a),
         "total_shots_h": _num(sh.get("Total Shots", 0)),
         "total_shots_a": _num(sa.get("Total Shots", 0)),
@@ -956,10 +1018,15 @@ def stats_coverage_ok(raw: Dict[str, float], minute: int) -> bool:
     require_fields = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
     if minute < require_from:
         return False
+    # Possession is deliberately NOT one of these. It was always close to a
+    # free pass - nonzero from the first minute of every match - and since
+    # _possession() substitutes an even split for a missing feed it is now
+    # literally always populated, so counting it would mean this check could
+    # be satisfied by data that never arrived.
     fields = [raw.get("xg_h", 0) + raw.get("xg_a", 0),
               raw.get("sot_h", 0) + raw.get("sot_a", 0),
               raw.get("cor_h", 0) + raw.get("cor_a", 0),
-              max(raw.get("pos_h", 0), raw.get("pos_a", 0))]
+              raw.get("total_shots_h", 0) + raw.get("total_shots_a", 0)]
     return sum(1 for v in fields if (v or 0) > 0) >= max(0, require_fields)
 
 
@@ -987,7 +1054,14 @@ def _xg_feed_is_dead(raw: Dict[str, float]) -> bool:
     return shots > 0
 
 
-def inplay_data_gate(raw: Dict[str, float], minute: int) -> Optional[str]:
+def fulltime_market_open(m: dict) -> bool:
+    """Is the 90-minute market this fixture would be tipped on still live?"""
+    st = (((m.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+    return st in FULLTIME_MARKET_OPEN_STATUSES
+
+
+def inplay_data_gate(raw: Dict[str, float], minute: int,
+                     match: Optional[dict] = None) -> Optional[str]:
     """
     Is there enough real observation here to BET on, as opposed to enough to
     record? Returns None when the fixture is bettable, else the reason.
@@ -998,8 +1072,17 @@ def inplay_data_gate(raw: Dict[str, float], minute: int) -> Optional[str]:
     still appear on the dashboard with the reason attached - a gate you cannot
     see is indistinguishable from a bug.
     """
+    if match is not None and not fulltime_market_open(match):
+        # Extra time, the break before it, or a shootout. The full-time market
+        # settled at 90 minutes; anything quoted now is a different bet.
+        return "market_already_settled"
     if minute < LIVE_TIP_MIN_MINUTE:
         return "too_early"
+    if minute > LIVE_TIP_MAX_MINUTE:
+        # Snapshots are harvested up to TRAIN_MAX_MINUTE, so scoring past it
+        # asks the model to extrapolate off the top of its training range -
+        # the same argument as LIVE_TIP_MIN_MINUTE, at the other end.
+        return "too_late"
     if REQUIRE_XG_FEED and _xg_feed_is_dead(raw):
         return "xg_feed_dead"
     if minute >= SHOT_DATA_MIN_MINUTE:
@@ -1028,6 +1111,39 @@ def _team_ids(m: dict) -> Tuple[int, int]:
     t = (m.get("teams") or {}) or {}
     return (int((t.get("home") or {}).get("id") or 0),
             int((t.get("away") or {}).get("id") or 0))
+
+
+def fulltime_goals(fx: dict) -> Tuple[int, int]:
+    """
+    The 90-minute score, which is what every market here settles on.
+
+    THE BUG THIS FIXES. API-Football's top-level `goals` object is the CURRENT
+    total and keeps counting through extra time, while `score.fulltime` is the
+    90-minute score. Results were being recorded from `goals` for every fixture
+    in FINAL_STATUSES - which includes AET and PEN - so any knockout tie that
+    went to extra time was stored with its 120-minute score.
+
+    Every market Goalsniper prices (Over/Under, BTTS, 1X2, Double Chance, Draw
+    No Bet) is a FULL-TIME market: bookmakers grade it on 90 minutes plus
+    stoppage and ignore extra time entirely. So a tie level at 1-1 after 90 and
+    finishing 3-2 after extra time was being stored as Over 2.5 = yes and
+    BTTS = yes, when the bets actually settled Under 2.5 and BTTS = yes at
+    1-1. That is a wrong TRAINING LABEL and a wrong P&L grade from the same
+    line of code.
+
+    Falls back to `goals` when score.fulltime is absent - it is null for
+    fixtures that have not finished, and for those `goals` is the live score,
+    which is what the caller wants.
+    """
+    ft = ((fx.get("score") or {}).get("fulltime") or {})
+    h, a = ft.get("home"), ft.get("away")
+    if h is None or a is None:
+        g = fx.get("goals") or {}
+        h, a = g.get("home"), g.get("away")
+    try:
+        return int(h or 0), int(a or 0)
+    except (TypeError, ValueError):
+        return 0, 0
 
 
 def _pretty_score(m: dict) -> str:
@@ -1149,6 +1265,88 @@ def _score_prob(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
         log.debug("[SCORE] calibration unusable (%s) — scoring uncalibrated", e)
         a, b = 1.0, 0.0
     return max(0.0, min(1.0, _sigmoid(offset + a * dev + b)))
+
+
+# ───────── Serving-side circuit breaker ─────────
+# A head whose own holdout says it should not be trusted must not be able to
+# send a tip. Warning about it in the nightly digest is not containment: the
+# scan runs every five minutes and the digest is read once a day, so a
+# miscalibrated head bets ~288 times before anyone sees the warning.
+#
+# EV is computed straight from the model's probability, so an N-point
+# overconfident head overstates every EV it produces by roughly N x odds
+# points. At a live price of 2.0 a 5pp gap is a 10pp phantom edge against an
+# EDGE_MIN_BPS of 3pp - the gate would be measuring the model's error rather
+# than the market's, and would pass exactly the bets with no real edge.
+MODEL_HEADS = ["BTTS_YES", "WLD_HOME", "WLD_DRAW", "WLD_AWAY"] + [
+    f"OU_{_fmt_line(ln)}" for ln in OU_LINES]
+CALIBRATION_GAP_SUPPRESS_PP = float(os.getenv("CALIBRATION_GAP_SUPPRESS_PP", "5.0"))
+# Below this many independent fixtures a holdout number is not an estimate.
+MIN_TRAIN_MATCHES_TO_BET = int(os.getenv("MIN_TRAIN_MATCHES_TO_BET", "300"))
+# A head that routinely disagrees with a priced market by this much is noisy,
+# not smart. Only meaningful for market-anchored heads, which is where it is
+# measured.
+MAX_DEVIATION_P95_PP = float(os.getenv("MAX_DEVIATION_P95_PP", "15.0"))
+# Share of training rows whose outcome the scoreline had already settled. Past
+# this the head's apparent skill is mostly answering decided questions, none of
+# which is bettable.
+MAX_DECIDED_SHARE_PCT = float(os.getenv("MAX_DECIDED_SHARE_PCT", "60.0"))
+
+
+def _head_health(name: str) -> Dict[str, Any]:
+    raw = get_setting_cached(f"model_health:{name}")
+    if not raw:
+        return {}
+    try:
+        out = json.loads(raw)
+        return out if isinstance(out, dict) else {}
+    except Exception:
+        return {}
+
+
+def head_fit_to_bet(name: str) -> Tuple[bool, Optional[str]]:
+    """
+    (ok, reason). False means SCORE but never TIP this head.
+
+    Absent health data is not a failure: heads trained before this existed, and
+    every prematch head, have none. Refusing to bet those would silently stop
+    the whole system on the next deploy, which is a worse failure than the one
+    being prevented. They pass, and the digest reports how many did.
+    """
+    h = _head_health(name)
+    if not h:
+        return True, None
+
+    gap = h.get("calibration_gap_pct")
+    if gap is not None and float(gap) > CALIBRATION_GAP_SUPPRESS_PP:
+        # Positive is OVERconfident: predicted minus actual.
+        return False, (f"overconfident by {float(gap):.1f}pp on holdout "
+                       f"(EV overstated ~{abs(float(gap)) * 2:.0f}pp at odds 2.0)")
+
+    n = h.get("n_train_matches")
+    if n is not None and int(n) < MIN_TRAIN_MATCHES_TO_BET:
+        return False, f"trained on {int(n)} fixtures, needs {MIN_TRAIN_MATCHES_TO_BET}"
+
+    p95 = h.get("deviation_p95_pp")
+    if p95 is not None and float(p95) > MAX_DEVIATION_P95_PP:
+        return False, (f"disagrees with the market by {float(p95):.1f}pp at p95 — "
+                       f"noise before it is edge")
+
+    dec = h.get("decided_share_pct")
+    if dec is not None and float(dec) > MAX_DECIDED_SHARE_PCT:
+        return False, (f"{float(dec):.0f}% of its training rows were already "
+                       f"settled when harvested")
+    return True, None
+
+
+def _suppressed_heads() -> Dict[str, str]:
+    """Every head currently refused a bet, with the reason. For the dashboard."""
+    out: Dict[str, str] = {}
+    for name in MODEL_HEADS:
+        ok, why = head_fit_to_bet(name)
+        if not ok and why:
+            out[name] = why
+    return out
 
 
 def _load_ou_model_for_line(line: float, prefix: str = "") -> Optional[Dict[str, Any]]:
@@ -1579,6 +1777,38 @@ def _market_key_and_selection(market_text: str, suggestion: str) -> Tuple[Option
     return None, None
 
 
+def head_for_candidate(market_text: str, suggestion: str) -> Optional[str]:
+    """Which model head produced this candidate, so its health can gate it."""
+    mt = market_text.replace("PRE ", "")
+    if mt == "BTTS":
+        return "BTTS_YES"
+    if mt.startswith("Over/Under"):
+        try:
+            return f"OU_{_fmt_line(float(suggestion.split()[1]))}"
+        except (ValueError, IndexError):
+            return None
+    # 1X2, Double Chance and Draw No Bet are all derived from the same three
+    # WLD heads, so any one of them being unfit taints the lot.
+    if mt in ("1X2", "Double Chance", "Draw No Bet"):
+        return "WLD_HOME"
+    return None
+
+
+def candidate_head_blocked(market_text: str, suggestion: str) -> Optional[str]:
+    """The reason this candidate's head may not bet, or None."""
+    head = head_for_candidate(market_text, suggestion)
+    if not head:
+        return None
+    heads = (["WLD_HOME", "WLD_DRAW", "WLD_AWAY"]
+             if head == "WLD_HOME" and market_text.replace("PRE ", "") != "BTTS"
+             else [head])
+    for h in heads:
+        ok, why = head_fit_to_bet(h)
+        if not ok:
+            return why
+    return None
+
+
 class PriceCheck(dict):
     """Result of _price_gate. Dict so it serialises straight into the log row."""
 
@@ -1607,6 +1837,17 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
     mkey, sel = _market_key_and_selection(market_text, suggestion)
     if not mkey or not sel:
         res["decision"] = "unmapped_market"
+        return res
+
+    # Placed FIRST, ahead of any odds work. A head its own holdout says is
+    # untrustworthy should not reach a price at all: spending a fetch on it and
+    # then reporting "EV too low" invites tuning EDGE_MIN_BPS when the problem
+    # is the model. Every tipping path runs through here, so this is the one
+    # place that cannot be bypassed.
+    blocked = candidate_head_blocked(market_text, suggestion)
+    if blocked:
+        res["decision"] = "head_suppressed"
+        res["suppressed_reason"] = blocked
         return res
 
     odds_map = fetch_odds(fid, live=live) if API_KEY else {}
@@ -1869,8 +2110,8 @@ def backfill_results_for_open_matches(max_rows: int = 400) -> int:
         st = (((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
         if st not in FINAL_STATUSES:
             continue
-        g = fx.get("goals") or {}
-        gh, ga = int(g.get("home") or 0), int(g.get("away") or 0)
+        # 90 minutes, not 120 - see fulltime_goals().
+        gh, ga = fulltime_goals(fx)
         league_id = int(((fx.get("league") or {}).get("id")) or 0) or None
         with db_conn() as c2:
             c2.execute(
@@ -2518,7 +2759,7 @@ def production_scan() -> Tuple[int, int]:
             # the cooldown is: a fixture we refuse to bet is still a fixture
             # worth SEEING, with the refusal shown next to it. Blocking the
             # snapshot instead would hide exactly the matches being asked about.
-            data_block = inplay_data_gate(raw, minute)
+            data_block = inplay_data_gate(raw, minute, match=m)
             if data_block:
                 data_gate[data_block] = data_gate.get(data_block, 0) + 1
 
@@ -2622,6 +2863,10 @@ def production_scan() -> Tuple[int, int]:
         log.info("[PROD] price_gate: %s", gate_decisions)
     if data_gate:
         log.info("[PROD] data_gate: %s", data_gate)
+    if gate_decisions.get("head_suppressed"):
+        log.warning("[PROD] %d candidate(s) refused because their model head is not fit "
+                    "to bet: %s", gate_decisions["head_suppressed"],
+                    _suppressed_heads() or "see model_health:*")
     if data_gate.get("xg_feed_dead"):
         # Worth its own line: this one is provable (shots recorded, xG exactly
         # zero) and it silently poisons every model head that reads xG.
@@ -2682,7 +2927,7 @@ def score_live_matches_now() -> Tuple[List[Dict[str, Any]], int]:
             out.append(_build_live_match_entry(fid, league, league_id, home, away, score,
                                                minute, candidates, kickoff_ts=kickoff, raw=raw,
                                                home_id=home_id, away_id=away_id,
-                                               data_block=inplay_data_gate(raw, minute)))
+                                               data_block=inplay_data_gate(raw, minute, match=m)))
         except Exception as e:
             log.warning("[LIVE-SCORE] failed for a fixture: %s", e)
             continue
@@ -3054,8 +3299,7 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
         except Exception as e:
             log.warning("[HIST-PRE] snapshot save failed for %s: %s", fid, e)
 
-        gh = int((fx.get("goals") or {}).get("home") or 0)
-        ga = int((fx.get("goals") or {}).get("away") or 0)
+        gh, ga = fulltime_goals(fx)
         try:
             with db_conn() as c:
                 c.execute(
@@ -3618,6 +3862,18 @@ def auto_train_job():
             lines.append("⚖️ <b>Row weighting</b>: one fixture, one observation "
                          "(snapshots share an outcome, so counting them as independent "
                          "told the fit it had ~9× the sample it has).")
+        # Containment, not just a warning: these heads are scored for the
+        # dashboard but cannot send a tip until their next retrain clears them.
+        try:
+            _MODELS_CACHE.invalidate()
+            _SETTINGS_CACHE.invalidate()
+            sup = _suppressed_heads()
+        except Exception:
+            sup = {}
+        if sup:
+            lines.append("⛔ <b>Heads suppressed from betting</b> (still scored, not tipped):")
+            for h, why in sorted(sup.items()):
+                lines.append(f"   • {escape(h)}: {escape(why)}")
         if res.get("anchor_fallbacks"):
             lines.append("⚠️ Anchored fit failed, fell back for: "
                          + ", ".join(escape(str(h)) for h in res["anchor_fallbacks"]))
@@ -3803,10 +4059,15 @@ def _start_scheduler_once():
                  bool(ALLOW_TIPS_WITHOUT_ODDS), EDGE_MIN_BPS, FAIR_EDGE_MIN_BPS,
                  MAX_MODEL_EDGE_BPS, MAX_OVERROUND_BPS, MAX_OVERROUND_BPS_3WAY,
                  ODDS_BOOKMAKER_ID or "none")
-        log.info("[CONFIG] live data gate: min_minute=%d (tip_min=%d, train_min=%d) "
+        log.info("[CONFIG] live data gate: minute %d-%d (tip_min=%d, train_min=%d) "
                  "shot_data_from=%d require_xg=%s",
-                 LIVE_TIP_MIN_MINUTE, TIP_MIN_MINUTE, TRAIN_MIN_MINUTE,
-                 SHOT_DATA_MIN_MINUTE, bool(REQUIRE_XG_FEED))
+                 LIVE_TIP_MIN_MINUTE, LIVE_TIP_MAX_MINUTE, TIP_MIN_MINUTE,
+                 TRAIN_MIN_MINUTE, SHOT_DATA_MIN_MINUTE, bool(REQUIRE_XG_FEED))
+        sup = _suppressed_heads()
+        if sup:
+            log.warning("[CONFIG] model heads NOT fit to bet: %s", sup)
+        else:
+            log.info("[CONFIG] all model heads pass their health check")
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
@@ -4012,6 +4273,57 @@ def http_pnl():
 def http_clv():
     _require_admin()
     return jsonify({"ok": True, "clv": compute_clv(days=_arg_int("days"))})
+
+
+@app.route("/admin/repair/fulltime-results", methods=["POST"])
+def http_repair_fulltime_results():
+    """
+    Re-grade stored results that were recorded from the extra-time score.
+
+    Results used to be read from API-Football's top-level `goals`, which keeps
+    counting through extra time, for every fixture in FINAL_STATUSES - and that
+    set includes AET and PEN. Every market here settles on 90 minutes, so a tie
+    level at 1-1 after 90 and finishing 3-2 after extra time was stored as
+    Over 2.5 = yes: a wrong training label and a wrong P&L grade from one line.
+
+    Writing is fixed; these are the rows written before it. Only fixtures whose
+    90-minute score actually differs are touched, so this is safe to re-run and
+    reports 0 once clean. Bounded by `limit` because each row costs one API
+    call, and ordered oldest-first so repeated runs make progress.
+    """
+    _require_admin()
+    limit = max(1, min(_arg_int("limit", 100) or 100, 500))
+    with db_conn() as c:
+        rows = c.execute(
+            "SELECT match_id, final_goals_h, final_goals_a FROM match_results "
+            "ORDER BY updated_ts ASC LIMIT %s", (limit,)).fetchall()
+
+    checked = fixed = 0
+    changes = []
+    for (mid, old_h, old_a) in rows:
+        fx = _fixture_by_id(int(mid))
+        if not fx:
+            continue
+        st = (((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st not in FINAL_STATUSES:
+            continue
+        checked += 1
+        gh, ga = fulltime_goals(fx)
+        if (gh, ga) == (int(old_h or 0), int(old_a or 0)):
+            continue
+        with db_conn() as c2:
+            c2.execute(
+                "UPDATE match_results SET final_goals_h=%s, final_goals_a=%s, btts_yes=%s, "
+                "updated_ts=%s WHERE match_id=%s",
+                (gh, ga, 1 if (gh > 0 and ga > 0) else 0, int(time.time()), int(mid)))
+        fixed += 1
+        changes.append({"match_id": int(mid), "was": f"{old_h}-{old_a}",
+                        "now": f"{gh}-{ga}", "status": st})
+    log.info("[REPAIR] full-time results: checked=%d fixed=%d", checked, fixed)
+    return jsonify({"ok": True, "checked": checked, "fixed": fixed,
+                    "changes": changes[:50],
+                    "note": "Re-run until fixed=0. Retrain afterwards so the corrected "
+                            "labels reach the models."})
 
 
 @app.route("/admin/diagnostics/price-gate", methods=["GET"])

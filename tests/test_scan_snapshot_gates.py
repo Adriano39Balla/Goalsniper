@@ -14,9 +14,9 @@ import pytest
 import main
 
 
-def _match(fid=555, minute=40, home_sot=3, away_sot=1):
+def _match(fid=555, minute=40, home_sot=3, away_sot=1, status="2H"):
     return {
-        "fixture": {"id": fid, "status": {"elapsed": minute}},
+        "fixture": {"id": fid, "status": {"elapsed": minute, "short": status}},
         "teams": {"home": {"id": 10, "name": "Home FC"}, "away": {"id": 20, "name": "Away FC"}},
         "goals": {"home": 1, "away": 0},
         "league": {"id": 39, "name": "Premier League", "country": "England"},
@@ -215,3 +215,49 @@ def test_harvesting_is_not_blocked_by_the_information_gate(monkeypatch):
                         lambda m, raw: harvested.append((m.get("fixture") or {}).get("id")))
     main.production_scan()
     assert harvested == [555], "an unbettable fixture is still training data"
+
+
+def test_a_fixture_in_extra_time_is_not_tipped(monkeypatch):
+    # Every market here settles on 90 minutes. Once a tie reaches extra time
+    # the bet is already decided, and the scoreline now includes goals that do
+    # not count toward it.
+    et = _match(status="ET", minute=105)
+    et["statistics"][0]["statistics"].append({"type": "Expected Goals", "value": "1.9"})
+    _stub_scan(monkeypatch, cooling_down=False, matches=[et])
+    _confident_model(monkeypatch)
+    main._set_live_snapshot([])
+
+    saved, _ = main.production_scan()
+
+    assert saved == 0
+    assert main._get_live_snapshot()["matches"][0]["data_block"] == "market_already_settled"
+
+
+def test_a_penalty_shootout_is_not_tipped(monkeypatch):
+    ps = _match(status="P", minute=120)
+    ps["statistics"][0]["statistics"].append({"type": "Expected Goals", "value": "1.9"})
+    _stub_scan(monkeypatch, cooling_down=False, matches=[ps])
+    _confident_model(monkeypatch)
+    main._set_live_snapshot([])
+    main.production_scan()
+    assert main._get_live_snapshot()["matches"][0]["data_block"] == "market_already_settled"
+
+
+def test_a_normal_second_half_fixture_is_still_tippable(monkeypatch):
+    ok = _match(status="2H", minute=60)
+    ok["statistics"][0]["statistics"].append({"type": "Expected Goals", "value": "1.2"})
+    _stub_scan(monkeypatch, cooling_down=False, matches=[ok])
+    _confident_model(monkeypatch)
+    main._set_live_snapshot([])
+    main.production_scan()
+    assert main._get_live_snapshot()["matches"][0]["data_block"] is None
+
+
+def test_half_time_counts_as_open(monkeypatch):
+    ht = _match(status="HT", minute=45)
+    ht["statistics"][0]["statistics"].append({"type": "Expected Goals", "value": "1.2"})
+    _stub_scan(monkeypatch, cooling_down=False, matches=[ht])
+    _confident_model(monkeypatch)
+    main._set_live_snapshot([])
+    main.production_scan()
+    assert main._get_live_snapshot()["matches"][0]["data_block"] is None

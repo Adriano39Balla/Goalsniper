@@ -73,6 +73,7 @@ import json
 import logging
 import math
 import os
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -1316,7 +1317,14 @@ def _train_binary_head(
         })
         mets["mean_predicted"] = float(np.mean(p_te))
         mets["mean_actual"] = float(np.mean(y_te))
-        mets["calibration_gap_pct"] = round(100.0 * (mets["mean_actual"] - mets["mean_predicted"]), 2)
+        # PREDICTED MINUS ACTUAL, so a POSITIVE gap means overconfident. The
+        # sign was inverted here while every consumer assumed this convention:
+        # the real OU_2.5 run (predicted 0.592, actual 0.504) produced -8.8 and
+        # was reported to the operator as "8.8pp underconfident" with no EV
+        # warning, when it was 8.8pp OVERconfident and overstating every EV it
+        # produced by roughly twice that at even money. The warning fired only
+        # on the heads that were not dangerous.
+        mets["calibration_gap_pct"] = round(100.0 * (mets["mean_predicted"] - mets["mean_actual"]), 2)
         logger.info("[METRICS] %s: acc=%.3f prec=%.3f brier=%.4f calib_gap=%+.2fpp (C=%g)",
                     ctx, mets["acc"], mets["precision"], mets["brier"],
                     mets["calibration_gap_pct"], C)
@@ -1325,6 +1333,20 @@ def _train_binary_head(
 
     mets["feature_importance"] = dict(sorted(
         zip(feature_names, m.coef_.ravel().tolist()), key=lambda x: abs(x[1]), reverse=True)[:10])
+
+    # Health record for the serving-side circuit breaker. Written next to the
+    # model so a head cannot be deployed without one: main.head_health() reads
+    # it and refuses to BET a head whose holdout says it should not be trusted.
+    # Scoring still happens - the dashboard needs it - only tipping stops.
+    buf.set(f"model_health:{model_key}", json.dumps({
+        "trained_ts": int(time.time()),
+        "calibration_gap_pct": mets.get("calibration_gap_pct"),
+        "n_train_matches": mets.get("n_train_matches"),
+        "n_holdout_matches": mets.get("n_holdout_matches"),
+        "market_anchored": mets.get("market_anchored"),
+        "deviation_p95_pp": (mets.get("deviation_from_market") or {}).get("p95_abs_pp"),
+        "decided_share_pct": (mets.get("already_decided") or {}).get("decided_share_pct"),
+    }))
 
     if threshold_label:
         thr_pct, diag, holdout = _decide_threshold(

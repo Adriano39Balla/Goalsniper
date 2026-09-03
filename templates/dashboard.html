@@ -336,6 +336,9 @@ const DECISION_LABELS = {
   too_early: 'Too early to bet',
   xg_feed_dead: 'xG feed missing — not bettable',
   no_shot_data: 'No shot data — feed looks dead',
+  too_late: 'Past the model\u2019s training range',
+  market_already_settled: 'Full-time market already settled',
+  head_suppressed: 'Model head suppressed — not fit to bet',
 };
 function decisionLabel(code) { return DECISION_LABELS[code] || code || '—'; }
 
