@@ -319,10 +319,18 @@ PRE_FEATURES: List[str] = [
     "pm_rest_diff",
     "pm_attack_defense_ratio",
     "pm_league_btts_rate", "pm_league_ov25_rate", "pm_league_ov35_rate",
-    # Form momentum: Recent performance is not in market prices
-    "pm_form_momentum_h", "pm_form_momentum_a",       # Wins in recent window (0-1)
-    "pm_goals_momentum_h", "pm_goals_momentum_a",     # Goals per game in recent window
-    "pm_recent_gf_h", "pm_recent_ga_h",               # Last 5 games averages
+    # Form momentum: recent performance, unweighted, as a counterweight to the
+    # decayed season-long block above.
+    #
+    # NOTE: pm_goals_momentum_h/a used to sit here alongside pm_recent_gf_h/a.
+    # Both were assigned momentum[...]["goals_for"] — the SAME expression — so
+    # they were exactly duplicated columns, the precise defect the header of
+    # this file records as having been purged from the old lists. Under L2 two
+    # identical columns split one effect arbitrarily and make both coefficients
+    # (and feature_importance) meaningless. Dropped; pm_recent_gf_h/a carries
+    # that signal and pairs with pm_recent_ga_h/a.
+    "pm_form_momentum_h", "pm_form_momentum_a",       # Win rate in recent window (0-1)
+    "pm_recent_gf_h", "pm_recent_ga_h",               # Recent goals for / against, per game
     "pm_recent_gf_a", "pm_recent_ga_a",
     "pm_home_form_h", "pm_away_form_a",               # Venue-specific form
 ]
@@ -561,18 +569,31 @@ def recent_form_momentum(team_id: int, games: List[dict], window_size: int = 5) 
     Unlike team_form_stats, this uses NO decay weighting - recent games
     get equal weight so a 2-game sample counts as much as a 5-game sample.
 
+    The window is selected by KICKOFF TIMESTAMP, not by list position, for the
+    reason decay_weights() states: the live path returns most-recent-first
+    (API-Football's /fixtures?last=) while the historical backfill builds its
+    windows oldest-first (main.py slices [-5:] off an ascending history). A
+    positional `finished[-window_size:]` therefore means "the newest N" during
+    training and "the OLDEST N" at serve time — the two paths would disagree
+    the moment a window held more than window_size finished games, which is a
+    train/serve parity break of exactly the kind this module exists to prevent.
+    Sorting here makes the result independent of which caller built the list.
+
     Returns:
     - momentum: win rate in recent window (0-1)
     - goals_for: average goals per game
     - goals_against: average goals against per game
-    - played: number of finished games found (may be < window_size)
+    - played: number of finished games in the window involving this team
     """
     finished = [g for g in games if _is_finished(g)]
     if not finished:
         return {"momentum": 0.0, "goals_for": 0.0, "goals_against": 0.0, "played": 0}
 
-    recent = finished[-window_size:]  # Last N games, most recent last
+    # Newest first by kickoff, then the most recent `window_size`. sorted() is
+    # stable, so fixtures sharing a timestamp keep their original relative order.
+    recent = sorted(finished, key=fixture_ts, reverse=True)[:window_size]
     gf = ga = wins = 0.0
+    played = 0
 
     for g in recent:
         th = ((g.get("teams") or {}).get("home") or {}).get("id")
@@ -587,12 +608,16 @@ def recent_form_momentum(team_id: int, games: List[dict], window_size: int = 5) 
         else:
             continue
 
+        # Counted here, not as len(recent): a fixture this team did not play in
+        # is skipped above, and including it in the denominator would dilute
+        # every one of these averages toward zero. team_form_stats() already
+        # counts this way; this had not.
+        played += 1
         gf += my
         ga += opp
         if my > opp:
             wins += 1
 
-    played = len(recent)
     if played == 0:
         return {"momentum": 0.0, "goals_for": 0.0, "goals_against": 0.0, "played": 0}
 
@@ -709,11 +734,9 @@ def assemble_prematch_features(
         "pm_league_btts_rate": float(lr.get("btts", DEFAULT_LEAGUE_RATES["btts"])),
         "pm_league_ov25_rate": float(lr.get("ov25", DEFAULT_LEAGUE_RATES["ov25"])),
         "pm_league_ov35_rate": float(lr.get("ov35", DEFAULT_LEAGUE_RATES["ov35"])),
-        # NEW: Form momentum (recent games only, captures short-term trends)
+        # Form momentum (recent games only, captures short-term trends)
         "pm_form_momentum_h": float(momentum_h.get("momentum", 0.0)),
         "pm_form_momentum_a": float(momentum_a.get("momentum", 0.0)),
-        "pm_goals_momentum_h": float(momentum_h.get("goals_for", 0.0)),
-        "pm_goals_momentum_a": float(momentum_a.get("goals_for", 0.0)),
         "pm_recent_gf_h": float(momentum_h.get("goals_for", 0.0)),
         "pm_recent_ga_h": float(momentum_h.get("goals_against", 0.0)),
         "pm_recent_gf_a": float(momentum_a.get("goals_for", 0.0)),

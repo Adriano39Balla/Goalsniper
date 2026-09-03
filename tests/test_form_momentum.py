@@ -18,10 +18,20 @@ TEAM_H = 123
 TEAM_A = 456
 
 
-def sample_fixture(team_id, goals_for, goals_against, is_home=True):
-    """Create a sample finished match for testing."""
+def sample_fixture(team_id, goals_for, goals_against, is_home=True, day=1):
+    """
+    A finished match for testing.
+
+    `day` sets the kickoff date, so a window can express real recency. This
+    matters: recent_form_momentum() selects its window by kickoff timestamp
+    rather than by list position, because the live path and the historical
+    backfill hand it lists ordered opposite ways. Fixtures built without
+    distinct dates cannot distinguish "newest N" from "oldest N" and so cannot
+    test that selection at all.
+    """
     return {
-        "fixture": {"id": 999, "status": {"short": "FT"}},
+        "fixture": {"id": 999, "status": {"short": "FT"},
+                    "date": f"2026-09-{day:02d}T15:00:00Z"},
         "teams": {
             "home": {"id": team_id if is_home else TEAM_A},
             "away": {"id": TEAM_A if is_home else team_id},
@@ -30,7 +40,7 @@ def sample_fixture(team_id, goals_for, goals_against, is_home=True):
             "home": goals_for if is_home else goals_against,
             "away": goals_against if is_home else goals_for,
         },
-        "date": "2026-09-01T15:00:00Z",
+        "date": f"2026-09-{day:02d}T15:00:00Z",
     }
 
 
@@ -89,11 +99,11 @@ def test_form_momentum_vs_season_form():
     # Recent momentum uses uniform weights (all recent games count equally)
     # This shows that recent_form_momentum captures pure recency
     all_season = [
-        sample_fixture(TEAM_H, 1, 2),  # Loss (old)
-        sample_fixture(TEAM_H, 0, 1),  # Loss (old)
-        sample_fixture(TEAM_H, 1, 1),  # Draw (old)
-        sample_fixture(TEAM_H, 2, 1),  # Win (recent)
-        sample_fixture(TEAM_H, 1, 0),  # Win (recent)
+        sample_fixture(TEAM_H, 1, 2, day=1),  # Loss (old)
+        sample_fixture(TEAM_H, 0, 1, day=2),  # Loss (old)
+        sample_fixture(TEAM_H, 1, 1, day=3),  # Draw (old)
+        sample_fixture(TEAM_H, 2, 1, day=4),  # Win (recent)
+        sample_fixture(TEAM_H, 1, 0, day=5),  # Win (recent)
     ]
 
     # Season form: uses decay weights, so recent games matter more
@@ -153,8 +163,6 @@ def test_assemble_prematch_includes_momentum_features():
     # New form momentum features should be present
     assert "pm_form_momentum_h" in features
     assert "pm_form_momentum_a" in features
-    assert "pm_goals_momentum_h" in features
-    assert "pm_goals_momentum_a" in features
     assert "pm_recent_gf_h" in features
     assert "pm_recent_ga_h" in features
     assert "pm_recent_gf_a" in features
@@ -187,3 +195,87 @@ def test_form_momentum_helps_distinguish_teams():
 
     # Team A has momentum (0.5 win rate), Team B doesn't (0.0)
     assert momentum_a["momentum"] > momentum_b["momentum"]
+
+
+# ───────── regressions ─────────
+
+def test_window_is_chosen_by_date_not_by_list_position():
+    """
+    The live path and the historical backfill order their windows opposite
+    ways: API-Football's /fixtures?last= returns most-recent-first, while the
+    backfill slices [-5:] off an ascending history. Selecting the window with
+    finished[-window_size:] therefore meant "newest N" while training and
+    "oldest N" while serving — the same fixture scored two different ways.
+    Both orderings must now produce the same numbers.
+    """
+    oldest_first = [
+        sample_fixture(TEAM_H, 0, 3, day=1),  # heavy loss, oldest
+        sample_fixture(TEAM_H, 0, 2, day=2),  # loss
+        sample_fixture(TEAM_H, 2, 0, day=3),  # win
+        sample_fixture(TEAM_H, 3, 0, day=4),  # win
+        sample_fixture(TEAM_H, 1, 0, day=5),  # win, newest
+    ]
+    newest_first = list(reversed(oldest_first))
+
+    backfill = recent_form_momentum(TEAM_H, oldest_first, window_size=3)
+    live = recent_form_momentum(TEAM_H, newest_first, window_size=3)
+
+    assert backfill == live, "train and serve disagree on the same fixture"
+    # ...and it is genuinely the three most RECENT games (3 wins), not the oldest.
+    assert backfill["momentum"] == 1.0
+    assert backfill["goals_against"] == 0.0
+
+
+def test_played_counts_only_this_teams_games():
+    """
+    A fixture the team did not play in is skipped, so counting it in the
+    denominator would dilute every average toward zero. team_form_stats()
+    already counts this way.
+    """
+    OTHER_A, OTHER_B = 777, 888
+    window = [
+        sample_fixture(TEAM_H, 2, 0, day=3),  # this team: a win
+        {  # two strangers, no TEAM_H involvement
+            "fixture": {"id": 1, "status": {"short": "FT"},
+                        "date": "2026-09-02T15:00:00Z"},
+            "teams": {"home": {"id": OTHER_A}, "away": {"id": OTHER_B}},
+            "goals": {"home": 1, "away": 1},
+            "date": "2026-09-02T15:00:00Z",
+        },
+    ]
+    m = recent_form_momentum(TEAM_H, window, window_size=5)
+
+    assert m["played"] == 1          # not 2
+    assert m["momentum"] == 1.0      # 1 win / 1 game, not 1/2
+    assert m["goals_for"] == 2.0     # not 1.0
+
+
+def test_prematch_vector_has_no_duplicated_columns():
+    """
+    pm_goals_momentum_h/a were assigned the same expression as
+    pm_recent_gf_h/a, so the matrix carried two pairs of identical columns.
+    Under L2 that splits one effect arbitrarily between them and makes both
+    coefficients — and feature_importance — meaningless. This is the defect
+    the feature_spec header records as having been purged from the old lists.
+    """
+    last_h = [sample_fixture(TEAM_H, 3, 1, day=d) for d in (1, 2, 3)]
+    last_a = [sample_fixture(TEAM_A, 0, 2, is_home=False, day=d) for d in (1, 2)]
+
+    features = assemble_prematch_features(
+        home_id=TEAM_H, away_id=TEAM_A,
+        last_h=last_h, last_a=last_a, h2h=[],
+        kickoff_ts=1700000000, rating_h=1600.0, rating_a=1500.0,
+        league_rates={"btts": 0.5, "ov25": 0.5, "ov35": 0.3},
+    )
+
+    dupes = {}
+    for name, value in features.items():
+        dupes.setdefault(value, []).append(name)
+    collisions = {v: names for v, names in dupes.items() if len(names) > 1}
+
+    # Distinct features may coincide numerically by luck; the specific pair
+    # that was literally the same expression must not both be present.
+    assert not ("pm_goals_momentum_h" in features and "pm_recent_gf_h" in features), \
+        f"duplicated column pair is back: {collisions}"
+    assert "pm_goals_momentum_h" not in features
+    assert "pm_goals_momentum_a" not in features
