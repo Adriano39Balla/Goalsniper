@@ -26,6 +26,13 @@ def _odds_payload(books):
         for name, sels in books.items()]}]}
 
 
+def _tip(odds=2.10, book="Bet365", lead_sec=300, prev_lead=None):
+    """A tips row as capture_closing_lines() now selects it."""
+    import time as _t
+    return (99, 1000, "PRE Over/Under 2.5", "Over 2.5 Goals", odds, book,
+            int(_t.time()) + lead_sec, prev_lead)
+
+
 def _capture(monkeypatch, tip_row, closing_books):
     """Run capture_closing_lines over one tip; return the recorded update."""
     monkeypatch.setattr(main, "_api_get",
@@ -55,8 +62,8 @@ def _capture(monkeypatch, tip_row, closing_books):
     return n, written
 
 
-# tip: (match_id, created_ts, market, suggestion, odds, book)
-TIP = (99, 1000, "PRE Over/Under 2.5", "Over 2.5 Goals", 2.10, "Bet365")
+# (match_id, created_ts, market, suggestion, odds, book, kickoff_ts, closing_lead_sec)
+TIP = _tip()
 
 
 def test_clv_is_measured_against_the_same_books_close(monkeypatch):
@@ -68,7 +75,7 @@ def test_clv_is_measured_against_the_same_books_close(monkeypatch):
         "LateBook": {"Over": 2.60, "Under": 1.55},
     })
     assert n == 1
-    closing, clv, _mid, _cts = written[0]
+    closing, clv, _lead, _mid, _cts = written[0]
     assert closing == pytest.approx(2.00)
     assert clv > 0, "beating the same book's close must read as positive CLV"
     assert clv == pytest.approx((2.10 / 2.00 - 1) * 100, abs=0.01)
@@ -81,7 +88,7 @@ def test_a_book_joining_late_cannot_drag_clv_negative(monkeypatch):
         "Bet365": {"Over": 2.10, "Under": 1.75},          # unchanged
         "SharpBook": {"Over": 3.40, "Under": 1.35},        # only quoting now
     })
-    closing, clv, _mid, _cts = written[0]
+    closing, clv, _lead, _mid, _cts = written[0]
     assert closing == pytest.approx(2.10)
     assert clv == pytest.approx(0.0, abs=0.01), "an unchanged line is zero CLV, not negative"
 
@@ -90,7 +97,7 @@ def test_drifting_against_us_still_reads_negative(monkeypatch):
     # The fix must not simply flatter the numbers - a real adverse move has
     # to still show up as negative CLV.
     _, written = _capture(monkeypatch, TIP, {"Bet365": {"Over": 2.40, "Under": 1.65}})
-    _closing, clv, _mid, _cts = written[0]
+    _closing, clv, _lead, _mid, _cts = written[0]
     assert clv < 0
 
 
@@ -102,7 +109,7 @@ def test_nothing_is_recorded_when_that_book_stops_quoting(monkeypatch):
 
 
 def test_nothing_is_recorded_for_a_tip_with_no_book(monkeypatch):
-    no_book = (99, 1000, "PRE Over/Under 2.5", "Over 2.5 Goals", 2.10, None)
+    no_book = _tip(book=None)
     n, written = _capture(monkeypatch, no_book, {"Bet365": {"Over": 2.00, "Under": 1.80}})
     assert n == 0
     assert written == []
@@ -119,3 +126,45 @@ def test_fetch_odds_exposes_per_book_prices(monkeypatch):
     # "best" is still the max across books - that is correct for EV, where
     # taking the best available price is exactly the point.
     assert entry["best"]["Over"]["odds"] == pytest.approx(2.05)
+
+
+# ───────── the price has to be the one closest to kickoff ─────────
+# This used to filter on `closing_odds IS NULL`, so the FIRST successful
+# capture won - the earliest one, up to CLV_CAPTURE_LEAD_MIN before kickoff.
+# That is not a closing line. The market sharpens as kickoff approaches, so
+# scoring a tip against a T-15 price rather than a T-0 one systematically
+# FLATTERS CLV - and CLV is the one instrument meant to say whether the edge
+# is real before the P&L can. An error in the flattering direction is the
+# worst kind here.
+
+def test_a_later_capture_replaces_an_earlier_one(monkeypatch):
+    # Already holds a price taken 600s out; now 120s out, so it must refresh.
+    n, written = _capture(monkeypatch, _tip(lead_sec=120, prev_lead=600),
+                          {"Bet365": {"Over": 1.95, "Under": 1.90}})
+    assert n == 1
+    closing, _clv, lead, _mid, _cts = written[0]
+    assert closing == pytest.approx(1.95)
+    assert lead <= 120, "the stored lead must be the newer, closer one"
+
+
+def test_an_earlier_capture_does_not_replace_a_later_one(monkeypatch):
+    # Cannot happen in the forward direction, but a re-run or a clock skew
+    # must never move the benchmark AWAY from kickoff.
+    n, written = _capture(monkeypatch, _tip(lead_sec=600, prev_lead=120),
+                          {"Bet365": {"Over": 1.95, "Under": 1.90}})
+    assert n == 0 and written == []
+
+
+def test_the_first_capture_is_taken_when_none_exists(monkeypatch):
+    n, written = _capture(monkeypatch, _tip(lead_sec=400, prev_lead=None),
+                          {"Bet365": {"Over": 2.00, "Under": 1.80}})
+    assert n == 1
+    assert written[0][2] <= 400
+
+
+def test_how_close_to_kickoff_the_benchmark_was_is_recorded(monkeypatch):
+    # Without this the CLV series cannot be judged, only read.
+    _, written = _capture(monkeypatch, _tip(lead_sec=90),
+                          {"Bet365": {"Over": 2.00, "Under": 1.80}})
+    lead = written[0][2]
+    assert 0 <= lead <= 90

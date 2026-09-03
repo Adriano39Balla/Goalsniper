@@ -603,6 +603,13 @@ def init_db():
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS stake_units DOUBLE PRECISION",
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS closing_odds DOUBLE PRECISION",
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS clv_pct DOUBLE PRECISION",
+            # Seconds before kickoff at which the closing price was taken. The
+            # line sharpens as kickoff approaches, so a price captured 15
+            # minutes out is a weaker benchmark than one taken at the bell -
+            # and being measured against a weaker benchmark FLATTERS CLV, the
+            # one number meant to decide whether the edge is real. Recorded so
+            # the series can be judged, not just read.
+            "ALTER TABLE tips ADD COLUMN IF NOT EXISTS closing_lead_sec INTEGER",
             "ALTER TABLE tip_snapshots ADD COLUMN IF NOT EXISTS kickoff_ts BIGINT",
             "ALTER TABLE prematch_snapshots ADD COLUMN IF NOT EXISTS kickoff_ts BIGINT",
         ]:
@@ -664,15 +671,36 @@ def send_telegram(text: str) -> bool:
 # level, so a plan running over its daily request cap failed silently with no
 # symptom beyond fewer tips. See /admin/status -> api_usage.
 _api_call_lock = threading.Lock()
-_api_call_stats = {"day": None, "total": 0, "rate_limited": 0, "api_errors": 0}
+_api_call_stats = {"day": None, "total": 0, "rate_limited": 0, "api_errors": 0,
+                   "by_endpoint": {}}
 
 
-def _track_api_call(status_code: Optional[int], api_error: bool = False) -> Dict[str, Any]:
+def _endpoint_of(url: str) -> str:
+    """Coarse label for quota accounting: the API-Football resource being hit."""
+    u = (url or "").split("?", 1)[0].rstrip("/")
+    for tail in ("/fixtures/statistics", "/fixtures/events", "/fixtures/lineups",
+                 "/odds/live", "/odds", "/fixtures", "/teams", "/standings"):
+        if u.endswith(tail):
+            return tail
+    return u.rsplit("/", 1)[-1] or "other"
+
+
+def _track_api_call(status_code: Optional[int], api_error: bool = False,
+                    url: str = "") -> Dict[str, Any]:
     today = datetime.now(TZ_UTC).strftime("%Y-%m-%d")
     with _api_call_lock:
         if _api_call_stats["day"] != today:
-            _api_call_stats.update(day=today, total=0, rate_limited=0, api_errors=0)
+            _api_call_stats.update(day=today, total=0, rate_limited=0, api_errors=0,
+                                   by_endpoint={})
         _api_call_stats["total"] += 1
+        if url:
+            # WHERE the quota goes, not just how much of it. The live scan and
+            # the prematch scan compete for one budget, and only one of them
+            # produces a closing line to measure against - so knowing the split
+            # is what makes the trade-off decidable instead of guessed at.
+            ep = _endpoint_of(url)
+            book = _api_call_stats.setdefault("by_endpoint", {})
+            book[ep] = book.get(ep, 0) + 1
         if status_code == 429:
             _api_call_stats["rate_limited"] += 1
         if api_error:
@@ -714,7 +742,20 @@ def api_response_error(js: Any) -> Optional[str]:
 
 def _api_call_stats_snapshot() -> Dict[str, Any]:
     with _api_call_lock:
-        return dict(_api_call_stats)
+        snap = dict(_api_call_stats)
+    ep = dict(snap.get("by_endpoint") or {})
+    snap["by_endpoint"] = dict(sorted(ep.items(), key=lambda kv: kv[1], reverse=True))
+    total = snap.get("total") or 0
+    if total and ep:
+        snap["by_endpoint_pct"] = {k: round(100.0 * v / total, 1)
+                                   for k, v in snap["by_endpoint"].items()}
+        # The live branch cannot be measured against a closing line; the
+        # prematch branch can. Spending most of one budget on the unmeasurable
+        # half is a decision worth making on purpose rather than by default.
+        live_side = sum(v for k, v in ep.items()
+                        if k in ("/fixtures/statistics", "/fixtures/events", "/odds/live"))
+        snap["live_scan_share_pct"] = round(100.0 * live_side / total, 1)
+    return snap
 
 
 def _api_get(url: str, params: dict, timeout: int = 15):
@@ -730,15 +771,15 @@ def _api_get(url: str, params: dict, timeout: int = 15):
                 # cannot cache it as "nothing was available". Logged at warning
                 # because it is almost always an account-level fault that stops
                 # the whole system until someone acts on it.
-                stats = _track_api_call(None, api_error=True)
+                stats = _track_api_call(None, api_error=True, url=url)
                 log.warning("[API] %s returned an error inside a 200 response: %s "
                             "(today: %d calls, %d such errors). No data was received — "
                             "this is not 'nothing was live'.",
                             url, problem, stats["total"], stats.get("api_errors", 0))
                 return None
-            _track_api_call(None)
+            _track_api_call(None, url=url)
             return js
-        stats = _track_api_call(r.status_code)
+        stats = _track_api_call(r.status_code, url=url)
         if r.status_code == 429:
             log.warning("[API] 429 rate-limited on %s (today: %d calls, %d rate-limited)",
                         url, stats["total"], stats["rate_limited"])
@@ -2216,9 +2257,10 @@ def capture_closing_lines(limit: int = 200) -> int:
     now = int(time.time())
     with db_conn() as c:
         rows = c.execute("""
-            SELECT match_id, created_ts, market, suggestion, odds, book
+            SELECT match_id, created_ts, market, suggestion, odds, book, kickoff_ts,
+                   closing_lead_sec
             FROM tips
-            WHERE is_prematch=1 AND closing_odds IS NULL AND odds IS NOT NULL
+            WHERE is_prematch=1 AND odds IS NOT NULL
               AND kickoff_ts IS NOT NULL
               AND kickoff_ts > %s AND kickoff_ts <= %s
             ORDER BY kickoff_ts ASC LIMIT %s
@@ -2226,7 +2268,20 @@ def capture_closing_lines(limit: int = 200) -> int:
 
     n = 0
     no_same_book = 0
-    for (mid, cts, market, sugg, tip_odds, book) in rows:
+    for (mid, cts, market, sugg, tip_odds, book, kickoff, prev_lead) in rows:
+        # RE-CAPTURED on every pass, keeping the price closest to kickoff.
+        #
+        # This used to filter on `closing_odds IS NULL`, so the FIRST
+        # successful capture won - the earliest one, up to CLV_CAPTURE_LEAD_MIN
+        # before kickoff. That is not a closing line. The market sharpens as
+        # kickoff approaches, so scoring a tip against a T-15 price rather than
+        # a T-0 one systematically FLATTERS CLV, and CLV is the one instrument
+        # meant to tell us whether the edge is real before the P&L can. An
+        # error in the flattering direction is the worst kind here.
+        lead = max(0, int(kickoff) - now)
+        if prev_lead is not None and int(prev_lead) <= lead:
+            # Already hold a price taken at least as close to kickoff.
+            continue
         odds_map = fetch_odds(int(mid), live=False)
         mkey, sel = _market_key_and_selection(market or "", sugg or "")
         if not mkey or not book:
@@ -2250,12 +2305,13 @@ def capture_closing_lines(limit: int = 200) -> int:
             continue
         clv = (float(tip_odds) / closing - 1.0) * 100.0
         with db_conn() as c2:
-            c2.execute("UPDATE tips SET closing_odds=%s, clv_pct=%s WHERE match_id=%s AND created_ts=%s",
-                       (closing, round(clv, 3), mid, cts))
+            c2.execute("UPDATE tips SET closing_odds=%s, clv_pct=%s, closing_lead_sec=%s "
+                       "WHERE match_id=%s AND created_ts=%s",
+                       (closing, round(clv, 3), lead, mid, cts))
         n += 1
     if n or no_same_book:
-        log.info("[CLV] captured %d closing prices (%d skipped: the book that priced the tip "
-                 "was not quoting at close)", n, no_same_book)
+        log.info("[CLV] captured/refreshed %d closing prices (%d skipped: the book that priced "
+                 "the tip was not quoting at close)", n, no_same_book)
     return n
 
 
@@ -2331,7 +2387,7 @@ def compute_clv(days: Optional[int] = None) -> Dict[str, Any]:
     cutoff = int(time.time()) - days * 86400 if days else 0
     with db_conn() as c:
         rows = c.execute("""
-            SELECT market, clv_pct FROM tips
+            SELECT market, clv_pct, closing_lead_sec FROM tips
             WHERE clv_pct IS NOT NULL AND created_ts >= %s
         """, (cutoff,)).fetchall()
     if not rows:
@@ -2339,9 +2395,12 @@ def compute_clv(days: Optional[int] = None) -> Dict[str, Any]:
                                 "and needs at least one full kickoff cycle."}
     by: Dict[str, List[float]] = {}
     allv: List[float] = []
-    for mkt, clv in rows:
+    leads: List[int] = []
+    for mkt, clv, lead in rows:
         by.setdefault(mkt or "?", []).append(float(clv))
         allv.append(float(clv))
+        if lead is not None:
+            leads.append(int(lead))
     allv.sort()
 
     def _summary(v: List[float]) -> Dict[str, Any]:
@@ -2349,8 +2408,26 @@ def compute_clv(days: Optional[int] = None) -> Dict[str, Any]:
                 "median_clv_pct": round(sorted(v)[len(v) // 2], 2),
                 "beat_close_pct": round(100.0 * sum(1 for x in v if x > 0) / len(v), 1)}
 
+    # How good the benchmark itself was. A line taken 15 minutes out is
+    # softer than one at the bell, and being scored against a softer line
+    # FLATTERS CLV - so a series with a large mean lead should be read with
+    # more suspicion than its number alone suggests.
+    bench: Dict[str, Any] = {}
+    if leads:
+        leads_sorted = sorted(leads)
+        bench = {
+            "n_with_lead": len(leads),
+            "median_sec_before_kickoff": leads_sorted[len(leads_sorted) // 2],
+            "mean_sec_before_kickoff": round(sum(leads) / len(leads)),
+            "worst_sec_before_kickoff": leads_sorted[-1],
+            "note": ("Seconds before kickoff at which the closing price was taken. "
+                     "Smaller is a sharper benchmark and a more honest CLV. Prices "
+                     "recorded before this field existed are excluded."),
+        }
+
     return {"overall": _summary(allv),
             "by_market": {k: _summary(v) for k, v in by.items() if v},
+            "benchmark_quality": bench,
             "note": "mean_clv_pct > 0 sustained over a few hundred prematch bets is the "
                     "strongest available evidence of a real edge. Negative CLV with positive "
                     "ROI means you have been lucky, not right. Prematch only."}
