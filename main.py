@@ -1776,6 +1776,40 @@ def _odd_value(v: dict) -> float:
         return 0.0
 
 
+# Where the goals line lives when it is not inside the selection label.
+#
+# The two odds endpoints disagree. The PREMATCH feed embeds it —
+# {"value": "Over 2.5", "odd": "1.95"} — and float(label.split()[-1]) reads it.
+# The IN-PLAY feed puts it in a SEPARATE field and leaves the label bare:
+#
+#     {"value": "Over", "odd": "1.95", "handicap": "2.5"}
+#
+# which is why that market is called "Over/Under Line" rather than
+# "Goals Over/Under". On a bare label float("over") raises, so every live
+# Over/Under selection was skipped and no OU price was ever recorded. With
+# market_fair_over25 among them, that is one of the five features the anchored
+# heads are pinned to, and it is consistent with the training run reporting
+# "only 0 rows / 0 fixtures carry a real market price" for the whole dataset.
+_OU_LINE_FIELDS = ("handicap", "line", "hcp", "total", "points")
+
+
+def _ou_line_of(v: dict, lbl: str) -> Optional[float]:
+    """The goals line for one Over/Under selection, from wherever the feed put it."""
+    try:  # prematch shape: the line is the last token of the label
+        return float(lbl.split()[-1].replace(",", "."))
+    except (ValueError, IndexError):
+        pass
+    for field in _OU_LINE_FIELDS:  # in-play shape: a field of its own
+        raw = v.get(field)
+        if raw in (None, ""):
+            continue
+        try:
+            return float(_txt(raw).replace(",", "."))
+        except ValueError:
+            continue
+    return None
+
+
 def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
     """Parse one bookmaker's one market into {market_key: {selection: odds}}."""
     mname = _market_name_normalize(mkt.get("name"))
@@ -1841,9 +1875,8 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
             o = _odd_value(v)
             if o <= 1.0:
                 continue
-            try:
-                ln = float(lbl.split()[-1].replace(",", "."))
-            except Exception:
+            ln = _ou_line_of(v, lbl)
+            if ln is None:
                 continue
             key = f"OU_{_fmt_line(ln)}"
             side = "Over" if "over" in lbl else "Under"
