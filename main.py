@@ -664,18 +664,52 @@ def send_telegram(text: str) -> bool:
 # level, so a plan running over its daily request cap failed silently with no
 # symptom beyond fewer tips. See /admin/status -> api_usage.
 _api_call_lock = threading.Lock()
-_api_call_stats = {"day": None, "total": 0, "rate_limited": 0}
+_api_call_stats = {"day": None, "total": 0, "rate_limited": 0, "api_errors": 0}
 
 
-def _track_api_call(status_code: Optional[int]) -> Dict[str, Any]:
+def _track_api_call(status_code: Optional[int], api_error: bool = False) -> Dict[str, Any]:
     today = datetime.now(TZ_UTC).strftime("%Y-%m-%d")
     with _api_call_lock:
         if _api_call_stats["day"] != today:
-            _api_call_stats.update(day=today, total=0, rate_limited=0)
+            _api_call_stats.update(day=today, total=0, rate_limited=0, api_errors=0)
         _api_call_stats["total"] += 1
         if status_code == 429:
             _api_call_stats["rate_limited"] += 1
+        if api_error:
+            _api_call_stats["api_errors"] = _api_call_stats.get("api_errors", 0) + 1
         return dict(_api_call_stats)
+
+
+def api_response_error(js: Any) -> Optional[str]:
+    """
+    The error API-Football reports INSIDE a 200 response, or None.
+
+    This is the trap in this API: quota exhaustion, an expired or insufficient
+    plan, and a bad key all come back as HTTP 200 with an empty `response` and
+    the reason in `errors`:
+
+        {"errors": {"requests": "You have reached the request limit for the day"},
+         "results": 0, "response": []}
+
+    Read only for `response`, that is indistinguishable from "no fixtures are
+    live" or "nothing is priced" - the system keeps running, quietly blind, and
+    every downstream diagnostic points somewhere else. This is the same shape
+    of failure as the in-play odds parser reading only `bookmakers`, which cost
+    a long hunt that one line of logging would have ended.
+
+    `errors` is a LIST (usually empty) when there is nothing wrong and a DICT
+    when there is, so both shapes have to be handled.
+    """
+    if not isinstance(js, dict):
+        return None
+    err = js.get("errors")
+    if isinstance(err, dict) and err:
+        return "; ".join(f"{k}: {v}" for k, v in err.items())
+    if isinstance(err, list) and err:
+        return "; ".join(str(e) for e in err)
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    return None
 
 
 def _api_call_stats_snapshot() -> Dict[str, Any]:
@@ -689,8 +723,21 @@ def _api_get(url: str, params: dict, timeout: int = 15):
     try:
         r = session.get(url, headers=HEADERS, params=params, timeout=timeout)
         if r.ok:
+            js = r.json()
+            problem = api_response_error(js)
+            if problem:
+                # Treated as a FAILED call, not as an empty result, so callers
+                # cannot cache it as "nothing was available". Logged at warning
+                # because it is almost always an account-level fault that stops
+                # the whole system until someone acts on it.
+                stats = _track_api_call(None, api_error=True)
+                log.warning("[API] %s returned an error inside a 200 response: %s "
+                            "(today: %d calls, %d such errors). No data was received — "
+                            "this is not 'nothing was live'.",
+                            url, problem, stats["total"], stats.get("api_errors", 0))
+                return None
             _track_api_call(None)
-            return r.json()
+            return js
         stats = _track_api_call(r.status_code)
         if r.status_code == 429:
             log.warning("[API] 429 rate-limited on %s (today: %d calls, %d rate-limited)",
@@ -1606,7 +1653,13 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     params: Dict[str, Any] = {"fixture": fid}
     if ODDS_BOOKMAKER_ID:
         params["bookmaker"] = ODDS_BOOKMAKER_ID
-    js = _api_get(ODDS_LIVE_URL if live else ODDS_PREMATCH_URL, params) or {}
+    js = _api_get(ODDS_LIVE_URL if live else ODDS_PREMATCH_URL, params)
+    if js is None:
+        # The call failed (network, HTTP error, or an error reported inside a
+        # 200). Deliberately NOT cached: caching {} here would extend a
+        # transient outage for the whole TTL and make every candidate in that
+        # window read as no_odds, which looks like a pricing problem.
+        return {}
 
     best: Dict[str, Dict[str, Dict[str, Any]]] = {}
     by_book: Dict[str, Dict[str, Dict[str, float]]] = {}
@@ -3725,6 +3778,25 @@ def daily_accuracy_digest() -> Optional[str]:
         except Exception:
             pass
         msg = "\n".join(lines)
+
+    # Two failures that otherwise look exactly like "a quiet day".
+    tail = []
+    try:
+        api = _api_call_stats_snapshot()
+        if api.get("api_errors"):
+            tail.append(f"🚨 API-Football returned {api['api_errors']} error(s) inside "
+                        f"200 responses today (quota, plan or key). Those calls got NO "
+                        f"data — a quiet scan may mean blindness, not calm.")
+        if api.get("rate_limited"):
+            tail.append(f"⏳ Rate-limited {api['rate_limited']}x of {api.get('total', 0)} calls.")
+        sup = _suppressed_heads()
+        if sup:
+            tail.append("⛔ Not betting: " + ", ".join(
+                f"{escape(h)} ({escape(w)})" for h, w in sorted(sup.items())))
+    except Exception as e:
+        log.debug("[DIGEST] health tail failed: %s", e)
+    if tail:
+        msg = msg + "\n" + "\n".join(tail)
 
     send_telegram(msg)
     return msg
