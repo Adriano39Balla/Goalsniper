@@ -1682,7 +1682,27 @@ _NOT_FULL_MATCH_SCOPE = (
     "minute", "extra", "overtime", "incl", "penalt", "shootout",
     "corner", "card", "booking", "offside", "foul", "shot", "save",
     "player", "exact", "odd", "even", "handicap", "asian",
+    # Combination bets: "Result / Both Teams To Score" pays only when BOTH legs
+    # land, so it is a different bet from either. It is listed here because the
+    # BTTS matcher below keys on "both teams" appearing anywhere and would
+    # otherwise claim it. The trailing slash is what distinguishes a combo from
+    # the plain "Fulltime Result" recognised as 1X2 below.
+    "result /", "result/",
 )
+
+# What API-Football calls the 90-minute 1X2 market. The prematch feed says
+# "Match Winner"; the IN-PLAY feed says "Fulltime Result", which matched none of
+# the patterns below and was dropped as unmapped — so live 1X2 prices never
+# arrived, and with them market_fair_home/draw/away, three of the five features
+# every anchored head is pinned to. Production logs show "Fulltime Result"
+# offered on 10 of the fixtures that then reported "no usable markets".
+_FULL_TIME_1X2_NAMES = ("match winner", "winner", "1x2",
+                        "fulltime result", "full time result", "ft result",
+                        "match result", "3-way result", "to win match")
+
+# What _market_name_normalize() returns when it recognised the market, as
+# opposed to handing back the raw name to mean "not one of ours".
+_KNOWN_MARKET_KEYS = ("BTTS", "DC", "DNB", "1X2", "OU")
 
 # Additionally for the goals total: a TEAM's total is not the MATCH total.
 # "Total - Home" quotes a plain "Over 2.5" priced ~4.0-9.0 (that team
@@ -1703,7 +1723,7 @@ def _market_name_normalize(s: Any) -> str:
         return "DC"
     if "draw no bet" in s:
         return "DNB"
-    if "match winner" in s or "winner" in s or "1x2" in s:
+    if any(n in s for n in _FULL_TIME_1X2_NAMES):
         return "1X2"
     if "over/under" in s or "total" in s or "goals" in s:
         if any(bad in s for bad in _OU_NOT_MATCH_TOTAL):
@@ -1951,17 +1971,45 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
         # only quoted markets we deliberately refuse (asian/quarter lines,
         # halves, corners) or whether the exclusion list is over-rejecting
         # something that is genuinely the full-match market.
-        offered = []
+        #
+        # Naming them is no longer enough. Production logs show fixtures
+        # offering "Match Goals", "Over/Under Line", "Double Chance" and "Both
+        # Teams to Score" — all of which _market_name_normalize() maps
+        # correctly — and still reporting nothing usable. So the loss is in the
+        # SELECTION values, not the market name, and the name alone cannot say
+        # which. Recognised markets that yielded no selection now report the
+        # values they actually carried, which is the one fact needed to tell a
+        # label we do not recognise ("Over" with the line in a separate field)
+        # from a price we correctly refuse (suspended, or <= 1.0).
+        offered, unusable = [], []
         for r in response[:3]:
             if not isinstance(r, dict):
                 continue
             for _bk_name, _bets in _iter_price_sources(r):
-                offered += [_txt(b.get("name")) for b in _bets if isinstance(b, dict)]
+                for b in _bets:
+                    if not isinstance(b, dict):
+                        continue
+                    raw_name = _txt(b.get("name"))
+                    offered.append(raw_name)
+                    if _market_name_normalize(raw_name) not in _KNOWN_MARKET_KEYS:
+                        continue  # deliberately refused — nothing to explain
+                    if len(unusable) >= 3:
+                        continue
+                    unusable.append({
+                        "market": raw_name,
+                        "values": [{"value": _txt(v.get("value")), "odd": _txt(v.get("odd")),
+                                    "suspended": v.get("suspended")}
+                                   for v in (b.get("values") or [])[:4] if isinstance(v, dict)],
+                    })
         log.warning("[ODDS] fixture %s (live=%s): %d response item(s) but no usable markets. "
                     "Top-level keys: %s. Markets offered: %s",
                     fid, live, len(response),
                     sorted(response[0].keys()) if isinstance(response[0], dict) else type(response[0]),
                     sorted(set(offered)) or "none")
+        if unusable:
+            log.warning("[ODDS] fixture %s: these ARE full-match markets we recognise, but none "
+                        "of their selections could be used — the loss is in the values, not the "
+                        "market name: %s", fid, unusable)
 
     out: Dict[str, Any] = {}
     for mkey, sels in best.items():
