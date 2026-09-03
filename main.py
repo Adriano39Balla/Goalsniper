@@ -1412,6 +1412,17 @@ def head_fit_to_bet(name: str) -> Tuple[bool, Optional[str]]:
     if not h:
         return True, None
 
+    # A validation finding is the training run refusing its own output. It is
+    # checked first because it means a number elsewhere in this record cannot
+    # be trusted to judge anything.
+    failed = h.get("validation_failed")
+    if failed:
+        return False, f"failed post-training validation — {failed}"
+
+    ok_parity, why_parity = verify_model_parity(name)
+    if not ok_parity:
+        return False, why_parity
+
     gap = h.get("calibration_gap_pct")
     if gap is not None and float(gap) > CALIBRATION_GAP_SUPPRESS_PP:
         # Positive is OVERconfident: predicted minus actual.
@@ -1437,6 +1448,48 @@ def head_fit_to_bet(name: str) -> Tuple[bool, Optional[str]]:
         return False, (f"{float(dec):.0f}% of its training rows were already "
                        f"settled when harvested")
     return True, None
+
+
+PARITY_TOLERANCE = float(os.getenv("PARITY_TOLERANCE", "1e-6"))
+_PARITY_CACHE = _TTLCache(ttl=int(os.getenv("PARITY_CACHE_TTL_SEC", "300")))
+
+
+def verify_model_parity(name: str) -> Tuple[bool, Optional[str]]:
+    """
+    Does the deployed model score its own training samples the way training did?
+
+    Training records a few real holdout rows with the probability it produced.
+    This re-scores them through the serving path and compares.
+
+    It is the only check that can catch train/serve DRIFT, and drift is the
+    failure mode neither side's own tests can see: each is internally
+    consistent, and the bug exists only in their disagreement. Every scaler,
+    calibration or market-offset change is a chance to introduce it — the
+    market anchor alone put the offset in three places that all had to agree.
+    """
+    cached = _PARITY_CACHE.get(name, _MISS)
+    if cached is not _MISS:
+        return cached
+
+    samples = (_head_health(name) or {}).get("golden_samples") or []
+    mdl = load_model_from_settings(name)
+    result: Tuple[bool, Optional[str]] = (True, None)
+    if samples and mdl:
+        worst = 0.0
+        for s_ in samples:
+            try:
+                got = _score_prob(dict(s_.get("features") or {}), mdl)
+                worst = max(worst, abs(got - float(s_.get("prob"))))
+            except Exception as e:
+                result = (False, f"could not re-score a training sample: {e}")
+                break
+        else:
+            if worst > PARITY_TOLERANCE:
+                result = (False, (f"scores its own training samples {worst:.4f} differently "
+                                  f"here than training did — the serving path and the "
+                                  f"fitted model disagree"))
+    _PARITY_CACHE.set(name, result)
+    return result
 
 
 def _suppressed_heads() -> Dict[str, str]:
@@ -3981,6 +4034,20 @@ def auto_train_job():
                 lines.append(f"   • {escape(name)}: {dd['decided_share_pct']:.0f}% of rows"
                              + (f" · base rate {dd['base_rate_all']:.2f} → {und:.2f} undecided"
                                 if und is not None else ""))
+
+        # The run refusing its own output. First, because a critical finding
+        # means other numbers in the same run cannot be trusted to judge
+        # anything.
+        val = res.get("validation") or {}
+        if val.get("n_critical"):
+            lines.append(f"🛑 <b>Validation: {val['n_critical']} critical finding(s)</b> — "
+                         f"{len(val.get('unfit_heads') or {})} head(s) refused a bet")
+            for f in [f for f in val.get("findings", [])
+                      if f.get("severity") == "CRITICAL"][:6]:
+                lines.append(f"   • {escape(str(f.get('head')))} "
+                             f"[{escape(str(f.get('check')))}]: {escape(str(f.get('detail')))}")
+        elif val:
+            lines.append(f"✅ Validation clean ({val.get('n_warning', 0)} warning(s))")
 
         # Skill against the best possible constant, per head. Ranked worst
         # first because a negative number is not a weak model, it is no model.

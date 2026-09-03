@@ -1376,7 +1376,29 @@ def _train_binary_head(
     # model so a head cannot be deployed without one: main.head_health() reads
     # it and refuses to BET a head whose holdout says it should not be trusted.
     # Scoring still happens - the dashboard needs it - only tipping stops.
+    # GOLDEN SAMPLES: a handful of real holdout rows with the probability this
+    # run produced for them. main.verify_model_parity() re-scores them through
+    # the serving path and asserts agreement.
+    #
+    # This is the one check that catches train/serve drift, and drift is the
+    # failure mode neither side's own tests can see: both are internally
+    # consistent, and only their disagreement is the bug. Every scaler,
+    # calibration and market-offset change in this file is a chance to
+    # introduce it.
+    golden: List[Dict[str, Any]] = []
+    try:
+        te_idx = np.flatnonzero(m_te)
+        for i in te_idx[:: max(1, len(te_idx) // 3)][:3]:
+            row = {name: float(X_all[i][j]) for j, name in enumerate(feature_names)}
+            if anchored and anchor_name:
+                row[anchor_name] = float(1.0 / (1.0 + np.exp(-offset_all[i])))
+            local = int(np.flatnonzero(te_idx == i)[0])
+            golden.append({"features": row, "prob": float(p_te[local])})
+    except Exception as e:
+        logger.warning("[PARITY] could not record golden samples for %s: %s", ctx, e)
+
     buf.set(f"model_health:{model_key}", json.dumps({
+        "golden_samples": golden,
         "trained_ts": int(time.time()),
         "calibration_gap_pct": mets.get("calibration_gap_pct"),
         "n_train_matches": mets.get("n_train_matches"),
@@ -1441,8 +1463,29 @@ def frame_anchor_report(df: pd.DataFrame) -> Dict[str, Any]:
     n = int(mask.sum())
     matches = int(df.loc[mask, "_match_id"].nunique()) if n else 0
     ok = n >= MIN_ANCHORED_ROWS and matches >= MIN_ANCHORED_MATCHES
+
+    # How many rows the mask admitted whose market value is sitting exactly on
+    # its neutral prior. This must be ~0: anything else means placeholders are
+    # being anchored to, which is the bug that made the first anchored run
+    # meaningless. Measured rather than assumed, because the assumption is
+    # precisely what failed.
+    placeholder = 0
+    if n:
+        sub = df.loc[mask]
+        for feat in sorted(set(MARKET_ANCHOR.values())):
+            if feat not in sub.columns:
+                continue
+            neutral = NEUTRAL_MARKET_PRIORS.get(feat)
+            if neutral is None:
+                continue
+            placeholder = max(placeholder,
+                              int((np.abs(sub[feat].to_numpy(dtype=float)
+                                          - float(neutral)) < 1e-9).sum()))
+
     out: Dict[str, Any] = {
         "anchored": ok, "anchored_rows": n, "anchored_matches": matches,
+        "placeholder_rows": placeholder,
+        "placeholder_share_pct": round(100.0 * placeholder / n, 2) if n else 0.0,
         "rows_required": MIN_ANCHORED_ROWS, "matches_required": MIN_ANCHORED_MATCHES,
         "anchored_share_pct": round(100.0 * n / max(1, len(df)), 1),
         "_mask": mask,
@@ -1582,6 +1625,150 @@ def select_feature_set(df: pd.DataFrame, y: np.ndarray, m_tr, m_ca,
         diag["improvement_vs_full"] = round(full_loss - best_loss, 5)
     return best, candidates[best], diag
 
+
+
+# ─────────────────── Post-training validation ─────────────────── #
+#
+# Every bug that reached production in this system had the same shape: code
+# that is correct read on its own, producing a number that is impossible read
+# in context. Reading the source cannot catch that class. Checking the output
+# can, and it costs nothing.
+#
+# So each check below is written against a defect that actually shipped. They
+# are not style rules or wishes - they are arithmetic that cannot be true if
+# the pipeline is working, and a head that trips one is refused a bet rather
+# than merely noted.
+
+# A head anchored to the market cannot routinely sit this far from it. The
+# anchor enters the linear predictor with a coefficient fixed at 1.0, so a
+# large deviation means either the anchor is not the market or the model has
+# escaped it. The run that exposed the placeholder bug reported p95 values of
+# 49-64pp.
+ANCHOR_DEVIATION_IMPOSSIBLE_PP = float(os.getenv("ANCHOR_DEVIATION_IMPOSSIBLE_PP", "30.0"))
+# Share of supposedly anchored rows whose market value sits exactly on the
+# neutral prior. Anything above a rounding artefact means the mask is letting
+# placeholders through, which is the bug itself rather than a symptom.
+PLACEHOLDER_ANCHOR_MAX_PCT = float(os.getenv("PLACEHOLDER_ANCHOR_MAX_PCT", "1.0"))
+
+
+def _finding(severity: str, head: str, check: str, detail: str) -> Dict[str, str]:
+    return {"severity": severity, "head": head, "check": check, "detail": detail}
+
+
+def validate_training_run(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Assert what must be true of a training run, against its own output.
+
+    Returns {"findings": [...], "unfit_heads": {head: reason}}. A CRITICAL
+    finding marks that head unfit to bet, which the serving-side circuit
+    breaker enforces - the point is containment, not a nicer log line.
+    """
+    findings: List[Dict[str, str]] = []
+    unfit: Dict[str, str] = {}
+
+    def crit(head: str, check: str, detail: str) -> None:
+        findings.append(_finding("CRITICAL", head, check, detail))
+        if head and head != "-":
+            unfit.setdefault(head, f"{check}: {detail}")
+
+    def warn(head: str, check: str, detail: str) -> None:
+        findings.append(_finding("WARNING", head, check, detail))
+
+    metrics = summary.get("metrics") or {}
+    for head, m in sorted(metrics.items()):
+        if not isinstance(m, dict) or "brier" not in m:
+            continue
+
+        # 1. The calibration-gap SIGN. This is checked because it drifted:
+        #    train_models computed actual - predicted while every consumer
+        #    assumed predicted - actual, so an 8.8pp overconfident head was
+        #    reported as underconfident with no EV warning attached.
+        mp, ma = m.get("mean_predicted"), m.get("mean_actual")
+        gap = m.get("calibration_gap_pct")
+        if None not in (mp, ma, gap):
+            expected = 100.0 * (float(mp) - float(ma))
+            if abs(float(gap) - expected) > 0.02:
+                crit(head, "calibration_gap_sign",
+                     f"reported {float(gap):+.2f}pp but predicted-minus-actual is "
+                     f"{expected:+.2f}pp — the sign convention has drifted")
+
+        # 2. A model that predicts one class is not a model. Every prematch
+        #    head in the first real run did exactly this while reporting
+        #    54-79% accuracy: PRE_OU_2.5 had tn=0 and fn=0.
+        cm = m.get("confusion_matrix") or {}
+        total = sum(cm.values()) if cm else 0
+        if total > 0:
+            pos_share = (cm.get("tp", 0) + cm.get("fp", 0)) / total
+            base = (cm.get("tp", 0) + cm.get("fn", 0)) / total
+            # Not "exactly one class": PRE_OU_3.5 predicted positive ONCE in
+            # 2,906 rows, which is no less degenerate than zero. Either an
+            # essentially one-sided call, or a positive rate wildly detached
+            # from the base rate it is supposed to track.
+            if pos_share <= 0.01 or pos_share >= 0.99 or abs(pos_share - base) > 0.35:
+                crit(head, "single_class_prediction",
+                     f"predicts positive on {pos_share * 100:.1f}% of holdout rows against a "
+                     f"{base * 100:.1f}% base rate (tp={cm.get('tp')} fp={cm.get('fp')} "
+                     f"tn={cm.get('tn')} fn={cm.get('fn')}) — accuracy "
+                     f"{float(m.get('acc') or 0) * 100:.1f}% is measuring the base rate")
+
+        # 3. Skill against the best possible constant.
+        skill = m.get("brier_skill")
+        if skill is not None and float(skill) <= 0:
+            crit(head, "no_skill",
+                 f"Brier skill {float(skill):+.4f} — worse than always predicting "
+                 f"the base rate")
+
+        # 4. An anchored head cannot routinely sit far from the price it is
+        #    pinned to. This is the check that would have caught the
+        #    placeholder anchor the day it shipped.
+        if m.get("market_anchored"):
+            dev = (m.get("deviation_from_market") or {}).get("p95_abs_pp")
+            if dev is not None and float(dev) > ANCHOR_DEVIATION_IMPOSSIBLE_PP:
+                crit(head, "anchor_not_binding",
+                     f"p95 deviation from market is {float(dev):.1f}pp with the anchor "
+                     f"coefficient fixed at 1.0 — the offset is not the market price, "
+                     f"or it is not being applied")
+            if not m.get("anchor_feature"):
+                crit(head, "anchor_unnamed",
+                     "flagged market_anchored with no anchor_feature recorded")
+
+        # 5. Plumbing that cannot be true.
+        n_tr, n_trm = m.get("n_train"), m.get("n_train_matches")
+        if None not in (n_tr, n_trm) and int(n_trm) > int(n_tr):
+            crit(head, "impossible_counts",
+                 f"{n_trm} fixtures from {n_tr} rows — fixtures cannot exceed rows")
+        for k in ("mean_predicted", "mean_actual", "prevalence"):
+            v = m.get(k)
+            if v is not None and not (0.0 <= float(v) <= 1.0):
+                crit(head, "probability_out_of_range", f"{k}={v}")
+
+        # 6. Thin evidence. A warning, not a block: the circuit breaker has
+        #    its own fixture floor and this would double-report it.
+        if n_trm is not None and int(n_trm) < 300:
+            warn(head, "thin_training_set",
+                 f"{n_trm} independent fixtures — holdout numbers are estimates "
+                 f"with wide error bars")
+
+    # 7. The anchoring mask itself. Reported by the loader, because the
+    #    training frame is the only place that can see it.
+    anc = summary.get("market_anchoring") or {}
+    if anc.get("anchored"):
+        ph = anc.get("placeholder_share_pct")
+        if ph is not None and float(ph) > PLACEHOLDER_ANCHOR_MAX_PCT:
+            crit("-", "placeholder_anchor",
+                 f"{float(ph):.1f}% of anchored rows carry a market value sitting "
+                 f"exactly on its neutral prior — the mask is admitting rows that "
+                 f"never had a price")
+
+    return {
+        "findings": findings,
+        "unfit_heads": unfit,
+        "n_critical": sum(1 for f in findings if f["severity"] == "CRITICAL"),
+        "n_warning": sum(1 for f in findings if f["severity"] == "WARNING"),
+        "note": ("Each check is arithmetic that cannot be true if the pipeline works, "
+                 "and each was written against a defect that actually shipped. A "
+                 "CRITICAL finding marks that head unfit to bet."),
+    }
 
 def _effective_min_rows(n_features: int, min_rows_env: int, rows_per_feature: int) -> int:
     """
@@ -2094,7 +2281,28 @@ def train_models(
         buf.set("model_metrics_latest", json.dumps(bundle))
         buf.set(f"model_metrics:{trained_at.strftime('%Y%m%dT%H%M%SZ')}", json.dumps(bundle))
 
-        # Nothing has been written to `settings` until this line.
+        # Nothing is written to `settings` until buf.flush() below, which
+        # runs only after validation has had its say.
+        # Refuse the run's own impossible output. Written after the metrics
+        # exist and BEFORE flush, so a head marked unfit here reaches serving
+        # already contained rather than betting until someone reads a digest.
+        validation = validate_training_run(summary)
+        summary["validation"] = validation
+        for f in validation["findings"]:
+            (logger.error if f["severity"] == "CRITICAL" else logger.warning)(
+                "[VALIDATE] %s %s/%s: %s", f["severity"], f["head"], f["check"], f["detail"])
+        for head, reason in validation["unfit_heads"].items():
+            key = f"model_health:{head}"
+            health = buf.get_json(key) or {}
+            health["validation_failed"] = reason
+            buf.set(key, json.dumps(health))
+        if validation["n_critical"]:
+            logger.error("[VALIDATE] %d critical finding(s); %d head(s) refused a bet: %s",
+                         validation["n_critical"], len(validation["unfit_heads"]),
+                         sorted(validation["unfit_heads"]))
+        else:
+            logger.info("[VALIDATE] no critical findings")
+
         buf.flush()
 
         logger.info("Trained: %s", [k for k, v in summary["trained"].items() if v])
