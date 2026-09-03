@@ -5012,6 +5012,7 @@ LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "8"))
 LOGIN_WINDOW_SEC = int(os.getenv("LOGIN_WINDOW_SEC", "900"))
 _login_attempts: Dict[str, List[float]] = defaultdict(list)
 _login_lock = threading.Lock()
+LOGIN_ATTEMPTS_MAX_IPS = int(os.getenv("LOGIN_ATTEMPTS_MAX_IPS", "10000"))
 
 
 def _login_rate_limited(ip: str) -> bool:
@@ -5022,14 +5023,47 @@ def _login_rate_limited(ip: str) -> bool:
     Per-process, so with N workers the effective limit is N x
     LOGIN_MAX_ATTEMPTS. That is still a hard ceiling on guessing rate and needs
     no shared state; a long random ADMIN_API_KEY remains the real defence.
+
+    THE BOUND MUST NOT BE A RESET. This previously read _login_attempts[ip] on
+    a defaultdict — creating an entry for every IP that so much as loaded the
+    form — and called .clear() once the table passed 10,000, wiping every IP's
+    counter at once. The key is taken from X-Forwarded-For, which the client
+    sets, so 10,001 requests carrying distinct fabricated values cost an
+    attacker nothing and flushed their own failures along with everyone else's.
+    Demonstrated: an address throttled after 8 failures is un-throttled
+    immediately afterwards, with its recorded failures gone. That returns the
+    endpoint to being the oracle this function exists to prevent.
+
+    Now only recorded FAILURES occupy the table (a read no longer inserts), and
+    the bound evicts addresses whose attempts have aged out of the window,
+    falling back to the least recently active — never the caller's own live
+    counter.
     """
     now = time.time()
     with _login_lock:
-        hits = [t for t in _login_attempts[ip] if now - t < LOGIN_WINDOW_SEC]
-        _login_attempts[ip] = hits
-        if len(_login_attempts) > 10000:      # bound memory
-            _login_attempts.clear()
+        hits = [t for t in _login_attempts.get(ip, ()) if now - t < LOGIN_WINDOW_SEC]
+        if hits:
+            _login_attempts[ip] = hits
+        else:
+            _login_attempts.pop(ip, None)
+        _evict_stale_login_attempts(now, keep_ip=ip)
         return len(hits) >= LOGIN_MAX_ATTEMPTS
+
+
+def _evict_stale_login_attempts(now: float, keep_ip: str) -> None:
+    """Bound the table without discarding a live counter. Caller holds the lock."""
+    if len(_login_attempts) <= LOGIN_ATTEMPTS_MAX_IPS:
+        return
+    for addr in [a for a, ts in _login_attempts.items()
+                 if a != keep_ip and not any(now - t < LOGIN_WINDOW_SEC for t in ts)]:
+        _login_attempts.pop(addr, None)
+    if len(_login_attempts) <= LOGIN_ATTEMPTS_MAX_IPS:
+        return
+    # Everything still here is inside the window. Drop least-recently-active
+    # first, so the addresses closest to being throttled are the last to go.
+    for addr, _ in sorted(((a, max(ts)) for a, ts in _login_attempts.items() if a != keep_ip),
+                          key=lambda kv: kv[1])[:len(_login_attempts) - LOGIN_ATTEMPTS_MAX_IPS]:
+        _login_attempts.pop(addr, None)
 
 
 def _login_record_failure(ip: str) -> None:
