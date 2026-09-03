@@ -1248,6 +1248,44 @@ def inplay_data_gate(raw: Dict[str, float], minute: int,
     return None
 
 
+def prematch_data_gate(feat: Dict[str, float]) -> Optional[str]:
+    """
+    The prematch counterpart of inplay_data_gate(): is there enough real
+    history here to BET on? Returns None when the fixture is bettable, else
+    the reason.
+
+    The in-play path refuses an all-zero observation twice, in
+    stats_coverage_ok() and again in inplay_data_gate(). The prematch path had
+    no equivalent at all — its only check was `if not feat`, and
+    assemble_prematch_features() ends with
+
+        return {k: float(f.get(k, 0.0)) for k in PRE_FEATURES}
+
+    so it ALWAYS returns a fully-populated dict and `feat` is never falsy. A
+    fixture whose team-form fetches all failed therefore arrived here as a
+    complete vector of zeros and was scored and tipped like any other. Worse,
+    every fixture in such an outage gets the SAME vector — two nameless 1500-Elo
+    sides with no history — so the model returns the same probability for all of
+    them and the scan can emit a burst of identical tips off data it never
+    received.
+
+    A team that genuinely played matches cannot have gf, ga, win and draw all
+    exactly zero: every finished game lands in exactly one of the three
+    outcomes, and a win moves `win`, a draw moves `draw`, and a defeat concedes
+    at least one goal and so moves `ga`. All four at zero therefore means the
+    window was empty — which after ODDS/form fetch failures is the common case,
+    not a rare one.
+    """
+    for side, tag in (("h", "home"), ("a", "away")):
+        observed = (abs(float(feat.get(f"pm_gf_{side}", 0.0)))
+                    + abs(float(feat.get(f"pm_ga_{side}", 0.0)))
+                    + abs(float(feat.get(f"pm_win_{side}", 0.0)))
+                    + abs(float(feat.get(f"pm_draw_{side}", 0.0))))
+        if observed <= 0.0:
+            return f"no_form_data_{tag}"
+    return None
+
+
 def _league_name(m: dict) -> Tuple[int, str]:
     lg = (m.get("league") or {}) or {}
     return int(lg.get("id") or 0), f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
@@ -3354,6 +3392,7 @@ def prematch_scan_save() -> int:
     feats_by_fid, freshly_fetched = _get_prematch_features_bulk(fixtures)
     saved = 0
     pred_rows: List[tuple] = []
+    data_gate: Dict[str, int] = {}
 
     for fx in fixtures:
         fixture = fx.get("fixture") or {}
@@ -3363,6 +3402,13 @@ def prematch_scan_save() -> int:
         feat = feats_by_fid.get(fid)
         if not fid or not feat:
             continue
+
+        # The snapshot is still saved below — a fixture we cannot bet is still
+        # worth harvesting — but nothing about it may reach a threshold or
+        # Telegram. Counted rather than skipped silently, for the reason the
+        # in-play gate states: a gate you cannot see is indistinguishable from
+        # a bug.
+        data_block = prematch_data_gate(feat)
 
         home = (teams.get("home") or {}).get("name", "")
         away = (teams.get("away") or {}).get("name", "")
@@ -3376,6 +3422,13 @@ def prematch_scan_save() -> int:
                 save_prematch_snapshot(fid, feat, kickoff)
             except Exception as e:
                 log.warning("[PREMATCH] snapshot save failed for %s: %s", fid, e)
+
+        # Placed AFTER the harvest for the reason production_scan() states at
+        # length: harvesting is data collection and a gate on BETTING must not
+        # also switch off data collection. Same split, same order.
+        if data_block:
+            data_gate[data_block] = data_gate.get(data_block, 0) + 1
+            continue
 
         if PREMATCH_DEDUP_ENABLE:
             with db_conn() as c:
@@ -3455,7 +3508,16 @@ def prematch_scan_save() -> int:
         pred_rows.extend(_trim_fixture_predictions(fixture_preds))
 
     _log_predictions(pred_rows)
-    log.info("[PREMATCH] saved=%d candidates_logged=%d", saved, len(pred_rows))
+    log.info("[PREMATCH] saved=%d candidates_logged=%d%s", saved, len(pred_rows),
+             f" data_gate={data_gate}" if data_gate else "")
+    if data_gate:
+        # Loud, because the overwhelmingly likely cause is that the team-form
+        # fetches failed rather than that these teams have never played: an
+        # empty window is what an API outage looks like from in here.
+        log.warning("[PREMATCH] %d fixture(s) had no usable form data and were not "
+                    "bet: %s. If this is most of the card, the team-form fetches "
+                    "are failing — check [API] warnings above.",
+                    sum(data_gate.values()), data_gate)
     return saved
 
 
