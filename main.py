@@ -758,8 +758,60 @@ def _api_call_stats_snapshot() -> Dict[str, Any]:
     return snap
 
 
+# ───────── Per-minute rate limit ─────────
+#
+# API-Football reports the PER-MINUTE limit the same way it reports quota
+# exhaustion: HTTP 200, empty `response`, and the reason in `errors`. The
+# urllib3 Retry mounted on `session` keys off HTTP STATUS CODES
+# (status_forcelist=[429, ...]), so it never sees this and never backs off.
+#
+# Nothing else throttled either, and the callers are deliberately concurrent —
+# fetch_live_matches() hydrates 8 fixtures at a time, each spawning 2 more
+# requests, and the prematch scan runs 8 fixtures x 3 requests. So the first
+# refusal was followed immediately by the rest of the burst, every one of them
+# spending a request to be refused again. Production logs show 8 such refusals
+# inside 140ms and 20 within a single scan.
+#
+# A refusal means the minute window is full, and the only useful response is to
+# stop asking until it rolls over. This records when that happened; _api_get()
+# refuses locally (spending nothing) until the window clears.
+_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("API_RATE_LIMIT_COOLDOWN_SEC", "60"))
+_rate_limit_until = 0.0
+
+# Matched against the message API-Football puts in `errors`. Kept narrow so a
+# genuine account fault (expired plan, bad key) is NOT silently swallowed as a
+# throttle — those need to stay loud and are not fixed by waiting.
+_RATE_LIMIT_MARKERS = ("requests per minute", "per minute of your subscription",
+                       "too many requests", "rate limit")
+
+
+def _note_rate_limit_if_present(problem: str) -> None:
+    """Start a cooldown if `problem` is the per-minute limit, else do nothing."""
+    global _rate_limit_until
+    msg = (problem or "").lower()
+    if not any(m in msg for m in _RATE_LIMIT_MARKERS):
+        return
+    with _api_call_lock:
+        was_cooling = _rate_limit_until > time.time()
+        _rate_limit_until = time.time() + _RATE_LIMIT_COOLDOWN_SEC
+    if not was_cooling:
+        log.warning("[API] per-minute rate limit hit — pausing outbound API calls "
+                    "for %.0fs instead of spending requests to be refused again.",
+                    _RATE_LIMIT_COOLDOWN_SEC)
+
+
+def _rate_limit_cooling_down() -> bool:
+    with _api_call_lock:
+        return _rate_limit_until > time.time()
+
+
 def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY:
+        return None
+    # A per-minute limit already reported by the API is still in force: spending
+    # another request to be told so again is what turns one refusal into the
+    # twenty-in-a-row bursts seen in production. Refuse locally instead.
+    if _rate_limit_cooling_down():
         return None
     try:
         r = session.get(url, headers=HEADERS, params=params, timeout=timeout)
@@ -771,6 +823,7 @@ def _api_get(url: str, params: dict, timeout: int = 15):
                 # cannot cache it as "nothing was available". Logged at warning
                 # because it is almost always an account-level fault that stops
                 # the whole system until someone acts on it.
+                _note_rate_limit_if_present(problem)
                 stats = _track_api_call(None, api_error=True, url=url)
                 log.warning("[API] %s returned an error inside a 200 response: %s "
                             "(today: %d calls, %d such errors). No data was received — "
@@ -827,7 +880,16 @@ def fetch_match_stats(fid: int) -> list:
     cached = STATS_CACHE.get(fid, _MISS)
     if cached is not _MISS:
         return cached
-    js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
+    js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid})
+    if js is None:
+        # The call FAILED (rate limit, network, or an error reported inside a
+        # 200). Not cached, for the reason fetch_odds() already states: caching
+        # [] here pins "this match has no statistics" for the whole 90s TTL, and
+        # every feature derived from stats — xg, shots, possession, corners —
+        # scores as 0.0 for a match that is in fact being played. That is not a
+        # neutral input: against a market anchor it reads as a confident
+        # deviation and produces a tip from data that was never received.
+        return []
     out = js.get("response", []) if isinstance(js, dict) else []
     STATS_CACHE.set(fid, out)
     return out
@@ -837,7 +899,9 @@ def fetch_match_events(fid: int) -> list:
     cached = EVENTS_CACHE.get(fid, _MISS)
     if cached is not _MISS:
         return cached
-    js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
+    js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fid})
+    if js is None:
+        return []  # failed, not empty — see fetch_match_stats()
     out = js.get("response", []) if isinstance(js, dict) else []
     EVENTS_CACHE.set(fid, out)
     return out
@@ -3165,7 +3229,15 @@ def _api_last_fixtures(team_id: int, n: int = 5) -> List[dict]:
     cached = TEAM_FORM_CACHE.get(key, _MISS)
     if cached is not _MISS:
         return cached
-    js = _api_get(FOOTBALL_API_URL, {"team": team_id, "last": n}) or {}
+    js = _api_get(FOOTBALL_API_URL, {"team": team_id, "last": n})
+    if js is None:
+        # Failed, not empty. This cache has a 30-MINUTE TTL, so caching [] here
+        # is the most damaging instance of the bug fetch_odds() guards against:
+        # assemble_prematch_features() would then see an empty window and derive
+        # every form feature as 0.0 — gf, ga, win, draw, the momentum block, the
+        # venue splits — i.e. score the fixture as though neither side had ever
+        # played, and keep doing so for half an hour.
+        return []
     out = js.get("response", []) if isinstance(js, dict) else []
     TEAM_FORM_CACHE.set(key, out)
     return out
@@ -3176,7 +3248,9 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
     cached = TEAM_FORM_CACHE.get(key, _MISS)
     if cached is not _MISS:
         return cached
-    js = _api_get(f"{FOOTBALL_API_URL}/headtohead", {"h2h": f"{home_id}-{away_id}", "last": n}) or {}
+    js = _api_get(f"{FOOTBALL_API_URL}/headtohead", {"h2h": f"{home_id}-{away_id}", "last": n})
+    if js is None:
+        return []  # failed, not empty — see _api_last_fixtures()
     out = js.get("response", []) if isinstance(js, dict) else []
     TEAM_FORM_CACHE.set(key, out)
     return out

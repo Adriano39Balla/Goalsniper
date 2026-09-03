@@ -20,11 +20,27 @@ in the same directory).
 """
 import os
 
+import pytest
+
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 os.environ.setdefault("API_KEY", "test-api-key")
 os.environ.setdefault("RUN_SCHEDULER", "0")
 
 import psycopg2.pool  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _clear_api_rate_limit_cooldown():
+    """
+    _api_get() refuses locally while a per-minute rate limit is in force, and
+    that flag is module-level state. A test that trips it would otherwise make
+    every later test's API call return None for reasons having nothing to do
+    with what those tests assert. Cleared on both sides of every test.
+    """
+    import main
+    main._rate_limit_until = 0.0
+    yield
+    main._rate_limit_until = 0.0
 
 
 class _FakeCursor:
