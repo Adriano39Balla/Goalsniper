@@ -88,6 +88,7 @@ from sklearn.metrics import (
 from feature_spec import (
     ODDS_TRUSTED_FROM_TS,
     DEFAULT_LEAGUE_RATES, FEATURES, CORE_FEATURES, PRE_FEATURES,
+    NEUTRAL_MARKET_PRIORS,
     LEAGUE_RATE_FIELDS_INPLAY, LEAGUE_RATE_FIELDS_PREMATCH,
     MARKET_ANCHOR, anchor_logit,
     build_inplay_features, derive_dc_dnb,
@@ -371,6 +372,32 @@ def _drop_untrusted_market_fair(raw: Dict[str, Any], created_ts: Optional[int]) 
     return dropped
 
 
+def _is_real_market_price(key: str, value: Any) -> bool:
+    """
+    Did this snapshot carry a de-vigged price for `key`, or a placeholder?
+
+    Absence is the primary signal, but it is not sufficient for rows already in
+    the database. main._market_fair_priors() used to return all five market
+    keys unconditionally, filled from NEUTRAL_MARKET_PRIORS where nothing had
+    resolved, so every snapshot harvested before that fix persisted a value
+    whether or not a price existed. Anchoring then treated a fabricated 0.5 as
+    the market's opinion — the first real training run showed heads deviating
+    from "market" by a mean of 20-24pp with a maximum of almost exactly 50pp,
+    which is the fingerprint of a model at ~0.95 against a placeholder at 0.50.
+
+    So a value landing EXACTLY on its neutral prior is also treated as absent.
+    A genuinely de-vigged price hitting 0.5000000000 or 0.3333333333 in float
+    is vanishingly unlikely, and discarding the odd real row that does costs
+    nothing next to anchoring to a number no bookmaker ever quoted.
+    """
+    if value is None:
+        return False
+    neutral = NEUTRAL_MARKET_PRIORS.get(key)
+    if neutral is not None and abs(float(value) - float(neutral)) < 1e-9:
+        return False
+    return True
+
+
 def already_decided_mask(df: pd.DataFrame, head: str) -> Optional[np.ndarray]:
     """
     Rows whose outcome was ALREADY SETTLED at the moment they were harvested.
@@ -497,7 +524,7 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
         # market wrong". A row with no market has nothing to be wrong about;
         # training on it with a neutral offset teaches deviation from 0.5,
         # which is a different question and pure noise for this one.
-        has_market = {k: (raw.get(k) is not None) for k in _MARKET_FAIR_KEYS}
+        has_market = {k: _is_real_market_price(k, raw.get(k)) for k in _MARKET_FAIR_KEYS}
 
         # League rates are injected after the split; a neutral placeholder here.
         f = build_inplay_features(raw, DEFAULT_LEAGUE_RATES)
@@ -1317,6 +1344,17 @@ def _train_binary_head(
         })
         mets["mean_predicted"] = float(np.mean(p_te))
         mets["mean_actual"] = float(np.mean(y_te))
+        # Brier SKILL against the best possible constant — a model that always
+        # predicts the holdout base rate. Zero or below means the head has
+        # learned nothing a single number could not do, whatever its accuracy
+        # or precision look like. Accuracy hides this completely: a head that
+        # calls every fixture Over on a 60% base rate scores 60% accuracy and
+        # has no skill at all.
+        base = float(np.mean(y_te))
+        brier_base = base * (1.0 - base)
+        mets["brier_base"] = round(brier_base, 6)
+        mets["brier_skill"] = (round(1.0 - mets["brier"] / brier_base, 4)
+                               if brier_base > 1e-9 else None)
         # PREDICTED MINUS ACTUAL, so a POSITIVE gap means overconfident. The
         # sign was inverted here while every consumer assumed this convention:
         # the real OU_2.5 run (predicted 0.592, actual 0.504) produced -8.8 and
@@ -1344,6 +1382,7 @@ def _train_binary_head(
         "n_train_matches": mets.get("n_train_matches"),
         "n_holdout_matches": mets.get("n_holdout_matches"),
         "market_anchored": mets.get("market_anchored"),
+        "brier_skill": mets.get("brier_skill"),
         "deviation_p95_pp": (mets.get("deviation_from_market") or {}).get("p95_abs_pp"),
         "decided_share_pct": (mets.get("already_decided") or {}).get("decided_share_pct"),
     }))

@@ -142,3 +142,43 @@ def test_an_unrecognised_market_is_not_blocked_by_this(monkeypatch):
     # unmapped_market is a different decision with a different fix.
     _health(monkeypatch, **{"OU_2.5": {"calibration_gap_pct": 9.0, "n_train_matches": 900}})
     assert main.candidate_head_blocked("Corners", "Over 9.5") is None
+
+
+# ───────── skill against the best possible constant ─────────
+# The most basic test there is, and accuracy hides it completely: a head that
+# calls every fixture Over on a 60% base rate reports 60% accuracy and has no
+# skill at all. Every prematch head in the first real run scored between
+# -0.005 and +0.006, while reporting accuracies of 54-79%.
+
+def test_a_head_with_no_skill_may_not_bet(monkeypatch):
+    _health(monkeypatch, **{"OU_2.5": {"calibration_gap_pct": 0.2, "n_train_matches": 900,
+                                       "brier_skill": -0.005}})
+    ok, why = main.head_fit_to_bet("OU_2.5")
+    assert ok is False
+    assert "learned nothing a single number could not do" in why
+
+
+def test_skill_indistinguishable_from_zero_is_not_enough(monkeypatch):
+    _health(monkeypatch, **{"OU_2.5": {"calibration_gap_pct": 0.2, "n_train_matches": 900,
+                                       "brier_skill": 0.006}})
+    assert main.head_fit_to_bet("OU_2.5")[0] is False
+
+
+def test_a_head_with_real_skill_bets(monkeypatch):
+    # The in-play heads in that same run scored +0.22 to +0.26.
+    _health(monkeypatch, **{"OU_2.5": {"calibration_gap_pct": 0.2, "n_train_matches": 900,
+                                       "brier_skill": 0.23, "deviation_p95_pp": 6.0}})
+    assert main.head_fit_to_bet("OU_2.5") == (True, None)
+
+
+def test_high_accuracy_does_not_rescue_a_skill_less_head(monkeypatch):
+    # PRE_OU_2.5 reported 60.2% accuracy and 100% recall by predicting Over on
+    # literally every fixture: tn=0, fn=0. Accuracy alone would wave it through.
+    _health(monkeypatch, **{"OU_2.5": {"calibration_gap_pct": 0.2, "n_train_matches": 900,
+                                       "brier_skill": -0.005, "acc": 0.602}})
+    assert main.head_fit_to_bet("OU_2.5")[0] is False
+
+
+def test_a_head_without_a_skill_number_is_judged_on_the_other_checks(monkeypatch):
+    _health(monkeypatch, **{"OU_2.5": {"calibration_gap_pct": 0.2, "n_train_matches": 900}})
+    assert main.head_fit_to_bet("OU_2.5") == (True, None)

@@ -1379,6 +1379,13 @@ MAX_DEVIATION_P95_PP = float(os.getenv("MAX_DEVIATION_P95_PP", "15.0"))
 # this the head's apparent skill is mostly answering decided questions, none of
 # which is bettable.
 MAX_DECIDED_SHARE_PCT = float(os.getenv("MAX_DECIDED_SHARE_PCT", "60.0"))
+# Brier skill against the best possible constant (always predict the base
+# rate). At or below zero the head has learned nothing a single number could
+# not do. This is the most basic test there is, and accuracy hides it
+# completely: a head calling every fixture Over on a 60% base rate reports 60%
+# accuracy and has no skill whatsoever. Every prematch head in the first real
+# run scored between -0.005 and +0.006 — noise around zero.
+MIN_BRIER_SKILL = float(os.getenv("MIN_BRIER_SKILL", "0.02"))
 
 
 def _head_health(name: str) -> Dict[str, Any]:
@@ -1410,6 +1417,11 @@ def head_fit_to_bet(name: str) -> Tuple[bool, Optional[str]]:
         # Positive is OVERconfident: predicted minus actual.
         return False, (f"overconfident by {float(gap):.1f}pp on holdout "
                        f"(EV overstated ~{abs(float(gap)) * 2:.0f}pp at odds 2.0)")
+
+    skill = h.get("brier_skill")
+    if skill is not None and float(skill) < MIN_BRIER_SKILL:
+        return False, (f"Brier skill {float(skill):+.3f} vs a constant — it has learned "
+                       f"nothing a single number could not do")
 
     n = h.get("n_train_matches")
     if n is not None and int(n) < MIN_TRAIN_MATCHES_TO_BET:
@@ -1817,10 +1829,26 @@ def _market_fair_priors(fid: int, live: bool) -> Dict[str, float]:
     only change is fetching it before scoring instead of only after a
     candidate already cleared its confidence threshold.
 
-    Falls back to NEUTRAL_MARKET_PRIORS per-market wherever odds are
-    unavailable or too thin to devig (see that constant for why).
+    Returns ONLY the markets that actually resolved to a de-vigged price.
+    build_inplay_features() fills anything absent from NEUTRAL_MARKET_PRIORS,
+    so the feature vector is unchanged either way.
+
+    THE BUG THIS FIXES. This used to start from dict(NEUTRAL_MARKET_PRIORS)
+    and overwrite what it could resolve, so it ALWAYS returned all five keys.
+    Snapshots therefore always persisted a market_fair_* value, and
+    load_inplay_data's "did this row carry a real market price?" test -
+    raw.get(k) is not None - was true for every row ever harvested.
+
+    Market anchoring then anchored to a neutral 0.5 wherever no price had
+    existed, which is precisely the outcome frame_anchor_mask() was written to
+    prevent. The damage is visible in the first real run: heads reported a mean
+    deviation from "market" of 20-24pp and a maximum of almost exactly 50pp -
+    the signature of a model saying ~0.95 against a fabricated market of 0.50,
+    not of a model with an opinion.
+
+    Absence has to stay absent for the row to be excludable later.
     """
-    out = dict(NEUTRAL_MARKET_PRIORS)
+    out: Dict[str, float] = {}
     if not fid:
         return out
     odds_map = fetch_odds(fid, live=live) if API_KEY else {}
@@ -2095,7 +2123,15 @@ def save_snapshot_from_match(m: dict, raw: Dict[str, float]) -> None:
     lg = m.get("league", {}) or {}
     fid = int(fx.get("id"))
     payload = {
-        "raw": {k: float(raw.get(k, 0.0)) for k in RAW_INPLAY_KEYS},
+        # A market probability that was never quoted is persisted as NULL, not
+        # as 0.0. Every other raw key is a count where a missing value and zero
+        # mean the same thing; a probability is the opposite — 0.0 reads as
+        # "the market says impossible" and would be the most confident wrong
+        # number in the row. NULL is also what lets training tell a real price
+        # from an absent one later, which is the whole basis of anchoring.
+        "raw": {k: (None if (k in NEUTRAL_MARKET_PRIORS and raw.get(k) is None)
+                    else float(raw.get(k, 0.0)))
+                for k in RAW_INPLAY_KEYS},
         "league_id": int(lg.get("id") or 0),
         "kickoff_ts": _kickoff_ts_of(m),
         "schema": 2,
@@ -3945,6 +3981,20 @@ def auto_train_job():
                 lines.append(f"   • {escape(name)}: {dd['decided_share_pct']:.0f}% of rows"
                              + (f" · base rate {dd['base_rate_all']:.2f} → {und:.2f} undecided"
                                 if und is not None else ""))
+
+        # Skill against the best possible constant, per head. Ranked worst
+        # first because a negative number is not a weak model, it is no model.
+        skills = []
+        for name, m in sorted((res.get("metrics") or {}).items()):
+            if isinstance(m, dict) and m.get("brier_skill") is not None:
+                skills.append((name, float(m["brier_skill"])))
+        if skills:
+            weak = [(n, v) for n, v in skills if v < MIN_BRIER_SKILL]
+            lines.append(f"🎯 <b>Skill vs a constant</b>: {len(skills) - len(weak)}/"
+                         f"{len(skills)} heads beat always-predict-the-base-rate")
+            for n, v in sorted(weak, key=lambda kv: kv[1])[:6]:
+                lines.append(f"   • {escape(n)}: {v:+.3f} — learned nothing a single "
+                             f"number could not do")
 
         drifted = []
         for name, m in sorted((res.get("metrics") or {}).items()):
