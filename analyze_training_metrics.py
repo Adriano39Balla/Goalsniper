@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import sys
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import psycopg2
@@ -302,9 +304,15 @@ def analyze_metrics() -> None:
 
         logger.info("")
 
-        # Write full metrics to file for detailed inspection
-        output_file = "/tmp/training_metrics_latest.json"
-        with open(output_file, "w") as f:
+        # Write full metrics to file for detailed inspection. Honour an
+        # explicit override, else fall back to the OS temp dir — "/tmp" does
+        # not exist on Windows and hard-coding it made this script (and its
+        # tests) unrunnable off Linux.
+        output_file = os.getenv(
+            "TRAINING_METRICS_OUT",
+            str(Path(tempfile.gettempdir()) / "training_metrics_latest.json"),
+        )
+        with open(output_file, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
         logger.info(f"Full metrics saved to: {output_file}")
 

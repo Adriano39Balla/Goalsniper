@@ -11,8 +11,10 @@ Analyzes the recent training run from the logs to confirm:
 6. Prematch models show expected metrics
 """
 
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -326,10 +328,14 @@ def main():
     results = parse_training_logs(str(log_file))
     analyze_results(results)
 
-    # Export metrics for inspection
-    metrics_file = Path("/tmp/training_verification.json")
+    # Export metrics for inspection. "/tmp" is Linux-only; fall back to the
+    # OS temp dir so this runs on Windows too, and allow an explicit override.
     import json
-    with open(metrics_file, "w") as f:
+    metrics_file = Path(os.getenv(
+        "VERIFICATION_OUT",
+        str(Path(tempfile.gettempdir()) / "training_verification.json"),
+    ))
+    with open(metrics_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"Detailed results saved to: {metrics_file}")
 

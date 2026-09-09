@@ -71,7 +71,7 @@ def test_both_call_sites_now_share_one_implementation():
     # through elo_update, so this pins the contract rather than the copies.
     import main
     assert main.elo_update is elo_update
-    src = open("main.py").read()
+    src = open("main.py", encoding="utf-8").read()
     assert "ELO_HOME_ADV" not in src, "main.py is computing Elo itself again"
 
 
