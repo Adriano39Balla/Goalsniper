@@ -89,13 +89,63 @@ try:
 except Exception:
     pass
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
-log = logging.getLogger("goalsniper")
-app = Flask(__name__)
-
-
 def _env_flag(name: str, default: str) -> bool:
     return os.getenv(name, default) not in ("0", "false", "False", "no", "NO")
+
+
+def _setup_logging() -> None:
+    """
+    Route records to stdout/stderr by level, instead of basicConfig's single
+    stderr stream.
+
+    logging.basicConfig() with no `stream=` installs one StreamHandler on
+    sys.stderr for every level. Railway's log pipeline - like most hosted
+    collectors - tags every stderr line severity=error, so INFO and WARNING
+    lines ("[PROD] saved=0 live_seen=14 ...", the per-minute rate-limit
+    notice, the xG-feed warning) all arrived tagged as errors, and a genuine
+    ERROR could not be picked out of that noise. Splitting the streams at
+    ERROR restores true severities. Text format is unchanged, so anything
+    that greps the logs still works; LOG_JSON=1 additionally emits one JSON
+    object per line, with an explicit `level` field, for collectors that
+    parse structured logs instead of text.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    if _env_flag("LOG_JSON", "0"):
+        class _JsonFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                payload = {
+                    "level": record.levelname.lower(),
+                    "severity": record.levelname.lower(),
+                    "logger": record.name,
+                    "message": record.getMessage(),
+                    "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+                }
+                if record.exc_info:
+                    payload["exception"] = self.formatException(record.exc_info)
+                return json.dumps(payload, default=str)
+        fmt: logging.Formatter = _JsonFormatter()
+    else:
+        fmt = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s")
+
+    out = logging.StreamHandler(sys.stdout)
+    out.setLevel(logging.INFO)
+    out.addFilter(lambda r: r.levelno < logging.ERROR)
+    out.setFormatter(fmt)
+    root.addHandler(out)
+
+    err = logging.StreamHandler(sys.stderr)
+    err.setLevel(logging.ERROR)
+    err.setFormatter(fmt)
+    root.addHandler(err)
+
+
+_setup_logging()
+log = logging.getLogger("goalsniper")
+app = Flask(__name__)
 
 
 # ───────── Dashboard session security ─────────
