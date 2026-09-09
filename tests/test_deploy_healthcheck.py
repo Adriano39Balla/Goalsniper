@@ -14,7 +14,7 @@ import main
 
 
 def _healthcheck_path():
-    with open("railway.json") as fh:
+    with open("railway.json", encoding="utf-8") as fh:
         return json.load(fh)["deploy"]["healthcheckPath"]
 
 
