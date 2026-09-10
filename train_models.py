@@ -1074,7 +1074,7 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
                               "effective_target": round(effective_target, 4),
                               "lift_over_base_pp": round(100.0 * (prec - base_rate), 2)}
 
-    best_t, best_prec, best_n = None, -1.0, 0
+    best_prec, best_n = -1.0, 0
     for t in grid:
         pred = (p >= t).astype(int)
         n_pred = int(pred.sum())
@@ -1082,7 +1082,7 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
             continue
         prec = float(precision_score(y, pred, zero_division=0))
         if prec > best_prec:
-            best_prec, best_t, best_n = prec, float(t), n_pred
+            best_prec, best_n = prec, n_pred
 
     diag = {"base_rate": round(base_rate, 4), "effective_target": round(effective_target, 4),
             "best_precision_found": round(best_prec, 4) if best_prec >= 0 else None,
@@ -2080,7 +2080,6 @@ def train_models(
                             len(np.unique(ip_match_ids)), len(df_ip))
                         if ip_weights is not None else "")
 
-            X = df_ip[FEATURES].to_numpy(dtype=float)
             summary["feature_counts"]["inplay"] = len(FEATURES)
             summary["feature_selection"] = {}
             # Measured on the real data, not argued from the code.

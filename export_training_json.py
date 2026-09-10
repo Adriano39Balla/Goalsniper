@@ -57,7 +57,7 @@ def get_db_connection():
         return psycopg2.connect(db_url)
     except psycopg2.Error as e:
         logger.error(f"Failed to connect to database: {e}")
-        raise SystemExit(1)
+        raise SystemExit(1) from e
 
 
 def get_setting(conn, key: str) -> Optional[str]:
@@ -108,7 +108,7 @@ def main():
         # Count unfit heads
         unfit_heads = validation.get("unfit_heads", {})
         if unfit_heads:
-            logger.error(f"Unfit heads (blocked from betting):")
+            logger.error("Unfit heads (blocked from betting):")
             for head, reason in sorted(unfit_heads.items()):
                 logger.error(f"  {head}: {reason}")
         else:

@@ -16,7 +16,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 
 
 def parse_training_logs(log_file: str) -> Dict:
@@ -214,7 +214,7 @@ def analyze_results(results: Dict) -> None:
     print()
 
     if results["flags"]["inplay_suppressed"]:
-        print(f"⚠ In-play markets suppressed due to holdout threshold failures:")
+        print("⚠ In-play markets suppressed due to holdout threshold failures:")
         for market in sorted(set(results["flags"]["inplay_suppressed"])):
             print(f"    {market}")
     else:
@@ -223,7 +223,7 @@ def analyze_results(results: Dict) -> None:
     print()
 
     if results["flags"]["prematch_suppressed"]:
-        print(f"⚠ Prematch markets suppressed (threshold not cleared):")
+        print("⚠ Prematch markets suppressed (threshold not cleared):")
         for market in sorted(set(results["flags"]["prematch_suppressed"])):
             print(f"    {market}")
         print()
@@ -258,7 +258,7 @@ def analyze_results(results: Dict) -> None:
 
     if results["prematch_metrics"].get("fixtures"):
         fixtures = results["prematch_metrics"]["fixtures"]
-        print(f"Prematch fixtures used:")
+        print("Prematch fixtures used:")
         print(f"  Train: {fixtures['train']}")
         print(f"  Cal:   {fixtures['cal']}")
         print(f"  Test:  {fixtures['holdout']}")
@@ -275,7 +275,7 @@ def analyze_results(results: Dict) -> None:
     print()
 
     if results["training_errors"]:
-        print(f"⚠ Errors detected during training:")
+        print("⚠ Errors detected during training:")
         for error in results["training_errors"]:
             print(f"    {error}")
     else:

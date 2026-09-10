@@ -17,7 +17,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import psycopg2
 from dotenv import load_dotenv
@@ -140,7 +140,7 @@ def analyze_metrics() -> None:
                         status = "✓" if p95 < 20 else "⚠" if p95 < 30 else "✗"
                         logger.info(f"  {status} {head:20s} | p95 deviation: {p95:6.2f}pp")
                         if p95 > 30:
-                            logger.error(f"    → Deviation too high for anchored head")
+                            logger.error("    → Deviation too high for anchored head")
         else:
             logger.info("(No market anchoring in this training run)")
 
