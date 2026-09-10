@@ -18,7 +18,7 @@ from __future__ import annotations
 import ast
 import builtins
 import sys
-from typing import Dict, List, Set, Tuple
+from typing import List, Set, Tuple
 
 BUILTINS: Set[str] = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__spec__"}
 

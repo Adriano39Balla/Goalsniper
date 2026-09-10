@@ -76,7 +76,7 @@ from urllib3.util.retry import Retry
 from feature_spec import (
     ELO_DEFAULT,
     DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS,
-    MARKET_ANCHOR, anchor_logit,
+    anchor_logit,
     ODDS_TRUSTED_FROM_TS, RAW_INPLAY_KEYS,
     assemble_prematch_features, build_inplay_features, derive_dc_dnb,
     devig, elo_update, ev as _ev, fixture_ts as _fixture_ts, kelly_fraction,
@@ -3801,7 +3801,7 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
         last_h = [g for g in team_history.get(th, []) if _fixture_ts(g) < cutoff][-5:]
         last_a = [g for g in team_history.get(ta, []) if _fixture_ts(g) < cutoff][-5:]
 
-        def _involves_both(g):
+        def _involves_both(g, th=th, ta=ta):
             hh = ((g.get("teams") or {}).get("home") or {}).get("id")
             aa = ((g.get("teams") or {}).get("away") or {}).get("id")
             return {hh, aa} == {th, ta}
