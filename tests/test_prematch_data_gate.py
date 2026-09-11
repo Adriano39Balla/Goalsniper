@@ -74,11 +74,36 @@ def test_a_defeat_to_nil_still_counts_as_observed():
     assert prematch_data_gate(feat) is None
 
 
-def test_the_gate_blocks_tipping_but_not_harvesting(monkeypatch):
+def test_the_gate_blocks_both_tipping_and_harvesting_of_a_blind_fixture(monkeypatch):
     """
-    The gate governs BETTING only. production_scan() harvests before its
-    coverage gate deliberately — moving collection behind a betting gate once
-    took in-play harvesting down to 1 snapshot in six hours.
+    CORRECTED ASSERTION. This test used to end with
+
+        assert harvested == [77], "harvesting must survive the betting gate"
+
+    on the reasoning that a gate governing BETTING must never switch off data
+    COLLECTION — a real lesson, learned when moving collection behind a
+    betting gate once took in-play harvesting down to 1 snapshot in six hours.
+
+    That lesson is sound and still holds; it was applied to the wrong gate.
+    prematch_data_gate() does not answer "would we bet this?". It answers "did
+    any form data arrive at all?", by testing whether gf, ga, win AND draw are
+    all exactly zero for a side — which, as its own docstring argues, a team
+    that has actually played cannot be. What it flags is not a thin
+    observation, it is the absence of one: the team-form fetches failed and
+    assemble_prematch_features() rendered that as a complete vector of zeros.
+
+    Harvesting it did not grow the training set, it poisoned it —
+    load_prematch_data()'s only filter is `if not feat`, which never fires on
+    a populated-with-zeros vector — and because prematch_snapshots is keyed on
+    match_id and upserts, a rate-limited rescan also CLOBBERED whatever good
+    snapshot was already there. Six hours of production logs on 2026-09-11
+    show 378 such rows written in a single scan.
+
+    The betting-gate lesson is preserved where it actually applies and is
+    pinned by tests/test_empty_observation_not_harvested.py: inplay_data_gate()
+    (xg_feed_dead, too_early, too_late, market_already_settled) still never
+    blocks a harvest, because a fixture with real shots and a dead xG channel
+    is genuinely observed data.
     """
     fx = {"fixture": {"id": 77, "date": "2026-09-01T15:00:00Z"},
           "league": {"id": 5, "country": "X", "name": "Y"},
@@ -98,4 +123,7 @@ def test_the_gate_blocks_tipping_but_not_harvesting(monkeypatch):
 
     assert saved == 0, "a fixture with no form data must not be tipped"
     assert sent == [], "nothing may reach Telegram off an all-zero vector"
-    assert harvested == [77], "harvesting must survive the betting gate"
+    assert harvested == [], (
+        "an all-zero vector is a non-observation, not data — writing it to "
+        "prematch_snapshots poisons the training set and can clobber a good "
+        "snapshot, since that table upserts on match_id")
