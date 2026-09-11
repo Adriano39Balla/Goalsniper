@@ -3206,8 +3206,47 @@ def production_scan() -> Tuple[int, int]:
             # The cadence is stated in TIME, not "the elapsed minute happens to
             # be divisible by 3", because nothing aligns the scan schedule with
             # that arithmetic.
+            # Did any statistics arrive AT ALL? Asked before the harvest, and
+            # the harvest now depends on it.
+            #
+            # THE BUG THIS FIXES. This check used to sit AFTER the harvest
+            # block, with the note "fine to record, not fine to bet on". That
+            # is true of a fixture we refuse to BET — but it is not true of a
+            # fixture we did not OBSERVE, and an all-zero stats vector is the
+            # second thing, not the first. fetch_match_stats() returns [] when
+            # the call failed (rate limit, outage, a league the plan does not
+            # cover), extract_raw_inplay() turns that into zeros for xg, shots,
+            # corners and cards, and save_snapshot_from_match() then wrote that
+            # row into tip_snapshots as though it were a recording of a quiet
+            # match. load_inplay_data() has no coverage filter of its own, so
+            # every one of those rows is fed to the fit as a real observation:
+            # the model is taught what happens "when a match has no shots and
+            # no xG at minute 60", which is a statement about our own blindness
+            # rather than about football.
+            #
+            # Six hours of production logs on 2026-09-11 show the scale:
+            # harvested=5/no_coverage=4, harvested=3/no_coverage=3,
+            # harvested=5/no_coverage=5 — roughly three quarters of everything
+            # harvested in that window carried no usable statistics and went
+            # straight into the training set.
+            #
+            # This is the SAME invariant fetch_odds(), fetch_match_stats() and
+            # _api_last_fixtures() each enforce in their own comments — a
+            # failed call must never be recorded as "nothing was there". Those
+            # three enforce it at the cache layer; it was being violated one
+            # layer further down, at the point of persistence.
+            #
+            # Note what this deliberately does NOT do: inplay_data_gate() —
+            # xg_feed_dead, too_early, too_late, market_already_settled — still
+            # governs BETTING only and still never blocks a harvest. A fixture
+            # with real shot data but a dead xG channel is genuine training
+            # data and is still recorded, which is what
+            # test_harvesting_is_not_blocked_by_the_information_gate pins.
+            coverage_ok = stats_coverage_ok(raw, minute)
+
             is_harvest_tick = (
                 HARVEST_MODE
+                and coverage_ok
                 and minute >= TRAIN_MIN_MINUTE
                 and (now_ts - last_snap.get(fid, 0)) >= HARVEST_EVERY_MINUTES * 60
             )
@@ -3219,10 +3258,7 @@ def production_scan() -> Tuple[int, int]:
                 except Exception as e:
                     log.warning("[HARVEST] snapshot failed for %s: %s", fid, e)
 
-            # Coverage governs TIPPING only. An all-zero stats vector makes the
-            # model output sigmoid(intercept), which carries no match
-            # information — fine to record, not fine to bet on.
-            if not stats_coverage_ok(raw, minute):
+            if not coverage_ok:
                 no_coverage += 1
                 continue
 
@@ -3577,15 +3613,38 @@ def prematch_scan_save() -> int:
         kickoff = _kickoff_ts_of(fx)
         kickoff_txt = _kickoff_berlin(fixture.get("date"))
 
-        if fid in freshly_fetched:
+        # THE BUG THIS FIXES. This used to save unconditionally, on the same
+        # "harvesting is data collection, a betting gate must not switch it
+        # off" reasoning production_scan() states. That reasoning holds for a
+        # gate that answers "would we bet this?" — but prematch_data_gate()
+        # does not answer that. It answers "did any form data arrive at all?",
+        # by testing whether gf, ga, win and draw are ALL exactly zero for a
+        # side, which a team that has actually played cannot be.
+        #
+        # So the rows it flags are not unbettable observations, they are
+        # non-observations: _api_last_fixtures()/_api_h2h() returned [] because
+        # the call failed, and assemble_prematch_features() turned that into a
+        # complete vector of zeros. Saving it wrote that vector into
+        # prematch_snapshots, which is the prematch TRAINING table, and
+        # load_prematch_data()'s only filter is `if not feat` — which never
+        # fires, because the vector is fully populated with zeros rather than
+        # empty.
+        #
+        # Worse, prematch_snapshots is keyed by match_id alone and upserts
+        # (DO UPDATE SET payload=EXCLUDED.payload), so a rate-limited rescan
+        # CLOBBERS a good snapshot with zeros.
+        #
+        # The 2026-09-11 05:54 scan is what this looks like in production: 384
+        # fixtures scanned during a 60-second rate-limit cooldown, "378
+        # fetched" in 3.4 seconds (i.e. not fetched at all — _api_get() was
+        # short-circuiting locally), and 382 flagged no_form_data. Every one of
+        # those was written to the training table.
+        if fid in freshly_fetched and not data_block:
             try:
                 save_prematch_snapshot(fid, feat, kickoff)
             except Exception as e:
                 log.warning("[PREMATCH] snapshot save failed for %s: %s", fid, e)
 
-        # Placed AFTER the harvest for the reason production_scan() states at
-        # length: harvesting is data collection and a gate on BETTING must not
-        # also switch off data collection. Same split, same order.
         if data_block:
             data_gate[data_block] = data_gate.get(data_block, 0) + 1
             continue
