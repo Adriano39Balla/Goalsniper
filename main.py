@@ -173,6 +173,7 @@ TARGET_PRECISION = float(os.getenv("TARGET_PRECISION", "0.60"))
 THRESH_MIN_PREDICTIONS = int(os.getenv("THRESH_MIN_PREDICTIONS", "100"))
 MIN_THRESH = float(os.getenv("MIN_THRESH", "55"))
 MAX_THRESH = float(os.getenv("MAX_THRESH", "85"))
+SUPPRESSED_THRESHOLD_PCT = float(os.getenv("SUPPRESSED_THRESHOLD_PCT", "101.0"))
 
 MOTD_PREDICT = _env_flag("MOTD_PREDICT", "1")
 MOTD_HOUR = int(os.getenv("MOTD_HOUR", "19"))
@@ -707,7 +708,7 @@ def fetch_live_matches() -> List[dict]:
         st = ((m.get("fixture", {}) or {}).get("status", {}) or {})
         elapsed = st.get("elapsed")
         short = (st.get("short") or "").upper()
-        if elapsed is None or elapsed > 120 or short not in INPLAY_STATUSES:
+        if elapsed is None or elapsed > 90 or short not in INPLAY_STATUSES:
             continue
         eligible.append(m)
 
@@ -1970,9 +1971,12 @@ def _get_market_threshold(m: str) -> float:
             return float(v)
     except Exception:
         pass
-    if base in DERIVED_MARKETS:
-        log.debug("[THRESHOLD] %s has no verified threshold — suppressed at %.1f%%", m, MAX_THRESH + 100)
-        return MAX_THRESH + 100.0  # unreachable: never fires
+    directional = (base in ("BTTS Yes", "BTTS No") or
+                   base.startswith("Over ") or base.startswith("Under "))
+    if base in DERIVED_MARKETS or directional:
+        log.debug("[THRESHOLD] %s has no verified threshold — suppressed at %.1f%%",
+                  m, SUPPRESSED_THRESHOLD_PCT)
+        return SUPPRESSED_THRESHOLD_PCT
     return float(CONF_THRESHOLD)
 
 
@@ -2030,11 +2034,12 @@ def _ou_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[st
     out = []
     for line in sorted(coherent):
         p_over = coherent[line]
-        mk = f"Over/Under {_fmt_line(line)}"
-        thr = thr_fn(mk)
-        for sug, p in ((f"Over {_fmt_line(line)} Goals", p_over),
-                       (f"Under {_fmt_line(line)} Goals", 1.0 - p_over)):
-            out.append((mk, sug, p, thr))
+        line_txt = _fmt_line(line)
+        mk = f"Over/Under {line_txt}"
+        over_thr = thr_fn(f"Over {line_txt}")
+        under_thr = thr_fn(f"Under {line_txt}")
+        out.append((mk, f"Over {line_txt} Goals", p_over, over_thr))
+        out.append((mk, f"Under {line_txt} Goals", 1.0 - p_over, under_thr))
     return out
 
 
@@ -2043,8 +2048,10 @@ def _btts_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[
     if not mdl:
         return []
     p = _score_prob(feat, mdl)
-    thr = thr_fn("BTTS")
-    return [("BTTS", "BTTS: Yes", p, thr), ("BTTS", "BTTS: No", 1.0 - p, thr)]
+    yes_thr = thr_fn("BTTS Yes")
+    no_thr = thr_fn("BTTS No")
+    return [("BTTS", "BTTS: Yes", p, yes_thr),
+            ("BTTS", "BTTS: No", 1.0 - p, no_thr)]
 
 
 def _wld_probs(feat: Dict[str, float], prefix: str) -> Optional[Tuple[float, float, float]]:
@@ -3338,10 +3345,12 @@ def auto_train_job():
         if drifted:
             lines.append("⚠️ <b>Miscalibrated heads</b> (holdout predicted − actual):")
             for name, gap in sorted(drifted, key=lambda kv: abs(kv[1]), reverse=True):
-                direction = "over" if gap > 0 else "under"
+                # calibration_gap_pct = actual - predicted. Negative means
+                # predicted > actual (overconfidence); positive means underconfidence.
+                direction = "under" if gap > 0 else "over"
                 lines.append(f"   • {escape(name)}: {gap:+.1f}pp {direction}confident "
                              f"→ EV overstated ~{abs(gap) * 2:.0f}pp at odds 2.0"
-                             if gap > 0 else
+                             if gap < 0 else
                              f"   • {escape(name)}: {gap:+.1f}pp {direction}confident")
             lines.append("   Treat their EV as unproven until the gap closes.")
 
@@ -3352,54 +3361,22 @@ def auto_train_job():
 
 
 def auto_tune_thresholds(days: int = 30) -> Dict[str, float]:
-    """Reads from `predictions` rather than `tips`, so it can observe the region
-    below the current threshold rather than ratcheting in one direction."""
+    """
+    Deliberately disabled as a writer.
+
+    The old routine selected and wrote thresholds from the same rolling
+    predictions sample, bypassing the train/cal/holdout verification used by
+    train_models.py. That can silently re-open a market the training pipeline
+    suppressed. Threshold changes now come only from the validated training
+    path (or an explicitly locked manual setting).
+    """
     if not AUTO_TUNE_ENABLE:
         return {}
-    cutoff = int(time.time()) - days * 86400
-    with db_conn() as c:
-        rows = c.execute("""
-            SELECT p.market, p.suggestion, p.prob,
-                   r.final_goals_h, r.final_goals_a, r.btts_yes
-            FROM predictions p JOIN match_results r ON r.match_id = p.match_id
-            WHERE p.created_ts >= %s AND p.prob IS NOT NULL
-        """, (cutoff,)).fetchall()
-
-    by: Dict[str, List[Tuple[float, int]]] = {}
-    for (mk, sugg, prob, gh, ga, btts) in rows:
-        out = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
-        if out is None:
-            continue
-        by.setdefault(mk, []).append((float(prob), int(out)))
-
-    tuned = {}
-    for mk, arr in by.items():
-        if len(arr) < THRESH_MIN_PREDICTIONS:
-            continue
-        if _is_threshold_locked(mk):
-            log.warning("[AUTO-TUNE] %s is locked — skipping", mk)
-            continue
-        best = None
-        for t_pct in [MIN_THRESH + i for i in range(int(MAX_THRESH - MIN_THRESH) + 1)]:
-            t = t_pct / 100.0
-            sel = [y for (p, y) in arr if p >= t]
-            if len(sel) < THRESH_MIN_PREDICTIONS:
-                continue
-            prec = sum(sel) / len(sel)
-            if prec >= TARGET_PRECISION:
-                best = float(t_pct)
-                break
-        if best is None:
-            continue
-        set_setting(f"conf_threshold:{mk}", f"{best:.2f}")
-        _SETTINGS_CACHE.invalidate(f"conf_threshold:{mk}")
-        tuned[mk] = best
-    if tuned:
-        send_telegram("🔧 Auto-tune updated thresholds:\n" +
-                      "\n".join(f"• {k}: {v:.1f}%" for k, v in tuned.items()))
-    else:
-        send_telegram("🔧 Auto-tune: no updates (insufficient data).")
-    return tuned
+    log.warning("[AUTO-TUNE] write path disabled: thresholds are controlled by "
+                "train_models.py holdout verification. No settings changed.")
+    send_telegram("🔒 Auto-tune made no changes: threshold writes are restricted to the "
+                  "holdout-verified training pipeline.")
+    return {}
 
 
 def retry_unsent_tips(minutes: int = 120, limit: int = 200) -> int:
@@ -3565,7 +3542,7 @@ except Exception as e:
 # ───────── Auth ─────────
 def _require_admin():
     body = request.get_json(silent=True) if request.is_json else None
-    key = (request.headers.get("X-API-Key") or request.args.get("key")
+    key = (request.headers.get("X-API-Key")
            or ((body or {}).get("key") if body else None))
     if not ADMIN_API_KEY or not key or not _safe_compare(key, ADMIN_API_KEY):
         abort(401)
@@ -3629,6 +3606,8 @@ def http_train():
         return jsonify({"ok": False, "reason": "training disabled"}), 400
     try:
         out = train_models()
+        if not out.get("ok"):
+            return jsonify({"ok": False, "result": out}), 500
         _MODELS_CACHE.invalidate()
         _SETTINGS_CACHE.invalidate()
         return jsonify({"ok": True, "result": out})
@@ -3781,8 +3760,8 @@ def http_thresholds():
     it has passed a holdout.
     """
     _require_admin()
-    markets = ["BTTS", "1X2", "Double Chance", "Draw No Bet"] + \
-              [f"Over/Under {_fmt_line(l)}" for l in OU_LINES]
+    markets = ["BTTS Yes", "BTTS No", "1X2", "Double Chance", "Draw No Bet"] + \
+              [x for l in OU_LINES for x in (f"Over {_fmt_line(l)}", f"Under {_fmt_line(l)}")]
     out = {}
     for phase_prefix in ("", "PRE "):
         for mk in markets:
@@ -3794,8 +3773,10 @@ def http_thresholds():
                 "effective_pct": round(effective, 2),
                 "derived_market": mk in DERIVED_MARKETS,
                 "locked": _is_threshold_locked(label),
-                "status": ("SUPPRESSED (never verified)" if raw is None and mk in DERIVED_MARKETS
-                           else "suppressed" if effective >= MAX_THRESH
+                "status": ("SUPPRESSED (never verified)"
+                           if raw is None and (mk in DERIVED_MARKETS or mk in ("BTTS Yes", "BTTS No")
+                                               or mk.startswith("Over ") or mk.startswith("Under "))
+                           else "suppressed" if effective >= SUPPRESSED_THRESHOLD_PCT
                            else "active" if raw is not None
                            else "default (untrained)"),
             }
