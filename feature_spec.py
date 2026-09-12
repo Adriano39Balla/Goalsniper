@@ -7,8 +7,8 @@ Previously main.py's extract_features() and train_models.py's load_inplay_data()
 each contained their own copy of the same ~40 derivations. Any divergence between
 them silently breaks train/serve parity, which is exactly the class of bug that
 produced the "shots on target key never matched" and "weights multiplied by 0.0"
-failures. Both paths now call the SAME functions in this module, so drift is
-structurally impossible rather than merely discouraged.
+failures. Both paths now call the SAME functions in this module, so feature-transformation
+drift is structurally prevented rather than merely discouraged.
 
 DESIGN NOTES ON THE FEATURE LISTS
 ---------------------------------
