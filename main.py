@@ -752,17 +752,39 @@ def send_telegram(text: str) -> bool:
 # level, so a plan running over its daily request cap failed silently with no
 # symptom beyond fewer tips. See /admin/status -> api_usage.
 _api_call_lock = threading.Lock()
-_api_call_stats = {"day": None, "total": 0, "rate_limited": 0}
+_api_call_stats = {
+    "day": None, "total": 0, "rate_limited": 0,
+    "daily_limit": None, "daily_remaining": None,
+    "minute_limit": None, "minute_remaining": None,
+}
 
 
-def _track_api_call(status_code: Optional[int]) -> Dict[str, Any]:
+def _track_api_call(status_code: Optional[int], headers: Optional[Any] = None) -> Dict[str, Any]:
     today = datetime.now(TZ_UTC).strftime("%Y-%m-%d")
     with _api_call_lock:
         if _api_call_stats["day"] != today:
-            _api_call_stats.update(day=today, total=0, rate_limited=0)
+            _api_call_stats.update(
+                day=today, total=0, rate_limited=0,
+                daily_limit=None, daily_remaining=None,
+                minute_limit=None, minute_remaining=None,
+            )
         _api_call_stats["total"] += 1
         if status_code == 429:
             _api_call_stats["rate_limited"] += 1
+        if headers is not None:
+            quota_headers = {
+                "daily_limit": "x-ratelimit-requests-limit",
+                "daily_remaining": "x-ratelimit-requests-remaining",
+                "minute_limit": "x-ratelimit-limit",
+                "minute_remaining": "x-ratelimit-remaining",
+            }
+            for field, header in quota_headers.items():
+                try:
+                    value = headers.get(header)
+                    if value not in (None, ""):
+                        _api_call_stats[field] = int(value)
+                except (TypeError, ValueError, AttributeError):
+                    continue
         return dict(_api_call_stats)
 
 
@@ -776,10 +798,14 @@ def _api_get(url: str, params: dict, timeout: int = 15):
         return None
     try:
         r = session.get(url, headers=HEADERS, params=params, timeout=timeout)
+        stats = _track_api_call(r.status_code, r.headers)
         if r.ok:
-            _track_api_call(None)
-            return r.json()
-        stats = _track_api_call(r.status_code)
+            payload = r.json()
+            api_errors = payload.get("errors") if isinstance(payload, dict) else None
+            if api_errors not in (None, {}, [], ""):
+                log.warning("[API] response errors on %s params=%s: %s",
+                            url, sorted(params), api_errors)
+            return payload
         if r.status_code == 429:
             log.warning("[API] 429 rate-limited on %s (today: %d calls, %d rate-limited)",
                         url, stats["total"], stats["rate_limited"])
@@ -872,7 +898,13 @@ def fetch_match_stats(fid: int) -> list:
         return cached
     js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
     out = js.get("response", []) if isinstance(js, dict) else []
-    STATS_CACHE.set(fid, out)
+    api_errors = js.get("errors") if isinstance(js, dict) else None
+    if api_errors not in (None, {}, [], ""):
+        log.warning("[STATS] fixture %s returned API errors: %s", fid, api_errors)
+    # Cache successful payloads. Do not turn an API error into a 90-second
+    # authoritative empty result: the next scan should be allowed to retry.
+    if not api_errors:
+        STATS_CACHE.set(fid, out)
     return out
 
 
@@ -1027,17 +1059,61 @@ def _num(v) -> float:
         return 0.0
 
 
-def extract_raw_inplay(m: dict) -> Dict[str, float]:
+_STATS_COVERAGE_GROUPS: Dict[str, Tuple[str, ...]] = {
+    "xg": ("Expected Goals", "expected_goals"),
+    "shots_on_goal": ("Shots on Goal",),
+    "corners": ("Corner Kicks",),
+    "possession": ("Ball Possession",),
+    "total_shots": ("Total Shots",),
+    "shots_inside": ("Shots insidebox",),
+    "passes": ("Total passes",),
+    "accurate_passes": ("Passes accurate",),
+    "fouls": ("Fouls",),
+    "saves": ("Goalkeeper Saves",),
+}
+
+
+def _stat_is_present(stats: Dict[str, Any], aliases: Tuple[str, ...]) -> bool:
+    """Presence is not positivity: a supplied value of zero is valid data."""
+    return any(name in stats and stats.get(name) not in (None, "") for name in aliases)
+
+
+def extract_raw_inplay(m: dict) -> Dict[str, Any]:
     """Pull the RAW_INPLAY_KEYS out of an API fixture object. Nothing derived."""
-    home = m["teams"]["home"]["name"]
-    away = m["teams"]["away"]["name"]
-    stats: Dict[str, Dict[str, Any]] = {}
+    home_obj = (m.get("teams") or {}).get("home") or {}
+    away_obj = (m.get("teams") or {}).get("away") or {}
+    home = str(home_obj.get("name") or "")
+    away = str(away_obj.get("name") or "")
+    home_id = int(home_obj.get("id") or 0)
+    away_id = int(away_obj.get("id") or 0)
+    stats_by_id: Dict[int, Dict[str, Any]] = {}
+    stats_by_name: Dict[str, Dict[str, Any]] = {}
     for s in (m.get("statistics") or []):
-        t = (s.get("team") or {}).get("name")
-        if t:
-            stats[t] = {(i.get("type") or ""): i.get("value") for i in (s.get("statistics") or [])}
-    sh = stats.get(home, {}) or {}
-    sa = stats.get(away, {}) or {}
+        team = s.get("team") or {}
+        values = {(i.get("type") or ""): i.get("value")
+                  for i in (s.get("statistics") or []) if isinstance(i, dict) and i.get("type")}
+        team_id = int(team.get("id") or 0)
+        team_name = str(team.get("name") or "").strip().casefold()
+        if team_id:
+            stats_by_id[team_id] = values
+        if team_name:
+            stats_by_name[team_name] = values
+
+    # Stable IDs are authoritative. Names remain as a compatibility fallback
+    # for old/test payloads that do not carry IDs.
+    sh = stats_by_id.get(home_id) if home_id else None
+    sa = stats_by_id.get(away_id) if away_id else None
+    sh = sh if sh is not None else stats_by_name.get(home.strip().casefold(), {})
+    sa = sa if sa is not None else stats_by_name.get(away.strip().casefold(), {})
+    sh = sh or {}
+    sa = sa or {}
+
+    paired_groups = [name for name, aliases in _STATS_COVERAGE_GROUPS.items()
+                     if _stat_is_present(sh, aliases) and _stat_is_present(sa, aliases)]
+    returned_groups = [name for name, aliases in _STATS_COVERAGE_GROUPS.items()
+                       if _stat_is_present(sh, aliases) or _stat_is_present(sa, aliases)]
+    xg_h_available = _stat_is_present(sh, _STATS_COVERAGE_GROUPS["xg"])
+    xg_a_available = _stat_is_present(sa, _STATS_COVERAGE_GROUPS["xg"])
 
     red_h = red_a = 0
     for ev_ in (m.get("events") or []):
@@ -1077,6 +1153,20 @@ def extract_raw_inplay(m: dict) -> Dict[str, float]:
         "passes_a": _num(sa.get("Total passes", 0)),
         "passes_acc_h": _num(sh.get("Passes accurate", 0)),
         "passes_acc_a": _num(sa.get("Passes accurate", 0)),
+        # Serving-only metadata. build_inplay_features() ignores keys outside
+        # RAW_INPLAY_KEYS, so this improves coverage decisions without changing
+        # the trained feature vector or breaking train/serve parity.
+        "_stats_home_found": bool(sh),
+        "_stats_away_found": bool(sa),
+        "_stats_response_teams": len(m.get("statistics") or []),
+        "_stats_paired_fields": len(paired_groups),
+        "_stats_paired_field_names": paired_groups,
+        "_stats_returned_fields": len(returned_groups),
+        "_stats_returned_field_names": returned_groups,
+        "_stats_home_field_names": sorted(sh),
+        "_stats_away_field_names": sorted(sa),
+        "_xg_h_available": xg_h_available,
+        "_xg_a_available": xg_a_available,
     }
 
 
@@ -1090,18 +1180,49 @@ def extract_features(m: dict) -> Tuple[Dict[str, float], Dict[str, float]]:
     return raw, build_inplay_features(raw, lr)
 
 
-def stats_coverage_ok(raw: Dict[str, float], minute: int) -> bool:
-    """Coverage is required from TIP_MIN_MINUTE onward: an all-zero stats vector
-    makes the model output sigmoid(intercept), which carries no match info."""
+def stats_coverage_ok(raw: Dict[str, Any], minute: int) -> bool:
+    """Require real statistic fields, while accepting legitimate zero values."""
     require_from = int(os.getenv("REQUIRE_STATS_MINUTE", str(TIP_MIN_MINUTE)))
     require_fields = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
     if minute < require_from:
         return False
+    if "_stats_paired_fields" in raw:
+        return (bool(raw.get("_stats_home_found"))
+                and bool(raw.get("_stats_away_found"))
+                and int(raw.get("_stats_returned_fields") or 0) >= max(0, require_fields))
+    # Compatibility for historical/test dictionaries without presence
+    # metadata. New live payloads always use the branch above.
     fields = [raw.get("xg_h", 0) + raw.get("xg_a", 0),
               raw.get("sot_h", 0) + raw.get("sot_a", 0),
               raw.get("cor_h", 0) + raw.get("cor_a", 0),
               max(raw.get("pos_h", 0), raw.get("pos_a", 0))]
     return sum(1 for v in fields if (v or 0) > 0) >= max(0, require_fields)
+
+
+def _stats_coverage_details(raw: Dict[str, Any], minute: int) -> Dict[str, Any]:
+    require_from = int(os.getenv("REQUIRE_STATS_MINUTE", str(TIP_MIN_MINUTE)))
+    require_fields = int(os.getenv("REQUIRE_DATA_FIELDS", "2"))
+    covered = stats_coverage_ok(raw, minute)
+    if minute < require_from:
+        reason = "before_required_minute"
+    elif not raw.get("_stats_home_found") or not raw.get("_stats_away_found"):
+        reason = "missing_team_statistics"
+    elif int(raw.get("_stats_returned_fields") or 0) < max(0, require_fields):
+        reason = "too_few_returned_fields"
+    else:
+        reason = "usable"
+    return {
+        "covered": bool(covered), "reason": reason,
+        "response_teams": int(raw.get("_stats_response_teams") or 0),
+        "returned_field_count": int(raw.get("_stats_returned_fields") or 0),
+        "returned_fields": list(raw.get("_stats_returned_field_names") or []),
+        "paired_field_count": int(raw.get("_stats_paired_fields") or 0),
+        "paired_fields": list(raw.get("_stats_paired_field_names") or []),
+        "home_fields": list(raw.get("_stats_home_field_names") or []),
+        "away_fields": list(raw.get("_stats_away_field_names") or []),
+        "xg_home_available": bool(raw.get("_xg_h_available")),
+        "xg_away_available": bool(raw.get("_xg_a_available")),
+    }
 
 
 def _league_name(m: dict) -> Tuple[int, str]:
@@ -2265,7 +2386,11 @@ def _format_tip_message(home, away, league, minute, score, suggestion, prob_pct,
     stat = ""
     if not prematch and any(raw.get(k, 0) for k in ("xg_h", "xg_a", "sot_h", "sot_a", "cor_h", "cor_a",
                                                     "pos_h", "pos_a", "red_h", "red_a")):
-        stat = (f"\n📊 xG {raw.get('xg_h',0):.2f}-{raw.get('xg_a',0):.2f}"
+        xg_h_known = bool(raw.get("_xg_h_available"))
+        xg_a_known = bool(raw.get("_xg_a_available"))
+        xg_h = f"{raw.get('xg_h', 0):.2f}" if xg_h_known else "N/A"
+        xg_a = f"{raw.get('xg_a', 0):.2f}" if xg_a_known else "N/A"
+        stat = (f"\n📊 xG {xg_h}-{xg_a}"
                 f" • SOT {int(raw.get('sot_h',0))}-{int(raw.get('sot_a',0))}"
                 f" • CK {int(raw.get('cor_h',0))}-{int(raw.get('cor_a',0))}")
         if raw.get("pos_h", 0) or raw.get("pos_a", 0):
@@ -2515,7 +2640,7 @@ def _last_snapshot_ts_bulk(fids: List[int]) -> Dict[int, int]:
 # it costs zero extra API calls - it's the same numbers the tipping logic
 # already has, just not thrown away. Backs GET /dashboard/live.
 _live_snapshot_lock = threading.Lock()
-_live_snapshot: Dict[str, Any] = {"updated_ts": 0, "matches": []}
+_live_snapshot: Dict[str, Any] = {"updated_ts": 0, "matches": [], "stats_diagnostics": []}
 
 
 def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, away: str,
@@ -2582,7 +2707,8 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
 
 
 def _set_live_snapshot(matches: List[Dict[str, Any]], live_seen: Optional[int] = None,
-                       no_coverage: Optional[int] = None) -> None:
+                       no_coverage: Optional[int] = None,
+                       stats_diagnostics: Optional[List[Dict[str, Any]]] = None) -> None:
     # live_seen/no_coverage travel with the matches so the dashboard can tell
     # "nothing is being played right now" apart from "plenty is being played,
     # none of it has usable stats yet" - an empty list on its own can't.
@@ -2591,6 +2717,7 @@ def _set_live_snapshot(matches: List[Dict[str, Any]], live_seen: Optional[int] =
         _live_snapshot["matches"] = matches
         _live_snapshot["live_seen"] = live_seen
         _live_snapshot["no_coverage"] = no_coverage
+        _live_snapshot["stats_diagnostics"] = list(stats_diagnostics or [])
 
 
 def _get_live_snapshot() -> Dict[str, Any]:
@@ -2598,7 +2725,33 @@ def _get_live_snapshot() -> Dict[str, Any]:
         return {"updated_ts": _live_snapshot["updated_ts"],
                 "matches": list(_live_snapshot["matches"]),
                 "live_seen": _live_snapshot.get("live_seen"),
-                "no_coverage": _live_snapshot.get("no_coverage")}
+                "no_coverage": _live_snapshot.get("no_coverage"),
+                "stats_diagnostics": list(_live_snapshot.get("stats_diagnostics") or [])}
+
+
+def _live_stats_diagnostic_payload() -> Dict[str, Any]:
+    """Sanitized explanation of statistics coverage from the latest scan."""
+    snap = _get_live_snapshot()
+    rows = snap.get("stats_diagnostics") or []
+    reasons: Dict[str, int] = {}
+    for row in rows:
+        reason = str(row.get("reason") or "unknown")
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return {
+        "updated_ts": snap.get("updated_ts"),
+        "live_seen": snap.get("live_seen"),
+        "diagnosed": len(rows),
+        "usable": sum(1 for row in rows if row.get("covered")),
+        "xg_available_both_teams": sum(
+            1 for row in rows
+            if row.get("xg_home_available") and row.get("xg_away_available")),
+        "reasons": reasons,
+        "fixtures": rows,
+        "api_usage": _api_call_stats_snapshot(),
+        "note": ("Zero is treated as a valid statistic. missing_team_statistics means the API "
+                 "did not return resolvable blocks for both team IDs; too_few_returned_fields "
+                 "means both teams were present but too few recognised statistic groups had values."),
+    }
 
 
 def production_scan() -> Tuple[int, int]:
@@ -2613,6 +2766,7 @@ def production_scan() -> Tuple[int, int]:
     now_ts = int(time.time())
     pred_rows: List[tuple] = []
     live_snapshot_matches: List[Dict[str, Any]] = []
+    stats_diagnostics: List[Dict[str, Any]] = []
     harvested = 0
     no_coverage = 0
     # Tally of _price_gate() outcomes across the whole scan - saved=0 with a
@@ -2635,6 +2789,12 @@ def production_scan() -> Tuple[int, int]:
 
             raw, feat = extract_features(m)
             minute = int(feat.get("minute", 0))
+            league_id, league = _league_name(m)
+            home, away = _teams(m)
+            stat_diag = _stats_coverage_details(raw, minute)
+            stat_diag.update({"fixture_id": fid, "league_id": league_id, "league": league,
+                              "home": home, "away": away, "minute": minute})
+            stats_diagnostics.append(stat_diag)
             if minute < TIP_MIN_MINUTE:
                 continue
 
@@ -2690,8 +2850,6 @@ def production_scan() -> Tuple[int, int]:
                         "AND suggestion<>'HARVEST' LIMIT 1",
                         (fid, now_ts - DUP_COOLDOWN_MIN * 60)).fetchone())
 
-            league_id, league = _league_name(m)
-            home, away = _teams(m)
             score = _pretty_score(m)
             kickoff = _kickoff_ts_of(m)
 
@@ -2782,11 +2940,22 @@ def production_scan() -> Tuple[int, int]:
             continue
 
     _log_predictions(pred_rows)
-    _set_live_snapshot(live_snapshot_matches, live_seen=live_seen, no_coverage=no_coverage)
+    _set_live_snapshot(live_snapshot_matches, live_seen=live_seen, no_coverage=no_coverage,
+                       stats_diagnostics=stats_diagnostics)
     log.info("[PROD] saved=%d live_seen=%d candidates_logged=%d harvested=%d no_coverage=%d",
              saved, live_seen, len(pred_rows), harvested, no_coverage)
     if gate_decisions:
         log.info("[PROD] price_gate: %s", gate_decisions)
+    if stats_diagnostics:
+        reason_counts: Dict[str, int] = {}
+        for row in stats_diagnostics:
+            reason = str(row.get("reason") or "unknown")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        log.info("[STATS] latest scan coverage=%s xg_both=%d/%d",
+                 reason_counts,
+                 sum(1 for row in stats_diagnostics
+                     if row.get("xg_home_available") and row.get("xg_away_available")),
+                 len(stats_diagnostics))
     if live_seen and no_coverage >= live_seen:
         # Every live fixture lacked usable statistics. Harvesting still runs, but
         # the rows are goals/minute only and nothing can be tipped. Usually means
@@ -2797,7 +2966,9 @@ def production_scan() -> Tuple[int, int]:
     return saved, live_seen
 
 
-def score_live_matches_now() -> Tuple[List[Dict[str, Any]], int]:
+def score_live_matches_now(
+    stats_diagnostics_out: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
     """
     Read-only, on-demand equivalent of production_scan()'s live-scoring step:
     fetches whatever is live RIGHT NOW and scores every market for every
@@ -2820,6 +2991,13 @@ def score_live_matches_now() -> Tuple[List[Dict[str, Any]], int]:
                 continue
             raw, feat = extract_features(m)
             minute = int(feat.get("minute", 0))
+            if stats_diagnostics_out is not None:
+                league_id, league = _league_name(m)
+                home, away = _teams(m)
+                stat_diag = _stats_coverage_details(raw, minute)
+                stat_diag.update({"fixture_id": fid, "league_id": league_id, "league": league,
+                                  "home": home, "away": away, "minute": minute})
+                stats_diagnostics_out.append(stat_diag)
             if minute < TIP_MIN_MINUTE or not stats_coverage_ok(raw, minute):
                 continue
 
@@ -4138,6 +4316,13 @@ def http_price_gate():
                         days=_arg_int("days", 7), phase=request.args.get("phase"))})
 
 
+@app.route("/admin/diagnostics/live-stats", methods=["GET"])
+def http_live_stats_diagnostic():
+    """Why each fixture did or did not pass live-statistics coverage."""
+    _require_admin()
+    return jsonify({"ok": True, "live_stats": _live_stats_diagnostic_payload()})
+
+
 @app.route("/admin/diagnostics/calibration", methods=["GET"])
 def http_calibration():
     _require_admin()
@@ -4504,6 +4689,17 @@ def dashboard_live():
     return jsonify({"ok": True, **_get_live_snapshot(), "server_ts": int(time.time())})
 
 
+@app.route("/dashboard/live-stats")
+def dashboard_live_stats():
+    """Phone-friendly statistics diagnostics using the dashboard session."""
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
+    if not _dashboard_authed():
+        abort(401)
+    return jsonify({"ok": True, "live_stats": _live_stats_diagnostic_payload(),
+                    "server_ts": int(time.time())})
+
+
 @app.route("/dashboard/live/refresh", methods=["POST"])
 def dashboard_live_refresh():
     """
@@ -4516,8 +4712,12 @@ def dashboard_live_refresh():
         return _dashboard_unavailable()
     if not _dashboard_authed():
         abort(401)
-    matches, live_seen = score_live_matches_now()
-    _set_live_snapshot(matches, live_seen=live_seen)
+    stats_diagnostics: List[Dict[str, Any]] = []
+    matches, live_seen = score_live_matches_now(stats_diagnostics)
+    no_coverage = sum(1 for row in stats_diagnostics
+                      if row.get("reason") not in ("usable", "before_required_minute"))
+    _set_live_snapshot(matches, live_seen=live_seen, no_coverage=no_coverage,
+                       stats_diagnostics=stats_diagnostics)
     return jsonify({"ok": True, **_get_live_snapshot(), "live_seen": live_seen,
                     "server_ts": int(time.time())})
 
