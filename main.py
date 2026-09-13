@@ -752,6 +752,10 @@ def send_telegram(text: str) -> bool:
 # level, so a plan running over its daily request cap failed silently with no
 # symptom beyond fewer tips. See /admin/status -> api_usage.
 _api_call_lock = threading.Lock()
+_api_pace_lock = threading.Lock()
+_api_next_request_ts = 0.0
+API_MIN_REQUEST_INTERVAL_SEC = max(
+    0.0, float(os.getenv("API_MIN_REQUEST_INTERVAL_SEC", "0.15")))
 _api_call_stats = {
     "day": None, "total": 0, "rate_limited": 0,
     "daily_limit": None, "daily_remaining": None,
@@ -803,10 +807,15 @@ def _api_rate_limit_cooldown(count: bool = True) -> None:
     with _api_call_lock:
         if count:
             _api_call_stats["rate_limited"] += 1
-        # API-Football reports minute-limit failures inside an HTTP 200 body.
-        # A 65-second pause safely crosses that rolling/reset boundary.
+        remaining = _api_call_stats.get("minute_remaining")
+        # A body-level rateLimit error while the response header still reports
+        # substantial minute capacity is a burst throttle, not exhaustion of
+        # the whole minute allowance. Back off briefly. Only wait across a
+        # minute boundary when the provider says no capacity remains (or did
+        # not supply enough information to distinguish the two cases).
+        cooldown_sec = 3.0 if isinstance(remaining, int) and remaining > 0 else 65.0
         _api_call_stats["cooldown_until_ts"] = max(
-            float(_api_call_stats.get("cooldown_until_ts") or 0), time.time() + 65.0)
+            float(_api_call_stats.get("cooldown_until_ts") or 0), time.time() + cooldown_sec)
 
 
 def _api_in_cooldown() -> bool:
@@ -821,10 +830,32 @@ def _is_rate_limit_error(errors: Any) -> bool:
         or "too many requests" in str(errors).lower()
 
 
+def _pace_api_request() -> bool:
+    """Reserve a request-start slot so worker threads cannot hit the API in a burst."""
+    global _api_next_request_ts
+    if _api_in_cooldown():
+        return False
+    with _api_pace_lock:
+        now = time.time()
+        with _api_call_lock:
+            minute_limit = _api_call_stats.get("minute_limit")
+        dynamic_interval = (60.0 / float(minute_limit) * 1.10
+                            if isinstance(minute_limit, int) and minute_limit > 0 else 0.0)
+        interval = max(API_MIN_REQUEST_INTERVAL_SEC, dynamic_interval)
+        slot = max(now, _api_next_request_ts)
+        _api_next_request_ts = slot + interval
+    delay = slot - now
+    if delay > 0:
+        time.sleep(delay)
+    # A request already in flight may have activated cooldown while this
+    # thread waited for its paced slot.
+    return not _api_in_cooldown()
+
+
 def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY:
         return None
-    if _api_in_cooldown():
+    if not _pace_api_request():
         return None
     try:
         r = session.get(url, headers=HEADERS, params=params, timeout=timeout)
