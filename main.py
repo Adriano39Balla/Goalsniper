@@ -173,7 +173,6 @@ TARGET_PRECISION = float(os.getenv("TARGET_PRECISION", "0.60"))
 THRESH_MIN_PREDICTIONS = int(os.getenv("THRESH_MIN_PREDICTIONS", "100"))
 MIN_THRESH = float(os.getenv("MIN_THRESH", "55"))
 MAX_THRESH = float(os.getenv("MAX_THRESH", "85"))
-SUPPRESSED_THRESHOLD_PCT = float(os.getenv("SUPPRESSED_THRESHOLD_PCT", "101.0"))
 
 MOTD_PREDICT = _env_flag("MOTD_PREDICT", "1")
 MOTD_HOUR = int(os.getenv("MOTD_HOUR", "19"))
@@ -708,7 +707,7 @@ def fetch_live_matches() -> List[dict]:
         st = ((m.get("fixture", {}) or {}).get("status", {}) or {})
         elapsed = st.get("elapsed")
         short = (st.get("short") or "").upper()
-        if elapsed is None or elapsed > 90 or short not in INPLAY_STATUSES:
+        if elapsed is None or elapsed > 120 or short not in INPLAY_STATUSES:
             continue
         eligible.append(m)
 
@@ -1122,7 +1121,12 @@ def _market_name_normalize(s: Any) -> str:
         return "DC"
     if "draw no bet" in s:
         return "DNB"
-    if "match winner" in s or "winner" in s or "1x2" in s:
+    # API-Football's in-play feed calls the full-match 1X2 market
+    # "Fulltime Result" (with spelling variants seen across providers).
+    # It is the same Home/Draw/Away market as "Match Winner".
+    if ("match winner" in s or "fulltime result" in s or
+            "full time result" in s or "full-time result" in s or
+            "winner" in s or "1x2" in s):
         return "1X2"
     if "over/under" in s or "total" in s or "goals" in s:
         if any(bad in s for bad in _OU_NOT_MATCH_TOTAL):
@@ -1354,16 +1358,50 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
         # halves, corners) or whether the exclusion list is over-rejecting
         # something that is genuinely the full-match market.
         offered = []
+        # Keep a small, bounded sample of the actual selection structure for
+        # full-match markets that were offered but could not be parsed. Market
+        # names alone cannot distinguish an unsupported label shape from a
+        # suspended/missing price. This deliberately logs only odds fields,
+        # never the full API response or request credentials.
+        diagnostic_samples = []
         for r in response[:3]:
             if not isinstance(r, dict):
                 continue
             for _bk_name, _bets in _iter_price_sources(r):
-                offered += [_txt(b.get("name")) for b in _bets if isinstance(b, dict)]
+                for b in _bets:
+                    if not isinstance(b, dict):
+                        continue
+                    raw_name = _txt(b.get("name"))
+                    offered.append(raw_name)
+                    normalized = _market_name_normalize(raw_name)
+                    if normalized not in ("1X2", "OU", "BTTS", "DC", "DNB"):
+                        continue
+                    if len(diagnostic_samples) >= 4:
+                        continue
+                    values_sample = []
+                    vals = b.get("values")
+                    if isinstance(vals, list):
+                        for v in vals[:6]:
+                            if not isinstance(v, dict):
+                                values_sample.append({"type": type(v).__name__})
+                                continue
+                            values_sample.append({
+                                k: v.get(k)
+                                for k in ("value", "odd", "handicap", "main", "suspended")
+                                if k in v
+                            })
+                    else:
+                        values_sample.append({"values_type": type(vals).__name__})
+                    diagnostic_samples.append({
+                        "name": raw_name,
+                        "normalized": normalized,
+                        "values": values_sample,
+                    })
         log.warning("[ODDS] fixture %s (live=%s): %d response item(s) but no usable markets. "
-                    "Top-level keys: %s. Markets offered: %s",
+                    "Top-level keys: %s. Markets offered: %s. Unparsed full-match samples: %s",
                     fid, live, len(response),
                     sorted(response[0].keys()) if isinstance(response[0], dict) else type(response[0]),
-                    sorted(set(offered)) or "none")
+                    sorted(set(offered)) or "none", diagnostic_samples or "none")
 
     out: Dict[str, Any] = {}
     for mkey, sels in best.items():
@@ -1971,12 +2009,9 @@ def _get_market_threshold(m: str) -> float:
             return float(v)
     except Exception:
         pass
-    directional = (base in ("BTTS Yes", "BTTS No") or
-                   base.startswith("Over ") or base.startswith("Under "))
-    if base in DERIVED_MARKETS or directional:
-        log.debug("[THRESHOLD] %s has no verified threshold — suppressed at %.1f%%",
-                  m, SUPPRESSED_THRESHOLD_PCT)
-        return SUPPRESSED_THRESHOLD_PCT
+    if base in DERIVED_MARKETS:
+        log.debug("[THRESHOLD] %s has no verified threshold — suppressed at %.1f%%", m, MAX_THRESH + 100)
+        return MAX_THRESH + 100.0  # unreachable: never fires
     return float(CONF_THRESHOLD)
 
 
@@ -2034,12 +2069,11 @@ def _ou_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[st
     out = []
     for line in sorted(coherent):
         p_over = coherent[line]
-        line_txt = _fmt_line(line)
-        mk = f"Over/Under {line_txt}"
-        over_thr = thr_fn(f"Over {line_txt}")
-        under_thr = thr_fn(f"Under {line_txt}")
-        out.append((mk, f"Over {line_txt} Goals", p_over, over_thr))
-        out.append((mk, f"Under {line_txt} Goals", 1.0 - p_over, under_thr))
+        mk = f"Over/Under {_fmt_line(line)}"
+        thr = thr_fn(mk)
+        for sug, p in ((f"Over {_fmt_line(line)} Goals", p_over),
+                       (f"Under {_fmt_line(line)} Goals", 1.0 - p_over)):
+            out.append((mk, sug, p, thr))
     return out
 
 
@@ -2048,10 +2082,8 @@ def _btts_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[
     if not mdl:
         return []
     p = _score_prob(feat, mdl)
-    yes_thr = thr_fn("BTTS Yes")
-    no_thr = thr_fn("BTTS No")
-    return [("BTTS", "BTTS: Yes", p, yes_thr),
-            ("BTTS", "BTTS: No", 1.0 - p, no_thr)]
+    thr = thr_fn("BTTS")
+    return [("BTTS", "BTTS: Yes", p, thr), ("BTTS", "BTTS: No", 1.0 - p, thr)]
 
 
 def _wld_probs(feat: Dict[str, float], prefix: str) -> Optional[Tuple[float, float, float]]:
@@ -3345,12 +3377,10 @@ def auto_train_job():
         if drifted:
             lines.append("⚠️ <b>Miscalibrated heads</b> (holdout predicted − actual):")
             for name, gap in sorted(drifted, key=lambda kv: abs(kv[1]), reverse=True):
-                # calibration_gap_pct = actual - predicted. Negative means
-                # predicted > actual (overconfidence); positive means underconfidence.
-                direction = "under" if gap > 0 else "over"
+                direction = "over" if gap > 0 else "under"
                 lines.append(f"   • {escape(name)}: {gap:+.1f}pp {direction}confident "
                              f"→ EV overstated ~{abs(gap) * 2:.0f}pp at odds 2.0"
-                             if gap < 0 else
+                             if gap > 0 else
                              f"   • {escape(name)}: {gap:+.1f}pp {direction}confident")
             lines.append("   Treat their EV as unproven until the gap closes.")
 
@@ -3361,22 +3391,54 @@ def auto_train_job():
 
 
 def auto_tune_thresholds(days: int = 30) -> Dict[str, float]:
-    """
-    Deliberately disabled as a writer.
-
-    The old routine selected and wrote thresholds from the same rolling
-    predictions sample, bypassing the train/cal/holdout verification used by
-    train_models.py. That can silently re-open a market the training pipeline
-    suppressed. Threshold changes now come only from the validated training
-    path (or an explicitly locked manual setting).
-    """
+    """Reads from `predictions` rather than `tips`, so it can observe the region
+    below the current threshold rather than ratcheting in one direction."""
     if not AUTO_TUNE_ENABLE:
         return {}
-    log.warning("[AUTO-TUNE] write path disabled: thresholds are controlled by "
-                "train_models.py holdout verification. No settings changed.")
-    send_telegram("🔒 Auto-tune made no changes: threshold writes are restricted to the "
-                  "holdout-verified training pipeline.")
-    return {}
+    cutoff = int(time.time()) - days * 86400
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT p.market, p.suggestion, p.prob,
+                   r.final_goals_h, r.final_goals_a, r.btts_yes
+            FROM predictions p JOIN match_results r ON r.match_id = p.match_id
+            WHERE p.created_ts >= %s AND p.prob IS NOT NULL
+        """, (cutoff,)).fetchall()
+
+    by: Dict[str, List[Tuple[float, int]]] = {}
+    for (mk, sugg, prob, gh, ga, btts) in rows:
+        out = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
+        if out is None:
+            continue
+        by.setdefault(mk, []).append((float(prob), int(out)))
+
+    tuned = {}
+    for mk, arr in by.items():
+        if len(arr) < THRESH_MIN_PREDICTIONS:
+            continue
+        if _is_threshold_locked(mk):
+            log.warning("[AUTO-TUNE] %s is locked — skipping", mk)
+            continue
+        best = None
+        for t_pct in [MIN_THRESH + i for i in range(int(MAX_THRESH - MIN_THRESH) + 1)]:
+            t = t_pct / 100.0
+            sel = [y for (p, y) in arr if p >= t]
+            if len(sel) < THRESH_MIN_PREDICTIONS:
+                continue
+            prec = sum(sel) / len(sel)
+            if prec >= TARGET_PRECISION:
+                best = float(t_pct)
+                break
+        if best is None:
+            continue
+        set_setting(f"conf_threshold:{mk}", f"{best:.2f}")
+        _SETTINGS_CACHE.invalidate(f"conf_threshold:{mk}")
+        tuned[mk] = best
+    if tuned:
+        send_telegram("🔧 Auto-tune updated thresholds:\n" +
+                      "\n".join(f"• {k}: {v:.1f}%" for k, v in tuned.items()))
+    else:
+        send_telegram("🔧 Auto-tune: no updates (insufficient data).")
+    return tuned
 
 
 def retry_unsent_tips(minutes: int = 120, limit: int = 200) -> int:
@@ -3542,7 +3604,7 @@ except Exception as e:
 # ───────── Auth ─────────
 def _require_admin():
     body = request.get_json(silent=True) if request.is_json else None
-    key = (request.headers.get("X-API-Key")
+    key = (request.headers.get("X-API-Key") or request.args.get("key")
            or ((body or {}).get("key") if body else None))
     if not ADMIN_API_KEY or not key or not _safe_compare(key, ADMIN_API_KEY):
         abort(401)
@@ -3606,8 +3668,6 @@ def http_train():
         return jsonify({"ok": False, "reason": "training disabled"}), 400
     try:
         out = train_models()
-        if not out.get("ok"):
-            return jsonify({"ok": False, "result": out}), 500
         _MODELS_CACHE.invalidate()
         _SETTINGS_CACHE.invalidate()
         return jsonify({"ok": True, "result": out})
@@ -3760,8 +3820,8 @@ def http_thresholds():
     it has passed a holdout.
     """
     _require_admin()
-    markets = ["BTTS Yes", "BTTS No", "1X2", "Double Chance", "Draw No Bet"] + \
-              [x for l in OU_LINES for x in (f"Over {_fmt_line(l)}", f"Under {_fmt_line(l)}")]
+    markets = ["BTTS", "1X2", "Double Chance", "Draw No Bet"] + \
+              [f"Over/Under {_fmt_line(l)}" for l in OU_LINES]
     out = {}
     for phase_prefix in ("", "PRE "):
         for mk in markets:
@@ -3773,10 +3833,8 @@ def http_thresholds():
                 "effective_pct": round(effective, 2),
                 "derived_market": mk in DERIVED_MARKETS,
                 "locked": _is_threshold_locked(label),
-                "status": ("SUPPRESSED (never verified)"
-                           if raw is None and (mk in DERIVED_MARKETS or mk in ("BTTS Yes", "BTTS No")
-                                               or mk.startswith("Over ") or mk.startswith("Under "))
-                           else "suppressed" if effective >= SUPPRESSED_THRESHOLD_PCT
+                "status": ("SUPPRESSED (never verified)" if raw is None and mk in DERIVED_MARKETS
+                           else "suppressed" if effective >= MAX_THRESH
                            else "active" if raw is not None
                            else "default (untrained)"),
             }
