@@ -7,8 +7,8 @@ Previously main.py's extract_features() and train_models.py's load_inplay_data()
 each contained their own copy of the same ~40 derivations. Any divergence between
 them silently breaks train/serve parity, which is exactly the class of bug that
 produced the "shots on target key never matched" and "weights multiplied by 0.0"
-failures. Both paths now call the SAME functions in this module, so feature-transformation
-drift is structurally prevented rather than merely discouraged.
+failures. Both paths now call the SAME functions in this module, so drift is
+structurally impossible rather than merely discouraged.
 
 DESIGN NOTES ON THE FEATURE LISTS
 ---------------------------------
@@ -37,8 +37,19 @@ coefficients (and therefore `feature_importance`) meaningless. Removed:
 Nonlinear derivations (ratios, products, indicators, absolute values) are kept:
 those carry information a linear model cannot recover from the components.
 
-Result: 56 in-play features and 25 prematch features, all of which vary and none
+Result: 56 in-play features and 30 prematch features, all of which vary and none
 of which is a linear function of the others.
+
+PREMATCH MARKET ANCHORING
+-------------------------
+pm_market_fair_* mirror the in-play market_fair_* features below: the
+de-vigged consensus prematch price, passed straight through as a feature
+rather than only used post-hoc by main.py's EV gate. Missing at call time (a
+fixture with no odds fetched yet, or every snapshot harvested before this was
+added) means neutral, not zero — a bare 0.0 would read as "the market says
+this outcome is impossible", which is false and would teach every
+pre-existing snapshot the wrong thing. See assemble_prematch_features()'s
+`market_fair` parameter and NEUTRAL_MARKET_PRIORS below.
 
 SCALING
 -------
@@ -202,6 +213,8 @@ PRE_FEATURES: List[str] = [
     "pm_rest_diff",
     "pm_attack_defense_ratio",
     "pm_league_btts_rate", "pm_league_ov25_rate", "pm_league_ov35_rate",
+    "pm_market_fair_home", "pm_market_fair_draw", "pm_market_fair_away",
+    "pm_market_fair_over25", "pm_market_fair_btts_yes",
 ]
 
 # Which feature holds each league base rate, per phase. Used by the training
@@ -488,10 +501,18 @@ def assemble_prematch_features(
     rating_h: float,
     rating_a: float,
     league_rates: Dict[str, float],
+    market_fair: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """
     Build the prematch feature vector. Single implementation shared by the live
     prematch scan, Match of the Day, and the historical season backfill.
+
+    market_fair: the dict main.py._market_fair_priors() returns (keys
+    market_fair_home/draw/away/over25/btts_yes), or None when unavailable -
+    historical backfill has no odds for past seasons, and a freshly-listed
+    fixture may not be priced yet. Missing keys fall back to
+    NEUTRAL_MARKET_PRIORS, the same "unknown is not impossible" rule
+    build_inplay_features() already applies on the in-play side.
     """
     ov25_h, ov35_h, btts_h = rate_totals(last_h)
     ov25_a, ov35_a, btts_a = rate_totals(last_a)
@@ -508,6 +529,7 @@ def assemble_prematch_features(
         rest_a = max(0.0, (kickoff_ts - form_a["last_ts"]) / 86400.0)
 
     lr = league_rates or DEFAULT_LEAGUE_RATES
+    mf = market_fair or {}
 
     f: Dict[str, float] = {
         "pm_gf_h": form_h["gf"], "pm_ga_h": form_h["ga"],
@@ -528,6 +550,11 @@ def assemble_prematch_features(
         "pm_league_btts_rate": float(lr.get("btts", DEFAULT_LEAGUE_RATES["btts"])),
         "pm_league_ov25_rate": float(lr.get("ov25", DEFAULT_LEAGUE_RATES["ov25"])),
         "pm_league_ov35_rate": float(lr.get("ov35", DEFAULT_LEAGUE_RATES["ov35"])),
+        "pm_market_fair_home": float(mf.get("market_fair_home", NEUTRAL_MARKET_PRIORS["market_fair_home"])),
+        "pm_market_fair_draw": float(mf.get("market_fair_draw", NEUTRAL_MARKET_PRIORS["market_fair_draw"])),
+        "pm_market_fair_away": float(mf.get("market_fair_away", NEUTRAL_MARKET_PRIORS["market_fair_away"])),
+        "pm_market_fair_over25": float(mf.get("market_fair_over25", NEUTRAL_MARKET_PRIORS["market_fair_over25"])),
+        "pm_market_fair_btts_yes": float(mf.get("market_fair_btts_yes", NEUTRAL_MARKET_PRIORS["market_fair_btts_yes"])),
     }
     return {k: float(f.get(k, 0.0)) for k in PRE_FEATURES}
 
