@@ -37,6 +37,36 @@ DASHBOARD ADDITIONS:
      logins fail at random. The dashboard now refuses to start without an
      explicit SECRET_KEY, and the login endpoint is rate-limited.
 
+THIS REVISION ADDS FOUR THINGS, NONE OF WHICH CHANGE HOW AN ALREADY-TIPPED BET
+IS GRADED:
+
+  1. PREMATCH MARKET ANCHORING. extract_prematch_features() now fetches the
+     de-vigged prematch consensus (the same _market_fair_priors() the in-play
+     path already used) and feeds it into assemble_prematch_features() as
+     pm_market_fair_*. The prematch model sees the market's own read for the
+     first time; in-play already had this.
+  2. CONCENTRATION MODE. CONCENTRATION_MODE=1 restricts every candidate-
+     generation call site to an explicit ACTIVE_MARKETS allowlist, and
+     refuses to boot if league scope (LEAGUE_ALLOW_IDS / PREMATCH_LEAGUE_IDS)
+     is left unbounded while it is on — see _enforce_concentration_scope().
+     GET /admin/diagnostics/league-density ranks actual leagues by settled-
+     fixture volume so the ten-or-so kept leagues are a measured choice, not
+     a guess.
+  3. EXECUTION REALISM. fetch_odds() now flags, per selection, whether the
+     best price is corroborated by enough books and isn't a spread outlier
+     against the next-best quote (MIN_BOOKS_FOR_EXECUTION(_LIVE),
+     MAX_EXECUTION_OUTLIER_PCT). _price_gate() refuses to tip on an
+     uncorroborated price — the same failure class as the team-totals
+     contamination fixed above, one level down at the single-book level.
+     NOTE: the live feed is one aggregated source, so it fails the default
+     2-book corroboration bar by construction — see MIN_BOOKS_FOR_EXECUTION_LIVE.
+  4. CLV AND LEAGUE-DENSITY DIAGNOSTICS. compute_clv_breakdown() slices the
+     clv_pct already captured by capture_closing_lines() by (market, league)
+     with a 95% CI, so a pocket of real edge is visible even inside a pooled
+     mean of zero. compute_league_density() ranks leagues by actual settled-
+     fixture volume for choosing CONCENTRATION_MODE's league list. See
+     GET /admin/diagnostics/clv-breakdown and GET /admin/diagnostics/league-density.
+
 Requires DATABASE_URL and API_KEY.
 """
 from __future__ import annotations
@@ -227,6 +257,52 @@ MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
 # full knowledge that a single source's overround is not a consensus.
 MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE",
                                         str(MIN_BOOKS_FOR_FAIR)))
+
+# ───────── Execution realism ─────────
+# MIN_BOOKS_FOR_FAIR governs whether a price is trustworthy enough to call
+# "the market's fair read" (the EV/edge benchmark). It says nothing about
+# whether the BEST price itself — the number a bet actually settles at — was
+# real and takeable. fetch_odds() keeps a running max() over whichever books
+# happen to be quoting a selection; a single book spiking a stale or fat-
+# fingered quote wins that max unconditionally and becomes both the recorded
+# tip price and the P&L settlement price for that bet. This is the same
+# failure class as the team-totals contamination already fixed in this file
+# (_market_name_normalize / _OU_NOT_MATCH_TOTAL) — a wrong price winning a
+# comparison it should never have been eligible for — just one level down:
+# there the wrong MARKET won the max, here a single uncorroborated BOOK does.
+#
+# Two independent checks, both applied to the specific selection being
+# priced (not the market as a whole) — see fetch_odds()'s "executability"
+# block and _price_gate()'s use of it:
+#   1. CORROBORATION: at least MIN_BOOKS_FOR_EXECUTION books must be quoting
+#      that exact selection. A price only one book is offering is a price
+#      nobody else in the market agrees exists.
+#   2. OUTLIER SPREAD: the best price cannot exceed the SECOND-best price by
+#      more than MAX_EXECUTION_OUTLIER_PCT. A price 40% above the next-best
+#      quote is far more likely to be a stale or broken feed than a genuine
+#      standout offer — real cross-book spreads on liquid markets are a few
+#      percent, not tens of percent.
+# A selection failing either check is not un-bettable — the fair-price
+# benchmark and EV gate above are untouched — it just cannot be the price
+# EXECUTED AND GRADED AT.
+MIN_BOOKS_FOR_EXECUTION = int(os.getenv("MIN_BOOKS_FOR_EXECUTION", "2"))
+# Same in-play caveat as MIN_BOOKS_FOR_FAIR_LIVE, and it bites immediately:
+# the live feed is ONE aggregated source (see LIVE_FEED_BOOK below), so every
+# in-play selection has exactly one book by construction and will fail this
+# at its default of 2. Set MIN_BOOKS_FOR_EXECUTION_LIVE=1 to accept the
+# in-play feed's own price uncorroborated — the outlier check then has
+# nothing to compare against either, so accepting it is a deliberate,
+# explicit trade-off, not a silent gap. Defaults strict so nothing loosens
+# by itself, matching MIN_BOOKS_FOR_FAIR_LIVE's own default.
+MIN_BOOKS_FOR_EXECUTION_LIVE = int(os.getenv("MIN_BOOKS_FOR_EXECUTION_LIVE",
+                                             str(MIN_BOOKS_FOR_EXECUTION)))
+MAX_EXECUTION_OUTLIER_PCT = float(os.getenv("MAX_EXECUTION_OUTLIER_PCT", "15.0"))
+# Mirrors REQUIRE_FAIR_PRICE's shape: 1 means a candidate whose price fails
+# corroboration or the outlier check is rejected outright (the decision
+# string reflects which); 0 means the check still runs and is logged but
+# never blocks a tip.
+REQUIRE_EXECUTABLE_PRICE = _env_flag("REQUIRE_EXECUTABLE_PRICE", "1")
+
 ODDS_BOOKMAKER_ID = os.getenv("ODDS_BOOKMAKER_ID")
 ALLOW_TIPS_WITHOUT_ODDS = _env_flag("ALLOW_TIPS_WITHOUT_ODDS", "0")
 
@@ -278,6 +354,75 @@ _GOALS_DOWN = {"BTTS: No"} | {f"Under {_fmt_line(l)} Goals" for l in OU_LINES}
 _HOME_SIDE = {"Home Win", "Double Chance: 1X", "Double Chance: 12", "Draw No Bet: Home"}
 _AWAY_SIDE = {"Away Win", "Double Chance: X2", "Double Chance: 12", "Draw No Bet: Away"}
 _CORRELATION_FAMILIES = (_GOALS_UP, _GOALS_DOWN, _HOME_SIDE, _AWAY_SIDE)
+
+# ───────── Concentration mode ─────────
+# A solo operator spreading pre+in-play x 7 markets x every league in the
+# world thins the data behind every individual head. CONCENTRATION_MODE lets
+# the operator explicitly commit to a subset of markets, enforced at every
+# candidate-generation call site (see _market_active()) rather than only
+# documented as a recommendation nobody re-checks later. It does NOT choose
+# which LEAGUES to keep — that needs real numbers, not a guess (see
+# compute_league_density() / GET /admin/diagnostics/league-density) — but it
+# does refuse to boot if concentration is on while league scope
+# (LEAGUE_ALLOW_IDS / PREMATCH_LEAGUE_IDS) is left unbounded, since "I turned
+# on concentration" while still scanning every league worldwide is exactly
+# the failure mode this exists to prevent. See _enforce_concentration_scope(),
+# called once at boot.
+CONCENTRATION_MODE = _env_flag("CONCENTRATION_MODE", "0")
+
+# Canonical bare market names — no "PRE " prefix, since that is a phase tag
+# concatenated only at the DB-insert call sites in prematch_scan_save()
+# (f"PRE {mk}") and in Telegram/dashboard formatting; it is never part of a
+# candidate tuple's market_text (see _ou_candidates/_btts_candidates/
+# _wld_candidates/_dc_dnb_candidates, which all emit bare names in both
+# phases). _market_family() strips it defensively anyway, for any caller
+# that passes an already phase-tagged string from tips/predictions.
+#
+# Mirrors http_thresholds()'s local `markets` list below — kept as an
+# independent literal rather than shared, so a future change to one cannot
+# silently reorder the other's JSON output.
+_ALL_MARKET_FAMILIES = (
+    {"BTTS", "1X2", "Double Chance", "Draw No Bet"}
+    | {f"Over/Under {_fmt_line(l)}" for l in OU_LINES}
+)
+
+_DEFAULT_ACTIVE_MARKETS = "BTTS,Over/Under 2.5"
+
+
+def _parse_active_markets(env_val: str) -> set:
+    names = {m.strip() for m in (env_val or "").split(",") if m.strip()}
+    unknown = names - _ALL_MARKET_FAMILIES
+    if unknown:
+        raise SystemExit(
+            f"ACTIVE_MARKETS contains unrecognised market(s): {sorted(unknown)}. "
+            f"Valid values: {sorted(_ALL_MARKET_FAMILIES)}")
+    return names
+
+
+# Only consulted when CONCENTRATION_MODE=1. Comma-separated bare market names
+# from _ALL_MARKET_FAMILIES, e.g. "BTTS,Over/Under 2.5,1X2". Deliberately
+# narrow by default (two markets) — concentration mode exists to force a real
+# choice, not to default to "everything" under a new setting's name.
+ACTIVE_MARKETS = (_parse_active_markets(os.getenv("ACTIVE_MARKETS", _DEFAULT_ACTIVE_MARKETS))
+                  if CONCENTRATION_MODE else set(_ALL_MARKET_FAMILIES))
+
+# Upper bound on distinct league IDs when concentration is on, enforced at
+# boot against LEAGUE_ALLOW_IDS / PREMATCH_LEAGUE_IDS (see
+# _enforce_concentration_scope()). A hard SystemExit rather than a log
+# warning, because a boot-time check nobody re-reads after a Railway restart
+# is not a check.
+MAX_ACTIVE_LEAGUES = int(os.getenv("MAX_ACTIVE_LEAGUES", "10"))
+
+
+def _market_family(market_text: str) -> str:
+    """Bare market name from a candidate/tip/prediction market string."""
+    return market_text[4:] if market_text.startswith("PRE ") else market_text
+
+
+def _market_active(market_text: str) -> bool:
+    """True unless CONCENTRATION_MODE has explicitly excluded this market."""
+    return _market_family(market_text) in ACTIVE_MARKETS
+
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -649,6 +794,12 @@ def _api_get(url: str, params: dict, timeout: int = 15):
 _BLOCK_PATTERNS = ["u17", "u18", "u19", "u20", "u21", "u23", "youth", "junior",
                    "reserve", "res.", "friendlies", "friendly"]
 
+# Module-level (not re-read per call) so _enforce_concentration_scope() can
+# validate them once at boot. Behaviour-identical to the old per-call
+# os.getenv() reads: these env vars never change during the process's life.
+LEAGUE_ALLOW_IDS = [x.strip() for x in os.getenv("LEAGUE_ALLOW_IDS", "").split(",") if x.strip()]
+LEAGUE_DENY_IDS = [x.strip() for x in os.getenv("LEAGUE_DENY_IDS", "").split(",") if x.strip()]
+
 
 def _blocked_league(league_obj: dict) -> bool:
     """
@@ -663,14 +814,48 @@ def _blocked_league(league_obj: dict) -> bool:
     """
     lg = league_obj or {}
     league_id = str(lg.get("id") or "")
-    allow = [x.strip() for x in os.getenv("LEAGUE_ALLOW_IDS", "").split(",") if x.strip()]
-    if allow:
-        return league_id not in allow
+    if LEAGUE_ALLOW_IDS:
+        return league_id not in LEAGUE_ALLOW_IDS
     txt = f"{lg.get('country','')} {lg.get('name','')} {lg.get('type','')}".lower()
     if any(p in txt for p in _BLOCK_PATTERNS):
         return True
-    deny = [x.strip() for x in os.getenv("LEAGUE_DENY_IDS", "").split(",") if x.strip()]
-    return league_id in deny
+    return league_id in LEAGUE_DENY_IDS
+
+
+def _enforce_concentration_scope() -> None:
+    """
+    CONCENTRATION_MODE is a promise to run fewer markets across fewer
+    leagues, not just fewer markets. An operator who turns concentration on
+    but leaves league scope unbounded has kept exactly the thin-data problem
+    ACTIVE_MARKETS was meant to fix — just on the league axis instead of the
+    market axis — and nothing else in this file would ever say so. This is
+    that check, run once at boot, hard-failing rather than warning: a log
+    line nobody re-reads after a Railway restart is not a check.
+
+    LEAGUE_ALLOW_IDS bounds in-play scope (_blocked_league). PREMATCH_LEAGUE_IDS
+    bounds prematch scope (_collect_todays_prematch_fixtures). Historical
+    backfill (backfill_historical_prematch) takes an explicit league argument
+    per call and is exempt — it is never scanned continuously, so it cannot
+    thin live data collection the way an unbounded scan does.
+    """
+    if not CONCENTRATION_MODE:
+        return
+    if not LEAGUE_ALLOW_IDS and not PREMATCH_LEAGUE_IDS:
+        raise SystemExit(
+            "CONCENTRATION_MODE=1 but neither LEAGUE_ALLOW_IDS nor PREMATCH_LEAGUE_IDS is set — "
+            "in-play and prematch scans would still cover every league worldwide. Set one or "
+            "both to your chosen league IDs (see GET /admin/diagnostics/league-density to pick "
+            "them from actual settled-fixture volume), or set CONCENTRATION_MODE=0.")
+    for name, ids in (("LEAGUE_ALLOW_IDS", LEAGUE_ALLOW_IDS),
+                      ("PREMATCH_LEAGUE_IDS", [str(x) for x in PREMATCH_LEAGUE_IDS])):
+        if ids and len(set(ids)) > MAX_ACTIVE_LEAGUES:
+            raise SystemExit(
+                f"CONCENTRATION_MODE=1 but {name} lists {len(set(ids))} leagues, over "
+                f"MAX_ACTIVE_LEAGUES={MAX_ACTIVE_LEAGUES}. Narrow it, or raise "
+                f"MAX_ACTIVE_LEAGUES if that ceiling is intentional.")
+    log.info("[CONCENTRATION] on — active_markets=%s league_allow=%d prematch_leagues=%d "
+             "max_active_leagues=%d", sorted(ACTIVE_MARKETS), len(LEAGUE_ALLOW_IDS),
+             len(PREMATCH_LEAGUE_IDS), MAX_ACTIVE_LEAGUES)
 
 
 def _kickoff_ts_of(fx: dict) -> int:
@@ -1121,12 +1306,7 @@ def _market_name_normalize(s: Any) -> str:
         return "DC"
     if "draw no bet" in s:
         return "DNB"
-    # API-Football's in-play feed calls the full-match 1X2 market
-    # "Fulltime Result" (with spelling variants seen across providers).
-    # It is the same Home/Draw/Away market as "Match Winner".
-    if ("match winner" in s or "fulltime result" in s or
-            "full time result" in s or "full-time result" in s or
-            "winner" in s or "1x2" in s):
+    if "match winner" in s or "winner" in s or "1x2" in s:
         return "1X2"
     if "over/under" in s or "total" in s or "goals" in s:
         if any(bad in s for bad in _OU_NOT_MATCH_TOTAL):
@@ -1261,12 +1441,59 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
 _MARKET_SELECTION_COUNT = {"BTTS": 2, "1X2": 3, "DC": 3, "DNB": 2}
 
 
+def _selection_executability(book_prices: Dict[str, float], min_books: int) -> Dict[str, Any]:
+    """
+    Whether a selection's BEST price is real and takeable, as distinct from
+    whether it is a good price to bet against (that's the fair-price/EV gate
+    below).
+
+    fetch_odds() keeps a running max() over whichever books happen to be
+    quoting a given selection. A single stale or fat-fingered quote wins that
+    max unconditionally, and the winning number becomes both the tip's
+    recorded price and — via compute_pnl/compute_market_significance/
+    monte_carlo_bankroll — the price it is graded against. That is the same
+    failure class as the team-totals contamination fixed elsewhere in this
+    file (a wrong candidate winning a max() it should never have been
+    eligible for), one level down: there the wrong MARKET won: here a single
+    uncorroborated BOOK does.
+
+    Two independent, cheap checks:
+      - corroboration: at least min_books distinct books quote this EXACT
+        selection (not just the market — a book can quote Home/Away in a
+        1X2 market while never quoting Draw at all).
+      - outlier spread: the best price does not exceed the second-best price
+        by more than MAX_EXECUTION_OUTLIER_PCT. With fewer than two prices
+        there is nothing to compare, so this check is silently skipped
+        (not failed) — corroboration alone governs that case.
+    """
+    n = len(book_prices)
+    if n == 0:
+        return {"n_books": 0, "best_odds": None, "second_best_odds": None,
+                "outlier_pct": None, "executable": False}
+    sorted_odds = sorted(book_prices.values(), reverse=True)
+    best_o = sorted_odds[0]
+    second_o = sorted_odds[1] if n >= 2 else None
+    outlier_pct = None
+    outlier_ok = True
+    if second_o is not None and second_o > 0:
+        outlier_pct = round((best_o / second_o - 1.0) * 100.0, 2)
+        outlier_ok = outlier_pct <= MAX_EXECUTION_OUTLIER_PCT
+    executable = (n >= min_books) and outlier_ok
+    return {"n_books": n, "best_odds": round(best_o, 4),
+            "second_best_odds": round(second_o, 4) if second_o is not None else None,
+            "outlier_pct": outlier_pct, "executable": executable}
+
+
 def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     """
     Returns, per market key:
       {"best": {selection: {"odds": float, "book": str}},
        "fair": {selection: float},          # consensus de-vigged probability
-       "n_books": int}
+       "n_books": int,
+       "by_book": {selection: {book_name: odds}},
+       "executability": {selection: {                    # NEW
+           "n_books": int, "best_odds": float, "second_best_odds": float|None,
+           "outlier_pct": float|None, "executable": bool}}}
 
     De-vigging happens WITHIN each bookmaker's complete market (de-vigging
     across best-of-many-books prices would produce a fake sub-1.0 overround and
@@ -1275,6 +1502,11 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
 
     FIX: the market total is now looked up per market rather than assumed to be
     1.0. Double Chance sums to 2.0 — see feature_spec.devig().
+
+    "executability" governs whether the price in "best" is corroborated and
+    non-outlying enough to actually bet at and grade against — separate from
+    whether "fair"/n_books says it's a good price to bet against. See
+    _selection_executability() and _price_gate()'s use of this block.
     """
     key = (fid, bool(live))
     cached = ODDS_CACHE.get(key, _MISS)
@@ -1358,56 +1590,26 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
         # halves, corners) or whether the exclusion list is over-rejecting
         # something that is genuinely the full-match market.
         offered = []
-        # Keep a small, bounded sample of the actual selection structure for
-        # full-match markets that were offered but could not be parsed. Market
-        # names alone cannot distinguish an unsupported label shape from a
-        # suspended/missing price. This deliberately logs only odds fields,
-        # never the full API response or request credentials.
-        diagnostic_samples = []
         for r in response[:3]:
             if not isinstance(r, dict):
                 continue
             for _bk_name, _bets in _iter_price_sources(r):
-                for b in _bets:
-                    if not isinstance(b, dict):
-                        continue
-                    raw_name = _txt(b.get("name"))
-                    offered.append(raw_name)
-                    normalized = _market_name_normalize(raw_name)
-                    if normalized not in ("1X2", "OU", "BTTS", "DC", "DNB"):
-                        continue
-                    if len(diagnostic_samples) >= 4:
-                        continue
-                    values_sample = []
-                    vals = b.get("values")
-                    if isinstance(vals, list):
-                        for v in vals[:6]:
-                            if not isinstance(v, dict):
-                                values_sample.append({"type": type(v).__name__})
-                                continue
-                            values_sample.append({
-                                k: v.get(k)
-                                for k in ("value", "odd", "handicap", "main", "suspended")
-                                if k in v
-                            })
-                    else:
-                        values_sample.append({"values_type": type(vals).__name__})
-                    diagnostic_samples.append({
-                        "name": raw_name,
-                        "normalized": normalized,
-                        "values": values_sample,
-                    })
+                offered += [_txt(b.get("name")) for b in _bets if isinstance(b, dict)]
         log.warning("[ODDS] fixture %s (live=%s): %d response item(s) but no usable markets. "
-                    "Top-level keys: %s. Markets offered: %s. Unparsed full-match samples: %s",
+                    "Top-level keys: %s. Markets offered: %s",
                     fid, live, len(response),
                     sorted(response[0].keys()) if isinstance(response[0], dict) else type(response[0]),
-                    sorted(set(offered)) or "none", diagnostic_samples or "none")
+                    sorted(set(offered)) or "none")
 
+    min_books_exec = MIN_BOOKS_FOR_EXECUTION_LIVE if live else MIN_BOOKS_FOR_EXECUTION
     out: Dict[str, Any] = {}
     for mkey, sels in best.items():
         fair = {k: (sum(v) / len(v)) for k, v in (fair_acc.get(mkey) or {}).items() if v}
+        by_book_mkey = by_book.get(mkey, {})
+        executability = {name: _selection_executability(by_book_mkey.get(name, {}), min_books_exec)
+                         for name in sels}
         out[mkey] = {"best": sels, "fair": fair, "n_books": len(books_seen.get(mkey, ())),
-                     "by_book": by_book.get(mkey, {})}
+                     "by_book": by_book_mkey, "executability": executability}
     ODDS_CACHE.set(key, out)
     return out
 
@@ -1487,10 +1689,18 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
     Gates, in order:
       1. odds exist (unless ALLOW_TIPS_WITHOUT_ODDS)
       2. odds within [min_for_market, MAX_ODDS_ALL]
-      3. a de-vigged fair price is computable (unless REQUIRE_FAIR_PRICE=0)
-      4. EV at the available price >= EDGE_MIN_BPS
-      5. edge over the fair price >= FAIR_EDGE_MIN_BPS
-      6. edge over the fair price <= MAX_MODEL_EDGE_BPS  (model-sanity cap)
+      3. the best price is EXECUTABLE — corroborated by enough books and not
+         an outlier spread against the next-best quote (unless
+         REQUIRE_EXECUTABLE_PRICE=0). See fetch_odds()'s "executability"
+         block and the MIN_BOOKS_FOR_EXECUTION(_LIVE) / MAX_EXECUTION_OUTLIER_PCT
+         module comment for why this is separate from the fair-price checks
+         below: a price can be a legitimate value the fair-price benchmark is
+         happy to bet against while still being a single stale quote that was
+         never actually takeable at that number.
+      4. a de-vigged fair price is computable (unless REQUIRE_FAIR_PRICE=0)
+      5. EV at the available price >= EDGE_MIN_BPS
+      6. edge over the fair price >= FAIR_EDGE_MIN_BPS
+      7. edge over the fair price <= MAX_MODEL_EDGE_BPS  (model-sanity cap)
     """
     res = PriceCheck(passed=False, odds=None, book=None, fair_prob=None,
                      ev_pct=None, decision="no_odds", n_books=0)
@@ -1516,6 +1726,17 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
     if not (_min_odds_for_market(market_text.replace("PRE ", "")) <= odds <= MAX_ODDS_ALL):
         res["decision"] = "odds_out_of_range"
         return res
+
+    exec_info = (entry.get("executability") or {}).get(sel) or {}
+    min_books_exec = MIN_BOOKS_FOR_EXECUTION_LIVE if live else MIN_BOOKS_FOR_EXECUTION
+    res["execution_n_books"] = int(exec_info.get("n_books") or 0)
+    res["execution_outlier_pct"] = exec_info.get("outlier_pct")
+    if not exec_info.get("executable", False):
+        res["decision"] = ("too_few_books_for_execution"
+                           if res["execution_n_books"] < min_books_exec
+                           else "execution_price_outlier")
+        if REQUIRE_EXECUTABLE_PRICE:
+            return res
 
     fair = (entry.get("fair") or {}).get(sel)
     if fair is None:
@@ -1904,8 +2125,12 @@ def compute_price_gate_breakdown(days: Optional[int] = None,
                           "treat tipped_pct as an upper bound."),
         "reading_note": ("no_odds / too_few_books dominating means the market has no usable "
                          "depth for these fixtures — the answer is league scope, not looser "
-                         "EV gates. ev_below_min / fair_edge_below_min dominating means the "
-                         "model agrees with the market and there is genuinely no edge to bet."),
+                         "EV gates. too_few_books_for_execution / execution_price_outlier "
+                         "dominating means prices exist but aren't corroborated well enough to "
+                         "actually execute at — see MIN_BOOKS_FOR_EXECUTION(_LIVE) and "
+                         "MAX_EXECUTION_OUTLIER_PCT. ev_below_min / fair_edge_below_min "
+                         "dominating means the model agrees with the market and there is "
+                         "genuinely no edge to bet."),
     }
 
 
@@ -1936,6 +2161,62 @@ def compute_clv(days: Optional[int] = None) -> Dict[str, Any]:
             "note": "mean_clv_pct > 0 sustained over a few hundred prematch bets is the "
                     "strongest available evidence of a real edge. Negative CLV with positive "
                     "ROI means you have been lucky, not right. Prematch only."}
+
+
+def compute_clv_breakdown(days: Optional[int] = None, min_n: int = 20) -> Dict[str, Any]:
+    """
+    CLV per (market, league), with a 95% CI on the mean — the same clv_pct
+    values compute_clv() already pools, sliced finely enough to say WHICH
+    combination has edge instead of one aggregate that can hide a strong
+    pocket and a bleeding one inside a mean of zero. clv_pct is only ever set
+    by capture_closing_lines(), which is prematch-only by construction, so no
+    is_prematch filter is needed here.
+    """
+    cutoff = int(time.time()) - days * 86400 if days else 0
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT market, league, clv_pct FROM tips
+            WHERE clv_pct IS NOT NULL AND created_ts >= %s
+        """, (cutoff,)).fetchall()
+
+    if not rows:
+        return {"n": 0, "note": "No closing prices captured yet."}
+
+    by: Dict[Tuple[str, str], List[float]] = {}
+    for mkt, league, clv in rows:
+        by.setdefault((mkt or "?", league or "?"), []).append(float(clv))
+
+    def _ci95(v: List[float]) -> Tuple[float, float]:
+        n = len(v)
+        mean = sum(v) / n
+        if n < 2:
+            return (round(mean, 2), round(mean, 2))
+        var = sum((x - mean) ** 2 for x in v) / (n - 1)
+        se = math.sqrt(var / n)
+        return (round(mean - 1.96 * se, 2), round(mean + 1.96 * se, 2))
+
+    out = []
+    for (mkt, league), vals in by.items():
+        n = len(vals)
+        mean = sum(vals) / n
+        lo, hi = _ci95(vals)
+        out.append({
+            "market": mkt, "league": league, "n": n,
+            "mean_clv_pct": round(mean, 2),
+            "ci95_low": lo, "ci95_high": hi,
+            "beat_close_pct": round(100.0 * sum(1 for x in vals if x > 0) / n, 1),
+            "below_min_n": n < min_n,
+        })
+    out.sort(key=lambda d: (d["below_min_n"], -d["mean_clv_pct"]))
+
+    return {
+        "window_days": days, "min_n": min_n, "n_combinations": len(out),
+        "breakdown": out,
+        "note": ("mean_clv_pct is the number to act on: sustained positive CLV is evidence of "
+                 "real edge; sustained negative CLV means retire that market/league even if its "
+                 "ROI looks fine — ROI without positive CLV is variance, not skill. "
+                 "below_min_n=true rows are too thin to trust regardless of what the CI says."),
+    }
 
 
 # ───────── Message formatting ─────────
@@ -2375,7 +2656,8 @@ def production_scan() -> Tuple[int, int]:
                           + _wld_candidates(feat, "", _get_market_threshold)
                           + _dc_dnb_candidates(feat, "", _get_market_threshold))
             candidates = [c for c in candidates
-                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)]
+                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
+                          and _market_active(c[0])]
             candidates.sort(key=lambda x: x[2], reverse=True)
 
             # Full breakdown for the dashboard, independent of whether any of
@@ -2507,7 +2789,8 @@ def score_live_matches_now() -> Tuple[List[Dict[str, Any]], int]:
                           + _wld_candidates(feat, "", _get_market_threshold)
                           + _dc_dnb_candidates(feat, "", _get_market_threshold))
             candidates = [c for c in candidates
-                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)]
+                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
+                          and _market_active(c[0])]
             candidates.sort(key=lambda x: x[2], reverse=True)
 
             home_id, away_id = _team_ids(m)
@@ -2581,8 +2864,17 @@ def extract_prematch_features(fx: dict) -> Dict[str, float]:
     league_id = ((fx.get("league") or {}).get("id"))
     lr = get_league_rates(int(league_id) if league_id else None)
     kickoff = _fixture_ts(fx) or time.time()
+    fid = int((fx.get("fixture") or {}).get("id") or 0)
+    # Same market anchor the in-play path already has via extract_features()'s
+    # call to _market_fair_priors(). Costs one more fetch_odds() call per
+    # SCANNED fixture (not just per tip) on a cold ODDS_CACHE; the repeat
+    # lookup _price_gate() makes later for the same fixture is absorbed by
+    # that cache. Reconsider the cost if PREMATCH_LEAGUE_IDS ever goes
+    # worldwide again.
+    market_fair = _market_fair_priors(fid, live=False) if fid else None
     return assemble_prematch_features(th, ta, last_h, last_a, h2h, kickoff,
-                                      ratings.get(th, ELO_DEFAULT), ratings.get(ta, ELO_DEFAULT), lr)
+                                      ratings.get(th, ELO_DEFAULT), ratings.get(ta, ELO_DEFAULT), lr,
+                                      market_fair=market_fair)
 
 
 def _safe_extract_prematch_features(fx: dict) -> Dict[str, float]:
@@ -2678,7 +2970,7 @@ def prematch_scan_save() -> int:
                       + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
                       + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
                       + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
-        candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS]
+        candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS and _market_active(c[0])]
         candidates.sort(key=lambda x: x[2], reverse=True)
 
         per_match = 0
@@ -2776,7 +3068,8 @@ def send_match_of_the_day() -> bool:
                       + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
                       + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
                       + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
-        candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS and c[2] * 100.0 >= c[3]]
+        candidates = [c for c in candidates
+                      if c[1] in ALLOWED_SUGGESTIONS and c[2] * 100.0 >= c[3] and _market_active(c[0])]
         if not candidates:
             continue
         candidates.sort(key=lambda x: x[2], reverse=True)
@@ -3240,6 +3533,51 @@ def compute_league_breakdown(market: Optional[str] = None, days: Optional[int] =
             "note": "Read-only. Nothing here changes a threshold automatically."}
 
 
+def compute_league_density(days: Optional[int] = None, min_n: int = 20) -> Dict[str, Any]:
+    """
+    Settled-fixture volume per league, for choosing CONCENTRATION_MODE's
+    league list from real numbers instead of a guess. A league can accumulate
+    plenty of TIPS while producing few RESOLVED fixtures (match_results), and
+    settled volume — not tip count or scan frequency — is the actual
+    constraint on training a model or verifying a threshold on holdout data.
+
+    days filters by match_results.updated_ts (when the result was recorded),
+    matching every other days= filter in this file. league_id is API-Football's
+    own id — cross-reference names via GET /admin/leagues.
+    """
+    cutoff = int(time.time()) - days * 86400 if days else 0
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT r.league_id, COUNT(*)::bigint AS n_results,
+                   COUNT(DISTINCT t.match_id)::bigint AS n_tipped_matches
+            FROM match_results r
+            LEFT JOIN tips t ON t.match_id = r.match_id AND t.suggestion <> 'HARVEST'
+            WHERE r.updated_ts >= %s AND r.league_id IS NOT NULL
+            GROUP BY r.league_id
+        """, (cutoff,)).fetchall()
+
+    out = []
+    for league_id, n_results, n_tipped in rows:
+        out.append({
+            "league_id": int(league_id),
+            "n_settled_fixtures": int(n_results),
+            "n_tipped_matches": int(n_tipped),
+            "below_min_n": int(n_results) < min_n,
+        })
+    out.sort(key=lambda d: d["n_settled_fixtures"], reverse=True)
+
+    return {
+        "window_days": days, "min_n": min_n, "n_leagues": len(out),
+        "leagues": out,
+        "note": ("Ranked by settled-fixture volume (match_results), the real constraint on "
+                 "training and holdout verification — not scan frequency or tip count. Use "
+                 "this to pick CONCENTRATION_MODE's LEAGUE_ALLOW_IDS / PREMATCH_LEAGUE_IDS: "
+                 "leagues below min_n cannot support a verified threshold regardless of how "
+                 "often they are scanned. Cross-reference league_id against GET /admin/leagues "
+                 "for names."),
+    }
+
+
 def daily_accuracy_digest() -> Optional[str]:
     if not DAILY_ACCURACY_DIGEST_ENABLE:
         return None
@@ -3560,10 +3898,13 @@ def _start_scheduler_once():
         # until you infer it from behaviour hours later.
         log.info("[CONFIG] price gate: min_books=%d (live=%d) require_fair=%s "
                  "allow_no_odds=%s edge_min=%dbps fair_edge_min=%dbps max_edge=%dbps "
-                 "odds_book_filter=%s",
+                 "odds_book_filter=%s exec_min_books=%d (live=%d) exec_max_outlier=%.1f%% "
+                 "require_executable=%s concentration_mode=%s",
                  MIN_BOOKS_FOR_FAIR, MIN_BOOKS_FOR_FAIR_LIVE, bool(REQUIRE_FAIR_PRICE),
                  bool(ALLOW_TIPS_WITHOUT_ODDS), EDGE_MIN_BPS, FAIR_EDGE_MIN_BPS,
-                 MAX_MODEL_EDGE_BPS, ODDS_BOOKMAKER_ID or "none")
+                 MAX_MODEL_EDGE_BPS, ODDS_BOOKMAKER_ID or "none",
+                 MIN_BOOKS_FOR_EXECUTION, MIN_BOOKS_FOR_EXECUTION_LIVE, MAX_EXECUTION_OUTLIER_PCT,
+                 bool(REQUIRE_EXECUTABLE_PRICE), bool(CONCENTRATION_MODE))
     except Exception as e:
         log.exception("[SCHED] failed: %s", e)
 
@@ -3771,6 +4112,15 @@ def http_clv():
     return jsonify({"ok": True, "clv": compute_clv(days=_arg_int("days"))})
 
 
+@app.route("/admin/diagnostics/clv-breakdown", methods=["GET"])
+def http_clv_breakdown():
+    """CLV sliced by (market, league) with a 95% CI — which pocket has edge,
+    not just whether the pooled average does."""
+    _require_admin()
+    return jsonify({"ok": True, "clv_breakdown": compute_clv_breakdown(
+        days=_arg_int("days"), min_n=_arg_int("min_n", 20))})
+
+
 @app.route("/admin/diagnostics/price-gate", methods=["GET"])
 def http_price_gate():
     """Why candidates are not becoming tips, over a window rather than per scan."""
@@ -3808,6 +4158,15 @@ def http_league_breakdown():
     _require_admin()
     return jsonify({"ok": True, "breakdown": compute_league_breakdown(
         market=request.args.get("market"), days=_arg_int("days"), min_n=_arg_int("min_n", 20))})
+
+
+@app.route("/admin/diagnostics/league-density", methods=["GET"])
+def http_league_density():
+    """Settled-fixture volume per league — pick CONCENTRATION_MODE's league
+    list from this, not a guess."""
+    _require_admin()
+    return jsonify({"ok": True, "league_density": compute_league_density(
+        days=_arg_int("days"), min_n=_arg_int("min_n", 20))})
 
 
 @app.route("/admin/thresholds", methods=["GET"])
@@ -3874,6 +4233,19 @@ def http_status():
         "tips": {"total": int(n_tips), "unsent": int(n_unsent), "with_closing_price": int(n_clv)},
         "predictions_logged": int(n_preds),
         "dashboard_enabled": DASHBOARD_ENABLED,
+        "concentration": {
+            "enabled": bool(CONCENTRATION_MODE),
+            "active_markets": sorted(ACTIVE_MARKETS),
+            "league_allow_ids": LEAGUE_ALLOW_IDS,
+            "prematch_league_ids": PREMATCH_LEAGUE_IDS,
+            "max_active_leagues": MAX_ACTIVE_LEAGUES,
+        },
+        "execution_realism": {
+            "min_books": MIN_BOOKS_FOR_EXECUTION,
+            "min_books_live": MIN_BOOKS_FOR_EXECUTION_LIVE,
+            "max_outlier_pct": MAX_EXECUTION_OUTLIER_PCT,
+            "require_executable_price": bool(REQUIRE_EXECUTABLE_PRICE),
+        },
         "last_training_run": metrics,
         "api_usage": _api_call_stats_snapshot(),
     })
@@ -4184,6 +4556,10 @@ def telegram_webhook(secret: str):
 
 # ───────── Boot ─────────
 def _on_boot():
+    # Runs first, before any DB connection is opened: a misconfigured
+    # CONCENTRATION_MODE should fail fast and cheap, not after the pool and
+    # schema are already up.
+    _enforce_concentration_scope()
     _init_pool()
     init_db()
     set_setting("boot_ts", str(int(time.time())))
@@ -4195,3 +4571,5 @@ _start_scheduler_once()
 
 if __name__ == "__main__":
     app.run(host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8080")))
+
+                
