@@ -756,6 +756,7 @@ _api_call_stats = {
     "day": None, "total": 0, "rate_limited": 0,
     "daily_limit": None, "daily_remaining": None,
     "minute_limit": None, "minute_remaining": None,
+    "cooldown_until_ts": 0,
 }
 
 
@@ -767,6 +768,7 @@ def _track_api_call(status_code: Optional[int], headers: Optional[Any] = None) -
                 day=today, total=0, rate_limited=0,
                 daily_limit=None, daily_remaining=None,
                 minute_limit=None, minute_remaining=None,
+                cooldown_until_ts=0,
             )
         _api_call_stats["total"] += 1
         if status_code == 429:
@@ -790,11 +792,39 @@ def _track_api_call(status_code: Optional[int], headers: Optional[Any] = None) -
 
 def _api_call_stats_snapshot() -> Dict[str, Any]:
     with _api_call_lock:
-        return dict(_api_call_stats)
+        out = dict(_api_call_stats)
+        out["cooldown_remaining_sec"] = max(
+            0, int(float(out.get("cooldown_until_ts") or 0) - time.time()))
+        return out
+
+
+def _api_rate_limit_cooldown(count: bool = True) -> None:
+    """Stop a rate-limit response from becoming hundreds more failed calls."""
+    with _api_call_lock:
+        if count:
+            _api_call_stats["rate_limited"] += 1
+        # API-Football reports minute-limit failures inside an HTTP 200 body.
+        # A 65-second pause safely crosses that rolling/reset boundary.
+        _api_call_stats["cooldown_until_ts"] = max(
+            float(_api_call_stats.get("cooldown_until_ts") or 0), time.time() + 65.0)
+
+
+def _api_in_cooldown() -> bool:
+    with _api_call_lock:
+        return time.time() < float(_api_call_stats.get("cooldown_until_ts") or 0)
+
+
+def _is_rate_limit_error(errors: Any) -> bool:
+    if errors in (None, {}, [], ""):
+        return False
+    return "ratelimit" in str(errors).replace("_", "").replace(" ", "").lower() \
+        or "too many requests" in str(errors).lower()
 
 
 def _api_get(url: str, params: dict, timeout: int = 15):
     if not API_KEY:
+        return None
+    if _api_in_cooldown():
         return None
     try:
         r = session.get(url, headers=HEADERS, params=params, timeout=timeout)
@@ -805,8 +835,11 @@ def _api_get(url: str, params: dict, timeout: int = 15):
             if api_errors not in (None, {}, [], ""):
                 log.warning("[API] response errors on %s params=%s: %s",
                             url, sorted(params), api_errors)
+                if _is_rate_limit_error(api_errors):
+                    _api_rate_limit_cooldown(count=True)
             return payload
         if r.status_code == 429:
+            _api_rate_limit_cooldown(count=False)  # already counted by _track_api_call
             log.warning("[API] 429 rate-limited on %s (today: %d calls, %d rate-limited)",
                         url, stats["total"], stats["rate_limited"])
         else:
@@ -896,7 +929,9 @@ def fetch_match_stats(fid: int) -> list:
     cached = STATS_CACHE.get(fid, _MISS)
     if cached is not _MISS:
         return cached
-    js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid}) or {}
+    js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid})
+    if not isinstance(js, dict):
+        return []
     out = js.get("response", []) if isinstance(js, dict) else []
     api_errors = js.get("errors") if isinstance(js, dict) else None
     if api_errors not in (None, {}, [], ""):
@@ -912,9 +947,13 @@ def fetch_match_events(fid: int) -> list:
     cached = EVENTS_CACHE.get(fid, _MISS)
     if cached is not _MISS:
         return cached
-    js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fid}) or {}
+    js = _api_get(f"{FOOTBALL_API_URL}/events", {"fixture": fid})
+    if not isinstance(js, dict):
+        return []
+    api_errors = js.get("errors")
     out = js.get("response", []) if isinstance(js, dict) else []
-    EVENTS_CACHE.set(fid, out)
+    if not api_errors:
+        EVENTS_CACHE.set(fid, out)
     return out
 
 
@@ -934,10 +973,12 @@ def fetch_live_matches() -> List[dict]:
     def _hydrate(m: dict) -> dict:
         fid = (m.get("fixture", {}) or {}).get("id")
         try:
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                fs = ex.submit(fetch_match_stats, fid)
-                fe = ex.submit(fetch_match_events, fid)
-                stats, events = fs.result(), fe.result()
+            # Statistics decide whether the fixture can be scored. Fetch them
+            # first; events are only needed for a fixture whose stats payload
+            # exists. Previously every worldwide fixture consumed both calls,
+            # allowing low-coverage leagues to starve useful matches.
+            stats = fetch_match_stats(fid)
+            events = fetch_match_events(fid) if stats else []
         except Exception as e:
             log.warning("[LIVE] stats/events fetch failed for fixture %s: %s", fid, e)
             stats, events = [], []
@@ -1170,14 +1211,21 @@ def extract_raw_inplay(m: dict) -> Dict[str, Any]:
     }
 
 
-def extract_features(m: dict) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """Returns (raw, features). Features come from feature_spec, shared with training."""
-    raw = extract_raw_inplay(m)
+def _complete_live_features(
+    m: dict, raw: Dict[str, Any], *, fetch_market_price: bool = True,
+) -> Tuple[Dict[str, Any], Dict[str, float]]:
+    """Finish a raw statistics row without wasting odds calls on unusable games."""
     fid = int((m.get("fixture") or {}).get("id") or 0)
-    raw.update(_market_fair_priors(fid, live=True))
+    raw.update(_market_fair_priors(fid, live=True)
+               if fetch_market_price else dict(NEUTRAL_MARKET_PRIORS))
     league_id = ((m.get("league") or {}).get("id"))
     lr = get_league_rates(int(league_id) if league_id else None)
     return raw, build_inplay_features(raw, lr)
+
+
+def extract_features(m: dict) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Returns (raw, features). Features come from feature_spec, shared with training."""
+    return _complete_live_features(m, extract_raw_inplay(m))
 
 
 def stats_coverage_ok(raw: Dict[str, Any], minute: int) -> bool:
@@ -1644,7 +1692,12 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     params: Dict[str, Any] = {"fixture": fid}
     if ODDS_BOOKMAKER_ID:
         params["bookmaker"] = ODDS_BOOKMAKER_ID
-    js = _api_get(ODDS_LIVE_URL if live else ODDS_PREMATCH_URL, params) or {}
+    js = _api_get(ODDS_LIVE_URL if live else ODDS_PREMATCH_URL, params)
+    if not isinstance(js, dict):
+        return {}
+    api_errors = js.get("errors")
+    if api_errors not in (None, {}, [], ""):
+        return {}
 
     best: Dict[str, Dict[str, Dict[str, Any]]] = {}
     by_book: Dict[str, Dict[str, Dict[str, float]]] = {}
@@ -2787,8 +2840,8 @@ def production_scan() -> Tuple[int, int]:
             if not fid:
                 continue
 
-            raw, feat = extract_features(m)
-            minute = int(feat.get("minute", 0))
+            raw = extract_raw_inplay(m)
+            minute = int(raw.get("minute", 0))
             league_id, league = _league_name(m)
             home, away = _teams(m)
             stat_diag = _stats_coverage_details(raw, minute)
@@ -2797,6 +2850,14 @@ def production_scan() -> Tuple[int, int]:
             stats_diagnostics.append(stat_diag)
             if minute < TIP_MIN_MINUTE:
                 continue
+
+            covered = stats_coverage_ok(raw, minute)
+            # Odds are model inputs, but requesting them for fixtures that
+            # already failed the statistics gate burns one additional API call
+            # per worldwide match without any possibility of producing a tip.
+            # Neutral priors keep harvested rows structurally valid.
+            raw, feat = _complete_live_features(
+                m, raw, fetch_market_price=covered)
 
             # Harvest BEFORE the coverage and duplicate gates. Three separate
             # concerns, previously collapsed into one:
@@ -2831,7 +2892,7 @@ def production_scan() -> Tuple[int, int]:
             # Coverage governs TIPPING only. An all-zero stats vector makes the
             # model output sigmoid(intercept), which carries no match
             # information — fine to record, not fine to bet on.
-            if not stats_coverage_ok(raw, minute):
+            if not covered:
                 no_coverage += 1
                 continue
 
@@ -2989,8 +3050,8 @@ def score_live_matches_now(
             fid = int((m.get("fixture", {}) or {}).get("id") or 0)
             if not fid:
                 continue
-            raw, feat = extract_features(m)
-            minute = int(feat.get("minute", 0))
+            raw = extract_raw_inplay(m)
+            minute = int(raw.get("minute", 0))
             if stats_diagnostics_out is not None:
                 league_id, league = _league_name(m)
                 home, away = _teams(m)
@@ -3000,6 +3061,7 @@ def score_live_matches_now(
                 stats_diagnostics_out.append(stat_diag)
             if minute < TIP_MIN_MINUTE or not stats_coverage_ok(raw, minute):
                 continue
+            raw, feat = _complete_live_features(m, raw, fetch_market_price=True)
 
             league_id, league = _league_name(m)
             home, away = _teams(m)
@@ -4176,7 +4238,10 @@ def http_init_db():
 @app.route("/admin/scan", methods=["POST", "GET"])
 def http_scan():
     _require_admin()
-    s, l = production_scan()
+    result = _run_with_pg_lock(1001, production_scan)
+    if result is None:
+        return jsonify({"ok": False, "error": "scan_already_running"}), 409
+    s, l = result
     return jsonify({"ok": True, "saved": s, "live_seen": l})
 
 
@@ -4713,7 +4778,10 @@ def dashboard_live_refresh():
     if not _dashboard_authed():
         abort(401)
     stats_diagnostics: List[Dict[str, Any]] = []
-    matches, live_seen = score_live_matches_now(stats_diagnostics)
+    result = _run_with_pg_lock(1001, score_live_matches_now, stats_diagnostics)
+    if result is None:
+        return jsonify({"ok": False, "error": "scan_already_running"}), 409
+    matches, live_seen = result
     no_coverage = sum(1 for row in stats_diagnostics
                       if row.get("reason") not in ("usable", "before_required_minute"))
     _set_live_snapshot(matches, live_seen=live_seen, no_coverage=no_coverage,
@@ -4755,8 +4823,12 @@ def telegram_webhook(secret: str):
         elif msg.startswith("/scan"):
             parts = msg.split()
             if len(parts) > 1 and ADMIN_API_KEY and _safe_compare(parts[1], ADMIN_API_KEY):
-                s, l = production_scan()
-                send_telegram(f"🔁 Scan done. Saved: {s}, Live seen: {l}")
+                result = _run_with_pg_lock(1001, production_scan)
+                if result is None:
+                    send_telegram("⏳ A scan is already running.")
+                else:
+                    s, l = result
+                    send_telegram(f"🔁 Scan done. Saved: {s}, Live seen: {l}")
             else:
                 send_telegram("🔒 Admin key required.")
     except Exception as e:
