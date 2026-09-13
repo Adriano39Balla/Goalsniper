@@ -86,7 +86,7 @@ from sklearn.metrics import (
 
 from feature_spec import (
     ODDS_TRUSTED_FROM_TS,
-    DEFAULT_LEAGUE_RATES, FEATURES, PRE_FEATURES,
+    DEFAULT_LEAGUE_RATES, FEATURES, PRE_FEATURES, NEUTRAL_MARKET_PRIORS,
     LEAGUE_RATE_FIELDS_INPLAY, LEAGUE_RATE_FIELDS_PREMATCH,
     build_inplay_features, derive_dc_dnb,
 )
@@ -106,6 +106,14 @@ EPS = 1e-6
 DEFAULT_LEAGUE_RATE_MIN_N = int(os.getenv("LEAGUE_RATE_MIN_N", "20"))
 C_GRID = [float(x) for x in os.getenv("TRAIN_C_GRID", "0.01,0.03,0.1,0.3,1.0,3.0").split(",")]
 FALLBACK_DRAW_PROB = float(os.getenv("FALLBACK_DRAW_PROB", "0.26"))
+
+# Neutral defaults for the market_fair_* prematch features when reading a
+# snapshot written before feature_spec.assemble_prematch_features() started
+# populating them - same treatment feature_spec.NEUTRAL_MARKET_PRIORS already
+# gives every other "odds were not available" case. Derived from
+# NEUTRAL_MARKET_PRIORS by prefixing each key with "pm_" (its PRE_FEATURES
+# name) rather than duplicated by hand, so the two cannot drift apart.
+_PM_MARKET_FAIR_DEFAULTS: Dict[str, float] = {f"pm_{k}": v for k, v in NEUTRAL_MARKET_PRIORS.items()}
 
 
 # ─────────────────────── DB helpers ─────────────────────── #
@@ -540,7 +548,18 @@ def load_prematch_data(conn: PGConnection) -> pd.DataFrame:
         if not feat:
             continue
 
-        f = {k: float(feat.get(k, 0.0) or 0.0) for k in PRE_FEATURES}
+        # feat.get(k) is not None (rather than the old `or 0.0`) distinguishes
+        # "key absent" from "key present with value 0.0" - the two behave
+        # identically for the 25 original keys (0.0 is the only falsy float,
+        # so `0.0 or 0.0` was always just 0.0 either way), but it matters for
+        # the five pm_market_fair_* keys: a legacy snapshot written before
+        # feature_spec.assemble_prematch_features() started populating them
+        # simply lacks the key, and should read as the market's neutral prior
+        # (e.g. 1/3 for a home-win probability), not as 0.0 - which would
+        # read as "the market says this team cannot win", exactly the false
+        # signal NEUTRAL_MARKET_PRIORS exists to prevent on the in-play side.
+        f = {k: float(feat[k]) if feat.get(k) is not None else float(_PM_MARKET_FAIR_DEFAULTS.get(k, 0.0))
+             for k in PRE_FEATURES}
         gh_f = _as_int(row["final_goals_h"])
         ga_f = _as_int(row["final_goals_a"])
         f["_match_id"] = _as_int(row["match_id"])
@@ -622,30 +641,25 @@ def _standardize(X_tr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return mean, scale
 
 
-def _fit_lr(X: np.ndarray, y: np.ndarray, C: float,
-            sample_weight: Optional[np.ndarray] = None) -> Optional[LogisticRegression]:
+def _fit_lr(X: np.ndarray, y: np.ndarray, C: float) -> Optional[LogisticRegression]:
     if len(np.unique(y)) < 2:
         return None
     # No class_weight="balanced": it rebases the intercept toward a 50/50 prior,
     # a large systematic upward bias on low-prevalence markets. The objective
     # here is a calibrated probability, not recall on a rare class.
-    return LogisticRegression(max_iter=3000, solver="liblinear", C=C).fit(
-        X, y, sample_weight=sample_weight)
+    return LogisticRegression(max_iter=3000, solver="liblinear", C=C).fit(X, y)
 
 
-def _select_C(X_tr, y_tr, X_ca, y_ca,
-              w_tr: Optional[np.ndarray] = None,
-              w_ca: Optional[np.ndarray] = None) -> Tuple[Optional[LogisticRegression], float]:
+def _select_C(X_tr, y_tr, X_ca, y_ca) -> Tuple[Optional[LogisticRegression], float]:
     """Pick the regularization strength by log loss on the calibration split."""
     best_m, best_C, best_ll = None, C_GRID[-1], float("inf")
     for C in C_GRID:
-        m = _fit_lr(X_tr, y_tr, C, sample_weight=w_tr)
+        m = _fit_lr(X_tr, y_tr, C)
         if m is None:
             continue
         try:
             p = m.predict_proba(X_ca)[:, 1]
-            ll = log_loss(y_ca, np.clip(p, EPS, 1 - EPS), labels=[0, 1],
-                          sample_weight=w_ca)
+            ll = log_loss(y_ca, np.clip(p, EPS, 1 - EPS), labels=[0, 1])
         except Exception:
             continue
         if ll < best_ll:
@@ -658,11 +672,9 @@ def _logit_vec(p: np.ndarray) -> np.ndarray:
     return np.log(p / (1 - p))
 
 
-def fit_platt(y_true: np.ndarray, p_raw: np.ndarray,
-              sample_weight: Optional[np.ndarray] = None) -> Tuple[float, float]:
+def fit_platt(y_true: np.ndarray, p_raw: np.ndarray) -> Tuple[float, float]:
     z = _logit_vec(p_raw).reshape(-1, 1)
-    lr = LogisticRegression(max_iter=1000, solver="lbfgs").fit(
-        z, y_true.astype(int), sample_weight=sample_weight)
+    lr = LogisticRegression(max_iter=1000, solver="lbfgs").fit(z, y_true.astype(int))
     return float(lr.coef_.ravel()[0]), float(lr.intercept_.ravel()[0])
 
 
@@ -716,12 +728,10 @@ def _validate(X: np.ndarray, y: np.ndarray, feature_names: List[str], context: s
 
 THRESHOLD_MARGIN = float(os.getenv("TARGET_PRECISION_MARGIN", "0.03"))
 THRESHOLD_FALLBACK = os.getenv("THRESHOLD_FALLBACK", "suppress").strip().lower()
-SUPPRESSED_THRESHOLD_PCT = float(os.getenv("SUPPRESSED_THRESHOLD_PCT", "101.0"))
 
 
 def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
                     min_preds: int, default_threshold: float,
-                    min_thresh_pct: float = 50.0,
                     max_thresh_pct: float = 85.0) -> Tuple[float, Dict[str, Any]]:
     """
     Smallest threshold reaching the precision target with at least min_preds
@@ -739,9 +749,7 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
     p = np.asarray(p, dtype=float)
     base_rate = float(y.mean()) if len(y) else 0.0
     effective_target = max(float(target_precision), base_rate + THRESHOLD_MARGIN)
-    lo = max(0.0, float(min_thresh_pct) / 100.0)
-    hi = min(0.999, float(max_thresh_pct) / 100.0)
-    grid = np.arange(lo, hi + 1e-12, 0.005)
+    grid = np.arange(0.50, 0.951, 0.005)
 
     for t in grid:
         pred = (p >= t).astype(int)
@@ -788,7 +796,7 @@ def _pick_threshold(y_true: np.ndarray, p: np.ndarray, target_precision: float,
                    "(best was %s). SUPPRESSING this market at %.1f%%.",
                    base_rate, THRESHOLD_MARGIN * 100, min_preds,
                    f"{best_prec:.4f}" if best_prec >= 0 else "n/a", max_thresh_pct)
-    return float(SUPPRESSED_THRESHOLD_PCT) / 100.0, diag
+    return float(max_thresh_pct) / 100.0, diag
 
 
 # ─────────────────────── Holdout verification ─────────────────────── #
@@ -871,19 +879,17 @@ def _decide_threshold(y_ca, p_ca, y_te, p_te, label: str, buf: "SettingsBuffer",
     bar. That was the gap that let Double Chance run on an unvalidated default.
     """
     thr_prob, diag = _pick_threshold(y_ca, p_ca, target_precision, min_preds,
-                                     default_thr_prob, min_thresh_pct=min_thresh,
-                                     max_thresh_pct=max_thresh)
+                                     default_thr_prob, max_thresh_pct=max_thresh)
     if extra_diag:
         diag.update(extra_diag)
-    thr_pct = (float(SUPPRESSED_THRESHOLD_PCT) if diag.get("method") == "suppressed"
-               else float(thr_prob * 100.0))
+    thr_pct = float(np.clip(thr_prob * 100.0, min_thresh, max_thresh))
     holdout = _threshold_on_holdout(y_te, p_te, thr_pct / 100.0)
 
     if diag.get("method") != "suppressed":
         confirmed, why = _holdout_verdict(holdout)
         holdout["verdict"] = why
         if not confirmed:
-            thr_pct = float(SUPPRESSED_THRESHOLD_PCT)
+            thr_pct = float(max_thresh)
             holdout["action"] = "SUPPRESSED — calibration lift did not survive the holdout"
             logger.warning("[HOLDOUT] %s: %s. Calibration said %s. Suppressing at %.1f%%.",
                            ctx, why, diag.get("lift_over_base_pp"), thr_pct)
@@ -892,35 +898,6 @@ def _decide_threshold(y_ca, p_ca, y_te, p_te, label: str, buf: "SettingsBuffer",
 
     buf.set_threshold(label, thr_pct, summary)
     return thr_pct, diag, holdout
-
-
-def _fit_directional_threshold_pair(
-    y_ca: np.ndarray, p_ca: np.ndarray, y_te: np.ndarray, p_te: np.ndarray,
-    positive_label: str, negative_label: str, buf: "SettingsBuffer",
-    summary: Dict[str, Any], target_precision: float, min_preds: int,
-    min_thresh: float, max_thresh: float, ctx: str,
-) -> Dict[str, Dict[str, Any]]:
-    """
-    Validate the positive and negative selections independently.
-
-    A single binary head is sufficient because P(No)=1-P(Yes) and
-    P(Under)=1-P(Over), but the betting thresholds are not interchangeable:
-    high-confidence positives and high-confidence negatives occupy different
-    regions of the probability distribution and can have very different
-    precision.
-    """
-    out: Dict[str, Dict[str, Any]] = {}
-    for label, y1, p1, y2, p2 in (
-        (positive_label, y_ca, p_ca, y_te, p_te),
-        (negative_label, 1 - y_ca, 1.0 - p_ca, 1 - y_te, 1.0 - p_te),
-    ):
-        thr_pct, diag, holdout = _decide_threshold(
-            y1, p1, y2, p2, label, buf, summary, target_precision, min_preds,
-            min_thresh, max_thresh, 0.65, f"{ctx} / {label}")
-        out[label] = {"threshold_pct": round(thr_pct, 2),
-                      "threshold_selection": diag,
-                      "holdout_at_threshold": holdout}
-    return out
 
 
 # ─────────────────────── Core fit ─────────────────────── #
@@ -937,7 +914,6 @@ def _train_binary_head(
     min_thresh_pct: float, max_thresh_pct: float,
     default_thr_prob: float,
     metrics_name: Optional[str] = None,
-    sample_weight_all: Optional[np.ndarray] = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Returns (ok, metrics, p_on_cal, p_on_holdout).
@@ -952,8 +928,6 @@ def _train_binary_head(
     X_tr, y_tr = X_all[m_tr], y_all[m_tr]
     X_ca, y_ca = X_all[m_ca], y_all[m_ca]
     X_te, y_te = X_all[m_te], y_all[m_te]
-    w_tr = sample_weight_all[m_tr] if sample_weight_all is not None else None
-    w_ca = sample_weight_all[m_ca] if sample_weight_all is not None else None
 
     if min(len(y_tr), len(y_ca), len(y_te)) < 20:
         logger.info("[SKIP] %s: split too small (train=%d cal=%d holdout=%d)",
@@ -973,12 +947,12 @@ def _train_binary_head(
     Z_ca = (X_ca - mean) / scale
     Z_te = (X_te - mean) / scale
 
-    m, C = _select_C(Z_tr, y_tr, Z_ca, y_ca, w_tr=w_tr, w_ca=w_ca)
+    m, C = _select_C(Z_tr, y_tr, Z_ca, y_ca)
     if m is None:
         return False, {}, None, None
 
     p_ca_raw = m.predict_proba(Z_ca)[:, 1]
-    a, b = fit_platt(y_ca, p_ca_raw, sample_weight=w_ca)
+    a, b = fit_platt(y_ca, p_ca_raw)
     p_ca = _apply_platt(p_ca_raw, a, b)
     p_te = _apply_platt(m.predict_proba(Z_te)[:, 1], a, b) if len(y_te) else np.array([])
 
@@ -1031,16 +1005,6 @@ def _train_binary_head(
         mets["holdout_at_threshold"] = holdout
 
     return True, mets, p_ca, p_te
-
-
-def _match_balanced_weights(df: pd.DataFrame) -> np.ndarray:
-    """Equalise total fitting weight per fixture when one match has many snapshots."""
-    if "_match_id" not in df.columns or len(df) == 0:
-        return np.ones(len(df), dtype=float)
-    counts = df.groupby("_match_id")["_match_id"].transform("count").to_numpy(dtype=float)
-    w = 1.0 / np.maximum(counts, 1.0)
-    mean = float(np.mean(w)) if len(w) else 1.0
-    return w / mean if mean > 0 else np.ones(len(df), dtype=float)
 
 
 def _effective_min_rows(n_features: int, min_rows_env: int, rows_per_feature: int) -> int:
@@ -1118,7 +1082,7 @@ def _fit_1x2_threshold(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray
 
     summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
     summary["metrics"][f"{label}_holdout_at_threshold"] = holdout
-    confirmed = thr_pct < SUPPRESSED_THRESHOLD_PCT and diag.get("method") != "suppressed"
+    confirmed = thr_pct < max_thresh and diag.get("method") != "suppressed"
     logger.info("[1X2] %s threshold %.2f%% (%s); holdout lift %s; confirmed=%s",
                 label, thr_pct, diag.get("method"), holdout.get("lift_over_base_pp"), confirmed)
     return confirmed
@@ -1164,7 +1128,7 @@ def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te
     if not parent_confirmed:
         for name in ("Double Chance", "Draw No Bet"):
             label = f"{prefix}{name}"
-            buf.set_threshold(label, float(SUPPRESSED_THRESHOLD_PCT), summary)
+            buf.set_threshold(label, float(max_thresh), summary)
             summary.setdefault("metrics", {})[f"{label}_holdout_at_threshold"] = {
                 "action": "SUPPRESSED — parent 1X2 market did not pass its own holdout",
                 "derived_from": f"{prefix}WLD_* heads",
@@ -1224,7 +1188,7 @@ def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te
         if len(y_ca) == 0 or len(np.unique(y_ca)) < 2:
             logger.info("[DERIVED] %s: no usable calibration sample — suppressing at %.1f%%",
                         label, max_thresh)
-            buf.set_threshold(label, float(SUPPRESSED_THRESHOLD_PCT), summary)
+            buf.set_threshold(label, float(max_thresh), summary)
             continue
         thr_pct, diag, holdout = _decide_threshold(
             y_ca, p_ca, y_te, p_te, label, buf, summary,
@@ -1233,9 +1197,9 @@ def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te
 
         # Economic floor, applied after the statistical one.
         lift = holdout.get("lift_over_base_pp")
-        if thr_pct < SUPPRESSED_THRESHOLD_PCT and lift is not None and lift < MIN_DERIVED_LIFT_PP:
-            buf.set_threshold(label, float(SUPPRESSED_THRESHOLD_PCT), summary)
-            thr_pct = float(SUPPRESSED_THRESHOLD_PCT)
+        if thr_pct < max_thresh and lift is not None and lift < MIN_DERIVED_LIFT_PP:
+            buf.set_threshold(label, float(max_thresh), summary)
+            thr_pct = float(max_thresh)
             holdout["action"] = (f"SUPPRESSED — holdout lift {lift}pp is below the "
                                  f"{MIN_DERIVED_LIFT_PP}pp economic floor for a derived market. "
                                  f"Significant only because the pooled sample is large; at "
@@ -1307,28 +1271,17 @@ def train_models(
             df_ip = _apply_league_rates(df_ip, rate_map, LEAGUE_RATE_FIELDS_INPLAY)
 
             X = df_ip[FEATURES].to_numpy(dtype=float)
-            inplay_weights = _match_balanced_weights(df_ip)
             summary["feature_counts"]["inplay"] = len(FEATURES)
 
-            y_btts = df_ip["label_btts"].to_numpy(dtype=int)
-            btts_decided = already_decided_mask(df_ip, "BTTS_YES")
-            btts_eligible = (~btts_decided if btts_decided is not None
-                             else np.ones(len(df_ip), dtype=bool))
-            ok, mets, p_ca, p_te = _train_binary_head(
-                buf, X, y_btts, m_tr & btts_eligible, m_ca & btts_eligible,
-                m_te & btts_eligible, FEATURES, "BTTS_YES", None, summary,
-                target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                "BTTS_YES", sample_weight_all=inplay_weights)
+            ok, mets, _, _ = _train_binary_head(
+                buf, X, df_ip["label_btts"].to_numpy(dtype=int), m_tr, m_ca, m_te, FEATURES,
+                "BTTS_YES", "BTTS", summary, target_precision, min_preds,
+                min_thresh, max_thresh, 0.65, "BTTS_YES")
             summary["trained"]["BTTS_YES"] = ok
             if ok:
                 summary["metrics"]["BTTS_YES"] = mets
-                dir_mets = _fit_directional_threshold_pair(
-                    y_btts[m_ca & btts_eligible], p_ca,
-                    y_btts[m_te & btts_eligible], p_te,
-                    "BTTS Yes", "BTTS No", buf, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, "BTTS")
-                mets["directional_thresholds"] = dir_mets
-                _dd = decided_diagnostics(df_ip, "BTTS_YES", y_btts)
+                _dd = decided_diagnostics(df_ip, "BTTS_YES",
+                                          df_ip["label_btts"].to_numpy(dtype=int))
                 if _dd:
                     mets["already_decided"] = _dd
                     logger.info("[DECIDED] BTTS_YES: %.1f%% of rows already settled when "
@@ -1339,24 +1292,14 @@ def train_models(
             totals = df_ip["final_goals_sum"].to_numpy(dtype=int)
             for line in ou_lines:
                 name = f"OU_{_fmt_line(line)}"
-                y_ou = (totals > line).astype(int)
-                ou_decided = already_decided_mask(df_ip, name)
-                ou_eligible = (~ou_decided if ou_decided is not None
-                               else np.ones(len(df_ip), dtype=bool))
-                ok, mets, p_ca, p_te = _train_binary_head(
-                    buf, X, y_ou, m_tr & ou_eligible, m_ca & ou_eligible, m_te & ou_eligible,
-                    FEATURES, name, None, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, 0.65, name, sample_weight_all=inplay_weights)
+                ok, mets, _, _ = _train_binary_head(
+                    buf, X, (totals > line).astype(int), m_tr, m_ca, m_te, FEATURES,
+                    name, f"Over/Under {_fmt_line(line)}", summary, target_precision, min_preds,
+                    min_thresh, max_thresh, 0.65, name)
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
-                    line_txt = _fmt_line(line)
-                    dir_mets = _fit_directional_threshold_pair(
-                        y_ou[m_ca & ou_eligible], p_ca, y_ou[m_te & ou_eligible], p_te,
-                        f"Over {line_txt}", f"Under {line_txt}", buf, summary,
-                        target_precision, min_preds, min_thresh, max_thresh, name)
-                    mets["directional_thresholds"] = dir_mets
-                    _dd = decided_diagnostics(df_ip, name, y_ou)
+                    _dd = decided_diagnostics(df_ip, name, (totals > line).astype(int))
                     if _dd:
                         mets["already_decided"] = _dd
                         logger.info("[DECIDED] %s: %.1f%% of rows already settled when "
@@ -1375,7 +1318,7 @@ def train_models(
                 ok, mets, p_ca, p_te = _train_binary_head(
                     buf, X, y.astype(int), m_tr, m_ca, m_te, FEATURES,
                     key, None, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, 0.45, key, sample_weight_all=inplay_weights)
+                    min_thresh, max_thresh, 0.45, key)
                 summary["trained"][key] = ok
                 if ok:
                     summary["metrics"][key] = mets
@@ -1409,35 +1352,24 @@ def train_models(
             Xp = df_pre[PRE_FEATURES].to_numpy(dtype=float)
             summary["feature_counts"]["prematch"] = len(PRE_FEATURES)
 
-            y_pre_btts = df_pre["label_btts"].to_numpy(dtype=int)
-            ok, mets, p_ca, p_te = _train_binary_head(
-                buf, Xp, y_pre_btts, m_tr, m_ca, m_te, PRE_FEATURES,
-                "PRE_BTTS_YES", None, summary, target_precision, min_preds,
+            ok, mets, _, _ = _train_binary_head(
+                buf, Xp, df_pre["label_btts"].to_numpy(dtype=int), m_tr, m_ca, m_te, PRE_FEATURES,
+                "PRE_BTTS_YES", "PRE BTTS", summary, target_precision, min_preds,
                 min_thresh, max_thresh, 0.65, "PRE_BTTS_YES")
             summary["trained"]["PRE_BTTS_YES"] = ok
             if ok:
                 summary["metrics"]["PRE_BTTS_YES"] = mets
-                mets["directional_thresholds"] = _fit_directional_threshold_pair(
-                    y_pre_btts[m_ca], p_ca, y_pre_btts[m_te], p_te,
-                    "PRE BTTS Yes", "PRE BTTS No", buf, summary, target_precision,
-                    min_preds, min_thresh, max_thresh, "PRE BTTS")
 
             totals = df_pre["final_goals_sum"].to_numpy(dtype=int)
             for line in ou_lines:
                 name = f"PRE_OU_{_fmt_line(line)}"
-                y_pre_ou = (totals > line).astype(int)
-                ok, mets, p_ca, p_te = _train_binary_head(
-                    buf, Xp, y_pre_ou, m_tr, m_ca, m_te, PRE_FEATURES,
-                    name, None, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, 0.65, name)
+                ok, mets, _, _ = _train_binary_head(
+                    buf, Xp, (totals > line).astype(int), m_tr, m_ca, m_te, PRE_FEATURES,
+                    name, f"PRE Over/Under {_fmt_line(line)}", summary, target_precision,
+                    min_preds, min_thresh, max_thresh, 0.65, name)
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
-                    line_txt = _fmt_line(line)
-                    mets["directional_thresholds"] = _fit_directional_threshold_pair(
-                        y_pre_ou[m_ca], p_ca, y_pre_ou[m_te], p_te,
-                        f"PRE Over {line_txt}", f"PRE Under {line_txt}", buf, summary,
-                        target_precision, min_preds, min_thresh, max_thresh, name)
 
             gd = df_pre["final_goals_diff"].to_numpy(dtype=int)
             heads = {}
