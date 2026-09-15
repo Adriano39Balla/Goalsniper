@@ -77,6 +77,7 @@ import logging
 import math
 import os
 import random
+import re
 import signal
 import sys
 import threading
@@ -235,6 +236,11 @@ MIN_ODDS_1X2 = float(os.getenv("MIN_ODDS_1X2", "1.30"))
 MIN_ODDS_DC = float(os.getenv("MIN_ODDS_DC", "1.15"))
 MIN_ODDS_DNB = float(os.getenv("MIN_ODDS_DNB", "1.20"))
 MAX_ODDS_ALL = float(os.getenv("MAX_ODDS_ALL", "20.0"))
+MAX_PREMATCH_ODDS_ALL = float(os.getenv("MAX_PREMATCH_ODDS_ALL", "6.0"))
+# Reject an executable quote that is wildly longer than the same market's
+# de-vigged consensus. This catches repeated bad mappings that a simple
+# best-versus-second-best comparison cannot detect.
+MAX_PRICE_VS_FAIR_PCT = float(os.getenv("MAX_PRICE_VS_FAIR_PCT", "20.0"))
 
 EDGE_MIN_BPS = int(os.getenv("EDGE_MIN_BPS", "300"))
 FAIR_EDGE_MIN_BPS = int(os.getenv("FAIR_EDGE_MIN_BPS", "200"))
@@ -518,6 +524,9 @@ _MODELS_CACHE = _TTLCache(MODELS_TTL)
 LEAGUE_RATE_TTL = int(os.getenv("LEAGUE_RATE_TTL_SEC", "21600"))
 LEAGUE_RATE_MIN_N = int(os.getenv("LEAGUE_RATE_MIN_N", "20"))
 _LEAGUE_RATE_CACHE = _TTLCache(LEAGUE_RATE_TTL)
+# Original observation times survive cache hits, allowing tip audits to show
+# how old the inputs really were when the decision was made.
+_STATS_FETCHED_TS: Dict[int, int] = {}
 
 try:
     from train_models import train_models
@@ -691,6 +700,12 @@ def init_db():
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS stake_units DOUBLE PRECISION",
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS closing_odds DOUBLE PRECISION",
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS clv_pct DOUBLE PRECISION",
+            "ALTER TABLE tips ADD COLUMN IF NOT EXISTS decision_ts BIGINT",
+            "ALTER TABLE tips ADD COLUMN IF NOT EXISTS stats_fetched_ts BIGINT",
+            "ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds_fetched_ts BIGINT",
+            "ALTER TABLE tips ADD COLUMN IF NOT EXISTS telegram_sent_ts BIGINT",
+            "ALTER TABLE tips ADD COLUMN IF NOT EXISTS price_verified INTEGER DEFAULT 0",
+            "ALTER TABLE tips ADD COLUMN IF NOT EXISTS audit_json TEXT",
             "ALTER TABLE tip_snapshots ADD COLUMN IF NOT EXISTS kickoff_ts BIGINT",
             "ALTER TABLE prematch_snapshots ADD COLUMN IF NOT EXISTS kickoff_ts BIGINT",
         ]:
@@ -971,6 +986,7 @@ def fetch_match_stats(fid: int) -> list:
     # authoritative empty result: the next scan should be allowed to retry.
     if not api_errors:
         STATS_CACHE.set(fid, out)
+        _STATS_FETCHED_TS[int(fid)] = int(time.time())
     return out
 
 
@@ -1577,11 +1593,11 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
             o = _odd_value(v)
             if o <= 1.0:
                 continue
-            if lbl.startswith("yes"):
+            if lbl == "yes":
                 d["Yes"] = o
-            elif lbl.startswith("no"):
+            elif lbl == "no":
                 d["No"] = o
-        return ("BTTS", d) if d else None
+        return ("BTTS", d) if set(d) == {"Yes", "No"} else None
     if mname == "1X2":
         d = {}
         for v in vals:
@@ -1595,7 +1611,7 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
                 d["Draw"] = o
             elif lbl in ("away", "2"):
                 d["Away"] = o
-        return ("1X2", d) if d else None
+        return ("1X2", d) if set(d) == {"Home", "Draw", "Away"} else None
     if mname == "DC":
         d = {}
         for v in vals:
@@ -1609,7 +1625,7 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
                 d["X2"] = o
             elif lbl in ("home/away", "12", "homeoraway"):
                 d["12"] = o
-        return ("DC", d) if d else None
+        return ("DC", d) if set(d) == {"1X", "X2", "12"} else None
     if mname == "DNB":
         d = {}
         for v in vals:
@@ -1621,24 +1637,48 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
                 d["Home"] = o
             elif lbl in ("away", "2"):
                 d["Away"] = o
-        return ("DNB", d) if d else None
+        return ("DNB", d) if set(d) == {"Home", "Away"} else None
     if mname == "OU":
         by_line: Dict[str, Dict[str, float]] = {}
         for v in vals:
             lbl = _txt(v.get("value")).strip().lower()
-            if "over" not in lbl and "under" not in lbl:
+            # Validate the selection as well as the enclosing market. Generic
+            # market names can contain team/period selections which must not
+            # be folded into a full-match total.
+            if any(bad in lbl for bad in _NOT_FULL_MATCH_SCOPE + _OU_NOT_MATCH_TOTAL):
+                continue
+            side_match = re.match(r"^(over|under)(?:\s+|$)", lbl)
+            if not side_match:
                 continue
             o = _odd_value(v)
             if o <= 1.0:
                 continue
+            label_nums = re.findall(r"(?<!\d)(\d+(?:[.,]\d+)?)(?!\d)", lbl)
+            label_line = float(label_nums[-1].replace(",", ".")) if label_nums else None
+            handicap = v.get("handicap")
             try:
-                ln = float(lbl.split()[-1].replace(",", "."))
-            except Exception:
+                handicap_line = (float(_txt(handicap).replace(",", "."))
+                                  if handicap not in (None, "") else None)
+            except (TypeError, ValueError):
+                handicap_line = None
+            # Prematch normally embeds the line in `value`; live odds place it
+            # in `handicap`. If both exist, they must describe the same line.
+            if (label_line is not None and handicap_line is not None
+                    and abs(label_line - handicap_line) > 1e-6):
+                continue
+            ln = handicap_line if handicap_line is not None else label_line
+            if ln is None:
+                continue
+            # Only exact lines the service trains and grades are eligible;
+            # quarter/integer Asian lines settle differently.
+            if not any(abs(ln - configured) <= 1e-6 for configured in OU_LINES):
                 continue
             key = f"OU_{_fmt_line(ln)}"
-            side = "Over" if "over" in lbl else "Under"
+            side = "Over" if side_match.group(1) == "over" else "Under"
             by_line.setdefault(key, {})[side] = o
-        return ("OU_MULTI", by_line) if by_line else None
+        complete = {k: sides for k, sides in by_line.items()
+                    if set(sides) == {"Over", "Under"}}
+        return ("OU_MULTI", complete) if complete else None
     return None
 
 
@@ -1724,6 +1764,7 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     if ODDS_BOOKMAKER_ID:
         params["bookmaker"] = ODDS_BOOKMAKER_ID
     js = _api_get(ODDS_LIVE_URL if live else ODDS_PREMATCH_URL, params)
+    fetched_ts = int(time.time())
     if not isinstance(js, dict):
         return {}
     api_errors = js.get("errors")
@@ -1849,8 +1890,12 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
         by_book_mkey = by_book.get(mkey, {})
         executability = {name: _selection_executability(by_book_mkey.get(name, {}), min_books_exec)
                          for name in sels}
+        source_updates = [_txt(r.get("update")) for r in response
+                          if isinstance(r, dict) and r.get("update") not in (None, "")]
         out[mkey] = {"best": sels, "fair": fair, "n_books": len(books_seen.get(mkey, ())),
-                     "by_book": by_book_mkey, "executability": executability}
+                     "by_book": by_book_mkey, "executability": executability,
+                     "fetched_ts": fetched_ts,
+                     "source_update": source_updates[0] if source_updates else None}
     ODDS_CACHE.set(key, out)
     return out
 
@@ -1960,9 +2005,14 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
     odds = float(best["odds"])
     res["odds"] = odds
     res["book"] = best.get("book")
+    res["odds_fetched_ts"] = entry.get("fetched_ts")
+    res["odds_source_update"] = entry.get("source_update")
 
     if not (_min_odds_for_market(market_text.replace("PRE ", "")) <= odds <= MAX_ODDS_ALL):
         res["decision"] = "odds_out_of_range"
+        return res
+    if not live and odds > MAX_PREMATCH_ODDS_ALL:
+        res["decision"] = "prematch_odds_implausible"
         return res
 
     fair = (entry.get("fair") or {}).get(sel)
@@ -1977,6 +2027,16 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
             return res
     else:
         res["fair_prob"] = float(fair)
+
+    if fair is not None and float(fair) > 0:
+        fair_odds = 1.0 / float(fair)
+        price_vs_fair_pct = (odds / fair_odds - 1.0) * 100.0
+        res["price_vs_fair_pct"] = round(price_vs_fair_pct, 2)
+        if price_vs_fair_pct > MAX_PRICE_VS_FAIR_PCT:
+            res["decision"] = "price_vs_fair_outlier"
+            log.warning("[PRICE] fixture %s %s: %.3f is %.1f%% above fair %.3f — suppressed",
+                        fid, suggestion, odds, price_vs_fair_pct, fair_odds)
+            return res
 
     # Current fetch_odds() entries always carry selection-level execution
     # metadata. Tolerate legacy/injected entries without it so a rolling
@@ -2026,6 +2086,38 @@ def _stake_units(prob: float, odds: Optional[float]) -> Optional[float]:
     f = kelly_fraction(prob, odds) * KELLY_FRACTION
     f = max(0.0, min(f, MAX_STAKE_PCT / 100.0))
     return round(BANKROLL_UNITS * f, 2)
+
+
+def _tip_audit_json(fid: int, phase: str, feat: Dict[str, float],
+                    raw: Optional[Dict[str, float]],
+                    candidates: List[Tuple[str, str, float, float]],
+                    pc: PriceCheck, decision_ts: int) -> str:
+    """Permanent evidence for reconstructing exactly why a tip was emitted."""
+    market_probabilities = {
+        suggestion: {"market": market, "prob": round(float(prob), 8),
+                     "threshold_pct": round(float(threshold), 4)}
+        for market, suggestion, prob, threshold in candidates
+    }
+    prefix = "PRE_" if phase == "prematch" else ""
+    wld = _wld_probs(feat, prefix)
+    if wld is not None:
+        market_probabilities["1X2 full vector"] = {
+            "home": round(wld[0], 8), "draw": round(wld[1], 8),
+            "away": round(wld[2], 8)}
+    payload = {
+        "schema_version": 1,
+        "fixture_id": int(fid),
+        "phase": phase,
+        "decision_ts": int(decision_ts),
+        "stats_fetched_ts": _STATS_FETCHED_TS.get(int(fid)) if phase == "live" else None,
+        "odds_fetched_ts": pc.get("odds_fetched_ts"),
+        "odds_source_update": pc.get("odds_source_update"),
+        "price_check": dict(pc),
+        "market_probabilities": market_probabilities,
+        "features": {k: float(v) for k, v in feat.items()},
+        "raw_stats": ({k: float(v) for k, v in raw.items()} if raw else None),
+    }
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
 # ───────── Prediction log ─────────
@@ -2265,6 +2357,7 @@ def capture_closing_lines(limit: int = 200) -> int:
             SELECT match_id, created_ts, market, suggestion, odds, book
             FROM tips
             WHERE is_prematch=1 AND closing_odds IS NULL AND odds IS NOT NULL
+              AND COALESCE(price_verified,0)=1
               AND kickoff_ts IS NOT NULL
               AND kickoff_ts > %s AND kickoff_ts <= %s
             ORDER BY kickoff_ts ASC LIMIT %s
@@ -2383,6 +2476,7 @@ def compute_clv(days: Optional[int] = None) -> Dict[str, Any]:
         rows = c.execute("""
             SELECT market, clv_pct FROM tips
             WHERE clv_pct IS NOT NULL AND created_ts >= %s
+              AND COALESCE(price_verified,0)=1
         """, (cutoff,)).fetchall()
     if not rows:
         return {"n": 0, "note": "No closing prices captured yet. CLV is prematch-only "
@@ -2420,6 +2514,7 @@ def compute_clv_breakdown(days: Optional[int] = None, min_n: int = 20) -> Dict[s
         rows = c.execute("""
             SELECT market, league, clv_pct FROM tips
             WHERE clv_pct IS NOT NULL AND created_ts >= %s
+              AND COALESCE(price_verified,0)=1
         """, (cutoff,)).fetchall()
 
     if not rows:
@@ -3001,21 +3096,26 @@ def production_scan() -> Tuple[int, int]:
                     c.execute(
                         "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,"
                         "confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,"
-                        "fair_prob,kickoff_ts,is_prematch,stake_units,sent_ok) "
-                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,0) "
+                        "fair_prob,kickoff_ts,is_prematch,stake_units,sent_ok,decision_ts,"
+                        "stats_fetched_ts,odds_fetched_ts,telegram_sent_ts,price_verified,audit_json) "
+                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                        "%s,%s,%s,%s,%s,%s) "
                         "ON CONFLICT (match_id, created_ts) DO NOTHING",
                         (fid, league_id, league, home, away, market_txt, suggestion,
                          float(prob_pct), float(prob), score, minute, created_ts,
                          pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"),
-                         kickoff, stake))
+                         kickoff, 0, stake, 0, base_now, _STATS_FETCHED_TS.get(fid),
+                         pc.get("odds_fetched_ts"), None, 1,
+                         _tip_audit_json(fid, "live", feat, raw, candidates, pc, base_now)))
 
                 sent = send_telegram(_format_tip_message(
                     home, away, league, minute, score, suggestion, prob_pct, raw,
                     pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"), stake))
                 if sent:
                     with db_conn() as c:
-                        c.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
-                                  (fid, created_ts))
+                        c.execute("UPDATE tips SET sent_ok=1,telegram_sent_ts=%s "
+                                  "WHERE match_id=%s AND created_ts=%s",
+                                  (int(time.time()), fid, created_ts))
 
                 saved += 1
                 per_match += 1
@@ -3323,12 +3423,16 @@ def prematch_scan_save() -> int:
                 c2.execute(
                     "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,"
                     "confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,"
-                    "fair_prob,kickoff_ts,is_prematch,stake_units,sent_ok) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,NULL,%s,%s,%s,%s,%s,%s,1,%s,0) "
+                    "fair_prob,kickoff_ts,is_prematch,stake_units,sent_ok,decision_ts,"
+                    "stats_fetched_ts,odds_fetched_ts,telegram_sent_ts,price_verified,audit_json) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                    "%s,%s,%s,%s,%s,%s) "
                     "ON CONFLICT (match_id, created_ts) DO NOTHING",
                     (fid, league_id, league, home, away, f"PRE {mk}", sug,
-                     float(pct), float(prob), created_ts, pc.get("odds"), pc.get("book"),
-                     pc.get("ev_pct"), pc.get("fair_prob"), kickoff, stake))
+                     float(pct), float(prob), None, None, created_ts, pc.get("odds"), pc.get("book"),
+                     pc.get("ev_pct"), pc.get("fair_prob"), kickoff, 1, stake, 0, base_now, None,
+                     pc.get("odds_fetched_ts"), None, 1,
+                     _tip_audit_json(fid, "prematch", feat, None, candidates, pc, base_now)))
 
             sent = send_telegram(_format_tip_message(
                 home, away, league, 0, "", sug, pct, None,
@@ -3336,8 +3440,9 @@ def prematch_scan_save() -> int:
                 stake, kickoff_txt=kickoff_txt, prematch=True))
             if sent:
                 with db_conn() as c2:
-                    c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s",
-                               (fid, created_ts))
+                    c2.execute("UPDATE tips SET sent_ok=1,telegram_sent_ts=%s "
+                               "WHERE match_id=%s AND created_ts=%s",
+                               (int(time.time()), fid, created_ts))
 
             saved += 1
             per_match += 1
@@ -3533,7 +3638,7 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
     with db_conn() as c:
         rows = c.execute("""
             SELECT t.market, t.suggestion, t.odds, t.created_ts, t.stake_units, t.clv_pct,
-                   r.final_goals_h, r.final_goals_a, r.btts_yes
+                   COALESCE(t.price_verified,0), r.final_goals_h, r.final_goals_a, r.btts_yes
             FROM tips t JOIN match_results r ON r.match_id = t.match_id
             WHERE t.suggestion<>'HARVEST' AND t.odds IS NOT NULL AND t.created_ts >= %s
             ORDER BY t.created_ts ASC
@@ -3551,7 +3656,7 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
     # counting them as a track record reports fiction as edge.
     stale = {"n_bets": 0, "n_wins": 0, "staked": 0.0, "profit": 0.0}
 
-    for (mkt, sugg, odds, cts, stake_units, clv, gh, ga, btts) in rows:
+    for (mkt, sugg, odds, cts, stake_units, clv, price_verified, gh, ga, btts) in rows:
         outcome = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
         if outcome is None:
             n_push += 1
@@ -3561,7 +3666,9 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
             continue
         profit = s * (float(odds) - 1.0) if outcome == 1 else -s
 
-        if int(cts or 0) < ODDS_TRUSTED_FROM_TS:
+        # Old records lack proof that their quote represented the suggested
+        # market. Preserve them for audit, but never mix them into headline ROI.
+        if not int(price_verified or 0) or int(cts or 0) < ODDS_TRUSTED_FROM_TS:
             stale["n_bets"] += 1
             stale["n_wins"] += 1 if outcome == 1 else 0
             stale["staked"] += s
@@ -3608,18 +3715,16 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
             "total_profit": round(stale["profit"], 2),
             "roi_pct": (round(stale["profit"] / stale["staked"] * 100.0, 2)
                         if stale["staked"] > 0 else 0.0),
-            "note": ("Graded at prices that were never available for the selection: team "
-                     "totals and half markets were being folded into the full-match markets, "
-                     "and the best price across that mix won. Reported for completeness, "
-                     "excluded from every figure above. Not recoverable — the true price at "
-                     "tip time was never recorded."),
+            "note": ("Legacy or unverified prices recorded before the strict market-and-line "
+                     "audit boundary. Preserved for inspection but excluded from every headline "
+                     "figure because the true executable selection price cannot be proven."),
         },
         "note": ("Real odds captured at tip time, never synthetic. Tips sent without odds are "
                  "excluded — there is no price to grade them against. Draw No Bet pushes on a "
                  "draw and is excluded rather than counted as a loss. If mean_clv_pct is "
                  "negative while roi_pct is positive, treat the ROI as variance, not edge. "
-                 "Figures cover bets priced after the market-mapping fix only; see "
-                 "excluded_unreliable_pricing for what came before."),
+                 "Headline figures contain only price_verified=1 records created by the strict "
+                 "market-and-line parser; see excluded_unreliable_pricing for older records."),
     }
 
 
@@ -3693,6 +3798,7 @@ def compute_market_significance(days: Optional[int] = None, min_n: int = 50) -> 
                    r.final_goals_h, r.final_goals_a, r.btts_yes
             FROM tips t JOIN match_results r ON r.match_id = t.match_id
             WHERE t.suggestion<>'HARVEST' AND t.odds IS NOT NULL AND t.created_ts >= %s
+              AND COALESCE(t.price_verified,0)=1
         """, (cutoff,)).fetchall()
 
     by: Dict[str, List[Tuple[float, int]]] = {}
@@ -3752,6 +3858,7 @@ def monte_carlo_bankroll(days: Optional[int], initial_bankroll: float, stake_pct
                    r.final_goals_h, r.final_goals_a, r.btts_yes
             FROM tips t JOIN match_results r ON r.match_id = t.match_id
             WHERE t.suggestion<>'HARVEST' AND t.odds IS NOT NULL AND t.created_ts >= %s
+              AND COALESCE(t.price_verified,0)=1
         """, (cutoff,)).fetchall()
 
     by_match: Dict[int, List[Tuple[float, int]]] = {}
@@ -3818,6 +3925,7 @@ def compute_league_breakdown(market: Optional[str] = None, days: Optional[int] =
                r.final_goals_h, r.final_goals_a, r.btts_yes
         FROM tips t JOIN match_results r ON r.match_id = t.match_id
         WHERE t.suggestion<>'HARVEST' AND t.created_ts >= %s
+          AND COALESCE(t.price_verified,0)=1
     """
     params: List[Any] = [cutoff]
     if market:
@@ -3908,6 +4016,7 @@ def daily_accuracy_digest() -> Optional[str]:
             FROM tips t LEFT JOIN match_results r ON r.match_id=t.match_id
             WHERE t.created_ts >= %s AND t.created_ts < %s
               AND t.suggestion<>'HARVEST' AND t.sent_ok=1
+              AND COALESCE(t.price_verified,0)=1
         """, (int(y0.timestamp()), int(y1.timestamp()))).fetchall()
 
     total = graded = wins = pushes = 0
@@ -4077,7 +4186,9 @@ def retry_unsent_tips(minutes: int = 120, limit: int = 200) -> int:
             odds, book, ev_pct, fair, stake, kickoff_txt=kickoff_txt, prematch=bool(is_pre)))
         if ok:
             with db_conn() as c2:
-                c2.execute("UPDATE tips SET sent_ok=1 WHERE match_id=%s AND created_ts=%s", (mid, cts))
+                c2.execute("UPDATE tips SET sent_ok=1,telegram_sent_ts=%s "
+                           "WHERE match_id=%s AND created_ts=%s",
+                           (int(time.time()), mid, cts))
             retried += 1
     if retried:
         log.info("[RETRY] resent %d", retried)
@@ -4661,12 +4772,14 @@ def dashboard_data():
         rows = c.execute(
             "SELECT match_id,league,home,away,market,suggestion,confidence,"
             "score_at_tip,minute,created_ts,odds,book,ev_pct,fair_prob,stake_units,"
-            "clv_pct,is_prematch,sent_ok "
+            "clv_pct,is_prematch,sent_ok,decision_ts,stats_fetched_ts,odds_fetched_ts,"
+            "telegram_sent_ts,price_verified "
             "FROM tips WHERE suggestion<>'HARVEST' ORDER BY created_ts DESC LIMIT %s", (limit,)
         ).fetchall()
     keys = ["match_id", "league", "home", "away", "market", "suggestion", "confidence",
             "score_at_tip", "minute", "created_ts", "odds", "book", "ev_pct", "fair_prob",
-            "stake_units", "clv_pct", "is_prematch", "sent_ok"]
+            "stake_units", "clv_pct", "is_prematch", "sent_ok", "decision_ts",
+            "stats_fetched_ts", "odds_fetched_ts", "telegram_sent_ts", "price_verified"]
     tips = [dict(zip(keys, r)) for r in rows]
     try:
         pnl = compute_pnl(days=days, stake=1.0)
@@ -4675,6 +4788,45 @@ def dashboard_data():
         pnl = {"error": str(e)}
     return jsonify({"ok": True, "tips": tips, "pnl": pnl, "build": build_info(),
                     "server_ts": int(time.time())})
+
+
+def _tip_audit_payload(fid: int) -> Tuple[Dict[str, Any], int]:
+    with db_conn() as c:
+        row = c.execute(
+            "SELECT match_id,home,away,market,suggestion,created_ts,decision_ts,"
+            "stats_fetched_ts,odds_fetched_ts,telegram_sent_ts,price_verified,audit_json "
+            "FROM tips WHERE match_id=%s AND suggestion<>'HARVEST' "
+            "ORDER BY created_ts DESC LIMIT 1", (fid,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "tip_not_found", "match_id": fid}, 404
+    keys = ["match_id", "home", "away", "market", "suggestion", "created_ts",
+            "decision_ts", "stats_fetched_ts", "odds_fetched_ts", "telegram_sent_ts",
+            "price_verified", "audit"]
+    out = dict(zip(keys, row))
+    raw_audit = out.get("audit")
+    if raw_audit:
+        try:
+            out["audit"] = json.loads(raw_audit)
+        except Exception:
+            out["audit"] = {"error": "stored audit JSON is unreadable"}
+    return {"ok": True, "tip": out, "server_ts": int(time.time())}, 200
+
+
+@app.route("/dashboard/tip-audit/<int:fid>")
+def dashboard_tip_audit(fid: int):
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
+    if not _dashboard_authed():
+        abort(401)
+    payload, status = _tip_audit_payload(fid)
+    return jsonify(payload), status
+
+
+@app.route("/admin/tip-audit/<int:fid>")
+def admin_tip_audit(fid: int):
+    _require_admin()
+    payload, status = _tip_audit_payload(fid)
+    return jsonify(payload), status
 
 
 # How many recent fixtures to pull per team. The window is split by venue
@@ -4828,11 +4980,13 @@ def http_latest():
     with db_conn() as c:
         rows = c.execute(
             "SELECT match_id,league,home,away,market,suggestion,confidence,confidence_raw,"
-            "score_at_tip,minute,created_ts,odds,book,ev_pct,fair_prob,stake_units,clv_pct,is_prematch "
+            "score_at_tip,minute,created_ts,odds,book,ev_pct,fair_prob,stake_units,clv_pct,is_prematch,"
+            "decision_ts,stats_fetched_ts,odds_fetched_ts,telegram_sent_ts,price_verified "
             "FROM tips WHERE suggestion<>'HARVEST' ORDER BY created_ts DESC LIMIT %s", (limit,)).fetchall()
     keys = ["match_id", "league", "home", "away", "market", "suggestion", "confidence",
             "confidence_raw", "score_at_tip", "minute", "created_ts", "odds", "book",
-            "ev_pct", "fair_prob", "stake_units", "clv_pct", "is_prematch"]
+            "ev_pct", "fair_prob", "stake_units", "clv_pct", "is_prematch", "decision_ts",
+            "stats_fetched_ts", "odds_fetched_ts", "telegram_sent_ts", "price_verified"]
     return jsonify({"ok": True, "tips": [dict(zip(keys, r)) for r in rows]})
 
 
