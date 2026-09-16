@@ -163,6 +163,8 @@ MAX_TIPS_PER_SCAN = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
 DUP_COOLDOWN_MIN = int(os.getenv("DUP_COOLDOWN_MIN", "20"))
 TIP_MIN_MINUTE = int(os.getenv("TIP_MIN_MINUTE", "8"))
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
+LIVE_MAX_INPUT_AGE_SEC = max(1, int(os.getenv("LIVE_MAX_INPUT_AGE_SEC", "120")))
+LIVE_MAX_ODDS_AGE_SEC = max(1, int(os.getenv("LIVE_MAX_ODDS_AGE_SEC", "90")))
 
 PREDICTIONS_PER_MATCH = int(os.getenv("PREDICTIONS_PER_MATCH", "1"))
 CORRELATED_EXTRA_EV_BPS = int(os.getenv("CORRELATED_EXTRA_EV_BPS", "400"))
@@ -515,6 +517,7 @@ STATS_CACHE = _TTLCache(ttl=90, maxsize=int(os.getenv("STATS_CACHE_MAXSIZE", "10
 EVENTS_CACHE = _TTLCache(ttl=90, maxsize=int(os.getenv("EVENTS_CACHE_MAXSIZE", "1000")))
 ODDS_CACHE = _TTLCache(ttl=int(os.getenv("ODDS_CACHE_TTL_SEC", "45")),
                        maxsize=int(os.getenv("ODDS_CACHE_MAXSIZE", "2000")))
+ODDS_DIAGNOSTICS = _TTLCache(ttl=900, maxsize=2000)
 TEAM_FORM_CACHE = _TTLCache(ttl=TEAM_FORM_TTL, maxsize=int(os.getenv("TEAM_FORM_CACHE_MAXSIZE", "8000")))
 
 SETTINGS_TTL = int(os.getenv("SETTINGS_TTL_SEC", "60"))
@@ -1006,6 +1009,7 @@ def fetch_match_events(fid: int) -> list:
 
 def fetch_live_matches() -> List[dict]:
     js = _api_get(FOOTBALL_API_URL, {"live": "all"}) or {}
+    observed_ts = int(time.time())
     matches = [m for m in (js.get("response", []) if isinstance(js, dict) else [])
                if not _blocked_league(m.get("league") or {})]
     eligible = []
@@ -1015,6 +1019,7 @@ def fetch_live_matches() -> List[dict]:
         short = (st.get("short") or "").upper()
         if elapsed is None or elapsed > 90 or short not in INPLAY_STATUSES:
             continue
+        m["_fixture_observed_ts"] = observed_ts
         eligible.append(m)
 
     def _hydrate(m: dict) -> dict:
@@ -1255,6 +1260,7 @@ def extract_raw_inplay(m: dict) -> Dict[str, Any]:
         "_stats_away_field_names": sorted(sa),
         "_xg_h_available": xg_h_available,
         "_xg_a_available": xg_a_available,
+        "_fixture_observed_ts": m.get("_fixture_observed_ts"),
     }
 
 
@@ -1413,7 +1419,10 @@ def _calibrate(p: float, cal: Dict[str, Any]) -> float:
 
 
 def _score_prob(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
-    p = _sigmoid(_linpred(feat, mdl))
+    linear = _linpred(feat, mdl)
+    if not math.isfinite(linear):
+        raise ValueError("non-finite model score")
+    p = _sigmoid(linear)
     cal = mdl.get("calibration") or {}
     if cal:
         try:
@@ -1422,7 +1431,9 @@ def _score_prob(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
             # Falling back to the UNCALIBRATED probability changes what the
             # number means while it still gets compared against the same
             # threshold, so leave a trace rather than swallowing it whole.
-            log.debug("[SCORE] calibration failed (%s) — using uncalibrated %.4f", e, p)
+            raise ValueError("model calibration failed") from e
+    if not math.isfinite(p):
+        raise ValueError("non-finite calibrated probability")
     return max(0.0, min(1.0, float(p)))
 
 
@@ -1514,28 +1525,18 @@ _OU_NOT_MATCH_TOTAL = ("home", "away", "team")
 
 
 def _market_name_normalize(s: Any) -> str:
-    s = _txt(s).lower()
-    # Returning the raw name leaves it unmapped, so _parse_book_market skips
-    # it rather than pricing one market's selection off another's.
-    if any(bad in s for bad in _NOT_FULL_MATCH_SCOPE):
-        return s
-    if "both teams" in s or "btts" in s:
-        return "BTTS"
-    if "double chance" in s:
-        return "DC"
-    if "draw no bet" in s:
-        return "DNB"
-    # API-Football's in-play feed calls the full-match 1X2 market
-    # "Fulltime Result" (with spelling variants seen across providers).
-    if ("match winner" in s or "fulltime result" in s or
-            "full time result" in s or "full-time result" in s or
-            "winner" in s or "1x2" in s):
-        return "1X2"
-    if "over/under" in s or "total" in s or "goals" in s:
-        if any(bad in s for bad in _OU_NOT_MATCH_TOTAL):
-            return s
-        return "OU"
-    return s
+    # Exact aliases only. A substring such as "winner" also matches combined
+    # winner/total markets, which must never price a straight match outcome.
+    name = " ".join(_txt(s).strip().casefold().replace("-", " ").split())
+    aliases = {
+        "1X2": {"match winner", "fulltime result", "full time result", "1x2", "winner"},
+        "BTTS": {"both teams score", "both teams to score", "btts"},
+        "DC": {"double chance"},
+        "DNB": {"draw no bet"},
+        "OU": {"goals over/under", "over/under", "over/under line", "match goals",
+               "total goals", "total goals over/under", "match total goals"},
+    }
+    return next((key for key, names in aliases.items() if name in names), "")
 
 
 # The in-play feed is one aggregated source rather than a panel of books, so
@@ -1572,20 +1573,29 @@ def _odd_value(v: dict) -> float:
     try:
         # In-play selections carry a suspended flag while the market is
         # frozen. A suspended price cannot be taken, so it is not a price.
-        if v.get("suspended") is True:
+        if not isinstance(v, dict) or _price_suspended(v):
             return 0.0
         raw = v.get("odd")
         if raw is None:
             return 0.0
-        return float(_txt(raw).replace(",", "."))
+        value = float(_txt(raw).replace(",", "."))
+        return value if math.isfinite(value) and value > 1.0 else 0.0
     except Exception:
         return 0.0
 
 
+def _price_suspended(obj: dict) -> bool:
+    return any(str(obj.get(k, "")).strip().lower() in ("true", "1", "yes")
+               for k in ("suspended", "blocked", "stopped"))
+
+
 def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
     """Parse one bookmaker's one market into {market_key: {selection: odds}}."""
+    if not isinstance(mkt, dict) or _price_suspended(mkt):
+        return None
     mname = _market_name_normalize(mkt.get("name"))
-    vals = mkt.get("values") or []
+    values = mkt.get("values")
+    vals = [v for v in values if isinstance(v, dict)] if isinstance(values, list) else []
     if mname == "BTTS":
         d = {}
         for v in vals:
@@ -1647,27 +1657,26 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
             # be folded into a full-match total.
             if any(bad in lbl for bad in _NOT_FULL_MATCH_SCOPE + _OU_NOT_MATCH_TOTAL):
                 continue
-            side_match = re.match(r"^(over|under)(?:\s+|$)", lbl)
+            side_match = re.fullmatch(r"(over|under)(?:\s+(\d+(?:[.,]\d+)?))?", lbl)
             if not side_match:
                 continue
             o = _odd_value(v)
             if o <= 1.0:
                 continue
-            label_nums = re.findall(r"(?<!\d)(\d+(?:[.,]\d+)?)(?!\d)", lbl)
-            label_line = float(label_nums[-1].replace(",", ".")) if label_nums else None
+            label_line = float(side_match.group(2).replace(",", ".")) if side_match.group(2) else None
             handicap = v.get("handicap")
             try:
                 handicap_line = (float(_txt(handicap).replace(",", "."))
                                   if handicap not in (None, "") else None)
             except (TypeError, ValueError):
-                handicap_line = None
+                continue
             # Prematch normally embeds the line in `value`; live odds place it
             # in `handicap`. If both exist, they must describe the same line.
             if (label_line is not None and handicap_line is not None
                     and abs(label_line - handicap_line) > 1e-6):
                 continue
             ln = handicap_line if handicap_line is not None else label_line
-            if ln is None:
+            if ln is None or not math.isfinite(ln) or ln % 1 != 0.5:
                 continue
             # Only exact lines the service trains and grades are eligible;
             # quarter/integer Asian lines settle differently.
@@ -1761,14 +1770,18 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
         return cached
 
     params: Dict[str, Any] = {"fixture": fid}
-    if ODDS_BOOKMAKER_ID:
+    if ODDS_BOOKMAKER_ID and not live:
         params["bookmaker"] = ODDS_BOOKMAKER_ID
     js = _api_get(ODDS_LIVE_URL if live else ODDS_PREMATCH_URL, params)
     fetched_ts = int(time.time())
+    diagnostics = {"fetched_ts": fetched_ts, "status": "ok", "markets": []}
+    ODDS_DIAGNOSTICS.set(key, diagnostics)
     if not isinstance(js, dict):
+        diagnostics["status"] = "api_unavailable"
         return {}
     api_errors = js.get("errors")
     if api_errors not in (None, {}, [], ""):
+        diagnostics["status"] = "api_error"
         return {}
 
     best: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -1784,10 +1797,23 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     # priced candidates rather than merely degraded ones. Failures are now
     # isolated to the market that caused them; everything else survives.
     response = js.get("response", []) if isinstance(js, dict) else []
+    if not isinstance(response, list):
+        diagnostics["status"] = "malformed_response"
+        return {}
+    if not response:
+        diagnostics["status"] = "no_markets_returned"
     for r in response:
+        if not isinstance(r, dict):
+            continue
+        status = r.get("status") or {}
+        if live and isinstance(status, dict) and _price_suspended(status):
+            diagnostics["status"] = "fixture_odds_suspended"
+            continue
         for book_name, bets in _iter_price_sources(r):
             per_market: Dict[str, Dict[str, float]] = {}
             for mkt in bets:
+                if not isinstance(mkt, dict):
+                    continue
                 try:
                     parsed = _parse_book_market(mkt)
                 except Exception as e:
@@ -1795,6 +1821,19 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
                     log.debug("[ODDS] fixture %s book %s market %r unparseable: %s",
                               fid, book_name, mkt.get("name"), e)
                     continue
+                if len(diagnostics["markets"]) < 80:
+                    normalized = _market_name_normalize(mkt.get("name"))
+                    values = mkt.get("values")
+                    diagnostics["markets"].append({
+                        "name": _txt(mkt.get("name")), "book": book_name,
+                        "normalized": normalized or None,
+                        "reason": ("accepted" if parsed else "suspended" if _price_suspended(mkt)
+                                   else "unsupported_market" if not normalized
+                                   else "incomplete_or_invalid_selections"),
+                        "values": [{k: v.get(k) for k in ("value", "odd", "handicap", "suspended")}
+                                   for v in (values[:8] if isinstance(values, list) else [])
+                                   if isinstance(v, dict)],
+                    })
                 if not parsed:
                     continue
                 mkey, payload = parsed
@@ -1806,6 +1845,8 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
 
             for mkey, sel in per_market.items():
                 try:
+                    if book_name in books_seen.get(mkey, set()):
+                        continue  # A repeated source must not get two consensus votes.
                     books_seen.setdefault(mkey, set()).add(book_name)
                     for name, o in sel.items():
                         cur = best.setdefault(mkey, {}).get(name)
@@ -1987,6 +2028,9 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
     """
     res = PriceCheck(passed=False, odds=None, book=None, fair_prob=None,
                      ev_pct=None, decision="no_odds", n_books=0)
+    if not math.isfinite(float(prob)) or not 0.0 <= prob <= 1.0:
+        res["decision"] = "invalid_probability"
+        return res
     mkey, sel = _market_key_and_selection(market_text, suggestion)
     if not mkey or not sel:
         res["decision"] = "unmapped_market"
@@ -2003,10 +2047,32 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
         return res
 
     odds = float(best["odds"])
+    if not math.isfinite(odds) or odds <= 1.0:
+        res["decision"] = "invalid_odds"
+        return res
     res["odds"] = odds
     res["book"] = best.get("book")
     res["odds_fetched_ts"] = entry.get("fetched_ts")
     res["odds_source_update"] = entry.get("source_update")
+    if live:
+        now = time.time()
+        fetched = entry.get("fetched_ts")
+        if fetched is None or not 0 <= now - float(fetched) <= LIVE_MAX_ODDS_AGE_SEC:
+            res["decision"] = "stale_odds"
+            return res
+        source_update = entry.get("source_update")
+        if source_update:
+            try:
+                updated = datetime.fromisoformat(str(source_update).replace("Z", "+00:00"))
+                if updated.tzinfo is None:
+                    raise ValueError("timezone missing")
+                age = now - updated.timestamp()
+            except (ValueError, TypeError, OverflowError):
+                res["decision"] = "invalid_odds_timestamp"
+                return res
+            if age < -30 or age > LIVE_MAX_ODDS_AGE_SEC:
+                res["decision"] = "stale_odds"
+                return res
 
     if not (_min_odds_for_market(market_text.replace("PRE ", "")) <= odds <= MAX_ODDS_ALL):
         res["decision"] = "odds_out_of_range"
@@ -2016,6 +2082,9 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
         return res
 
     fair = (entry.get("fair") or {}).get(sel)
+    if fair is not None and (not math.isfinite(float(fair)) or not 0.0 < float(fair) < 1.0):
+        res["decision"] = "invalid_fair_probability"
+        return res
     if fair is None:
         res["decision"] = "no_fair_price"
         if REQUIRE_FAIR_PRICE:
@@ -2088,6 +2157,34 @@ def _stake_units(prob: float, odds: Optional[float]) -> Optional[float]:
     return round(BANKROLL_UNITS * f, 2)
 
 
+def _live_delivery_check(fid: int, raw: Dict[str, Any], pc: PriceCheck) -> PriceCheck:
+    """Final score/clock check. No synthetic prices or predictions are substituted."""
+    now = time.time()
+    for timestamp in (raw.get("_fixture_observed_ts"), _STATS_FETCHED_TS.get(fid)):
+        if timestamp is None or not 0 <= now - float(timestamp) <= LIVE_MAX_INPUT_AGE_SEC:
+            return PriceCheck(**{**pc, "passed": False, "decision": "stale_live_inputs"})
+    current = _fixture_by_id(fid)
+    if not current:
+        return PriceCheck(**{**pc, "passed": False, "decision": "fixture_recheck_failed"})
+    status = (current.get("fixture") or {}).get("status") or {}
+    goals = current.get("goals") or {}
+    elapsed = status.get("elapsed")
+    if (status.get("short") not in {"1H", "HT", "2H"} or elapsed is None
+            or not 0 <= float(elapsed) - float(raw["minute"]) <= 1
+            or float(elapsed) > 90
+            or goals.get("home") is None or goals.get("away") is None
+            or float(goals["home"]) != float(raw["goals_h"])
+            or float(goals["away"]) != float(raw["goals_a"])):
+        return PriceCheck(**{**pc, "passed": False, "decision": "fixture_state_changed"})
+    if any(time.time() - float(ts) > LIVE_MAX_INPUT_AGE_SEC for ts in
+           (raw["_fixture_observed_ts"], _STATS_FETCHED_TS[fid])):
+        return PriceCheck(**{**pc, "passed": False, "decision": "stale_live_inputs"})
+    if time.time() - float(pc.get("odds_fetched_ts") or 0) > LIVE_MAX_ODDS_AGE_SEC:
+        return PriceCheck(**{**pc, "passed": False, "decision": "stale_odds"})
+    pc["fixture_rechecked_ts"] = int(time.time())
+    return pc
+
+
 def _tip_audit_json(fid: int, phase: str, feat: Dict[str, float],
                     raw: Optional[Dict[str, float]],
                     candidates: List[Tuple[str, str, float, float]],
@@ -2115,9 +2212,9 @@ def _tip_audit_json(fid: int, phase: str, feat: Dict[str, float],
         "price_check": dict(pc),
         "market_probabilities": market_probabilities,
         "features": {k: float(v) for k, v in feat.items()},
-        "raw_stats": ({k: float(v) for k, v in raw.items()} if raw else None),
+        "raw_stats": dict(raw) if raw else None,
     }
-    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True, allow_nan=False)
 
 
 # ───────── Prediction log ─────────
@@ -2726,6 +2823,14 @@ def _wld_probs(feat: Dict[str, float], prefix: str) -> Optional[Tuple[float, flo
     1.30-1.35x. The draw head is trained and used, so the normalisation is over
     all three outcomes.
     """
+    details = _wld_details(feat, prefix)
+    if details is None:
+        return None
+    p = details["normalized"]
+    return p["home"], p["draw"], p["away"]
+
+
+def _wld_details(feat: Dict[str, float], prefix: str) -> Optional[Dict[str, Any]]:
     mh = load_model_from_settings(f"{prefix}WLD_HOME")
     md = load_model_from_settings(f"{prefix}WLD_DRAW")
     ma = load_model_from_settings(f"{prefix}WLD_AWAY")
@@ -2740,8 +2845,13 @@ def _wld_probs(feat: Dict[str, float], prefix: str) -> Optional[Tuple[float, flo
         # empirical draw prior so the denominator is still a full 1X2 one.
         pd_ = float(os.getenv("FALLBACK_DRAW_PROB", "0.26"))
         log.warning("[1X2] %sWLD_DRAW model missing — using fallback draw prior %.2f", prefix, pd_)
-    s = max(EPS, ph + pd_ + pa)
-    return ph / s, pd_ / s, pa / s
+    s = ph + pd_ + pa
+    if not math.isfinite(s) or s <= EPS:
+        raise ValueError("invalid 1X2 normalization sum")
+    return {"before_normalization": {"home": ph, "draw": pd_, "away": pa},
+            "normalization_sum": s,
+            "normalized": {"home": ph / s, "draw": pd_ / s, "away": pa / s},
+            "draw_fallback_used": not bool(md)}
 
 
 def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
@@ -2826,7 +2936,8 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
                             score: str, minute: int,
                             candidates: List[Tuple[str, str, float, float]],
                             kickoff_ts: int = 0, raw: Optional[Dict[str, float]] = None,
-                            home_id: int = 0, away_id: int = 0) -> Dict[str, Any]:
+                            home_id: int = 0, away_id: int = 0,
+                            feat: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     # For every candidate that clears its own threshold, run it through the
     # same _price_gate() production_scan() uses to decide whether it would
     # actually get tipped, and surface *why* when it wouldn't - "high
@@ -2847,11 +2958,15 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
         prob_pct = round(float(pr) * 100.0, 1)
         thr_pct = round(float(thr), 1)
         row = {"market": mt, "suggestion": sg, "prob_pct": prob_pct, "threshold_pct": thr_pct}
-        if prob_pct >= thr_pct:
+        if float(pr) * 100.0 >= float(thr):
             pc = _price_gate(mt, sg, fid, pr, live=True)
             row["decision"] = pc["decision"]
             row["odds"] = pc.get("odds")
             row["ev_pct"] = pc.get("ev_pct")
+            for key in ("fair_prob", "fair_edge_pct", "n_books", "book",
+                        "odds_fetched_ts", "odds_source_update", "price_vs_fair_pct"):
+                row[key] = pc.get(key)
+            row["gate_passed"] = bool(pc["passed"])
         else:
             row["decision"] = "below_threshold"
             row["odds"] = None
@@ -2878,6 +2993,12 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
         "home_id": int(home_id or 0), "away_id": int(away_id or 0),
         "kickoff_ts": int(kickoff_ts or 0), "stats": stats,
         "markets": markets,
+        "wld_diagnostics": _wld_details(feat, "") if feat is not None else None,
+        "odds_diagnostics": ODDS_DIAGNOSTICS.get((fid, True)),
+        "gate_limits": {"max_model_edge_pp": MAX_MODEL_EDGE_BPS / 100.0,
+                        "min_ev_pct": EDGE_MIN_BPS / 100.0,
+                        "min_fair_edge_pp": FAIR_EDGE_MIN_BPS / 100.0},
+        "decision_note": "tipped means price gate passed; delivery and fixture limits are checked separately",
         # Count of candidates that would actually be tipped (passed the full
         # price gate), not just candidates with high raw confidence - this is
         # what "worth a look" should mean on the dashboard.
@@ -3054,7 +3175,7 @@ def production_scan() -> Tuple[int, int]:
             home_id, away_id = _team_ids(m)
             live_snapshot_matches.append(_build_live_match_entry(
                 fid, league, league_id, home, away, score, minute, candidates,
-                kickoff_ts=kickoff, raw=raw, home_id=home_id, away_id=away_id))
+                kickoff_ts=kickoff, raw=raw, home_id=home_id, away_id=away_id, feat=feat))
 
             # Displayed above, just not re-tipped yet.
             if cooling_down:
@@ -3072,6 +3193,11 @@ def production_scan() -> Tuple[int, int]:
                                 decision="below_threshold" if below else "per_match_cap")
                 if not below and not capped:
                     pc = _price_gate(market_txt, suggestion, fid, prob, live=True)
+                    if pc["passed"]:
+                        ODDS_CACHE.invalidate((fid, True))
+                        pc = _price_gate(market_txt, suggestion, fid, prob, live=True)
+                        if pc["passed"]:
+                            pc = _live_delivery_check(fid, raw, pc)
                     if pc["passed"] and _correlation_blocked(suggestion, taken):
                         extra = int(round((pc.get("ev_pct") or 0) * 100)) - EDGE_MIN_BPS
                         if extra < CORRELATED_EXTRA_EV_BPS:
@@ -3091,6 +3217,8 @@ def production_scan() -> Tuple[int, int]:
                 created_ts = base_now + idx
                 prob_pct = round(float(prob) * 100.0, 1)
                 stake = _stake_units(prob, pc.get("odds"))
+                decision_ts = int(time.time())
+                audit_json = _tip_audit_json(fid, "live", feat, raw, candidates, pc, decision_ts)
 
                 with db_conn() as c:
                     c.execute(
@@ -3104,9 +3232,8 @@ def production_scan() -> Tuple[int, int]:
                         (fid, league_id, league, home, away, market_txt, suggestion,
                          float(prob_pct), float(prob), score, minute, created_ts,
                          pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"),
-                         kickoff, 0, stake, 0, base_now, _STATS_FETCHED_TS.get(fid),
-                         pc.get("odds_fetched_ts"), None, 1,
-                         _tip_audit_json(fid, "live", feat, raw, candidates, pc, base_now)))
+                         kickoff, 0, stake, 0, decision_ts, _STATS_FETCHED_TS.get(fid),
+                         pc.get("odds_fetched_ts"), None, int(bool(pc.get("odds"))), audit_json))
 
                 sent = send_telegram(_format_tip_message(
                     home, away, league, minute, score, suggestion, prob_pct, raw,
@@ -3211,7 +3338,7 @@ def score_live_matches_now(
             home_id, away_id = _team_ids(m)
             out.append(_build_live_match_entry(fid, league, league_id, home, away, score,
                                                minute, candidates, kickoff_ts=kickoff, raw=raw,
-                                               home_id=home_id, away_id=away_id))
+                                               home_id=home_id, away_id=away_id, feat=feat))
         except Exception as e:
             log.warning("[LIVE-SCORE] failed for a fixture: %s", e)
             continue
@@ -3418,6 +3545,8 @@ def prematch_scan_save() -> int:
             created_ts = base_now + idx
             pct = round(float(prob) * 100.0, 1)
             stake = _stake_units(prob, pc.get("odds"))
+            decision_ts = int(time.time())
+            audit_json = _tip_audit_json(fid, "prematch", feat, None, candidates, pc, decision_ts)
 
             with db_conn() as c2:
                 c2.execute(
@@ -3430,9 +3559,8 @@ def prematch_scan_save() -> int:
                     "ON CONFLICT (match_id, created_ts) DO NOTHING",
                     (fid, league_id, league, home, away, f"PRE {mk}", sug,
                      float(pct), float(prob), None, None, created_ts, pc.get("odds"), pc.get("book"),
-                     pc.get("ev_pct"), pc.get("fair_prob"), kickoff, 1, stake, 0, base_now, None,
-                     pc.get("odds_fetched_ts"), None, 1,
-                     _tip_audit_json(fid, "prematch", feat, None, candidates, pc, base_now)))
+                     pc.get("ev_pct"), pc.get("fair_prob"), kickoff, 1, stake, 0, decision_ts, None,
+                     pc.get("odds_fetched_ts"), None, int(bool(pc.get("odds"))), audit_json))
 
             sent = send_telegram(_format_tip_message(
                 home, away, league, 0, "", sug, pct, None,
