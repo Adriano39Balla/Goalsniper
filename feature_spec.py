@@ -37,19 +37,16 @@ coefficients (and therefore `feature_importance`) meaningless. Removed:
 Nonlinear derivations (ratios, products, indicators, absolute values) are kept:
 those carry information a linear model cannot recover from the components.
 
-Result: 56 in-play features and 30 prematch features, all of which vary and none
-of which is a linear function of the others.
+Prematch model inputs exclude market priors until historical point-in-time
+prices can support a consistent training and serving distribution.
 
 PREMATCH MARKET ANCHORING
 -------------------------
-pm_market_fair_* mirror the in-play market_fair_* features below: the
-de-vigged consensus prematch price, passed straight through as a feature
-rather than only used post-hoc by main.py's EV gate. Missing at call time (a
-fixture with no odds fetched yet, or every snapshot harvested before this was
-added) means neutral, not zero — a bare 0.0 would read as "the market says
-this outcome is impossible", which is false and would teach every
-pre-existing snapshot the wrong thing. See assemble_prematch_features()'s
-`market_fair` parameter and NEUTRAL_MARKET_PRIORS below.
+pm_market_fair_* remain in assembled snapshots for audit and future research,
+but are excluded from PRE_FEATURES. Historical backfill cannot reconstruct
+these prices reliably. New prematch models therefore use the same non-market
+feature set for both historical and current rows. Old models containing prior
+weights must be retrained before serving. In-play priors are unchanged.
 
 SCALING
 -------
@@ -213,8 +210,8 @@ PRE_FEATURES: List[str] = [
     "pm_rest_diff",
     "pm_attack_defense_ratio",
     "pm_league_btts_rate", "pm_league_ov25_rate", "pm_league_ov35_rate",
-    "pm_market_fair_home", "pm_market_fair_draw", "pm_market_fair_away",
-    "pm_market_fair_over25", "pm_market_fair_btts_yes",
+    # Exclude market priors until historical point-in-time prices exist.
+    # Raw snapshots retain them for audit; newly trained models do not use them.
 ]
 
 # Which feature holds each league base rate, per phase. Used by the training
