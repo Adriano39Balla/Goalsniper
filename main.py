@@ -83,6 +83,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, defaultdict
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape
@@ -2891,6 +2892,67 @@ def _dc_dnb_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tupl
     ]
 
 
+def _fixture_tip_history(fid: int) -> List[str]:
+    # Include queued tips as well as delivered tips: retries must not create
+    # a second position. The restriction persists beyond the scan cooldown.
+    with db_conn() as c:
+        return [row[0] for row in c.execute(
+            "SELECT suggestion FROM tips WHERE match_id=%s AND suggestion<>'HARVEST'",
+            (fid,)).fetchall()]
+
+
+def _history_rejection(suggestion: str, taken: List[str]) -> Optional[str]:
+    if suggestion in taken:
+        return "duplicate_fixture_selection"
+    opposite = {"BTTS: Yes": "BTTS: No", "BTTS: No": "BTTS: Yes",
+                "Home Win": "Away Win", "Away Win": "Home Win",
+                "Draw No Bet: Home": "Draw No Bet: Away",
+                "Draw No Bet: Away": "Draw No Bet: Home"}.get(suggestion)
+    if opposite in taken:
+        return "opposing_fixture_selection"
+    match = re.fullmatch(r"(Over|Under) (\d+(?:\.\d+)?) Goals", suggestion)
+    if match:
+        opposite = ("Under" if match[1] == "Over" else "Over") + " " + match[2] + " Goals"
+        if opposite in taken:
+            return "opposing_fixture_selection"
+    return None
+
+
+def _directional_market(market: str, suggestion: str) -> str:
+    if re.fullmatch(r"(?:Over|Under) \d+(?:\.\d+)? Goals", suggestion):
+        return ("PRE " if (market or "").startswith("PRE ") else "") + suggestion.removesuffix(" Goals")
+    return market or "?"
+
+
+@contextmanager
+def _tip_transaction():
+    with db_conn() as c:
+        # Ordinary pooled queries use autocommit; this section needs one
+        # transaction spanning the advisory lock, history read and insertion.
+        c.conn.autocommit = False
+        try:
+            yield c
+            c.conn.commit()
+        except BaseException:
+            c.conn.rollback()
+            raise
+        finally:
+            c.conn.autocommit = True
+
+
+def _reserve_fixture_selection(c, fid: int, suggestion: str) -> bool:
+    # Lock and recheck inside the INSERT transaction so simultaneous workers
+    # cannot both accept the same selection from an earlier history snapshot.
+    c.execute("SELECT pg_advisory_xact_lock(%s,%s)", (19018, fid))
+    previous = [row[0] for row in c.execute(
+        "SELECT suggestion FROM tips WHERE match_id=%s AND suggestion<>'HARVEST'",
+        (fid,)).fetchall()]
+    reason = _history_rejection(suggestion, previous)
+    if reason:
+        log.info("[HISTORY] fixture %s %s: %s", fid, suggestion, reason)
+    return reason is None
+
+
 def _correlation_blocked(suggestion: str, taken: List[str]) -> bool:
     for fam in _CORRELATION_FAMILIES:
         if suggestion in fam and any(t in fam for t in taken):
@@ -3182,7 +3244,7 @@ def production_scan() -> Tuple[int, int]:
                 continue
 
             per_match = 0
-            taken: List[str] = []
+            taken: List[str] = _fixture_tip_history(fid)
             base_now = int(time.time())
             fixture_preds: List[tuple] = []
 
@@ -3192,7 +3254,9 @@ def production_scan() -> Tuple[int, int]:
                 pc = PriceCheck(passed=False, odds=None, book=None, fair_prob=None, ev_pct=None,
                                 decision="below_threshold" if below else "per_match_cap")
                 if not below and not capped:
-                    pc = _price_gate(market_txt, suggestion, fid, prob, live=True)
+                    history_reason = _history_rejection(suggestion, taken)
+                    pc = (PriceCheck(passed=False, decision=history_reason) if history_reason else
+                          _price_gate(market_txt, suggestion, fid, prob, live=True))
                     if pc["passed"]:
                         ODDS_CACHE.invalidate((fid, True))
                         pc = _price_gate(market_txt, suggestion, fid, prob, live=True)
@@ -3220,7 +3284,9 @@ def production_scan() -> Tuple[int, int]:
                 decision_ts = int(time.time())
                 audit_json = _tip_audit_json(fid, "live", feat, raw, candidates, pc, decision_ts)
 
-                with db_conn() as c:
+                with _tip_transaction() as c:
+                    if not _reserve_fixture_selection(c, fid, suggestion):
+                        continue
                     c.execute(
                         "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,"
                         "confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,"
@@ -3516,7 +3582,7 @@ def prematch_scan_save() -> int:
         candidates.sort(key=lambda x: x[2], reverse=True)
 
         per_match = 0
-        taken: List[str] = []
+        taken: List[str] = _fixture_tip_history(fid)
         base_now = int(time.time())
         fixture_preds: List[tuple] = []
 
@@ -3526,7 +3592,9 @@ def prematch_scan_save() -> int:
             pc = PriceCheck(passed=False, odds=None, book=None, fair_prob=None, ev_pct=None,
                             decision="below_threshold" if below else "per_match_cap")
             if not below and not capped:
-                pc = _price_gate(mk, sug, fid, prob, live=False)
+                history_reason = _history_rejection(sug, taken)
+                pc = (PriceCheck(passed=False, decision=history_reason) if history_reason else
+                      _price_gate(mk, sug, fid, prob, live=False))
                 if pc["passed"] and _correlation_blocked(sug, taken):
                     extra = int(round((pc.get("ev_pct") or 0) * 100)) - EDGE_MIN_BPS
                     if extra < CORRELATED_EXTRA_EV_BPS:
@@ -3548,7 +3616,9 @@ def prematch_scan_save() -> int:
             decision_ts = int(time.time())
             audit_json = _tip_audit_json(fid, "prematch", feat, None, candidates, pc, decision_ts)
 
-            with db_conn() as c2:
+            with _tip_transaction() as c2:
+                if not _reserve_fixture_selection(c2, fid, sug):
+                    continue
                 c2.execute(
                     "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,"
                     "confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,"
@@ -3766,7 +3836,7 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
     with db_conn() as c:
         rows = c.execute("""
             SELECT t.market, t.suggestion, t.odds, t.created_ts, t.stake_units, t.clv_pct,
-                   COALESCE(t.price_verified,0), r.final_goals_h, r.final_goals_a, r.btts_yes
+                   COALESCE(t.price_verified,0), r.final_goals_h, r.final_goals_a, r.btts_yes, t.match_id
             FROM tips t JOIN match_results r ON r.match_id = t.match_id
             WHERE t.suggestion<>'HARVEST' AND t.odds IS NOT NULL AND t.created_ts >= %s
             ORDER BY t.created_ts ASC
@@ -3775,6 +3845,8 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
     total_staked = total_profit = 0.0
     n_bets = n_wins = n_push = 0
     by_market: Dict[str, Dict[str, float]] = {}
+    by_selection = {}
+    fixture_ids = set()
     equity: List[Dict[str, Any]] = []
     running = 0.0
     clvs: List[float] = []
@@ -3784,10 +3856,11 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
     # counting them as a track record reports fiction as edge.
     stale = {"n_bets": 0, "n_wins": 0, "staked": 0.0, "profit": 0.0}
 
-    for (mkt, sugg, odds, cts, stake_units, clv, price_verified, gh, ga, btts) in rows:
+    for (mkt, sugg, odds, cts, stake_units, clv, price_verified, gh, ga, btts, fid) in rows:
         outcome = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
         if outcome is None:
-            n_push += 1
+            if int(price_verified or 0) and int(cts or 0) >= ODDS_TRUSTED_FROM_TS:
+                n_push += 1
             continue
         s = float(stake_units) if (use_kelly and stake_units) else float(stake)
         if s <= 0:
@@ -3804,6 +3877,15 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
             continue
 
         n_bets += 1
+        fixture_ids.add(fid)
+        directional = _directional_market(mkt, sugg)
+        ds = by_selection.setdefault(directional, {"bets": 0, "wins": 0, "profit": 0.0,
+                                                   "staked": 0.0, "fixtures": set()})
+        ds["bets"] += 1
+        ds["wins"] += int(outcome == 1)
+        ds["profit"] += profit
+        ds["staked"] += s
+        ds["fixtures"].add(fid)
         total_staked += s
         if outcome == 1:
             n_wins += 1
@@ -3834,6 +3916,12 @@ def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool 
         "roi_pct": round(roi, 2),
         "mean_clv_pct": round(sum(clvs) / len(clvs), 2) if clvs else None,
         "by_market": market_summary,
+        "n_fixtures": len(fixture_ids),
+        "by_selection": {key: {"bets": d["bets"], "wins": d["wins"],
+            "n_fixtures": len(d["fixtures"]), "profit": round(d["profit"], 2),
+            "staked": round(d["staked"], 2),
+            "roi_pct": round(100 * d["profit"] / d["staked"], 2) if d["staked"] else 0.0}
+            for key, d in by_selection.items()},
         "equity_curve": equity,
         "odds_trusted_from_ts": ODDS_TRUSTED_FROM_TS,
         "excluded_unreliable_pricing": {
@@ -4140,7 +4228,8 @@ def daily_accuracy_digest() -> Optional[str]:
 
     with db_conn() as c:
         rows = c.execute("""
-            SELECT t.market, t.suggestion, r.final_goals_h, r.final_goals_a, r.btts_yes
+            SELECT t.market, t.suggestion, r.final_goals_h, r.final_goals_a, r.btts_yes,
+                   t.odds, t.match_id
             FROM tips t LEFT JOIN match_results r ON r.match_id=t.match_id
             WHERE t.created_ts >= %s AND t.created_ts < %s
               AND t.suggestion<>'HARVEST' AND t.sent_ok=1
@@ -4148,9 +4237,13 @@ def daily_accuracy_digest() -> Optional[str]:
         """, (int(y0.timestamp()), int(y1.timestamp()))).fetchall()
 
     total = graded = wins = pushes = 0
+    profit = 0.0
+    priced = 0
+    fixtures = set()
     by: Dict[str, Dict[str, int]] = {}
-    for (mkt, sugg, gh, ga, btts) in rows:
+    for (mkt, sugg, gh, ga, btts, odds, fid) in rows:
         total += 1  # counted before the grading guard, so "Sent" != "Graded"
+        fixtures.add(fid)
         if gh is None:
             continue
         out = _tip_outcome_for_result(sugg, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
@@ -4159,9 +4252,17 @@ def daily_accuracy_digest() -> Optional[str]:
             continue
         graded += 1
         wins += 1 if out == 1 else 0
-        d = by.setdefault(mkt or "?", {"graded": 0, "wins": 0})
+        d = by.setdefault(_directional_market(mkt, sugg), {"graded": 0, "wins": 0,
+                            "profit": 0.0, "priced": 0, "fixtures": set()})
+        d["fixtures"].add(fid)
         d["graded"] += 1
         d["wins"] += 1 if out == 1 else 0
+        if odds is not None and math.isfinite(float(odds)) and float(odds) > 1.0:
+            result_profit = float(odds) - 1.0 if out == 1 else -1.0
+            profit += result_profit
+            priced += 1
+            d["profit"] += result_profit
+            d["priced"] += 1
 
     if total == 0:
         msg = "📊 <b>Daily Digest</b>\nNo tips sent yesterday."
@@ -4169,20 +4270,18 @@ def daily_accuracy_digest() -> Optional[str]:
         lines = ["📊 <b>Daily Digest</b> (yesterday, Berlin time)",
                  f"Sent: {total}  •  Graded: {graded}  •  Pushed: {pushes}  •  "
                  f"Pending: {total - graded - pushes}"]
+        lines.append(f"Fixtures: {len(fixtures)}")
         if graded:
             lines.append(f"Wins: {wins}  •  Accuracy: {100.0*wins/graded:.1f}%")
             for mk, st in sorted(by.items()):
                 if st["graded"]:
                     lines.append(f"• {escape(mk)} — {st['wins']}/{st['graded']} "
-                                 f"({100.0*st['wins']/st['graded']:.1f}%)")
-        try:
-            pnl = compute_pnl(days=1, stake=1.0)
-            if pnl["n_bets"] > 0:
-                sign = "+" if pnl["total_profit"] >= 0 else ""
-                lines.append(f"💰 P&L (1u): {sign}{pnl['total_profit']:.2f}u  •  "
-                             f"ROI: {pnl['roi_pct']:+.1f}%")
-        except Exception:
-            pass
+                                 f"({100.0*st['wins']/st['graded']:.1f}%)"
+                                 f" • {len(st['fixtures'])} fixtures"
+                                 f" • {st['profit']:+.2f}u ({st['priced']} priced)")
+        if priced:
+            lines.append(f"💰 P&L (1u): {profit:+.2f}u  •  ROI: {100.0*profit/priced:+.1f}%"
+                         f" • {priced} priced bets")
         try:
             clv = compute_clv(days=7)
             ov = clv.get("overall")
