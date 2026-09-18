@@ -818,7 +818,7 @@ MIN_HOLDOUT_SELECTIONS = int(os.getenv("MIN_HOLDOUT_SELECTIONS", "30"))
 MIN_HOLDOUT_LIFT_SE = float(os.getenv("MIN_HOLDOUT_LIFT_SE", "2.5"))
 
 
-def _threshold_on_holdout(y_te: np.ndarray, p_te: np.ndarray, thr_prob: float) -> Dict[str, Any]:
+def _threshold_on_holdout(y_te: np.ndarray, p_te: np.ndarray, thr_prob: float, groups=None) -> Dict[str, Any]:
     """
     Re-measure a chosen threshold on data that had no part in choosing it.
 
@@ -828,18 +828,40 @@ def _threshold_on_holdout(y_te: np.ndarray, p_te: np.ndarray, thr_prob: float) -
     """
     if y_te is None or p_te is None or len(y_te) == 0 or len(p_te) == 0:
         return {"note": "no holdout available", "lift_in_std_errors": None}
-    sel = np.asarray(p_te) >= float(thr_prob)
-    n_sel = int(sel.sum())
-    base = float(np.mean(y_te))
+    y = np.asarray(y_te, dtype=float)
+    p = np.asarray(p_te, dtype=float)
+    if y.shape != p.shape or not np.isfinite(y).all() or not np.isfinite(p).all():
+        raise ValueError("invalid holdout vectors")
+    if groups is None:
+        raise ValueError("fixture IDs required for holdout verification")
+    groups = np.asarray(groups)
+    if groups.shape != y.shape:
+        raise ValueError("holdout fixture IDs must align with predictions")
+    _, inverse = np.unique(groups, return_inverse=True)
+    count = np.bincount(inverse)
+    base_by_fixture = np.bincount(inverse, weights=y) / count
+    sel = p >= float(thr_prob)
+    selected_count = np.bincount(inverse, weights=sel, minlength=len(count))
+    selected = selected_count > 0
+    n_sel = int(selected.sum())
+    base = float(base_by_fixture.mean())
     if n_sel == 0:
         return {"n_at_threshold": 0, "base_rate": round(base, 4),
-                "lift_in_std_errors": None,
-                "note": "threshold selects nothing on the holdout"}
-
-    prec = float(np.mean(np.asarray(y_te)[sel]))
+                "lift_in_std_errors": None, "note": "no selected fixtures"}
+    selected_means = np.divide(
+        np.bincount(inverse, weights=y * sel, minlength=len(count)),
+        selected_count, out=np.zeros(len(count)), where=selected)
+    prec = float(selected_means[selected].mean())
     lift_pp = 100.0 * (prec - base)
-    se_pp = 100.0 * math.sqrt(max(base * (1.0 - base), 1e-12) / n_sel)
-    out = {"n_at_threshold": n_sel,
+    # Fixture-level influence function includes uncertainty in the estimated
+    # baseline and its covariance with selected precision. A null variance
+    # floor avoids claiming certainty from a uniform tiny sample.
+    influence = selected * (selected_means - prec) / selected.mean() - (base_by_fixture - base)
+    cluster_var = float(np.var(influence, ddof=1) / len(count)) if len(count) > 1 else 1.0
+    se_pp = 100.0 * math.sqrt(max(cluster_var, base * (1.0-base) / n_sel, 1e-12))
+
+    out = {"n_at_threshold": n_sel, "n_selected_rows": int(sel.sum()),
+           "independence_unit": "fixture",
            "precision_at_threshold": round(prec, 4),
            "base_rate": round(base, 4),
            "lift_over_base_pp": round(lift_pp, 2),
@@ -882,7 +904,7 @@ def _holdout_verdict(holdout: Dict[str, Any]) -> Tuple[bool, str]:
 def _decide_threshold(y_ca, p_ca, y_te, p_te, label: str, buf: "SettingsBuffer",
                       summary: Dict[str, Any], target_precision: float, min_preds: int,
                       min_thresh: float, max_thresh: float, default_thr_prob: float,
-                      ctx: str, extra_diag: Optional[Dict[str, Any]] = None
+                      ctx: str, extra_diag: Optional[Dict[str, Any]] = None, groups_te=None
                       ) -> Tuple[float, Dict[str, Any], Dict[str, Any]]:
     """
     Pick on CAL, verify on HOLDOUT, write only if confirmed.
@@ -898,7 +920,7 @@ def _decide_threshold(y_ca, p_ca, y_te, p_te, label: str, buf: "SettingsBuffer",
         diag.update(extra_diag)
     thr_pct = (float(SUPPRESSED_THRESHOLD_PCT) if diag.get("method") == "suppressed"
                else float(thr_prob * 100.0))
-    holdout = _threshold_on_holdout(y_te, p_te, thr_pct / 100.0)
+    holdout = _threshold_on_holdout(y_te, p_te, thr_pct / 100.0, groups=groups_te)
 
     if diag.get("method") != "suppressed":
         confirmed, why = _holdout_verdict(holdout)
@@ -919,7 +941,7 @@ def _fit_directional_threshold_pair(
     y_ca: np.ndarray, p_ca: np.ndarray, y_te: np.ndarray, p_te: np.ndarray,
     positive_label: str, negative_label: str, buf: "SettingsBuffer",
     summary: Dict[str, Any], target_precision: float, min_preds: int,
-    min_thresh: float, max_thresh: float, ctx: str,
+    min_thresh: float, max_thresh: float, ctx: str, groups_te=None,
 ) -> Dict[str, Dict[str, Any]]:
     """Validate positive and complementary negative selections independently."""
     out: Dict[str, Dict[str, Any]] = {}
@@ -929,7 +951,7 @@ def _fit_directional_threshold_pair(
     ):
         thr_pct, diag, holdout = _decide_threshold(
             y1, p1, y2, p2, label, buf, summary, target_precision, min_preds,
-            min_thresh, max_thresh, 0.65, f"{ctx} / {label}")
+            min_thresh, max_thresh, 0.65, f"{ctx} / {label}", groups_te=groups_te)
         out[label] = {"threshold_pct": round(thr_pct, 2),
                       "threshold_selection": diag,
                       "holdout_at_threshold": holdout}
@@ -937,6 +959,16 @@ def _fit_directional_threshold_pair(
 
 
 # ─────────────────────── Core fit ─────────────────────── #
+
+def _eligible_match_weights(df, eligible):
+    ids = df["_match_id"].to_numpy()
+    _, inverse, counts = np.unique(ids[eligible], return_inverse=True, return_counts=True)
+    weights = np.zeros(len(df), dtype=float)
+    if len(inverse):
+        weights[eligible] = 1.0 / counts[inverse]
+        weights[eligible] /= weights[eligible].mean()
+    return weights
+
 
 def _train_binary_head(
     buf: SettingsBuffer,
@@ -951,6 +983,7 @@ def _train_binary_head(
     default_thr_prob: float,
     metrics_name: Optional[str] = None,
     sample_weight_all: Optional[np.ndarray] = None,
+    groups_all=None,
 ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Returns (ok, metrics, p_on_cal, p_on_holdout).
@@ -1038,7 +1071,7 @@ def _train_binary_head(
         thr_pct, diag, holdout = _decide_threshold(
             y_ca, p_ca, y_te, p_te, threshold_label, buf, summary,
             target_precision, min_preds, min_thresh_pct, max_thresh_pct,
-            default_thr_prob, ctx)
+            default_thr_prob, ctx, groups_te=np.asarray(groups_all)[m_te])
         mets["threshold_pct"] = round(thr_pct, 2)
         mets["threshold_selection"] = diag
         mets["holdout_at_threshold"] = holdout
@@ -1095,7 +1128,7 @@ def _wld_triple(heads: Dict[str, Tuple[bool, Optional[np.ndarray], Optional[np.n
 def _fit_1x2_threshold(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray,
                        buf: SettingsBuffer, summary: Dict[str, Any],
                        label: str, target_precision: float, min_preds: int,
-                       min_thresh: float, max_thresh: float) -> bool:
+                       min_thresh: float, max_thresh: float, groups_all=None) -> bool:
     """
     Pick the 1X2 threshold on EXACTLY the statistic serving compares against:
     the 3-way normalised per-side probability, pooled over home and away.
@@ -1127,7 +1160,8 @@ def _fit_1x2_threshold(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray
         "price instead.")}
     thr_pct, diag, holdout = _decide_threshold(
         ys_ca, probs_ca, ys_te, probs_te, label, buf, summary,
-        target_precision, min_preds, min_thresh, max_thresh, 0.45, label, extra_diag=caveat)
+        target_precision, min_preds, min_thresh, max_thresh, 0.45, label, extra_diag=caveat,
+        groups_te=np.tile(np.asarray(groups_all)[m_te], 2) if len(ys_te) else np.array([]))
 
     summary.setdefault("metrics", {})[f"{label}_threshold_diag"] = diag
     summary["metrics"][f"{label}_holdout_at_threshold"] = holdout
@@ -1144,7 +1178,7 @@ def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te
                                    buf: SettingsBuffer, summary: Dict[str, Any],
                                    prefix: str, target_precision: float, min_preds: int,
                                    min_thresh: float, max_thresh: float,
-                                   parent_confirmed: bool) -> None:
+                                   parent_confirmed: bool, groups_all=None) -> None:
     """
     Double Chance and Draw No Bet, verified rather than defaulted.
 
@@ -1242,7 +1276,9 @@ def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te
         thr_pct, diag, holdout = _decide_threshold(
             y_ca, p_ca, y_te, p_te, label, buf, summary,
             target_precision, min_preds, min_thresh, max_thresh, 0.65, label,
-            extra_diag={"derived_from": f"{prefix}WLD_* heads", "note": note})
+            extra_diag={"derived_from": f"{prefix}WLD_* heads", "note": note},
+            groups_te=(np.tile(np.asarray(groups_all)[m_te], 3) if name == "Double Chance"
+                       else np.tile(np.asarray(groups_all)[m_te][gd[m_te] != 0], 2)) if len(y_te) else np.array([]))
 
         # Economic floor, applied after the statistical one.
         lift = holdout.get("lift_over_base_pp")
@@ -1332,7 +1368,7 @@ def train_models(
                 buf, X, y_btts, m_tr & btts_eligible, m_ca & btts_eligible,
                 m_te & btts_eligible, FEATURES, "BTTS_YES", None, summary,
                 target_precision, min_preds, min_thresh, max_thresh, 0.65,
-                "BTTS_YES", sample_weight_all=inplay_weights)
+                "BTTS_YES", sample_weight_all=_eligible_match_weights(df_ip, btts_eligible))
             summary["trained"]["BTTS_YES"] = ok
             if ok:
                 summary["metrics"]["BTTS_YES"] = mets
@@ -1340,7 +1376,7 @@ def train_models(
                     y_btts[m_ca & btts_eligible], p_ca,
                     y_btts[m_te & btts_eligible], p_te,
                     "BTTS Yes", "BTTS No", buf, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, "BTTS")
+                    min_thresh, max_thresh, "BTTS", groups_te=df_ip.loc[m_te & btts_eligible, "_match_id"].to_numpy())
                 _dd = decided_diagnostics(df_ip, "BTTS_YES", y_btts)
                 if _dd:
                     mets["already_decided"] = _dd
@@ -1359,7 +1395,7 @@ def train_models(
                 ok, mets, p_ca, p_te = _train_binary_head(
                     buf, X, y_ou, m_tr & ou_eligible, m_ca & ou_eligible, m_te & ou_eligible,
                     FEATURES, name, None, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, 0.65, name, sample_weight_all=inplay_weights)
+                    min_thresh, max_thresh, 0.65, name, sample_weight_all=_eligible_match_weights(df_ip, ou_eligible))
                 summary["trained"][name] = ok
                 if ok:
                     summary["metrics"][name] = mets
@@ -1367,7 +1403,8 @@ def train_models(
                     mets["directional_thresholds"] = _fit_directional_threshold_pair(
                         y_ou[m_ca & ou_eligible], p_ca, y_ou[m_te & ou_eligible], p_te,
                         f"Over {line_txt}", f"Under {line_txt}", buf, summary,
-                        target_precision, min_preds, min_thresh, max_thresh, name)
+                        target_precision, min_preds, min_thresh, max_thresh, name,
+                        groups_te=df_ip.loc[m_te & ou_eligible, "_match_id"].to_numpy())
                     _dd = decided_diagnostics(df_ip, name, y_ou)
                     if _dd:
                         mets["already_decided"] = _dd
@@ -1394,10 +1431,11 @@ def train_models(
                 heads[key] = (ok, p_ca, p_te)
 
             parent_ok = _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "1X2",
-                                           target_precision, min_preds, min_thresh, max_thresh)
+                                           target_precision, min_preds, min_thresh, max_thresh,
+                                           groups_all=df_ip["_match_id"].to_numpy())
             _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "",
                                            target_precision, min_preds, min_thresh, max_thresh,
-                                           parent_confirmed=parent_ok)
+                                           parent_confirmed=parent_ok, groups_all=df_ip["_match_id"].to_numpy())
         else:
             reason = (f"have {n_ip} snapshots / {n_ip_matches} fixtures, "
                       f"need {need_ip} / {min_matches_inplay}")
@@ -1432,7 +1470,7 @@ def train_models(
                 mets["directional_thresholds"] = _fit_directional_threshold_pair(
                     y_pre_btts[m_ca], p_ca, y_pre_btts[m_te], p_te,
                     "PRE BTTS Yes", "PRE BTTS No", buf, summary, target_precision,
-                    min_preds, min_thresh, max_thresh, "PRE BTTS")
+                    min_preds, min_thresh, max_thresh, "PRE BTTS", groups_te=df_pre.loc[m_te, "_match_id"].to_numpy())
 
             totals = df_pre["final_goals_sum"].to_numpy(dtype=int)
             for line in ou_lines:
@@ -1449,7 +1487,8 @@ def train_models(
                     mets["directional_thresholds"] = _fit_directional_threshold_pair(
                         y_pre_ou[m_ca], p_ca, y_pre_ou[m_te], p_te,
                         f"PRE Over {line_txt}", f"PRE Under {line_txt}", buf, summary,
-                        target_precision, min_preds, min_thresh, max_thresh, name)
+                        target_precision, min_preds, min_thresh, max_thresh, name,
+                        groups_te=df_pre.loc[m_te, "_match_id"].to_numpy())
 
             gd = df_pre["final_goals_diff"].to_numpy(dtype=int)
             heads = {}
@@ -1465,10 +1504,11 @@ def train_models(
                 heads[key.replace("PRE_", "")] = (ok, p_ca, p_te)
 
             parent_ok = _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "PRE 1X2",
-                                           target_precision, min_preds, min_thresh, max_thresh)
+                                           target_precision, min_preds, min_thresh, max_thresh,
+                                           groups_all=df_pre["_match_id"].to_numpy())
             _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "PRE ",
                                            target_precision, min_preds, min_thresh, max_thresh,
-                                           parent_confirmed=parent_ok)
+                                           parent_confirmed=parent_ok, groups_all=df_pre["_match_id"].to_numpy())
         else:
             reason = f"have {n_pre} rows, need {need_pre}"
             logger.info("Prematch: not enough data (%s).", reason)
