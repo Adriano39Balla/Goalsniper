@@ -37,16 +37,19 @@ coefficients (and therefore `feature_importance`) meaningless. Removed:
 Nonlinear derivations (ratios, products, indicators, absolute values) are kept:
 those carry information a linear model cannot recover from the components.
 
-Prematch model inputs exclude market priors until historical point-in-time
-prices can support a consistent training and serving distribution.
+Result: 56 in-play features and 30 prematch features, all of which vary and none
+of which is a linear function of the others.
 
 PREMATCH MARKET ANCHORING
 -------------------------
-pm_market_fair_* remain in assembled snapshots for audit and future research,
-but are excluded from PRE_FEATURES. Historical backfill cannot reconstruct
-these prices reliably. New prematch models therefore use the same non-market
-feature set for both historical and current rows. Old models containing prior
-weights must be retrained before serving. In-play priors are unchanged.
+pm_market_fair_* mirror the in-play market_fair_* features below: the
+de-vigged consensus prematch price, passed straight through as a feature
+rather than only used post-hoc by main.py's EV gate. Missing at call time (a
+fixture with no odds fetched yet, or every snapshot harvested before this was
+added) means neutral, not zero — a bare 0.0 would read as "the market says
+this outcome is impossible", which is false and would teach every
+pre-existing snapshot the wrong thing. See assemble_prematch_features()'s
+`market_fair` parameter and NEUTRAL_MARKET_PRIORS below.
 
 SCALING
 -------
@@ -210,8 +213,8 @@ PRE_FEATURES: List[str] = [
     "pm_rest_diff",
     "pm_attack_defense_ratio",
     "pm_league_btts_rate", "pm_league_ov25_rate", "pm_league_ov35_rate",
-    # Exclude market priors until historical point-in-time prices exist.
-    # Raw snapshots retain them for audit; newly trained models do not use them.
+    "pm_market_fair_home", "pm_market_fair_draw", "pm_market_fair_away",
+    "pm_market_fair_over25", "pm_market_fair_btts_yes",
 ]
 
 # Which feature holds each league base rate, per phase. Used by the training
@@ -361,27 +364,9 @@ def _is_finished(g: dict) -> bool:
     return st in FINISHED_STATUSES
 
 
-def _game_key(g: dict) -> Any:
+def decay_weights(games: List[dict]) -> Dict[int, float]:
     """
-    Stable identity for a fixture dict, for use as a decay_weights() key.
-
-    id(g) works only as long as every caller shares the exact same dict
-    objects between building the weight map and looking weights up - true
-    today because every caller here filters/sorts the same list without
-    copying its elements, but one `[dict(g) for g in games]` anywhere in the
-    pipeline would make every lookup silently miss and fall back to
-    weight=1.0 for every game, with nothing to notice it by (no exception,
-    no log - just quietly-wrong recency weighting). A fixture's own API id
-    is stable across copies; id() remains only as a last-resort fallback for
-    malformed/test dicts that carry no fixture id at all.
-    """
-    fid = (g.get("fixture") or {}).get("id")
-    return ("fid", fid) if fid is not None else ("obj", id(g))
-
-
-def decay_weights(games: List[dict]) -> Dict[Any, float]:
-    """
-    Exponential recency weights keyed by _game_key(game).
+    Exponential recency weights keyed by id(game).
 
     FIX: ranks only FINISHED fixtures. Previously an abandoned or postponed
     fixture inside the last-5 window consumed the weight-1.0 slot and demoted
@@ -393,7 +378,7 @@ def decay_weights(games: List[dict]) -> Dict[Any, float]:
     """
     finished = [g for g in games if _is_finished(g)]
     dated = sorted(((g, fixture_ts(g)) for g in finished), key=lambda x: x[1], reverse=True)
-    return {_game_key(g): FORM_DECAY_RATE ** i for i, (g, _) in enumerate(dated)}
+    return {id(g): FORM_DECAY_RATE ** i for i, (g, _) in enumerate(dated)}
 
 
 def team_form_stats(team_id: int, games: List[dict]) -> Dict[str, Any]:
@@ -416,7 +401,7 @@ def team_form_stats(team_id: int, games: List[dict]) -> Dict[str, Any]:
             my, opp = ga_, gh
         else:
             continue
-        w = w_map.get(_game_key(g), 1.0)
+        w = w_map.get(id(g), 1.0)
         gf += my * w
         ga += opp * w
         total_w += w
@@ -467,7 +452,7 @@ def rate_totals(games: List[dict]) -> Tuple[float, float, float]:
             continue
         gh = int((g.get("goals") or {}).get("home") or 0)
         ga = int((g.get("goals") or {}).get("away") or 0)
-        w = w_map.get(_game_key(g), 1.0)
+        w = w_map.get(id(g), 1.0)
         total_w += w
         if gh + ga > 2:
             ov25 += w
@@ -491,7 +476,7 @@ def h2h_counts(h2h: List[dict], home_id: int, away_id: int) -> Tuple[float, floa
         ta = ((g.get("teams") or {}).get("away") or {}).get("id")
         gh = int((g.get("goals") or {}).get("home") or 0)
         ga = int((g.get("goals") or {}).get("away") or 0)
-        w = w_map.get(_game_key(g), 1.0)
+        w = w_map.get(id(g), 1.0)
         total_w += w
         if gh == ga:
             dr += w
@@ -571,19 +556,7 @@ def assemble_prematch_features(
         "pm_market_fair_over25": float(mf.get("market_fair_over25", NEUTRAL_MARKET_PRIORS["market_fair_over25"])),
         "pm_market_fair_btts_yes": float(mf.get("market_fair_btts_yes", NEUTRAL_MARKET_PRIORS["market_fair_btts_yes"])),
     }
-    # Returns PRE_FEATURES plus the pm_market_fair_* audit keys - NOT just
-    # PRE_FEATURES. The docstring above already promised these "remain in
-    # assembled snapshots for audit and future research", but filtering the
-    # return to PRE_FEATURES here discarded them before save_prematch_snapshot()
-    # ever saw them, so main.py was paying for a fetch_odds() call every scan
-    # and then throwing the result away. Every caller that scores or trains a
-    # model reads feature values by name from a fixed list (PRE_FEATURES, or a
-    # model blob's own `weights` keys) and ignores keys it doesn't ask for, so
-    # carrying these extra keys through is inert for every model input and
-    # only changes what gets persisted for later analysis.
-    out = {k: float(f.get(k, 0.0)) for k in PRE_FEATURES}
-    out.update({k: v for k, v in f.items() if k.startswith("pm_market_fair_")})
-    return out
+    return {k: float(f.get(k, 0.0)) for k in PRE_FEATURES}
 
 
 # ───────── Derived 1X2 markets ─────────
