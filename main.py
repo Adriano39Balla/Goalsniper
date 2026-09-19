@@ -1327,6 +1327,47 @@ def _stats_coverage_details(raw: Dict[str, Any], minute: int) -> Dict[str, Any]:
     }
 
 
+def prematch_data_gate(feat: Dict[str, float]) -> Optional[str]:
+    """
+    The prematch counterpart of stats_coverage_ok(): did any form data arrive?
+    Returns None when the fixture was genuinely observed, else the reason.
+
+    The in-play path refuses an empty observation. The prematch path has no
+    equivalent — its only check is `if not feat`, and
+    assemble_prematch_features() ends with
+
+        out = {k: float(f.get(k, 0.0)) for k in PRE_FEATURES}
+
+    so it ALWAYS returns a fully-populated dict and `feat` is never falsy. A
+    fixture whose team-form fetches all failed therefore arrives as a complete
+    vector of zeros, is written to prematch_snapshots, and is read back by
+    load_prematch_data() as a real observation.
+
+    Two things make that worse than one bad row. Every fixture in the same
+    outage gets the SAME vector — two nameless 1500-Elo sides with no history —
+    so a fit sees a large block of identical inputs carrying whatever label each
+    fixture happened to produce, which is unlearnable noise. And
+    prematch_snapshots upserts on match_id, so a rescan during a rate-limit
+    cooldown CLOBBERS a good snapshot that was already there.
+
+    A team that genuinely played matches cannot have gf, ga, win and draw all
+    exactly zero: every finished game lands in exactly one of the three
+    outcomes, and a win moves `win`, a draw moves `draw`, and a defeat concedes
+    at least one goal and so moves `ga`. All four at zero therefore means the
+    window was empty. That is a test for the ABSENCE of an observation, not for
+    a thin one — which is why, unlike a betting gate, it is allowed to stop a
+    harvest.
+    """
+    for side, tag in (("h", "home"), ("a", "away")):
+        observed = (abs(float(feat.get(f"pm_gf_{side}", 0.0)))
+                    + abs(float(feat.get(f"pm_ga_{side}", 0.0)))
+                    + abs(float(feat.get(f"pm_win_{side}", 0.0)))
+                    + abs(float(feat.get(f"pm_draw_{side}", 0.0))))
+        if observed <= 0.0:
+            return f"no_form_data_{tag}"
+    return None
+
+
 def _league_name(m: dict) -> Tuple[int, str]:
     lg = (m.get("league") or {}) or {}
     return int(lg.get("id") or 0), f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
@@ -3185,8 +3226,35 @@ def production_scan() -> Tuple[int, int]:
             # The cadence is stated in TIME, not "the elapsed minute happens to
             # be divisible by 3", because nothing aligns the scan schedule with
             # that arithmetic.
+            #
+            # `covered` IS in this condition, and the regression described above
+            # is not the reason to take it out. Both statements are true because
+            # stats_coverage_ok() is not one test:
+            #
+            #   - "did the statistics feed return anything at all?" — the paired
+            #     -fields branch below, checking _stats_home_found /
+            #     _stats_away_found / _stats_returned_fields. When that is False
+            #     the /fixtures/statistics call failed or was refused, and
+            #     extract_raw_inplay() rendered the absence as 0.0 across xg,
+            #     shots, corners and cards. Harvesting that rows teaches the fit
+            #     "no shots and no xG at minute 60" as a real match state — a
+            #     statement about our own blindness, not about football. It is
+            #     not thin data, it is the absence of data, and load_inplay_data()
+            #     has no filter that would drop it later.
+            #
+            #   - "is the observation rich enough to BET on?" — that part is a
+            #     betting judgement and it is NOT what blocks a harvest here.
+            #     Nothing below skips collection for a fixture whose feed
+            #     answered: a real 0-0 at minute 20 returns field groups whose
+            #     values are zero, passes, and is harvested exactly as before.
+            #
+            # The regression above came from a `continue` placed ahead of the
+            # harvest block, which skipped BOTH. This adds a term to the harvest
+            # condition instead; the `if not covered: continue` below still runs
+            # after it, so the gating of TIPPING is unchanged.
             is_harvest_tick = (
                 HARVEST_MODE
+                and covered
                 and minute >= TRAIN_MIN_MINUTE
                 and (now_ts - last_snap.get(fid, 0)) >= HARVEST_EVERY_MINUTES * 60
             )
@@ -3540,6 +3608,7 @@ def prematch_scan_save() -> int:
         return 0
     feats_by_fid, freshly_fetched = _get_prematch_features_bulk(fixtures)
     saved = 0
+    no_form = 0
     pred_rows: List[tuple] = []
 
     for fx in fixtures:
@@ -3558,11 +3627,20 @@ def prematch_scan_save() -> int:
         kickoff = _kickoff_ts_of(fx)
         kickoff_txt = _kickoff_berlin(fixture.get("date"))
 
-        if fid in freshly_fetched:
+        data_block = prematch_data_gate(feat)
+
+        if fid in freshly_fetched and not data_block:
             try:
                 save_prematch_snapshot(fid, feat, kickoff)
             except Exception as e:
                 log.warning("[PREMATCH] snapshot save failed for %s: %s", fid, e)
+
+        # Scoring an all-zero vector gives every fixture in the outage the same
+        # probability, so the scan can emit a burst of identical tips off data
+        # it never received. Real money on a fetch that failed.
+        if data_block:
+            no_form += 1
+            continue
 
         if PREMATCH_DEDUP_ENABLE:
             with db_conn() as c:
@@ -3651,7 +3729,11 @@ def prematch_scan_save() -> int:
         pred_rows.extend(_trim_fixture_predictions(fixture_preds))
 
     _log_predictions(pred_rows)
-    log.info("[PREMATCH] saved=%d candidates_logged=%d", saved, len(pred_rows))
+    # no_form is the operator-facing symptom of a failed form fetch. It sitting
+    # at or near the fixture count means the team-form calls are being refused,
+    # not that the card is quiet.
+    log.info("[PREMATCH] saved=%d candidates_logged=%d no_form=%d/%d",
+             saved, len(pred_rows), no_form, len(fixtures))
     return saved
 
 
@@ -3666,7 +3748,7 @@ def send_match_of_the_day() -> bool:
     feats_by_fid, freshly_fetched = _get_prematch_features_bulk(fixtures)
     for fx in fixtures:
         fid = int((fx.get("fixture") or {}).get("id") or 0)
-        if fid in freshly_fetched:
+        if fid in freshly_fetched and not prematch_data_gate(freshly_fetched[fid]):
             try:
                 save_prematch_snapshot(fid, freshly_fetched[fid], _kickoff_ts_of(fx))
             except Exception:
@@ -3756,7 +3838,7 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
 
     lr = get_league_rates(league_id)
     elo_local: Dict[int, float] = {}
-    snapshots_saved = results_saved = 0
+    snapshots_saved = results_saved = hist_no_form = 0
     last_ts = 0.0
 
     for fx in fixtures:
@@ -3787,11 +3869,19 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
         feat = assemble_prematch_features(th, ta, last_h, last_a, h2h, cutoff,
                                           rating_h, rating_a, lr)
 
-        try:
-            save_prematch_snapshot(int(fid), feat, int(cutoff))
-            snapshots_saved += 1
-        except Exception as e:
-            log.warning("[HIST-PRE] snapshot save failed for %s: %s", fid, e)
+        # Backfill has its own way of producing a blind vector: a side with no
+        # fixtures in team_history before the cutoff — the opening rounds of a
+        # season, a promoted club, a gap in what was fetched — assembles to all
+        # zeros just like a failed live fetch. The result below is still
+        # recorded; only the unusable feature row is skipped.
+        if prematch_data_gate(feat):
+            hist_no_form += 1
+        else:
+            try:
+                save_prematch_snapshot(int(fid), feat, int(cutoff))
+                snapshots_saved += 1
+            except Exception as e:
+                log.warning("[HIST-PRE] snapshot save failed for %s: %s", fid, e)
 
         gh = int((fx.get("goals") or {}).get("home") or 0)
         ga = int((fx.get("goals") or {}).get("away") or 0)
@@ -3823,7 +3913,8 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
 
     _LEAGUE_RATE_CACHE.invalidate()
     return {"fixtures_seen": len(fixtures), "snapshots_saved": snapshots_saved,
-            "results_saved": results_saved, "api_diagnostics_per_season": diags}
+            "results_saved": results_saved, "skipped_no_form": hist_no_form,
+            "api_diagnostics_per_season": diags}
 
 
 # ───────── Analytics ─────────
