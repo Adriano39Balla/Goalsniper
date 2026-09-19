@@ -3504,8 +3504,20 @@ def _collect_todays_prematch_fixtures() -> List[dict]:
                 fixtures.append(r)
     fixtures = [f for f in fixtures if not _blocked_league(f.get("league") or {})]
     if PREMATCH_LEAGUE_IDS:
+        before = len(fixtures)
         fixtures = [f for f in fixtures
                     if int(((f.get("league") or {}).get("id") or 0)) in PREMATCH_LEAGUE_IDS]
+        # A league ID that is wrong — a typo, or a competition re-issued under a
+        # new ID between seasons — costs nothing at startup and simply never
+        # matches, so that league silently stops being scanned forever. Nothing
+        # else in the system would ever say so. Not every configured league
+        # plays every day, so a low number here is not by itself a fault; a
+        # number that never moves off zero for an ID is. Cross-check the list
+        # against the API catalogue with /admin/diagnostics/league-filter.
+        matched = {int(((f.get("league") or {}).get("id") or 0)) for f in fixtures}
+        log.info("[PREMATCH] league filter kept %d of %d fixtures; %d of %d configured "
+                 "league IDs are on today's card",
+                 len(fixtures), before, len(matched), len(PREMATCH_LEAGUE_IDS))
     else:
         log.warning("[PREMATCH] PREMATCH_LEAGUE_IDS is empty — scanning %d fixtures worldwide. "
                     "This will consume ~%d API calls on a cold cache.",
@@ -5007,6 +5019,277 @@ def http_xg_feed():
             rep["blocked_from_betting"][m["data_block"]] = \
                 rep["blocked_from_betting"].get(m["data_block"], 0) + 1
     return jsonify({"ok": True, "xg_feed": rep})
+
+
+# ───────── Blind-snapshot diagnostic ─────────
+#
+# How many harvested rows record nothing at all.
+#
+# A snapshot written while the statistics or team-form fetch was failing is a
+# vector of zeros, and neither training loader filters those out:
+# load_inplay_data() has no coverage test, and load_prematch_data()'s only
+# filter is `if not feat`, which never fires because the vector is
+# populated-with-zeros rather than empty. So each one is fed to the fit as a
+# real observation, teaching it what happens "when a match has no shots and no
+# xG at minute 60" — a statement about our own blindness, not about football.
+#
+# Writing them is fixed (see production_scan and prematch_scan_save). This
+# measures what was written before that, because the answer decides whether
+# the existing training set is usable or has to be purged and rebuilt.
+
+# The statistics channels that prove SOMETHING was observed. Possession is
+# excluded deliberately, for the same reason stats_coverage_ok() excludes it:
+# _possession() substitutes an even split when the feed is absent, so it is
+# non-zero even on a row where nothing arrived.
+_OBSERVED_INPLAY_FIELDS = ("sot_h", "sot_a", "total_shots_h", "total_shots_a",
+                           "cor_h", "cor_a", "xg_h", "xg_a")
+# Mirrors prematch_data_gate() exactly: a side that has actually played cannot
+# have goals-for, goals-against, wins AND draws all at zero.
+_OBSERVED_PREMATCH_HOME = ("pm_gf_h", "pm_ga_h", "pm_win_h", "pm_draw_h")
+_OBSERVED_PREMATCH_AWAY = ("pm_gf_a", "pm_ga_a", "pm_win_a", "pm_draw_a")
+
+
+def _json_num(path: str, key: str) -> str:
+    """One numeric field out of a snapshot payload, 0.0 when absent."""
+    return f"COALESCE((payload::json->'{path}'->>'{key}')::float, 0)"
+
+
+def _inplay_observed_sum_sql() -> str:
+    """
+    SQL summing the in-play channels that prove something was observed.
+
+    Schema-2 rows keep them under `raw`; schema-1 rows keep the same key names
+    under `stat` (see load_inplay_data()'s compatibility shim), and there are
+    still hundreds of those. Reading only `raw` would report every legacy row
+    as blind, which is exactly the kind of wrong number this endpoint exists
+    to avoid producing.
+
+    Built from a module-level constant of literal column names — no caller
+    input reaches this string.
+    """
+    return " + ".join(f"GREATEST({_json_num('raw', k)}, {_json_num('stat', k)})"
+                      for k in _OBSERVED_INPLAY_FIELDS)
+
+
+def _prematch_observed_sum_sql(fields: Tuple[str, ...]) -> str:
+    return " + ".join(_json_num("feat", k) for k in fields)
+
+
+def count_blind_snapshots() -> Dict[str, Any]:
+    """Rows in each training table that record no observation at all."""
+    ip_sum = _inplay_observed_sum_sql()
+    # load_inplay_data() only ever reads minute 15-90, so a blind row outside
+    # that window never reaches the fit and should not be counted as damage.
+    # Schema 2 keeps the minute under `raw`; schema 1 keeps it at the top level.
+    ip_minute = ("COALESCE((payload::json->'raw'->>'minute')::float, "
+                 "(payload::json->>'minute')::float, 0)")
+    pre_home = _prematch_observed_sum_sql(_OBSERVED_PREMATCH_HOME)
+    pre_away = _prematch_observed_sum_sql(_OBSERVED_PREMATCH_AWAY)
+
+    with db_conn() as c:
+        ip_total = int(c.execute("SELECT COUNT(*) FROM tip_snapshots").fetchone()[0] or 0)
+        ip_blind = int(c.execute(
+            f"SELECT COUNT(*) FROM tip_snapshots WHERE ({ip_sum}) = 0").fetchone()[0] or 0)
+        # What is actually in the training set today: joined to a result, and
+        # inside the minute window the loader reads.
+        ip_blind_training = int(c.execute(
+            f"SELECT COUNT(*) FROM tip_snapshots s JOIN match_results r "
+            f"ON r.match_id = s.match_id "
+            f"WHERE ({ip_sum}) = 0 AND ({ip_minute}) BETWEEN %s AND %s",
+            (TRAIN_MIN_MINUTE, LIVE_TIP_MAX_MINUTE)).fetchone()[0] or 0)
+        ip_total_training = int(c.execute(
+            f"SELECT COUNT(*) FROM tip_snapshots s JOIN match_results r "
+            f"ON r.match_id = s.match_id WHERE ({ip_minute}) BETWEEN %s AND %s",
+            (TRAIN_MIN_MINUTE, LIVE_TIP_MAX_MINUTE)).fetchone()[0] or 0)
+
+        pre_total = int(c.execute("SELECT COUNT(*) FROM prematch_snapshots").fetchone()[0] or 0)
+        pre_blind = int(c.execute(
+            f"SELECT COUNT(*) FROM prematch_snapshots "
+            f"WHERE ({pre_home}) = 0 OR ({pre_away}) = 0").fetchone()[0] or 0)
+        pre_blind_training = int(c.execute(
+            f"SELECT COUNT(*) FROM prematch_snapshots p JOIN match_results r "
+            f"ON r.match_id = p.match_id "
+            f"WHERE ({pre_home}) = 0 OR ({pre_away}) = 0").fetchone()[0] or 0)
+        pre_total_training = int(c.execute(
+            "SELECT COUNT(*) FROM prematch_snapshots p JOIN match_results r "
+            "ON r.match_id = p.match_id").fetchone()[0] or 0)
+
+    def _pct(n: int, d: int) -> float:
+        return round(100.0 * n / d, 2) if d else 0.0
+
+    ip_share = _pct(ip_blind_training, ip_total_training)
+    pre_share = _pct(pre_blind_training, pre_total_training)
+    worst = max(ip_share, pre_share)
+    if worst == 0:
+        verdict = ("No blind rows in either training set. Nothing to purge.")
+    elif worst < 5:
+        verdict = (f"{worst:.1f}% of one training set records nothing. Small enough to "
+                   f"leave alone — the fit will not notice it.")
+    elif worst < 20:
+        verdict = (f"{worst:.1f}% of one training set records nothing. Worth purging "
+                   f"before the next retrain; it is diluting every head fitted on it.")
+    else:
+        verdict = (f"{worst:.1f}% of one training set records nothing. This is enough to "
+                   f"dominate a fit on its own: a large block of identical all-zero "
+                   f"vectors carrying whatever label the fixture happened to produce is "
+                   f"unlearnable noise, and is a sufficient explanation on its own for a "
+                   f"head reporting no skill. Purge and retrain before drawing any "
+                   f"conclusion about whether these models can work.")
+
+    return {
+        "in_play": {
+            "rows_total": ip_total, "rows_blind": ip_blind,
+            "blind_pct_of_table": _pct(ip_blind, ip_total),
+            "rows_in_training_set": ip_total_training,
+            "blind_in_training_set": ip_blind_training,
+            "blind_pct_of_training_set": ip_share,
+            "observed_if_any_of": list(_OBSERVED_INPLAY_FIELDS),
+        },
+        "prematch": {
+            "rows_total": pre_total, "rows_blind": pre_blind,
+            "blind_pct_of_table": _pct(pre_blind, pre_total),
+            "rows_in_training_set": pre_total_training,
+            "blind_in_training_set": pre_blind_training,
+            "blind_pct_of_training_set": pre_share,
+            "observed_if_any_of": {"home": list(_OBSERVED_PREMATCH_HOME),
+                                   "away": list(_OBSERVED_PREMATCH_AWAY)},
+        },
+        "verdict": verdict,
+        "method": ("A row is blind when every channel that proves an observation is "
+                   "exactly zero — for in-play, all of shots/SOT/corners/xG (possession "
+                   "is excluded: an absent feed is substituted with an even split, so it "
+                   "is never zero); for prematch, gf+ga+win+draw on either side, which is "
+                   "the same test prematch_data_gate() applies. Legacy schema-1 in-play "
+                   "rows keep those fields under `stat` rather than `raw` and are read "
+                   "from both."),
+        "note": ("Read blind_pct_of_training_set, not blind_pct_of_table: the second "
+                 "counts rows whose fixture has no result yet, which are not in any fit. "
+                 "Writing new blind rows is already fixed; this measures what was written "
+                 "before that."),
+    }
+
+
+@app.route("/admin/diagnostics/blind-snapshots", methods=["GET"])
+def http_blind_snapshots():
+    """Harvested rows that record no observation at all. Read-only."""
+    _require_admin()
+    try:
+        return jsonify({"ok": True, "blind_snapshots": count_blind_snapshots()})
+    except Exception as e:
+        log.exception("[BLIND] diagnostic failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# PREMATCH_LEAGUE_IDS is the single biggest lever on API spend — an empty list
+# scans every fixture on earth — but it is also the quietest thing in the config
+# to get wrong. A league ID that does not exist, or that the API re-issued under
+# a new number between seasons, is not an error anywhere: _int_list() parses it
+# fine, _collect_todays_prematch_fixtures() simply never matches it, and that
+# league is never scanned again. Nothing logs it. The only symptom is a card
+# that is quieter than expected, which reads like a slow day.
+#
+# This resolves the configured IDs against the API's own catalogue in ONE call,
+# and also replays the filters that run BEFORE the league list is applied —
+# LEAGUE_ALLOW_IDS in particular, which is a hard allowlist: an ID configured
+# here but absent from that one is dropped before this filter is ever reached.
+def check_league_filter() -> Dict[str, Any]:
+    """Resolve PREMATCH_LEAGUE_IDS against the live API league catalogue."""
+    raw = os.getenv("PREMATCH_LEAGUE_IDS", "")
+    entries = [x.strip() for x in raw.split(",") if x.strip()]
+    unparsed = [x for x in entries if not x.lstrip("-").isdigit()]
+
+    if not PREMATCH_LEAGUE_IDS:
+        return {
+            "catalogue_reachable": True, "configured_count": 0,
+            "unparsed_entries": unparsed, "resolved": [], "unresolved_ids": [],
+            "blocked_ids": [],
+            "verdict": ("PREMATCH_LEAGUE_IDS is unset, so every fixture on the day's "
+                        "worldwide card is scanned — roughly 3 API calls each. This is "
+                        "what pins the per-minute limit and starves the in-play scans "
+                        "that share it."),
+        }
+
+    # `current=true` returns one season per league instead of every season ever
+    # played, which is the difference between a response of a few hundred KB and
+    # one large enough to time out.
+    js = _api_get(f"{BASE_URL}/leagues", {"current": "true"})
+    if js is None:
+        # The call FAILED. Reporting every ID as unresolved here would be the
+        # same mistake this endpoint's sibling exists to measure: a failed fetch
+        # is not a finding. Say the check could not run.
+        return {
+            "catalogue_reachable": False, "configured_count": len(PREMATCH_LEAGUE_IDS),
+            "unparsed_entries": unparsed,
+            "verdict": ("The /leagues call failed or was refused (rate limit, network, "
+                        "or no API key). No conclusion — this is not evidence that any "
+                        "configured ID is wrong. Retry."),
+        }
+
+    catalogue: Dict[int, Dict[str, Any]] = {}
+    for item in (js.get("response", []) if isinstance(js, dict) else []):
+        lg = item.get("league") or {}
+        try:
+            lid = int(lg.get("id"))
+        except (TypeError, ValueError):
+            continue
+        catalogue[lid] = {
+            "id": lid, "name": lg.get("name"), "type": lg.get("type"),
+            "country": (item.get("country") or {}).get("name"),
+            "season": next((s.get("year") for s in (item.get("seasons") or [])), None),
+        }
+
+    resolved, unresolved, blocked = [], [], []
+    for lid in PREMATCH_LEAGUE_IDS:
+        entry = catalogue.get(lid)
+        if entry is None:
+            unresolved.append(lid)
+            continue
+        # Same dict shape _blocked_league() sees during a real scan.
+        if _blocked_league({"id": lid, "name": entry["name"],
+                            "country": entry["country"], "type": entry["type"]}):
+            blocked.append(lid)
+            entry = dict(entry, blocked_before_this_filter=True)
+        resolved.append(entry)
+
+    bits = [f"{len(resolved)} of {len(PREMATCH_LEAGUE_IDS)} configured league IDs "
+            f"resolve to a competition with a current season."]
+    if unresolved:
+        bits.append(f"{len(unresolved)} do not ({', '.join(str(i) for i in unresolved)}) — "
+                    f"those leagues are silently never scanned. Look each up with "
+                    f"/admin/leagues?search=<name> and replace the ID.")
+    if blocked:
+        bits.append(f"{len(blocked)} resolve but are dropped BEFORE this filter runs "
+                    f"({', '.join(str(i) for i in blocked)}) — by LEAGUE_ALLOW_IDS, "
+                    f"LEAGUE_DENY_IDS, or a name matching the youth/reserve/friendly "
+                    f"block patterns. Listing them here has no effect while that holds.")
+    if unparsed:
+        bits.append(f"{len(unparsed)} entries are not numbers ({', '.join(unparsed)}) and "
+                    f"were dropped when the env var was parsed.")
+    if not (unresolved or blocked or unparsed):
+        bits.append("Nothing is being silently dropped.")
+
+    return {
+        "catalogue_reachable": True,
+        "configured_count": len(PREMATCH_LEAGUE_IDS),
+        "unparsed_entries": unparsed,
+        "resolved": resolved,
+        "unresolved_ids": unresolved,
+        "blocked_ids": blocked,
+        "verdict": " ".join(bits),
+    }
+
+
+@app.route("/admin/diagnostics/league-filter", methods=["GET"])
+def http_league_filter():
+    """Does every configured PREMATCH_LEAGUE_IDS entry name a real league?"""
+    _require_admin()
+    try:
+        out = check_league_filter()
+    except Exception as e:
+        log.exception("[LEAGUE-FILTER] diagnostic failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    ok = bool(out.get("catalogue_reachable"))
+    return jsonify({"ok": ok, "league_filter": out}), (200 if ok else 503)
 
 
 @app.route("/admin/repair/fulltime-results", methods=["POST"])
