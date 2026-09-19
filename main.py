@@ -40,11 +40,15 @@ DASHBOARD ADDITIONS:
 THIS REVISION ADDS FOUR THINGS, NONE OF WHICH CHANGE HOW AN ALREADY-TIPPED BET
 IS GRADED:
 
-  1. PREMATCH MARKET ANCHORING. extract_prematch_features() now fetches the
-     de-vigged prematch consensus (the same _market_fair_priors() the in-play
-     path already used) and feeds it into assemble_prematch_features() as
-     pm_market_fair_*. The prematch model sees the market's own read for the
-     first time; in-play already had this.
+  1. PREMATCH MARKET ANCHORING (AUDIT ONLY). extract_prematch_features() now
+     fetches the de-vigged prematch consensus (the same _market_fair_priors()
+     the in-play path already used) and assemble_prematch_features() carries
+     it through as pm_market_fair_*, now actually reaching prematch_snapshots
+     for audit and future research (previously computed, then discarded
+     before the snapshot was written - see feature_spec.py). It is still
+     excluded from PRE_FEATURES: historical backfill cannot reconstruct
+     point-in-time prices, so the live model does not see it yet, unlike
+     in-play, which already uses its equivalent as a real feature.
   2. CONCENTRATION MODE. CONCENTRATION_MODE=1 restricts every candidate-
      generation call site to an explicit ACTIVE_MARKETS allowlist, and
      refuses to boot if league scope (LEAGUE_ALLOW_IDS / PREMATCH_LEAGUE_IDS)
@@ -230,7 +234,20 @@ def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     return out or default
 
 
-OU_LINES = [ln for ln in _parse_lines(os.getenv("OU_LINES", "2.5,3.5"), [2.5, 3.5]) if abs(ln - 1.5) > 1e-6]
+_OU_LINES_RAW = _parse_lines(os.getenv("OU_LINES", "2.5,3.5"), [2.5, 3.5])
+# Over 1.5 is excluded: in football it is a near-certainty market (average
+# goals/match runs well above 1.5), so its fair price sits far below
+# MIN_ODDS_OU (1.30) on almost every fixture - training or serving it would
+# spend a model slot and API calls on a line MIN_ODDS_OU already vetoes
+# nearly every time it would otherwise fire. This is a stated assumption
+# about typical odds distributions, not a structural constraint of the code
+# below - if it doesn't hold for a given book/league mix, remove the filter
+# rather than working around it.
+_OU_EXCLUDED_15 = [ln for ln in _OU_LINES_RAW if abs(ln - 1.5) <= 1e-6]
+if _OU_EXCLUDED_15:
+    log.warning("[CONFIG] OU_LINES included 1.5 - excluded (see comment above); "
+                "serving lines: %s", [l for l in _OU_LINES_RAW if abs(l - 1.5) > 1e-6])
+OU_LINES = [ln for ln in _OU_LINES_RAW if abs(ln - 1.5) > 1e-6]
 
 # ───────── Odds / EV controls ─────────
 MIN_ODDS_OU = float(os.getenv("MIN_ODDS_OU", "1.30"))
@@ -261,14 +278,17 @@ REQUIRE_FAIR_PRICE = _env_flag("REQUIRE_FAIR_PRICE", "1")
 # is trustworthy enough to bet against.
 MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
 # The in-play feed is ONE aggregated source, not a panel of books, so it can
-# never reach MIN_BOOKS_FOR_FAIR - live candidates would sit at
-# too_few_books forever. This is a separate knob rather than a lower global
-# value because prematch genuinely does have multiple books and should keep
-# demanding a consensus. Defaults to the strict value so nothing loosens by
-# itself: set it to 1 to accept the in-play feed's own de-vigged price, in
-# full knowledge that a single source's overround is not a consensus.
-MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE",
-                                        str(MIN_BOOKS_FOR_FAIR)))
+# NEVER reach MIN_BOOKS_FOR_FAIR - every live candidate sat at too_few_books
+# forever when this defaulted to inherit the prematch value. That is not a
+# stricter live policy, it is live tipping being silently off by
+# construction, with no error and no log line distinguishing it from "no
+# edge today." Defaults to 1 now - the same live-aware default
+# MIN_BOOKS_FOR_EXECUTION_LIVE already uses below - which means live trades
+# on the feed's own single-book de-vigged price, in full knowledge that one
+# source's overround is not a consensus. Raise it back above 1 (it will then
+# never pass) if live tipping should stay off until a real multi-book live
+# panel exists.
+MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE", "1"))
 
 # ───────── Execution realism ─────────
 # MIN_BOOKS_FOR_FAIR governs whether a price is trustworthy enough to call
@@ -975,6 +995,35 @@ def _enforce_concentration_scope() -> None:
     log.info("[CONCENTRATION] on — active_markets=%s league_allow=%d prematch_leagues=%d "
              "max_active_leagues=%d", sorted(ACTIVE_MARKETS), len(LEAGUE_ALLOW_IDS),
              len(PREMATCH_LEAGUE_IDS), MAX_ACTIVE_LEAGUES)
+
+
+def _warn_if_live_pricing_impossible() -> None:
+    """
+    The in-play feed is structurally ONE book (LIVE_FEED_BOOK) - n_books for
+    every live selection is always 1, by construction, forever, no matter how
+    many fixtures are scanned or how the odds provider's coverage improves.
+    If either live-side corroboration knob is set above 1, every live
+    candidate fails it unconditionally and live tipping is off - which reads
+    in the logs identically to "no edge found today," not as a
+    misconfiguration. Loud at boot beats silent in production; this is the
+    same "make it fail where you can see it" instinct as
+    _enforce_concentration_scope() above, just as a warning rather than a
+    hard exit, because disabling live tipping this way could be deliberate.
+    """
+    problems = []
+    if MIN_BOOKS_FOR_FAIR_LIVE > 1 and REQUIRE_FAIR_PRICE:
+        problems.append(f"MIN_BOOKS_FOR_FAIR_LIVE={MIN_BOOKS_FOR_FAIR_LIVE} with REQUIRE_FAIR_PRICE=1")
+    if MIN_BOOKS_FOR_EXECUTION_LIVE > 1 and REQUIRE_EXECUTABLE_PRICE:
+        problems.append(f"MIN_BOOKS_FOR_EXECUTION_LIVE={MIN_BOOKS_FOR_EXECUTION_LIVE} with "
+                        f"REQUIRE_EXECUTABLE_PRICE=1")
+    if problems:
+        log.warning("[CONFIG] live in-play tipping is structurally DISABLED by: %s — the live "
+                    "feed (%s) is one aggregated book, so n_books for every live selection is "
+                    "always 1 and can never clear a requirement above 1. This is not a stricter "
+                    "live policy, it is live tipping silently off, indistinguishable in the logs "
+                    "from 'no edge today'. If that is intentional, ignore this warning; "
+                    "otherwise set the *_LIVE variant(s) named above to 1.",
+                    "; ".join(problems), LIVE_FEED_BOOK)
 
 
 def _kickoff_ts_of(fx: dict) -> int:
@@ -2177,6 +2226,27 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
             res["decision"] = "edge_implausible"
             log.warning("[SANITY] fixture %s %s: model %.1f%% vs fair %.1f%% — suppressed",
                         fid, suggestion, prob * 100, float(fair) * 100)
+            return res
+    else:
+        # No consensus fair price at all (REQUIRE_FAIR_PRICE=0 and none was
+        # computable). Normally MAX_MODEL_EDGE_BPS is what catches a model
+        # claiming to be wildly smarter than the market - the exact incident
+        # its own comment describes. With fair=None there is nothing to
+        # compare the model's probability against, so that protection was
+        # simply skipped here, silently, whenever this branch was reached.
+        # The raw (vigged) implied probability from the same odds is a
+        # weaker benchmark - it still contains the book's own margin, so it
+        # systematically understates edge - but it is unconditionally
+        # available and still catches the same failure mode: a model far
+        # more confident than even the un-devigged market price.
+        naive_fair = 1.0 / odds
+        naive_edge = prob - naive_fair
+        res["naive_edge_pct"] = round(naive_edge * 100.0, 2)
+        if int(round(naive_edge * 10000)) > MAX_MODEL_EDGE_BPS:
+            res["decision"] = "edge_implausible_no_consensus"
+            log.warning("[SANITY] fixture %s %s: model %.1f%% vs raw implied %.1f%% (no "
+                        "consensus fair price available) — suppressed",
+                        fid, suggestion, prob * 100, naive_fair * 100)
             return res
 
     res["passed"] = True
@@ -3528,7 +3598,9 @@ def extract_prematch_features(fx: dict) -> Dict[str, float]:
     # SCANNED fixture (not just per tip) on a cold ODDS_CACHE; the repeat
     # lookup _price_gate() makes later for the same fixture is absorbed by
     # that cache. Reconsider the cost if PREMATCH_LEAGUE_IDS ever goes
-    # worldwide again.
+    # worldwide again. The values this buys are audit-only (see
+    # feature_spec.assemble_prematch_features): they are excluded from
+    # PRE_FEATURES and never reach the model, only the stored snapshot.
     market_fair = _market_fair_priors(fid, live=False) if fid else None
     return assemble_prematch_features(th, ta, last_h, last_a, h2h, kickoff,
                                       ratings.get(th, ELO_DEFAULT), ratings.get(ta, ELO_DEFAULT), lr,
@@ -5254,7 +5326,21 @@ def telegram_webhook(secret: str):
         abort(403)
     update = request.get_json(silent=True) or {}
     try:
-        msg = (update.get("message") or {}).get("text") or ""
+        message = update.get("message") or {}
+        msg = message.get("text") or ""
+        sender_chat_id = str((message.get("chat") or {}).get("id") or "")
+        # The path secret proves the request came from Telegram, not that it
+        # came from OUR chat - anyone who learns/guesses this URL could reach
+        # every command below, previously including /scan by also guessing or
+        # shoulder-surfing the admin key typed in plain text into a chat
+        # (Telegram chat history, backups and linked-device sync all then
+        # carry it). Only TELEGRAM_CHAT_ID may act now. Responds 200 with no
+        # action for anyone else, rather than 403, so a prober can't tell
+        # "wrong chat" from "wrong secret" by response code.
+        if not TELEGRAM_CHAT_ID or sender_chat_id != str(TELEGRAM_CHAT_ID):
+            log.warning("[TELEGRAM] webhook message from unrecognised chat_id=%s ignored",
+                        sender_chat_id or "unknown")
+            return jsonify({"ok": True})
         if msg.startswith("/start"):
             send_telegram("👋 goalsniper is online.")
         elif msg.startswith("/digest"):
@@ -5264,16 +5350,12 @@ def telegram_webhook(secret: str):
         elif msg.startswith("/clv"):
             send_telegram(f"<pre>{escape(json.dumps(compute_clv(days=30), indent=2)[:3500])}</pre>")
         elif msg.startswith("/scan"):
-            parts = msg.split()
-            if len(parts) > 1 and ADMIN_API_KEY and _safe_compare(parts[1], ADMIN_API_KEY):
-                result = _run_with_pg_lock(1001, production_scan)
-                if result is None:
-                    send_telegram("⏳ A scan is already running.")
-                else:
-                    s, l = result
-                    send_telegram(f"🔁 Scan done. Saved: {s}, Live seen: {l}")
+            result = _run_with_pg_lock(1001, production_scan)
+            if result is None:
+                send_telegram("⏳ A scan is already running.")
             else:
-                send_telegram("🔒 Admin key required.")
+                s, l = result
+                send_telegram(f"🔁 Scan done. Saved: {s}, Live seen: {l}")
     except Exception as e:
         log.warning("telegram webhook parse error: %s", e)
     return jsonify({"ok": True})
@@ -5285,6 +5367,7 @@ def _on_boot():
     # CONCENTRATION_MODE should fail fast and cheap, not after the pool and
     # schema are already up.
     _enforce_concentration_scope()
+    _warn_if_live_pricing_impossible()
     _init_pool()
     init_db()
     set_setting("boot_ts", str(int(time.time())))
