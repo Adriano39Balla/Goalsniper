@@ -1320,15 +1320,34 @@ def train_models(
     min_matches_inplay = int(os.getenv("MIN_MATCHES_INPLAY", "300"))
     embargo_groups = int(os.getenv("TRAIN_EMBARGO_GROUPS", "0"))
 
+    # OU_LINES is main.py's serving-side config for which lines it generates
+    # candidates for; OU_TRAIN_LINES was a second, independent env var for
+    # the same concept on the training side. Two names for one setting meant
+    # changing one without the other left a line silently mismatched - either
+    # a trained model no live fixture ever asks for, or a served line with no
+    # model behind it (_load_ou_model_for_line() just returns None and that
+    # candidate is quietly dropped, no error either way). OU_LINES now wins
+    # when set; OU_TRAIN_LINES is kept only as a fallback for a deploy that
+    # already set the old name.
+    _ou_lines_env = os.getenv("OU_LINES") or os.getenv("OU_TRAIN_LINES", "2.5,3.5")
     ou_lines: List[float] = []
-    for t in os.getenv("OU_TRAIN_LINES", "2.5,3.5").split(","):
+    for t in _ou_lines_env.split(","):
         t = t.strip()
         if t:
             try:
                 ou_lines.append(float(t))
             except Exception:
                 pass
+    # Mirrors main.py's own OU_LINES filter: it never serves Over/Under 1.5
+    # (see that file's comment on the exclusion), so training a model for it
+    # here would just be a model nothing ever calls.
+    ou_lines = [ln for ln in ou_lines if abs(ln - 1.5) > 1e-6]
     ou_lines = ou_lines or [2.5, 3.5]
+    if os.getenv("OU_LINES") and os.getenv("OU_TRAIN_LINES") and \
+            os.getenv("OU_LINES") != os.getenv("OU_TRAIN_LINES"):
+        logger.warning("[CONFIG] OU_LINES (%s) and OU_TRAIN_LINES (%s) are both set and "
+                       "disagree — training uses OU_LINES.",
+                       os.getenv("OU_LINES"), os.getenv("OU_TRAIN_LINES"))
 
     target_precision = float(os.getenv("TARGET_PRECISION", "0.60"))
     min_preds = int(os.getenv("THRESH_MIN_PREDICTIONS", "100"))
