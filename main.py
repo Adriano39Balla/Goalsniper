@@ -40,15 +40,11 @@ DASHBOARD ADDITIONS:
 THIS REVISION ADDS FOUR THINGS, NONE OF WHICH CHANGE HOW AN ALREADY-TIPPED BET
 IS GRADED:
 
-  1. PREMATCH MARKET ANCHORING (AUDIT ONLY). extract_prematch_features() now
-     fetches the de-vigged prematch consensus (the same _market_fair_priors()
-     the in-play path already used) and assemble_prematch_features() carries
-     it through as pm_market_fair_*, now actually reaching prematch_snapshots
-     for audit and future research (previously computed, then discarded
-     before the snapshot was written - see feature_spec.py). It is still
-     excluded from PRE_FEATURES: historical backfill cannot reconstruct
-     point-in-time prices, so the live model does not see it yet, unlike
-     in-play, which already uses its equivalent as a real feature.
+  1. PREMATCH MARKET ANCHORING. extract_prematch_features() now fetches the
+     de-vigged prematch consensus (the same _market_fair_priors() the in-play
+     path already used) and feeds it into assemble_prematch_features() as
+     pm_market_fair_*. The prematch model sees the market's own read for the
+     first time; in-play already had this.
   2. CONCENTRATION MODE. CONCENTRATION_MODE=1 restricts every candidate-
      generation call site to an explicit ACTIVE_MARKETS allowlist, and
      refuses to boot if league scope (LEAGUE_ALLOW_IDS / PREMATCH_LEAGUE_IDS)
@@ -234,20 +230,7 @@ def _parse_lines(env_val: str, default: List[float]) -> List[float]:
     return out or default
 
 
-_OU_LINES_RAW = _parse_lines(os.getenv("OU_LINES", "2.5,3.5"), [2.5, 3.5])
-# Over 1.5 is excluded: in football it is a near-certainty market (average
-# goals/match runs well above 1.5), so its fair price sits far below
-# MIN_ODDS_OU (1.30) on almost every fixture - training or serving it would
-# spend a model slot and API calls on a line MIN_ODDS_OU already vetoes
-# nearly every time it would otherwise fire. This is a stated assumption
-# about typical odds distributions, not a structural constraint of the code
-# below - if it doesn't hold for a given book/league mix, remove the filter
-# rather than working around it.
-_OU_EXCLUDED_15 = [ln for ln in _OU_LINES_RAW if abs(ln - 1.5) <= 1e-6]
-if _OU_EXCLUDED_15:
-    log.warning("[CONFIG] OU_LINES included 1.5 - excluded (see comment above); "
-                "serving lines: %s", [l for l in _OU_LINES_RAW if abs(l - 1.5) > 1e-6])
-OU_LINES = [ln for ln in _OU_LINES_RAW if abs(ln - 1.5) > 1e-6]
+OU_LINES = [ln for ln in _parse_lines(os.getenv("OU_LINES", "2.5,3.5"), [2.5, 3.5]) if abs(ln - 1.5) > 1e-6]
 
 # ───────── Odds / EV controls ─────────
 MIN_ODDS_OU = float(os.getenv("MIN_ODDS_OU", "1.30"))
@@ -278,17 +261,14 @@ REQUIRE_FAIR_PRICE = _env_flag("REQUIRE_FAIR_PRICE", "1")
 # is trustworthy enough to bet against.
 MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
 # The in-play feed is ONE aggregated source, not a panel of books, so it can
-# NEVER reach MIN_BOOKS_FOR_FAIR - every live candidate sat at too_few_books
-# forever when this defaulted to inherit the prematch value. That is not a
-# stricter live policy, it is live tipping being silently off by
-# construction, with no error and no log line distinguishing it from "no
-# edge today." Defaults to 1 now - the same live-aware default
-# MIN_BOOKS_FOR_EXECUTION_LIVE already uses below - which means live trades
-# on the feed's own single-book de-vigged price, in full knowledge that one
-# source's overround is not a consensus. Raise it back above 1 (it will then
-# never pass) if live tipping should stay off until a real multi-book live
-# panel exists.
-MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE", "1"))
+# never reach MIN_BOOKS_FOR_FAIR - live candidates would sit at
+# too_few_books forever. This is a separate knob rather than a lower global
+# value because prematch genuinely does have multiple books and should keep
+# demanding a consensus. Defaults to the strict value so nothing loosens by
+# itself: set it to 1 to accept the in-play feed's own de-vigged price, in
+# full knowledge that a single source's overround is not a consensus.
+MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE",
+                                        str(MIN_BOOKS_FOR_FAIR)))
 
 # ───────── Execution realism ─────────
 # MIN_BOOKS_FOR_FAIR governs whether a price is trustworthy enough to call
@@ -454,13 +434,15 @@ def _market_active(market_text: str) -> bool:
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise SystemExit("DATABASE_URL is required")
 
 BASE_URL = "https://v3.football.api-sports.io"
 FOOTBALL_API_URL = f"{BASE_URL}/fixtures"
 ODDS_PREMATCH_URL = f"{BASE_URL}/odds"
 ODDS_LIVE_URL = f"{BASE_URL}/odds/live"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
-INPLAY_STATUSES = {"1H", "HT", "2H"}  # regular-time model and settlement policy
+INPLAY_STATUSES = {"1H", "HT", "2H", "ET", "BT", "P"}
 FINAL_STATUSES = {"FT", "AET", "PEN"}
 
 session = requests.Session()
@@ -592,10 +574,6 @@ class PooledConn:
                 conn = self.pool.getconn()
                 conn.autocommit = True
                 self.cur = conn.cursor()
-                self.cur.execute("SELECT set_config('statement_timeout', %s, false), "
-                                 "set_config('lock_timeout', %s, false)",
-                                 (os.getenv("DB_STATEMENT_TIMEOUT_MS", "120000"),
-                                  os.getenv("DB_LOCK_TIMEOUT_MS", "5000")))
                 self.conn = conn
                 return self
             except (psycopg2.pool.PoolError, psycopg2.OperationalError,
@@ -644,11 +622,9 @@ class PooledConn:
 
 def _init_pool():
     global POOL
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is required")
     dsn = DATABASE_URL + (("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
                           if "sslmode=" not in DATABASE_URL else "")
-    POOL = ThreadedConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX", "20")), dsn=dsn, connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT_SEC", "10")))
+    POOL = ThreadedConnectionPool(minconn=1, maxconn=int(os.getenv("DB_POOL_MAX", "20")), dsn=dsn)
 
 
 def db_conn():
@@ -740,8 +716,7 @@ def init_db():
             try:
                 c.execute(stmt)
             except Exception as e:
-                log.error("[SCHEMA] required migration failed: %s", type(e).__name__)
-                raise
+                log.warning("[SCHEMA] %s -> %s", stmt, e)
 
         for stmt in [
             "CREATE INDEX IF NOT EXISTS idx_results_league ON match_results (league_id)",
@@ -757,13 +732,11 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_pre_snap_kickoff ON prematch_snapshots (kickoff_ts)",
             "CREATE INDEX IF NOT EXISTS idx_pred_match ON predictions (match_id)",
             "CREATE INDEX IF NOT EXISTS idx_pred_created ON predictions (created_ts DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_pred_phase_created ON predictions (phase, created_ts DESC)",
         ]:
             try:
                 c.execute(stmt)
             except Exception as e:
-                log.error("[SCHEMA] required migration failed: %s", type(e).__name__)
-                raise
+                log.warning("[SCHEMA] %s -> %s", stmt, e)
 
         if _env_flag("PURGE_LEGACY_HARVEST_TIPS", "1"):
             try:
@@ -785,9 +758,9 @@ def send_telegram(text: str) -> bool:
                                "disable_web_page_preview": True}, timeout=10)
         if not r.ok:
             log.warning("[TELEGRAM] send failed: HTTP %s — %s", r.status_code, r.text[:300])
-        return bool(r.ok and r.json().get("ok") is True)
+        return r.ok
     except Exception as e:
-        log.warning("[TELEGRAM] delivery outcome uncertain: %s", type(e).__name__)
+        log.warning("[TELEGRAM] send raised: %s", e)
         return False
 
 
@@ -995,35 +968,6 @@ def _enforce_concentration_scope() -> None:
     log.info("[CONCENTRATION] on — active_markets=%s league_allow=%d prematch_leagues=%d "
              "max_active_leagues=%d", sorted(ACTIVE_MARKETS), len(LEAGUE_ALLOW_IDS),
              len(PREMATCH_LEAGUE_IDS), MAX_ACTIVE_LEAGUES)
-
-
-def _warn_if_live_pricing_impossible() -> None:
-    """
-    The in-play feed is structurally ONE book (LIVE_FEED_BOOK) - n_books for
-    every live selection is always 1, by construction, forever, no matter how
-    many fixtures are scanned or how the odds provider's coverage improves.
-    If either live-side corroboration knob is set above 1, every live
-    candidate fails it unconditionally and live tipping is off - which reads
-    in the logs identically to "no edge found today," not as a
-    misconfiguration. Loud at boot beats silent in production; this is the
-    same "make it fail where you can see it" instinct as
-    _enforce_concentration_scope() above, just as a warning rather than a
-    hard exit, because disabling live tipping this way could be deliberate.
-    """
-    problems = []
-    if MIN_BOOKS_FOR_FAIR_LIVE > 1 and REQUIRE_FAIR_PRICE:
-        problems.append(f"MIN_BOOKS_FOR_FAIR_LIVE={MIN_BOOKS_FOR_FAIR_LIVE} with REQUIRE_FAIR_PRICE=1")
-    if MIN_BOOKS_FOR_EXECUTION_LIVE > 1 and REQUIRE_EXECUTABLE_PRICE:
-        problems.append(f"MIN_BOOKS_FOR_EXECUTION_LIVE={MIN_BOOKS_FOR_EXECUTION_LIVE} with "
-                        f"REQUIRE_EXECUTABLE_PRICE=1")
-    if problems:
-        log.warning("[CONFIG] live in-play tipping is structurally DISABLED by: %s — the live "
-                    "feed (%s) is one aggregated book, so n_books for every live selection is "
-                    "always 1 and can never clear a requirement above 1. This is not a stricter "
-                    "live policy, it is live tipping silently off, indistinguishable in the logs "
-                    "from 'no edge today'. If that is intentional, ignore this warning; "
-                    "otherwise set the *_LIVE variant(s) named above to 1.",
-                    "; ".join(problems), LIVE_FEED_BOOK)
 
 
 def _kickoff_ts_of(fx: dict) -> int:
@@ -1445,10 +1389,6 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
             break
         except Exception as e:
             log.warning("[MODEL] parse %s failed: %s", name, e)
-    if mdl and name.startswith("PRE_") and any(
-            str(k).startswith("pm_market_fair_") for k in (mdl.get("weights") or {})):
-        log.warning("[MODEL] %s disabled until retraining: historical market-prior mismatch", name)
-        mdl = None
     _MODELS_CACHE.set(name, mdl)
     return mdl
 
@@ -1463,25 +1403,13 @@ def _linpred(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
     scaler = mdl.get("scaler") or {}
     mean = scaler.get("mean") or {}
     scale = scaler.get("scale") or {}
-    weights = mdl.get("weights") or {}
-    if not weights:
-        raise ValueError("model has no weights")
     s = float(mdl.get("intercept") or 0.0)
-    for k, w in weights.items():
-        if k not in feat:
-            raise ValueError(f"missing model feature: {k}")
-        x, weight = float(feat[k]), float(w)
-        if not math.isfinite(x) or not math.isfinite(weight):
-            raise ValueError(f"non-finite model input: {k}")
-        if scaler:
-            if k not in mean or k not in scale:
-                raise ValueError(f"incomplete model scaler: {k}")
-            sc, center = float(scale[k]), float(mean[k])
-            if not math.isfinite(sc) or sc <= 0 or not math.isfinite(center):
-                raise ValueError(f"invalid model scaler: {k}")
-            x = (x - center) / sc
-        s += weight * x
-
+    for k, w in (mdl.get("weights") or {}).items():
+        x = float(feat.get(k, 0.0))
+        if k in mean:
+            sc = float(scale.get(k, 1.0)) or 1.0
+            x = (x - float(mean[k])) / sc
+        s += float(w or 0.0) * x
     return s
 
 
@@ -1492,8 +1420,6 @@ def _calibrate(p: float, cal: Dict[str, Any]) -> float:
 
 
 def _score_prob(feat: Dict[str, float], mdl: Dict[str, Any]) -> float:
-    if any(str(name).startswith("pm_market_fair_") for name in (mdl.get("weights") or {})):
-        raise ValueError("prematch model uses unsupported historical market priors; retrain required")
     linear = _linpred(feat, mdl)
     if not math.isfinite(linear):
         raise ValueError("non-finite model score")
@@ -1704,11 +1630,11 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
             o = _odd_value(v)
             if o <= 1.0:
                 continue
-            if lbl in ("home/draw", "draw/home", "1x", "x1", "homeordraw", "draworhome"):
+            if lbl in ("home/draw", "1x", "homeordraw"):
                 d["1X"] = o
-            elif lbl in ("draw/away", "away/draw", "x2", "2x", "draworaway", "awayordraw"):
+            elif lbl in ("draw/away", "x2", "draworaway"):
                 d["X2"] = o
-            elif lbl in ("home/away", "away/home", "12", "21", "homeoraway", "awayorhome"):
+            elif lbl in ("home/away", "12", "homeoraway"):
                 d["12"] = o
         return ("DC", d) if set(d) == {"1X", "X2", "12"} else None
     if mname == "DNB":
@@ -1883,8 +1809,6 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
         status = r.get("status") or {}
         if live and isinstance(status, dict) and _price_suspended(status):
             diagnostics["status"] = "fixture_odds_suspended"
-            diagnostics.setdefault("fixture_statuses", []).append(
-                {k: status.get(k) for k in ("stopped", "blocked", "suspended")})
             continue
         for book_name, bets in _iter_price_sources(r):
             per_market: Dict[str, Dict[str, float]] = {}
@@ -1996,11 +1920,10 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
                         "values": values_sample,
                     })
         log.warning("[ODDS] fixture %s (live=%s): %d response item(s) but no usable markets. "
-                    "Top-level keys: %s. Markets offered: %s. Full-match samples: %s. Fixture states: %s",
+                    "Top-level keys: %s. Markets offered: %s. Unparsed full-match samples: %s",
                     fid, live, len(response),
                     sorted(response[0].keys()) if isinstance(response[0], dict) else type(response[0]),
-                    sorted(set(offered)) or "none", diagnostic_samples or "none",
-                    diagnostics.get("fixture_statuses", []))
+                    sorted(set(offered)) or "none", diagnostic_samples or "none")
 
     min_books_exec = MIN_BOOKS_FOR_EXECUTION_LIVE if live else MIN_BOOKS_FOR_EXECUTION
     out: Dict[str, Any] = {}
@@ -2087,7 +2010,7 @@ class PriceCheck(dict):
     """Result of _price_gate. Dict so it serialises straight into the log row."""
 
 
-def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: bool, *, draw_prob: Optional[float] = None) -> PriceCheck:
+def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: bool) -> PriceCheck:
     """
     Single place where a candidate meets the market.
 
@@ -2202,13 +2125,6 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
                 return res
 
     edge_ev = _ev(prob, odds)
-    if mkey == "DNB":
-        if draw_prob is None or not math.isfinite(draw_prob) or not 0 <= draw_prob < 1:
-            res["decision"] = "missing_draw_probability"
-            return res
-        res["conditional_ev_pct"] = round(edge_ev * 100.0, 2)
-        res["draw_prob"] = draw_prob
-        edge_ev *= 1.0 - draw_prob  # expected return per original stake, including pushes
     res["ev_pct"] = round(edge_ev * 100.0, 2)
     if int(round(edge_ev * 10000)) < EDGE_MIN_BPS:
         res["decision"] = "ev_below_min"
@@ -2226,27 +2142,6 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
             res["decision"] = "edge_implausible"
             log.warning("[SANITY] fixture %s %s: model %.1f%% vs fair %.1f%% — suppressed",
                         fid, suggestion, prob * 100, float(fair) * 100)
-            return res
-    else:
-        # No consensus fair price at all (REQUIRE_FAIR_PRICE=0 and none was
-        # computable). Normally MAX_MODEL_EDGE_BPS is what catches a model
-        # claiming to be wildly smarter than the market - the exact incident
-        # its own comment describes. With fair=None there is nothing to
-        # compare the model's probability against, so that protection was
-        # simply skipped here, silently, whenever this branch was reached.
-        # The raw (vigged) implied probability from the same odds is a
-        # weaker benchmark - it still contains the book's own margin, so it
-        # systematically understates edge - but it is unconditionally
-        # available and still catches the same failure mode: a model far
-        # more confident than even the un-devigged market price.
-        naive_fair = 1.0 / odds
-        naive_edge = prob - naive_fair
-        res["naive_edge_pct"] = round(naive_edge * 100.0, 2)
-        if int(round(naive_edge * 10000)) > MAX_MODEL_EDGE_BPS:
-            res["decision"] = "edge_implausible_no_consensus"
-            log.warning("[SANITY] fixture %s %s: model %.1f%% vs raw implied %.1f%% (no "
-                        "consensus fair price available) — suppressed",
-                        fid, suggestion, prob * 100, naive_fair * 100)
             return res
 
     res["passed"] = True
@@ -2404,14 +2299,7 @@ def save_snapshot_from_match(m: dict, raw: Dict[str, float]) -> None:
         c.execute("INSERT INTO tip_snapshots(match_id, created_ts, payload, kickoff_ts) "
                   "VALUES (%s,%s,%s,%s) ON CONFLICT (match_id, created_ts) "
                   "DO UPDATE SET payload=EXCLUDED.payload, kickoff_ts=EXCLUDED.kickoff_ts",
-                  (fid, int(time.time()), _snapshot_json(payload), payload["kickoff_ts"]))
-
-
-def _snapshot_json(payload):
-    encoded = json.dumps(payload, allow_nan=False)
-    if len(encoded.encode("utf-8")) > 200000:
-        raise ValueError("snapshot exceeds 200000 bytes")
-    return encoded
+                  (fid, int(time.time()), json.dumps(payload)[:200000], payload["kickoff_ts"]))
 
 
 def save_prematch_snapshot(fid: int, feat: Dict[str, float], kickoff_ts: int) -> None:
@@ -2421,7 +2309,7 @@ def save_prematch_snapshot(fid: int, feat: Dict[str, float], kickoff_ts: int) ->
         c.execute("INSERT INTO prematch_snapshots(match_id, created_ts, payload, kickoff_ts) "
                   "VALUES (%s,%s,%s,%s) ON CONFLICT (match_id) DO UPDATE SET "
                   "created_ts=EXCLUDED.created_ts, payload=EXCLUDED.payload, kickoff_ts=EXCLUDED.kickoff_ts",
-                  (fid, int(time.time()), _snapshot_json(payload), int(kickoff_ts)))
+                  (fid, int(time.time()), json.dumps(payload)[:200000], int(kickoff_ts)))
 
 
 # ───────── Grading ─────────
@@ -2925,22 +2813,6 @@ def _btts_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[
             ("BTTS", "BTTS: No", 1.0 - p, no_thr)]
 
 
-def _generate_candidates(feat, prefix, threshold_fn):
-    candidates = (_ou_candidates(feat, prefix, threshold_fn)
-                  + _btts_candidates(feat, prefix, threshold_fn)
-                  + _wld_candidates(feat, prefix, threshold_fn)
-                  + _dc_dnb_candidates(feat, prefix, threshold_fn))
-    return [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS
-            and _market_active(c[0]) and (prefix or _candidate_is_sane(c[1], feat))]
-
-
-def _candidate_draw_prob(feat, prefix, suggestion):
-    if not suggestion.startswith("Draw No Bet:"):
-        return None
-    triple = _wld_probs(feat, prefix) if feat is not None else None
-    return float(triple[1]) if triple is not None else None
-
-
 def _wld_probs(feat: Dict[str, float], prefix: str) -> Optional[Tuple[float, float, float]]:
     """
     Normalised (p_home, p_draw, p_away) summing to 1, or None if heads missing.
@@ -3149,7 +3021,7 @@ def _build_live_match_entry(fid: int, league: str, league_id: int, home: str, aw
         thr_pct = round(float(thr), 1)
         row = {"market": mt, "suggestion": sg, "prob_pct": prob_pct, "threshold_pct": thr_pct}
         if float(pr) * 100.0 >= float(thr):
-            pc = _price_gate(mt, sg, fid, pr, live=True, draw_prob=_candidate_draw_prob(feat, "", sg))
+            pc = _price_gate(mt, sg, fid, pr, live=True)
             row["decision"] = pc["decision"]
             row["odds"] = pc.get("odds")
             row["ev_pct"] = pc.get("ev_pct")
@@ -3351,7 +3223,10 @@ def production_scan() -> Tuple[int, int]:
             score = _pretty_score(m)
             kickoff = _kickoff_ts_of(m)
 
-            candidates = _generate_candidates(feat, "", _get_market_threshold)
+            candidates = (_ou_candidates(feat, "", _get_market_threshold)
+                          + _btts_candidates(feat, "", _get_market_threshold)
+                          + _wld_candidates(feat, "", _get_market_threshold)
+                          + _dc_dnb_candidates(feat, "", _get_market_threshold))
             candidates = [c for c in candidates
                           if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
                           and _market_active(c[0])]
@@ -3381,10 +3256,10 @@ def production_scan() -> Tuple[int, int]:
                 if not below and not capped:
                     history_reason = _history_rejection(suggestion, taken)
                     pc = (PriceCheck(passed=False, decision=history_reason) if history_reason else
-                          _price_gate(market_txt, suggestion, fid, prob, live=True, draw_prob=_candidate_draw_prob(feat, "", suggestion)))
+                          _price_gate(market_txt, suggestion, fid, prob, live=True))
                     if pc["passed"]:
                         ODDS_CACHE.invalidate((fid, True))
-                        pc = _price_gate(market_txt, suggestion, fid, prob, live=True, draw_prob=_candidate_draw_prob(feat, "", suggestion))
+                        pc = _price_gate(market_txt, suggestion, fid, prob, live=True)
                         if pc["passed"]:
                             pc = _live_delivery_check(fid, raw, pc)
                     if pc["passed"] and _correlation_blocked(suggestion, taken):
@@ -3487,7 +3362,9 @@ def score_live_matches_now(
     to answer "what does the model see right now" for a human looking at the
     dashboard, e.g. via /dashboard/live/refresh.
 
-    Uses the same candidate generator as production; this path does not send tips.
+    Deliberately duplicates production_scan()'s candidate-building step
+    rather than sharing it, so a bug in this read-only path can never affect
+    what the live tipping bot actually does.
     """
     matches = fetch_live_matches()
     live_seen = len(matches)
@@ -3515,7 +3392,10 @@ def score_live_matches_now(
             score = _pretty_score(m)
             kickoff = _kickoff_ts_of(m)
 
-            candidates = _generate_candidates(feat, "", _get_market_threshold)
+            candidates = (_ou_candidates(feat, "", _get_market_threshold)
+                          + _btts_candidates(feat, "", _get_market_threshold)
+                          + _wld_candidates(feat, "", _get_market_threshold)
+                          + _dc_dnb_candidates(feat, "", _get_market_threshold))
             candidates = [c for c in candidates
                           if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
                           and _market_active(c[0])]
@@ -3598,9 +3478,7 @@ def extract_prematch_features(fx: dict) -> Dict[str, float]:
     # SCANNED fixture (not just per tip) on a cold ODDS_CACHE; the repeat
     # lookup _price_gate() makes later for the same fixture is absorbed by
     # that cache. Reconsider the cost if PREMATCH_LEAGUE_IDS ever goes
-    # worldwide again. The values this buys are audit-only (see
-    # feature_spec.assemble_prematch_features): they are excluded from
-    # PRE_FEATURES and never reach the model, only the stored snapshot.
+    # worldwide again.
     market_fair = _market_fair_priors(fid, live=False) if fid else None
     return assemble_prematch_features(th, ta, last_h, last_a, h2h, kickoff,
                                       ratings.get(th, ELO_DEFAULT), ratings.get(ta, ELO_DEFAULT), lr,
@@ -3696,7 +3574,10 @@ def prematch_scan_save() -> int:
         if MAX_PREMATCH_TIPS_PER_SCAN and saved >= MAX_PREMATCH_TIPS_PER_SCAN:
             break
 
-        candidates = _generate_candidates(feat, "PRE_", _get_market_threshold_pre)
+        candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
         candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS and _market_active(c[0])]
         candidates.sort(key=lambda x: x[2], reverse=True)
 
@@ -3713,7 +3594,7 @@ def prematch_scan_save() -> int:
             if not below and not capped:
                 history_reason = _history_rejection(sug, taken)
                 pc = (PriceCheck(passed=False, decision=history_reason) if history_reason else
-                      _price_gate(mk, sug, fid, prob, live=False, draw_prob=_candidate_draw_prob(feat, "PRE_", sug)))
+                      _price_gate(mk, sug, fid, prob, live=False))
                 if pc["passed"] and _correlation_blocked(sug, taken):
                     extra = int(round((pc.get("ev_pct") or 0) * 100)) - EDGE_MIN_BPS
                     if extra < CORRELATED_EXTRA_EV_BPS:
@@ -3801,7 +3682,10 @@ def send_match_of_the_day() -> bool:
         if not feat:
             continue
 
-        candidates = _generate_candidates(feat, "PRE_", _get_market_threshold_pre)
+        candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
         candidates = [c for c in candidates
                       if c[1] in ALLOWED_SUGGESTIONS and c[2] * 100.0 >= c[3] and _market_active(c[0])]
         if not candidates:
@@ -3811,7 +3695,7 @@ def send_match_of_the_day() -> bool:
         if prob * 100.0 < MOTD_CONF_MIN:
             continue
 
-        pc = _price_gate(mk, sug, fid, prob, live=False, draw_prob=_candidate_draw_prob(feat, "PRE_", sug))
+        pc = _price_gate(mk, sug, fid, prob, live=False)
         if not pc["passed"]:
             continue
 
@@ -4509,12 +4393,33 @@ def auto_tune_thresholds(days: int = 30) -> Dict[str, float]:
 
 
 def retry_unsent_tips(minutes: int = 120, limit: int = 200) -> int:
-    """Retain pending tips for audit; do not replay stale or uncertain deliveries."""
-    # A timeout may mean Telegram accepted the message. Replaying a persisted
-    # live tip also bypasses all current fixture/price checks. Keep pending rows
-    # for audit, but never blindly resend them. Fresh scans make fresh decisions.
-    log.info("[RETRY] automatic tip replay disabled; unsent rows retained for audit")
-    return 0
+    """Both scan paths send inline; this only catches Telegram outages."""
+    cutoff = int(time.time()) - minutes * 60
+    with db_conn() as c:
+        rows = c.execute(
+            "SELECT match_id,league,home,away,market,suggestion,confidence,score_at_tip,minute,"
+            "created_ts,odds,book,ev_pct,fair_prob,stake_units,is_prematch,kickoff_ts "
+            "FROM tips WHERE sent_ok=0 AND created_ts >= %s ORDER BY created_ts ASC LIMIT %s",
+            (cutoff, limit)).fetchall()
+
+    retried = 0
+    for (mid, league, home, away, market, sugg, conf, score, minute, cts, odds, book,
+         ev_pct, fair, stake, is_pre, kickoff) in rows:
+        kickoff_txt = "TBD"
+        if kickoff:
+            kickoff_txt = datetime.fromtimestamp(int(kickoff), TZ_UTC).astimezone(BERLIN_TZ).strftime("%H:%M")
+        ok = send_telegram(_format_tip_message(
+            home, away, league, int(minute or 0), score or "", sugg, float(conf), None,
+            odds, book, ev_pct, fair, stake, kickoff_txt=kickoff_txt, prematch=bool(is_pre)))
+        if ok:
+            with db_conn() as c2:
+                c2.execute("UPDATE tips SET sent_ok=1,telegram_sent_ts=%s "
+                           "WHERE match_id=%s AND created_ts=%s",
+                           (int(time.time()), mid, cts))
+            retried += 1
+    if retried:
+        log.info("[RETRY] resent %d", retried)
+    return retried
 
 
 # ───────── Scheduler ─────────
@@ -4689,8 +4594,7 @@ def health():
             n = c.execute("SELECT COUNT(*) FROM tips WHERE suggestion<>'HARVEST'").fetchone()[0]
         return jsonify({"ok": True, "db": "ok", "tips_count": int(n)})
     except Exception as e:
-        log.exception("[HEALTH] database unavailable")
-        return jsonify({"ok": False, "error": "database_unavailable"}), 503
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/init-db", methods=["POST"])
@@ -5017,25 +4921,18 @@ def _login_rate_limited(ip: str) -> bool:
     LOGIN_MAX_ATTEMPTS. That is still a hard ceiling on guessing rate and needs
     no shared state; a long random ADMIN_API_KEY remains the real defence.
     """
-    now = time.monotonic()
+    now = time.time()
     with _login_lock:
-        for address, stamps in list(_login_attempts.items()):
-            recent = [t for t in stamps if now - t < LOGIN_WINDOW_SEC]
-            if recent:
-                _login_attempts[address] = recent
-            else:
-                del _login_attempts[address]
-        # Fail closed for new keys at capacity; do not erase active bans.
-        if ip not in _login_attempts and len(_login_attempts) >= 10000:
-            return True
-        return len(_login_attempts.get(ip, [])) >= LOGIN_MAX_ATTEMPTS
+        hits = [t for t in _login_attempts[ip] if now - t < LOGIN_WINDOW_SEC]
+        _login_attempts[ip] = hits
+        if len(_login_attempts) > 10000:      # bound memory
+            _login_attempts.clear()
+        return len(hits) >= LOGIN_MAX_ATTEMPTS
 
 
 def _login_record_failure(ip: str) -> None:
     with _login_lock:
-        if ip not in _login_attempts and len(_login_attempts) >= 10000:
-            return
-        _login_attempts[ip] = (_login_attempts.get(ip, []) + [time.monotonic()])[-LOGIN_MAX_ATTEMPTS:]
+        _login_attempts[ip].append(time.time())
 
 
 def _dashboard_authed() -> bool:
@@ -5057,7 +4954,7 @@ def _dashboard_unavailable():
 def dashboard_login():
     if not DASHBOARD_ENABLED:
         return _dashboard_unavailable()
-    ip = request.remote_addr or "unknown"  # never trust arbitrary forwarding headers
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
     if request.method == "POST":
         if _login_rate_limited(ip):
             log.warning("[DASHBOARD] login rate-limited for %s", ip)
@@ -5326,21 +5223,7 @@ def telegram_webhook(secret: str):
         abort(403)
     update = request.get_json(silent=True) or {}
     try:
-        message = update.get("message") or {}
-        msg = message.get("text") or ""
-        sender_chat_id = str((message.get("chat") or {}).get("id") or "")
-        # The path secret proves the request came from Telegram, not that it
-        # came from OUR chat - anyone who learns/guesses this URL could reach
-        # every command below, previously including /scan by also guessing or
-        # shoulder-surfing the admin key typed in plain text into a chat
-        # (Telegram chat history, backups and linked-device sync all then
-        # carry it). Only TELEGRAM_CHAT_ID may act now. Responds 200 with no
-        # action for anyone else, rather than 403, so a prober can't tell
-        # "wrong chat" from "wrong secret" by response code.
-        if not TELEGRAM_CHAT_ID or sender_chat_id != str(TELEGRAM_CHAT_ID):
-            log.warning("[TELEGRAM] webhook message from unrecognised chat_id=%s ignored",
-                        sender_chat_id or "unknown")
-            return jsonify({"ok": True})
+        msg = (update.get("message") or {}).get("text") or ""
         if msg.startswith("/start"):
             send_telegram("👋 goalsniper is online.")
         elif msg.startswith("/digest"):
@@ -5350,12 +5233,16 @@ def telegram_webhook(secret: str):
         elif msg.startswith("/clv"):
             send_telegram(f"<pre>{escape(json.dumps(compute_clv(days=30), indent=2)[:3500])}</pre>")
         elif msg.startswith("/scan"):
-            result = _run_with_pg_lock(1001, production_scan)
-            if result is None:
-                send_telegram("⏳ A scan is already running.")
+            parts = msg.split()
+            if len(parts) > 1 and ADMIN_API_KEY and _safe_compare(parts[1], ADMIN_API_KEY):
+                result = _run_with_pg_lock(1001, production_scan)
+                if result is None:
+                    send_telegram("⏳ A scan is already running.")
+                else:
+                    s, l = result
+                    send_telegram(f"🔁 Scan done. Saved: {s}, Live seen: {l}")
             else:
-                s, l = result
-                send_telegram(f"🔁 Scan done. Saved: {s}, Live seen: {l}")
+                send_telegram("🔒 Admin key required.")
     except Exception as e:
         log.warning("telegram webhook parse error: %s", e)
     return jsonify({"ok": True})
@@ -5367,45 +5254,14 @@ def _on_boot():
     # CONCENTRATION_MODE should fail fast and cheap, not after the pool and
     # schema are already up.
     _enforce_concentration_scope()
-    _warn_if_live_pricing_impossible()
     _init_pool()
     init_db()
     set_setting("boot_ts", str(int(time.time())))
 
 
-_service_initialized = False
-_service_init_lock = threading.Lock()
-
-
-def create_app():
-    """Explicit service startup. Production: gunicorn --workers 1 'main:create_app()'."""
-    global _service_initialized
-    with _service_init_lock:
-        if not _service_initialized:
-            _on_boot()
-            _start_scheduler_once()
-            _service_initialized = True
-    return app
-
-
-@app.before_request
-def _dashboard_same_origin():
-    # Origin/Referer validation requires no template changes and covers login
-    # and every cookie-authenticated dashboard mutation. Missing proof fails closed.
-    if request.path.startswith("/dashboard/") and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        from urllib.parse import urlsplit
-        source = request.headers.get("Origin") or request.headers.get("Referer") or ""
-        try:
-            origin = urlsplit(source)
-            valid = origin.netloc.lower() == request.host.lower() and origin.scheme in {"http", "https"}
-            if app.config.get("SESSION_COOKIE_SECURE"):
-                valid = valid and origin.scheme == "https"
-        except ValueError:
-            valid = False
-        if not valid:
-            abort(403)
-
+# Order matters: the schema must exist before any scheduled job can run.
+_on_boot()
+_start_scheduler_once()
 
 if __name__ == "__main__":
-    create_app()
     app.run(host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8080")))
