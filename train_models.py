@@ -503,6 +503,11 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
         f["_ts"] = _first_int(row["kickoff_ts"], row["res_kickoff"], row["created_ts"])
         if not f["_ts"]:
             no_ts += 1
+            # A row without an event timestamp cannot participate in a valid
+            # time split. Putting it at timestamp 0 silently moves unknown
+            # data into TRAIN and makes holdout metrics look cleaner than they
+            # are. Preserve it in the database, but exclude it from training.
+            continue
         f["final_goals_sum"] = gh_f + ga_f
         f["final_goals_diff"] = gh_f - ga_f
         f["label_btts"] = 1 if _as_int(row["btts_yes"]) == 1 else 0
@@ -516,9 +521,7 @@ def load_inplay_data(conn: PGConnection, min_minute: int = 15,
                        "to the neutral prior. Everything else in those rows is kept. This "
                        "count falls to 0 as the window ages out.", untrusted_fair)
     if no_ts:
-        logger.warning("[LOAD] %d in-play snapshots have no usable timestamp — they sort to the "
-                       "front of the chronological split (i.e. into TRAIN). Harmless for legacy "
-                       "rows, but if this count keeps growing, kickoff_ts is not being written.",
+        logger.warning("[LOAD] excluded %d in-play snapshots without a usable event timestamp",
                        no_ts)
     if not feats:
         return pd.DataFrame()
@@ -570,15 +573,15 @@ def load_prematch_data(conn: PGConnection) -> pd.DataFrame:
                               payload.get("kickoff_ts"), row["created_ts"])
         if not f["_ts"]:
             no_ts += 1
+            continue
         f["final_goals_sum"] = gh_f + ga_f
         f["final_goals_diff"] = gh_f - ga_f
         f["label_btts"] = 1 if _as_int(row["btts_yes"]) == 1 else 0
         feats.append(f)
 
     if no_ts:
-        logger.warning("[LOAD] %d prematch snapshots have no usable timestamp — they sort into "
-                       "TRAIN. Re-run /admin/backfill-prematch-history to stamp historical rows "
-                       "with their real kickoff time.", no_ts)
+        logger.warning("[LOAD] excluded %d prematch snapshots without a usable event timestamp. "
+                       "Re-run /admin/backfill-prematch-history to recover them.", no_ts)
     if not feats:
         return pd.DataFrame()
     df = pd.DataFrame(feats)
@@ -603,14 +606,18 @@ def grouped_time_split(df: pd.DataFrame, cal_size: float, test_size: float,
 
     gcol = "_match_id" if "_match_id" in df.columns else None
     tcol = "_ts" if "_ts" in df.columns else None
-    if gcol is None or tcol is None:
-        rng = np.random.default_rng(int(os.getenv("TRAIN_SPLIT_SEED", "42")))
-        idx = np.arange(n)
-        rng.shuffle(idx)
-        c1 = int(n * (1 - cal_size - test_size))
-        c2 = int(n * (1 - test_size))
+    if tcol is None:
+        raise ValueError("valid chronological training split requires a _ts column")
+    if gcol is None:
+        # Timestamps remain usable even for legacy data without match IDs. Use
+        # row-level chronological masks rather than falling back to a random
+        # split, which would invalidate the system's calibration claims.
+        order = np.argsort(pd.to_numeric(df[tcol], errors="coerce").to_numpy())
+        c1 = max(1, int(n * (1 - cal_size - test_size)))
+        c2 = max(c1 + 1, int(n * (1 - test_size)))
         tr = np.zeros(n, dtype=bool); ca = np.zeros(n, dtype=bool); te = np.zeros(n, dtype=bool)
-        tr[idx[:c1]] = True; ca[idx[c1:c2]] = True; te[idx[c2:]] = True
+        tr[order[:c1]] = True; ca[order[c1:c2]] = True; te[order[c2:]] = True
+        logger.warning("[SPLIT] _match_id missing; using row-level chronological split")
         return tr, ca, te
 
     group_time = df.groupby(gcol)[tcol].min().sort_values()
