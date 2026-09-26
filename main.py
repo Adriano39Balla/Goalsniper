@@ -2876,24 +2876,22 @@ def _wld_details(feat: Dict[str, float], prefix: str) -> Optional[Dict[str, Any]
     mh = load_model_from_settings(f"{prefix}WLD_HOME")
     md = load_model_from_settings(f"{prefix}WLD_DRAW")
     ma = load_model_from_settings(f"{prefix}WLD_AWAY")
-    if not (mh and ma):
+    # A complete 1X2 vector is required. A hand-written draw fallback makes
+    # the denominator look complete while the model is actually missing a
+    # head, distorting 1X2, Double Chance and DNB together.
+    if not (mh and md and ma):
+        log.warning("[1X2] %sWLD model set incomplete — suppressing derived markets", prefix)
         return None
     ph = _score_prob(feat, mh)
     pa = _score_prob(feat, ma)
-    if md:
-        pd_ = _score_prob(feat, md)
-    else:
-        # Rather than silently reverting to the DNB error, fall back to an
-        # empirical draw prior so the denominator is still a full 1X2 one.
-        pd_ = float(os.getenv("FALLBACK_DRAW_PROB", "0.26"))
-        log.warning("[1X2] %sWLD_DRAW model missing — using fallback draw prior %.2f", prefix, pd_)
+    pd_ = _score_prob(feat, md)
     s = ph + pd_ + pa
     if not math.isfinite(s) or s <= EPS:
         raise ValueError("invalid 1X2 normalization sum")
     return {"before_normalization": {"home": ph, "draw": pd_, "away": pa},
             "normalization_sum": s,
             "normalized": {"home": ph / s, "draw": pd_ / s, "away": pa / s},
-            "draw_fallback_used": not bool(md)}
+            "draw_fallback_used": False}
 
 
 def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
@@ -2931,6 +2929,32 @@ def _dc_dnb_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tupl
         ("Draw No Bet", "Draw No Bet: Home", d["DNB_Home"], dnb_thr),
         ("Draw No Bet", "Draw No Bet: Away", d["DNB_Away"], dnb_thr),
     ]
+
+
+def _build_candidates(
+    feat: Dict[str, float],
+    prefix: str,
+    threshold_fn,
+    *,
+    enforce_live_state: bool = False,
+    thresholded_only: bool = False,
+) -> List[Tuple[str, str, float, float]]:
+    """Build one canonical candidate list for every serving path."""
+    candidates = (
+        _ou_candidates(feat, prefix, threshold_fn)
+        + _btts_candidates(feat, prefix, threshold_fn)
+        + _wld_candidates(feat, prefix, threshold_fn)
+        + _dc_dnb_candidates(feat, prefix, threshold_fn)
+    )
+    candidates = [
+        candidate for candidate in candidates
+        if candidate[1] in ALLOWED_SUGGESTIONS
+        and _market_active(candidate[0])
+        and (not enforce_live_state or _candidate_is_sane(candidate[1], feat))
+        and (not thresholded_only or candidate[2] * 100.0 >= candidate[3])
+    ]
+    candidates.sort(key=lambda item: item[2], reverse=True)
+    return candidates
 
 
 def _fixture_tip_history(fid: int) -> List[str]:
@@ -3291,14 +3315,8 @@ def production_scan() -> Tuple[int, int]:
             score = _pretty_score(m)
             kickoff = _kickoff_ts_of(m)
 
-            candidates = (_ou_candidates(feat, "", _get_market_threshold)
-                          + _btts_candidates(feat, "", _get_market_threshold)
-                          + _wld_candidates(feat, "", _get_market_threshold)
-                          + _dc_dnb_candidates(feat, "", _get_market_threshold))
-            candidates = [c for c in candidates
-                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
-                          and _market_active(c[0])]
-            candidates.sort(key=lambda x: x[2], reverse=True)
+            candidates = _build_candidates(
+                feat, "", _get_market_threshold, enforce_live_state=True)
 
             # Full breakdown for the dashboard, independent of whether any of
             # these candidates go on to clear a threshold or the price gate.
@@ -3460,14 +3478,8 @@ def score_live_matches_now(
             score = _pretty_score(m)
             kickoff = _kickoff_ts_of(m)
 
-            candidates = (_ou_candidates(feat, "", _get_market_threshold)
-                          + _btts_candidates(feat, "", _get_market_threshold)
-                          + _wld_candidates(feat, "", _get_market_threshold)
-                          + _dc_dnb_candidates(feat, "", _get_market_threshold))
-            candidates = [c for c in candidates
-                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
-                          and _market_active(c[0])]
-            candidates.sort(key=lambda x: x[2], reverse=True)
+            candidates = _build_candidates(
+                feat, "", _get_market_threshold, enforce_live_state=True)
 
             home_id, away_id = _team_ids(m)
             out.append(_build_live_match_entry(fid, league, league_id, home, away, score,
@@ -3652,12 +3664,7 @@ def prematch_scan_save() -> int:
         if MAX_PREMATCH_TIPS_PER_SCAN and saved >= MAX_PREMATCH_TIPS_PER_SCAN:
             break
 
-        candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
-        candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS and _market_active(c[0])]
-        candidates.sort(key=lambda x: x[2], reverse=True)
+        candidates = _build_candidates(feat, "PRE_", _get_market_threshold_pre)
 
         per_match = 0
         taken: List[str] = _fixture_tip_history(fid)
@@ -3764,12 +3771,8 @@ def send_match_of_the_day() -> bool:
         if not feat:
             continue
 
-        candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
-        candidates = [c for c in candidates
-                      if c[1] in ALLOWED_SUGGESTIONS and c[2] * 100.0 >= c[3] and _market_active(c[0])]
+        candidates = _build_candidates(
+            feat, "PRE_", _get_market_threshold_pre, thresholded_only=True)
         if not candidates:
             continue
         candidates.sort(key=lambda x: x[2], reverse=True)
