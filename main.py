@@ -105,6 +105,14 @@ from psycopg2.pool import ThreadedConnectionPool
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError as exc:
+    if exc.name != "dotenv":
+        raise
+else:
+    load_dotenv()
+
 from feature_spec import (
     ELO_DEFAULT,
     DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS,
@@ -114,11 +122,6 @@ from feature_spec import (
     enforce_ou_monotonicity, venue_form_stats,
 )
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 log = logging.getLogger("goalsniper")
@@ -260,15 +263,15 @@ REQUIRE_FAIR_PRICE = _env_flag("REQUIRE_FAIR_PRICE", "1")
 # Best price is still taken across every book; this governs whether the FAIR side
 # is trustworthy enough to bet against.
 MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
-# The in-play feed is ONE aggregated source, not a panel of books, so it can
-# never reach MIN_BOOKS_FOR_FAIR - live candidates would sit at
-# too_few_books forever. This is a separate knob rather than a lower global
-# value because prematch genuinely does have multiple books and should keep
-# demanding a consensus. Defaults to the strict value so nothing loosens by
-# itself: set it to 1 to accept the in-play feed's own de-vigged price, in
-# full knowledge that a single source's overround is not a consensus.
-MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE",
-                                        str(MIN_BOOKS_FOR_FAIR)))
+# Live odds expose one aggregate source. Keep the strict default; accepting
+# that source explicitly requires MIN_BOOKS_FOR_FAIR_LIVE=1.
+MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE", str(MIN_BOOKS_FOR_FAIR)))
+if min(MIN_BOOKS_FOR_FAIR, MIN_BOOKS_FOR_FAIR_LIVE) < 1:
+    raise SystemExit("Fair-price source counts must be positive")
+if REQUIRE_FAIR_PRICE and MIN_BOOKS_FOR_FAIR_LIVE > 1:
+    log.warning("[CONFIG] live fair-price gate blocks the single-source feed: "
+                "MIN_BOOKS_FOR_FAIR_LIVE=%d; set 1 explicitly to accept it",
+                MIN_BOOKS_FOR_FAIR_LIVE)
 
 # ───────── Execution realism ─────────
 # MIN_BOOKS_FOR_FAIR governs whether a price is trustworthy enough to call
@@ -534,12 +537,16 @@ _STATS_FETCHED_TS: Dict[int, int] = {}
 
 try:
     from train_models import train_models
+except ImportError as e:  # pragma: no cover
+    # Do not boot a service that looks healthy while its training endpoint is a
+    # hidden stub because a deployment dependency is missing. Railway should
+    # fail the release and show the real package/import error in the logs.
+    raise RuntimeError(
+        "train_models could not be imported. Install the runtime dependencies "
+        "required by train_models before starting goalsniper."
+    ) from e
 except Exception as e:  # pragma: no cover
-    _IMPORT_ERR = repr(e)
-
-    def train_models(*args, **kwargs):  # type: ignore
-        log.warning("train_models not available: %s", _IMPORT_ERR)
-        return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
+    raise RuntimeError("train_models failed during import; deployment is not safe") from e
 
 
 # ───────── DB pool ─────────
@@ -1403,7 +1410,7 @@ def _sigmoid(x: float) -> float:
 
 
 def _logit(p: float) -> float:
-    p = max(EPS, min(1 - EPS, float(p)))
+    p = max(1e-6, min(1 - 1e-6, float(p)))  # Matches training Platt clipping.
     return math.log(p / (1 - p))
 
 
@@ -2000,15 +2007,23 @@ def _market_fair_priors(fid: int, live: bool) -> Dict[str, float]:
     if not fid:
         return out
     odds_map = fetch_odds(fid, live=live) if API_KEY else {}
-    wld = (odds_map.get("1X2") or {}).get("fair") or {}
+    def trusted_fair(market_key: str) -> Dict[str, float]:
+        entry = odds_map.get(market_key) or {}
+        fair = entry.get("fair") or {}
+        minimum = MIN_BOOKS_FOR_FAIR_LIVE if live else MIN_BOOKS_FOR_FAIR
+        if int(entry.get("n_books") or 0) < minimum:
+            return {}
+        return fair
+
+    wld = trusted_fair("1X2")
     if all(k in wld for k in ("Home", "Draw", "Away")):
         out["market_fair_home"] = float(wld["Home"])
         out["market_fair_draw"] = float(wld["Draw"])
         out["market_fair_away"] = float(wld["Away"])
-    ou25 = (odds_map.get("OU_2.5") or {}).get("fair") or {}
+    ou25 = trusted_fair("OU_2.5")
     if "Over" in ou25:
         out["market_fair_over25"] = float(ou25["Over"])
-    btts = (odds_map.get("BTTS") or {}).get("fair") or {}
+    btts = trusted_fair("BTTS")
     if "Yes" in btts:
         out["market_fair_btts_yes"] = float(btts["Yes"])
     return out
@@ -4962,6 +4977,13 @@ def http_status():
             "league_allow_ids": LEAGUE_ALLOW_IDS,
             "prematch_league_ids": PREMATCH_LEAGUE_IDS,
             "max_active_leagues": MAX_ACTIVE_LEAGUES,
+        },
+        "fair_price": {
+            "required": REQUIRE_FAIR_PRICE,
+            "min_books": MIN_BOOKS_FOR_FAIR,
+            "min_books_live": MIN_BOOKS_FOR_FAIR_LIVE,
+            "live_feed_sources": 1,
+            "live_blocked_by_source_count": REQUIRE_FAIR_PRICE and MIN_BOOKS_FOR_FAIR_LIVE > 1,
         },
         "execution_realism": {
             "min_books": MIN_BOOKS_FOR_EXECUTION,
