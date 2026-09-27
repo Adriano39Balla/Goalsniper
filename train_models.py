@@ -84,6 +84,14 @@ from sklearn.metrics import (
     log_loss, precision_score, recall_score,
 )
 
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError as exc:
+    if exc.name != "dotenv":
+        raise
+else:
+    load_dotenv()
+
 from feature_spec import (
     ODDS_TRUSTED_FROM_TS,
     DEFAULT_LEAGUE_RATES, FEATURES, PRE_FEATURES, NEUTRAL_MARKET_PRIORS,
@@ -91,11 +99,6 @@ from feature_spec import (
     build_inplay_features, derive_dc_dnb,
 )
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -105,7 +108,6 @@ PGConnection = psycopg2.extensions.connection
 EPS = 1e-6
 DEFAULT_LEAGUE_RATE_MIN_N = int(os.getenv("LEAGUE_RATE_MIN_N", "20"))
 C_GRID = [float(x) for x in os.getenv("TRAIN_C_GRID", "0.01,0.03,0.1,0.3,1.0,3.0").split(",")]
-FALLBACK_DRAW_PROB = float(os.getenv("FALLBACK_DRAW_PROB", "0.26"))
 
 # Neutral defaults for the market_fair_* prematch features when reading a
 # snapshot written before feature_spec.assemble_prematch_features() started
@@ -1087,16 +1089,22 @@ def _wld_triple(heads: Dict[str, Tuple[bool, Optional[np.ndarray], Optional[np.n
     ok_h, p_h = _get("WLD_HOME")
     ok_d, p_d = _get("WLD_DRAW")
     ok_a, p_a = _get("WLD_AWAY")
-    if not (ok_h and ok_a) or p_h is None or p_a is None or len(p_h) == 0:
+    # Serving requires all three heads. Training must use the same contract;
+    # inventing a draw prior here can create a verified threshold that serving
+    # later refuses to use, or worse, combine with a stale draw model.
+    if (not (ok_h and ok_d and ok_a)
+            or p_h is None or p_d is None or p_a is None
+            or len(p_h) == 0 or len(p_d) != len(p_h) or len(p_a) != len(p_h)):
         return None
-    p_hc = np.clip(p_h, EPS, 1 - EPS)
-    p_ac = np.clip(p_a, EPS, 1 - EPS)
-    if ok_d and p_d is not None and len(p_d) == len(p_hc):
-        p_dc = np.clip(p_d, EPS, 1 - EPS)
-    else:
-        p_dc = np.full_like(p_hc, FALLBACK_DRAW_PROB)
-    s = np.maximum(p_hc + p_dc + p_ac, EPS)
-    return p_hc / s, p_dc / s, p_ac / s
+    arrays = tuple(np.asarray(p, dtype=float) for p in (p_h, p_d, p_a))
+    if any(p.ndim != 1 or not np.all(np.isfinite(p))
+           or np.any((p < 0) | (p > 1)) for p in arrays):
+        return None
+    total = arrays[0] + arrays[1] + arrays[2]
+    if np.any(total <= 1e-12):
+        return None
+    return tuple(p / total for p in arrays)
+
 
 
 def _fit_1x2_threshold(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray,
@@ -1112,8 +1120,7 @@ def _fit_1x2_threshold(heads, gd: np.ndarray, m_ca: np.ndarray, m_te: np.ndarray
     """
     tri_ca = _wld_triple(heads, idx=1)
     if tri_ca is None:
-        logger.info("[1X2] %s: home/away heads unavailable — threshold not set", label)
-        return False
+        raise ValueError(f"{label}: incomplete or invalid 1X2 heads; no models published")
     phn_ca, _pdn_ca, pan_ca = tri_ca
     gd_ca = gd[m_ca]
     probs_ca = np.concatenate([phn_ca, pan_ca])
