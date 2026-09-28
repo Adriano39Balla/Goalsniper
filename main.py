@@ -105,6 +105,14 @@ from psycopg2.pool import ThreadedConnectionPool
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError as exc:
+    if exc.name != "dotenv":
+        raise
+else:
+    load_dotenv()
+
 from feature_spec import (
     ELO_DEFAULT,
     DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS,
@@ -114,11 +122,6 @@ from feature_spec import (
     enforce_ou_monotonicity, venue_form_stats,
 )
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 log = logging.getLogger("goalsniper")
@@ -269,6 +272,13 @@ MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
 # full knowledge that a single source's overround is not a consensus.
 MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE",
                                         str(MIN_BOOKS_FOR_FAIR)))
+
+if min(MIN_BOOKS_FOR_FAIR, MIN_BOOKS_FOR_FAIR_LIVE) < 1:
+    raise SystemExit("Fair-price source counts must be positive")
+if REQUIRE_FAIR_PRICE and MIN_BOOKS_FOR_FAIR_LIVE > 1:
+    log.warning("[CONFIG] live tips blocked by fair-price source count: "
+                "the feed has one source, MIN_BOOKS_FOR_FAIR_LIVE=%d. "
+                "Set 1 explicitly to accept that source.", MIN_BOOKS_FOR_FAIR_LIVE)
 
 # ───────── Execution realism ─────────
 # MIN_BOOKS_FOR_FAIR governs whether a price is trustworthy enough to call
@@ -534,12 +544,16 @@ _STATS_FETCHED_TS: Dict[int, int] = {}
 
 try:
     from train_models import train_models
+except ImportError as e:  # pragma: no cover
+    # Do not boot a service that looks healthy while its training endpoint is a
+    # hidden stub because a deployment dependency is missing. Railway should
+    # fail the release and show the real package/import error in the logs.
+    raise RuntimeError(
+        "train_models could not be imported. Install the runtime dependencies "
+        "required by train_models before starting goalsniper."
+    ) from e
 except Exception as e:  # pragma: no cover
-    _IMPORT_ERR = repr(e)
-
-    def train_models(*args, **kwargs):  # type: ignore
-        log.warning("train_models not available: %s", _IMPORT_ERR)
-        return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
+    raise RuntimeError("train_models failed during import; deployment is not safe") from e
 
 
 # ───────── DB pool ─────────
@@ -1403,7 +1417,7 @@ def _sigmoid(x: float) -> float:
 
 
 def _logit(p: float) -> float:
-    p = max(EPS, min(1 - EPS, float(p)))
+    p = max(1e-6, min(1 - 1e-6, float(p)))  # Matches training Platt clipping.
     return math.log(p / (1 - p))
 
 
@@ -1673,7 +1687,7 @@ def _parse_book_market(mkt: dict) -> Optional[Tuple[str, Dict[str, float]]]:
                 continue
             if lbl in ("home/draw", "1x", "homeordraw"):
                 d["1X"] = o
-            elif lbl in ("draw/away", "x2", "draworaway"):
+            elif lbl in ("draw/away", "away/draw", "x2", "draworaway", "awayordraw"):
                 d["X2"] = o
             elif lbl in ("home/away", "12", "homeoraway"):
                 d["12"] = o
@@ -1850,6 +1864,7 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
         status = r.get("status") or {}
         if live and isinstance(status, dict) and _price_suspended(status):
             diagnostics["status"] = "fixture_odds_suspended"
+            log.info("[ODDS] fixture %s: feed-level suspension; prices ignored", fid)
             continue
         for book_name, bets in _iter_price_sources(r):
             per_market: Dict[str, Dict[str, float]] = {}
@@ -2876,24 +2891,22 @@ def _wld_details(feat: Dict[str, float], prefix: str) -> Optional[Dict[str, Any]
     mh = load_model_from_settings(f"{prefix}WLD_HOME")
     md = load_model_from_settings(f"{prefix}WLD_DRAW")
     ma = load_model_from_settings(f"{prefix}WLD_AWAY")
-    if not (mh and ma):
+    # A complete 1X2 vector is required. A hand-written draw fallback makes
+    # the denominator look complete while the model is actually missing a
+    # head, distorting 1X2, Double Chance and DNB together.
+    if not (mh and md and ma):
+        log.warning("[1X2] %sWLD model set incomplete — suppressing derived markets", prefix)
         return None
     ph = _score_prob(feat, mh)
     pa = _score_prob(feat, ma)
-    if md:
-        pd_ = _score_prob(feat, md)
-    else:
-        # Rather than silently reverting to the DNB error, fall back to an
-        # empirical draw prior so the denominator is still a full 1X2 one.
-        pd_ = float(os.getenv("FALLBACK_DRAW_PROB", "0.26"))
-        log.warning("[1X2] %sWLD_DRAW model missing — using fallback draw prior %.2f", prefix, pd_)
+    pd_ = _score_prob(feat, md)
     s = ph + pd_ + pa
     if not math.isfinite(s) or s <= EPS:
         raise ValueError("invalid 1X2 normalization sum")
     return {"before_normalization": {"home": ph, "draw": pd_, "away": pa},
             "normalization_sum": s,
             "normalized": {"home": ph / s, "draw": pd_ / s, "away": pa / s},
-            "draw_fallback_used": not bool(md)}
+            "draw_fallback_used": False}
 
 
 def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
@@ -4959,6 +4972,13 @@ def http_status():
             "league_allow_ids": LEAGUE_ALLOW_IDS,
             "prematch_league_ids": PREMATCH_LEAGUE_IDS,
             "max_active_leagues": MAX_ACTIVE_LEAGUES,
+        },
+        "fair_price": {
+            "required": REQUIRE_FAIR_PRICE,
+            "min_books": MIN_BOOKS_FOR_FAIR,
+            "min_books_live": MIN_BOOKS_FOR_FAIR_LIVE,
+            "live_feed_sources": 1,
+            "live_blocked_by_source_count": REQUIRE_FAIR_PRICE and MIN_BOOKS_FOR_FAIR_LIVE > 1,
         },
         "execution_realism": {
             "min_books": MIN_BOOKS_FOR_EXECUTION,
