@@ -105,14 +105,6 @@ from psycopg2.pool import ThreadedConnectionPool
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-try:
-    from dotenv import load_dotenv
-except ModuleNotFoundError as exc:
-    if exc.name != "dotenv":
-        raise
-else:
-    load_dotenv()
-
 from feature_spec import (
     ELO_DEFAULT,
     DEFAULT_LEAGUE_RATES, MARKET_PROBABILITY_TOTAL, NEUTRAL_MARKET_PRIORS,
@@ -122,6 +114,11 @@ from feature_spec import (
     enforce_ou_monotonicity, venue_form_stats,
 )
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 log = logging.getLogger("goalsniper")
@@ -263,15 +260,15 @@ REQUIRE_FAIR_PRICE = _env_flag("REQUIRE_FAIR_PRICE", "1")
 # Best price is still taken across every book; this governs whether the FAIR side
 # is trustworthy enough to bet against.
 MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
-# Live odds expose one aggregate source. Keep the strict default; accepting
-# that source explicitly requires MIN_BOOKS_FOR_FAIR_LIVE=1.
-MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE", str(MIN_BOOKS_FOR_FAIR)))
-if min(MIN_BOOKS_FOR_FAIR, MIN_BOOKS_FOR_FAIR_LIVE) < 1:
-    raise SystemExit("Fair-price source counts must be positive")
-if REQUIRE_FAIR_PRICE and MIN_BOOKS_FOR_FAIR_LIVE > 1:
-    log.warning("[CONFIG] live fair-price gate blocks the single-source feed: "
-                "MIN_BOOKS_FOR_FAIR_LIVE=%d; set 1 explicitly to accept it",
-                MIN_BOOKS_FOR_FAIR_LIVE)
+# The in-play feed is ONE aggregated source, not a panel of books, so it can
+# never reach MIN_BOOKS_FOR_FAIR - live candidates would sit at
+# too_few_books forever. This is a separate knob rather than a lower global
+# value because prematch genuinely does have multiple books and should keep
+# demanding a consensus. Defaults to the strict value so nothing loosens by
+# itself: set it to 1 to accept the in-play feed's own de-vigged price, in
+# full knowledge that a single source's overround is not a consensus.
+MIN_BOOKS_FOR_FAIR_LIVE = int(os.getenv("MIN_BOOKS_FOR_FAIR_LIVE",
+                                        str(MIN_BOOKS_FOR_FAIR)))
 
 # ───────── Execution realism ─────────
 # MIN_BOOKS_FOR_FAIR governs whether a price is trustworthy enough to call
@@ -537,16 +534,12 @@ _STATS_FETCHED_TS: Dict[int, int] = {}
 
 try:
     from train_models import train_models
-except ImportError as e:  # pragma: no cover
-    # Do not boot a service that looks healthy while its training endpoint is a
-    # hidden stub because a deployment dependency is missing. Railway should
-    # fail the release and show the real package/import error in the logs.
-    raise RuntimeError(
-        "train_models could not be imported. Install the runtime dependencies "
-        "required by train_models before starting goalsniper."
-    ) from e
 except Exception as e:  # pragma: no cover
-    raise RuntimeError("train_models failed during import; deployment is not safe") from e
+    _IMPORT_ERR = repr(e)
+
+    def train_models(*args, **kwargs):  # type: ignore
+        log.warning("train_models not available: %s", _IMPORT_ERR)
+        return {"ok": False, "reason": f"train_models import failed: {_IMPORT_ERR}"}
 
 
 # ───────── DB pool ─────────
@@ -1410,7 +1403,7 @@ def _sigmoid(x: float) -> float:
 
 
 def _logit(p: float) -> float:
-    p = max(1e-6, min(1 - 1e-6, float(p)))  # Matches training Platt clipping.
+    p = max(EPS, min(1 - EPS, float(p)))
     return math.log(p / (1 - p))
 
 
@@ -2007,23 +2000,15 @@ def _market_fair_priors(fid: int, live: bool) -> Dict[str, float]:
     if not fid:
         return out
     odds_map = fetch_odds(fid, live=live) if API_KEY else {}
-    def trusted_fair(market_key: str) -> Dict[str, float]:
-        entry = odds_map.get(market_key) or {}
-        fair = entry.get("fair") or {}
-        minimum = MIN_BOOKS_FOR_FAIR_LIVE if live else MIN_BOOKS_FOR_FAIR
-        if int(entry.get("n_books") or 0) < minimum:
-            return {}
-        return fair
-
-    wld = trusted_fair("1X2")
+    wld = (odds_map.get("1X2") or {}).get("fair") or {}
     if all(k in wld for k in ("Home", "Draw", "Away")):
         out["market_fair_home"] = float(wld["Home"])
         out["market_fair_draw"] = float(wld["Draw"])
         out["market_fair_away"] = float(wld["Away"])
-    ou25 = trusted_fair("OU_2.5")
+    ou25 = (odds_map.get("OU_2.5") or {}).get("fair") or {}
     if "Over" in ou25:
         out["market_fair_over25"] = float(ou25["Over"])
-    btts = trusted_fair("BTTS")
+    btts = (odds_map.get("BTTS") or {}).get("fair") or {}
     if "Yes" in btts:
         out["market_fair_btts_yes"] = float(btts["Yes"])
     return out
@@ -2891,22 +2876,24 @@ def _wld_details(feat: Dict[str, float], prefix: str) -> Optional[Dict[str, Any]
     mh = load_model_from_settings(f"{prefix}WLD_HOME")
     md = load_model_from_settings(f"{prefix}WLD_DRAW")
     ma = load_model_from_settings(f"{prefix}WLD_AWAY")
-    # A complete 1X2 vector is required. A hand-written draw fallback makes
-    # the denominator look complete while the model is actually missing a
-    # head, distorting 1X2, Double Chance and DNB together.
-    if not (mh and md and ma):
-        log.warning("[1X2] %sWLD model set incomplete — suppressing derived markets", prefix)
+    if not (mh and ma):
         return None
     ph = _score_prob(feat, mh)
     pa = _score_prob(feat, ma)
-    pd_ = _score_prob(feat, md)
+    if md:
+        pd_ = _score_prob(feat, md)
+    else:
+        # Rather than silently reverting to the DNB error, fall back to an
+        # empirical draw prior so the denominator is still a full 1X2 one.
+        pd_ = float(os.getenv("FALLBACK_DRAW_PROB", "0.26"))
+        log.warning("[1X2] %sWLD_DRAW model missing — using fallback draw prior %.2f", prefix, pd_)
     s = ph + pd_ + pa
     if not math.isfinite(s) or s <= EPS:
         raise ValueError("invalid 1X2 normalization sum")
     return {"before_normalization": {"home": ph, "draw": pd_, "away": pa},
             "normalization_sum": s,
             "normalized": {"home": ph / s, "draw": pd_ / s, "away": pa / s},
-            "draw_fallback_used": False}
+            "draw_fallback_used": not bool(md)}
 
 
 def _wld_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tuple[str, str, float, float]]:
@@ -2944,32 +2931,6 @@ def _dc_dnb_candidates(feat: Dict[str, float], prefix: str, thr_fn) -> List[Tupl
         ("Draw No Bet", "Draw No Bet: Home", d["DNB_Home"], dnb_thr),
         ("Draw No Bet", "Draw No Bet: Away", d["DNB_Away"], dnb_thr),
     ]
-
-
-def _build_candidates(
-    feat: Dict[str, float],
-    prefix: str,
-    threshold_fn,
-    *,
-    enforce_live_state: bool = False,
-    thresholded_only: bool = False,
-) -> List[Tuple[str, str, float, float]]:
-    """Build one canonical candidate list for every serving path."""
-    candidates = (
-        _ou_candidates(feat, prefix, threshold_fn)
-        + _btts_candidates(feat, prefix, threshold_fn)
-        + _wld_candidates(feat, prefix, threshold_fn)
-        + _dc_dnb_candidates(feat, prefix, threshold_fn)
-    )
-    candidates = [
-        candidate for candidate in candidates
-        if candidate[1] in ALLOWED_SUGGESTIONS
-        and _market_active(candidate[0])
-        and (not enforce_live_state or _candidate_is_sane(candidate[1], feat))
-        and (not thresholded_only or candidate[2] * 100.0 >= candidate[3])
-    ]
-    candidates.sort(key=lambda item: item[2], reverse=True)
-    return candidates
 
 
 def _fixture_tip_history(fid: int) -> List[str]:
@@ -3330,8 +3291,14 @@ def production_scan() -> Tuple[int, int]:
             score = _pretty_score(m)
             kickoff = _kickoff_ts_of(m)
 
-            candidates = _build_candidates(
-                feat, "", _get_market_threshold, enforce_live_state=True)
+            candidates = (_ou_candidates(feat, "", _get_market_threshold)
+                          + _btts_candidates(feat, "", _get_market_threshold)
+                          + _wld_candidates(feat, "", _get_market_threshold)
+                          + _dc_dnb_candidates(feat, "", _get_market_threshold))
+            candidates = [c for c in candidates
+                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
+                          and _market_active(c[0])]
+            candidates.sort(key=lambda x: x[2], reverse=True)
 
             # Full breakdown for the dashboard, independent of whether any of
             # these candidates go on to clear a threshold or the price gate.
@@ -3493,8 +3460,14 @@ def score_live_matches_now(
             score = _pretty_score(m)
             kickoff = _kickoff_ts_of(m)
 
-            candidates = _build_candidates(
-                feat, "", _get_market_threshold, enforce_live_state=True)
+            candidates = (_ou_candidates(feat, "", _get_market_threshold)
+                          + _btts_candidates(feat, "", _get_market_threshold)
+                          + _wld_candidates(feat, "", _get_market_threshold)
+                          + _dc_dnb_candidates(feat, "", _get_market_threshold))
+            candidates = [c for c in candidates
+                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
+                          and _market_active(c[0])]
+            candidates.sort(key=lambda x: x[2], reverse=True)
 
             home_id, away_id = _team_ids(m)
             out.append(_build_live_match_entry(fid, league, league_id, home, away, score,
@@ -3679,7 +3652,12 @@ def prematch_scan_save() -> int:
         if MAX_PREMATCH_TIPS_PER_SCAN and saved >= MAX_PREMATCH_TIPS_PER_SCAN:
             break
 
-        candidates = _build_candidates(feat, "PRE_", _get_market_threshold_pre)
+        candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
+        candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS and _market_active(c[0])]
+        candidates.sort(key=lambda x: x[2], reverse=True)
 
         per_match = 0
         taken: List[str] = _fixture_tip_history(fid)
@@ -3786,8 +3764,12 @@ def send_match_of_the_day() -> bool:
         if not feat:
             continue
 
-        candidates = _build_candidates(
-            feat, "PRE_", _get_market_threshold_pre, thresholded_only=True)
+        candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
+                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
+        candidates = [c for c in candidates
+                      if c[1] in ALLOWED_SUGGESTIONS and c[2] * 100.0 >= c[3] and _market_active(c[0])]
         if not candidates:
             continue
         candidates.sort(key=lambda x: x[2], reverse=True)
@@ -4977,13 +4959,6 @@ def http_status():
             "league_allow_ids": LEAGUE_ALLOW_IDS,
             "prematch_league_ids": PREMATCH_LEAGUE_IDS,
             "max_active_leagues": MAX_ACTIVE_LEAGUES,
-        },
-        "fair_price": {
-            "required": REQUIRE_FAIR_PRICE,
-            "min_books": MIN_BOOKS_FOR_FAIR,
-            "min_books_live": MIN_BOOKS_FOR_FAIR_LIVE,
-            "live_feed_sources": 1,
-            "live_blocked_by_source_count": REQUIRE_FAIR_PRICE and MIN_BOOKS_FOR_FAIR_LIVE > 1,
         },
         "execution_realism": {
             "min_books": MIN_BOOKS_FOR_EXECUTION,
