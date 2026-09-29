@@ -345,6 +345,10 @@ CALIBRATION_GAP_WARN_PP = float(os.getenv("CALIBRATION_GAP_WARN_PP", "3.0"))
 
 PREDICTION_LOG_ENABLE = _env_flag("PREDICTION_LOG_ENABLE", "1")
 PREDICTION_LOG_MIN_PROB = float(os.getenv("PREDICTION_LOG_MIN_PROB", "0.35"))
+SHADOW_ENABLE = _env_flag("SHADOW_ENABLE", "1")
+SHADOW_ONLY = _env_flag("SHADOW_ONLY", "0")
+if SHADOW_ONLY and not SHADOW_ENABLE:
+    raise SystemExit("SHADOW_ONLY=1 requires SHADOW_ENABLE=1")
 
 # Markets with no model of their own — they are algebraic transforms of the 1X2
 # heads. They must never fall back to a default threshold: see
@@ -424,6 +428,8 @@ def _parse_active_markets(env_val: str) -> set:
 # choice, not to default to "everything" under a new setting's name.
 ACTIVE_MARKETS = (_parse_active_markets(os.getenv("ACTIVE_MARKETS", _DEFAULT_ACTIVE_MARKETS))
                   if CONCENTRATION_MODE else set(_ALL_MARKET_FAMILIES))
+DISABLED_MARKETS = _parse_active_markets(os.getenv("DISABLED_MARKETS", ""))
+DISABLED_LEAGUE_IDS = set(_int_list(os.getenv("DISABLED_LEAGUE_IDS", "")))
 
 # Upper bound on distinct league IDs when concentration is on, enforced at
 # boot against LEAGUE_ALLOW_IDS / PREMATCH_LEAGUE_IDS (see
@@ -439,8 +445,9 @@ def _market_family(market_text: str) -> str:
 
 
 def _market_active(market_text: str) -> bool:
-    """True unless CONCENTRATION_MODE has explicitly excluded this market."""
-    return _market_family(market_text) in ACTIVE_MARKETS
+    """Explicit blocks override the active-market set."""
+    family = _market_family(market_text)
+    return family in ACTIVE_MARKETS and family not in DISABLED_MARKETS
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -704,6 +711,20 @@ def init_db():
             prob DOUBLE PRECISION, threshold_pct DOUBLE PRECISION,
             odds DOUBLE PRECISION, fair_prob DOUBLE PRECISION,
             ev_pct DOUBLE PRECISION, decision TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS scan_funnel (
+            id BIGSERIAL PRIMARY KEY, created_ts BIGINT NOT NULL,
+            phase TEXT NOT NULL, counts TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS shadow_picks (
+            id BIGSERIAL PRIMARY KEY, match_id BIGINT NOT NULL,
+            league_id BIGINT, league TEXT, kickoff_ts BIGINT,
+            created_ts BIGINT NOT NULL, phase TEXT NOT NULL, minute INTEGER,
+            market TEXT NOT NULL, suggestion TEXT NOT NULL,
+            prob DOUBLE PRECISION NOT NULL, threshold_pct DOUBLE PRECISION,
+            odds DOUBLE PRECISION NOT NULL, book TEXT, fair_prob DOUBLE PRECISION,
+            ev_pct DOUBLE PRECISION, stake_units DOUBLE PRECISION,
+            model_version TEXT NOT NULL, closing_odds DOUBLE PRECISION,
+            clv_pct DOUBLE PRECISION,
+            UNIQUE(match_id, phase, suggestion))""")
 
         for stmt in [
             "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS league_id BIGINT",
@@ -746,6 +767,9 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_pre_snap_kickoff ON prematch_snapshots (kickoff_ts)",
             "CREATE INDEX IF NOT EXISTS idx_pred_match ON predictions (match_id)",
             "CREATE INDEX IF NOT EXISTS idx_pred_created ON predictions (created_ts DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_scan_funnel_created ON scan_funnel (created_ts DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_shadow_created ON shadow_picks (created_ts DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_shadow_close ON shadow_picks (phase,kickoff_ts) WHERE closing_odds IS NULL",
         ]:
             try:
                 c.execute(stmt)
@@ -938,6 +962,8 @@ def _blocked_league(league_obj: dict) -> bool:
     """
     lg = league_obj or {}
     league_id = str(lg.get("id") or "")
+    if league_id.isdigit() and int(league_id) in DISABLED_LEAGUE_IDS:
+        return True
     allow_ids = [x.strip() for x in os.getenv("LEAGUE_ALLOW_IDS", "").split(",") if x.strip()]
     deny_ids = [x.strip() for x in os.getenv("LEAGUE_DENY_IDS", "").split(",") if x.strip()]
     if allow_ids:
@@ -2308,6 +2334,46 @@ def _log_predictions(rows: List[tuple]) -> None:
         log.warning("[PRED-LOG] insert failed: %s", e)
 
 
+def _model_version() -> str:
+    """Training timestamp plus deployed commit, frozen with each prospective pick."""
+    raw = get_setting_cached("model_metrics_latest")
+    try:
+        trained = (json.loads(raw) if raw else {}).get("trained_at_utc") or "unknown"
+    except (ValueError, TypeError):
+        trained = "unknown"
+    return f"{trained}|{os.getenv('RAILWAY_GIT_COMMIT_SHA', 'unknown')[:12]}"
+
+
+def _save_funnel(phase: str, counts: Dict[str, int]) -> None:
+    try:
+        with db_conn() as c:
+            c.execute("INSERT INTO scan_funnel(created_ts,phase,counts) VALUES(%s,%s,%s)",
+                      (int(time.time()), phase, json.dumps(counts, sort_keys=True)))
+    except Exception as e:
+        log.warning("[FUNNEL] save failed: %s", e)
+    log.info("[FUNNEL] %s %s", phase, counts)
+
+
+def _shadow_record(fid: int, league_id: int, league: str, kickoff: int,
+                   phase: str, minute: int, market: str, suggestion: str,
+                   prob: float, threshold: float, pc: PriceCheck) -> bool:
+    """One immutable first qualifying quote per fixture/phase/selection."""
+    if not SHADOW_ENABLE or not pc.get("passed") or not pc.get("odds"):
+        return False
+    with db_conn() as c:
+        inserted = c.execute("""
+            INSERT INTO shadow_picks(match_id,league_id,league,kickoff_ts,created_ts,
+                phase,minute,market,suggestion,prob,threshold_pct,odds,book,fair_prob,
+                ev_pct,stake_units,model_version)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(match_id,phase,suggestion) DO NOTHING RETURNING id
+        """, (fid, league_id, league, kickoff, int(time.time()), phase, minute,
+              market, suggestion, float(prob), float(threshold), float(pc["odds"]),
+              pc.get("book"), pc.get("fair_prob"), pc.get("ev_pct"),
+              _stake_units(prob, pc.get("odds")), _model_version())).fetchone()
+    return bool(inserted)
+
+
 # ───────── Elo ─────────
 def get_team_ratings_bulk(team_ids: List[int]) -> Dict[int, float]:
     ids = [t for t in set(team_ids) if t]
@@ -2549,6 +2615,28 @@ def capture_closing_lines(limit: int = 200) -> int:
     if n or no_same_book:
         log.info("[CLV] captured %d closing prices (%d skipped: the book that priced the tip "
                  "was not quoting at close)", n, no_same_book)
+    if SHADOW_ENABLE:
+        with db_conn() as c:
+            shadow_rows = c.execute("""
+                SELECT id,match_id,market,suggestion,odds,book FROM shadow_picks
+                WHERE phase='prematch' AND closing_odds IS NULL AND kickoff_ts > %s
+                  AND kickoff_ts <= %s ORDER BY kickoff_ts LIMIT %s
+            """, (now, now + CLV_CAPTURE_LEAD_MIN * 60, limit)).fetchall()
+        for sid, mid, market, suggestion, entry_odds, book in shadow_rows:
+            if not book:
+                continue
+            mkey, sel = _market_key_and_selection(market, suggestion)
+            if not mkey or not sel:
+                continue
+            prices = ((fetch_odds(int(mid), live=False).get(mkey) or {}).get("by_book") or {}).get(sel) or {}
+            close = prices.get(book)
+            if close is None or float(close) <= 1.0:
+                continue
+            clv = (float(entry_odds) / float(close) - 1.0) * 100.0
+            with db_conn() as c:
+                c.execute("UPDATE shadow_picks SET closing_odds=%s,clv_pct=%s WHERE id=%s",
+                          (float(close), round(clv, 3), sid))
+            n += 1
     return n
 
 
@@ -3176,6 +3264,7 @@ def production_scan() -> Tuple[int, int]:
     if live_seen == 0:
         log.info("[PROD] no live")
         _set_live_snapshot([], live_seen=0, no_coverage=0)
+        _save_funnel("live", {"fixtures_seen": 0, "tips_saved": 0})
         return 0, 0
 
     saved = 0
@@ -3189,6 +3278,9 @@ def production_scan() -> Tuple[int, int]:
     # healthy live_seen count is otherwise unexplainable from this log line
     # alone (was it no odds? too few books? edge implausible?).
     gate_decisions: Dict[str, int] = {}
+    funnel: Dict[str, int] = {"fixtures_seen": live_seen}
+    def count(reason: str) -> None:
+        funnel[reason] = funnel.get(reason, 0) + 1
     last_snap: Dict[int, int] = {}
     if HARVEST_MODE:
         try:
@@ -3212,6 +3304,7 @@ def production_scan() -> Tuple[int, int]:
                               "home": home, "away": away, "minute": minute})
             stats_diagnostics.append(stat_diag)
             if minute < TIP_MIN_MINUTE:
+                count("before_minute")
                 continue
 
             covered = stats_coverage_ok(raw, minute)
@@ -3284,7 +3377,9 @@ def production_scan() -> Tuple[int, int]:
             # information — fine to record, not fine to bet on.
             if not covered:
                 no_coverage += 1
+                count("statistics_unusable")
                 continue
+            count("statistics_usable")
 
             # The cooldown stops a fixture being TIPPED twice in quick
             # succession. It is not a reason to hide the match from the
@@ -3308,6 +3403,10 @@ def production_scan() -> Tuple[int, int]:
                           + _btts_candidates(feat, "", _get_market_threshold)
                           + _wld_candidates(feat, "", _get_market_threshold)
                           + _dc_dnb_candidates(feat, "", _get_market_threshold))
+            funnel["generated_candidates"] = funnel.get("generated_candidates", 0) + len(candidates)
+            funnel["market_or_sanity_filtered"] = funnel.get("market_or_sanity_filtered", 0) + sum(
+                1 for c in candidates if c[1] not in ALLOWED_SUGGESTIONS
+                or not _candidate_is_sane(c[1], feat) or not _market_active(c[0]))
             candidates = [c for c in candidates
                           if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
                           and _market_active(c[0])]
@@ -3322,6 +3421,7 @@ def production_scan() -> Tuple[int, int]:
 
             # Displayed above, just not re-tipped yet.
             if cooling_down:
+                count("fixture_cooldown")
                 continue
 
             per_match = 0
@@ -3330,6 +3430,7 @@ def production_scan() -> Tuple[int, int]:
             fixture_preds: List[tuple] = []
 
             for idx, (market_txt, suggestion, prob, thr) in enumerate(candidates):
+                count("candidates")
                 below = prob * 100.0 < thr
                 capped = per_match >= max(1, PREDICTIONS_PER_MATCH)
                 pc = PriceCheck(passed=False, odds=None, book=None, fair_prob=None, ev_pct=None,
@@ -3349,6 +3450,7 @@ def production_scan() -> Tuple[int, int]:
                             pc["passed"] = False
                             pc["decision"] = "correlated_with_existing_tip"
                     gate_decisions[pc["decision"]] = gate_decisions.get(pc["decision"], 0) + 1
+                count(pc["decision"])
 
                 if PREDICTION_LOG_ENABLE and (is_harvest_tick or pc["passed"]) and prob >= PREDICTION_LOG_MIN_PROB:
                     fixture_preds.append((fid, league_id, kickoff, base_now, "live", minute,
@@ -3358,6 +3460,13 @@ def production_scan() -> Tuple[int, int]:
 
                 if not pc["passed"]:
                     continue
+
+                _shadow_record(fid, league_id, league, kickoff, "live", minute,
+                               market_txt, suggestion, prob, thr, pc)
+                if SHADOW_ONLY:
+                    per_match += 1
+                    taken.append(suggestion)
+                    break
 
                 created_ts = base_now + idx
                 prob_pct = round(float(prob) * 100.0, 1)
@@ -3412,6 +3521,9 @@ def production_scan() -> Tuple[int, int]:
              saved, live_seen, len(pred_rows), harvested, no_coverage)
     if gate_decisions:
         log.info("[PROD] price_gate: %s", gate_decisions)
+    funnel["tips_saved"] = saved
+    funnel["shadow_only"] = int(SHADOW_ONLY)
+    _save_funnel("live", funnel)
     if stats_diagnostics:
         reason_counts: Dict[str, int] = {}
         for row in stats_diagnostics:
@@ -3618,11 +3730,15 @@ def _get_prematch_features_bulk(fixtures: List[dict]) -> Tuple[Dict[int, Dict[st
 def prematch_scan_save() -> int:
     fixtures = _collect_todays_prematch_fixtures()
     if not fixtures:
+        _save_funnel("prematch", {"fixtures_seen": 0, "tips_saved": 0})
         return 0
     feats_by_fid, freshly_fetched = _get_prematch_features_bulk(fixtures)
     saved = 0
     no_form = 0
     pred_rows: List[tuple] = []
+    funnel: Dict[str, int] = {"fixtures_seen": len(fixtures)}
+    def count(reason: str) -> None:
+        funnel[reason] = funnel.get(reason, 0) + 1
 
     for fx in fixtures:
         fixture = fx.get("fixture") or {}
@@ -3631,6 +3747,7 @@ def prematch_scan_save() -> int:
         fid = int(fixture.get("id") or 0)
         feat = feats_by_fid.get(fid)
         if not fid or not feat:
+            count("features_missing")
             continue
 
         home = (teams.get("home") or {}).get("name", "")
@@ -3653,6 +3770,7 @@ def prematch_scan_save() -> int:
         # it never received. Real money on a fetch that failed.
         if data_block:
             no_form += 1
+            count("form_unusable")
             continue
 
         if PREMATCH_DEDUP_ENABLE:
@@ -3660,6 +3778,7 @@ def prematch_scan_save() -> int:
                 dup = c.execute("SELECT 1 FROM tips WHERE match_id=%s AND is_prematch=1 "
                                 "AND suggestion<>'HARVEST' LIMIT 1", (fid,)).fetchone()
             if dup:
+                count("fixture_already_tipped")
                 continue
 
         if MAX_PREMATCH_TIPS_PER_SCAN and saved >= MAX_PREMATCH_TIPS_PER_SCAN:
@@ -3669,6 +3788,9 @@ def prematch_scan_save() -> int:
                       + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
                       + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
                       + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
+        funnel["generated_candidates"] = funnel.get("generated_candidates", 0) + len(candidates)
+        funnel["market_filtered"] = funnel.get("market_filtered", 0) + sum(
+            1 for c in candidates if c[1] not in ALLOWED_SUGGESTIONS or not _market_active(c[0]))
         candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS and _market_active(c[0])]
         candidates.sort(key=lambda x: x[2], reverse=True)
 
@@ -3678,6 +3800,7 @@ def prematch_scan_save() -> int:
         fixture_preds: List[tuple] = []
 
         for idx, (mk, sug, prob, thr) in enumerate(candidates):
+            count("candidates")
             below = prob * 100.0 < thr
             capped = per_match >= max(1, PREDICTIONS_PER_MATCH)
             pc = PriceCheck(passed=False, odds=None, book=None, fair_prob=None, ev_pct=None,
@@ -3691,6 +3814,7 @@ def prematch_scan_save() -> int:
                     if extra < CORRELATED_EXTRA_EV_BPS:
                         pc["passed"] = False
                         pc["decision"] = "correlated_with_existing_tip"
+            count(pc["decision"])
 
             if PREDICTION_LOG_ENABLE and prob >= PREDICTION_LOG_MIN_PROB:
                 fixture_preds.append((fid, league_id, kickoff, base_now, "prematch", 0,
@@ -3700,6 +3824,13 @@ def prematch_scan_save() -> int:
 
             if not pc["passed"]:
                 continue
+
+            _shadow_record(fid, league_id, league, kickoff, "prematch", 0,
+                           f"PRE {mk}", sug, prob, thr, pc)
+            if SHADOW_ONLY:
+                per_match += 1
+                taken.append(sug)
+                break
 
             created_ts = base_now + idx
             pct = round(float(prob) * 100.0, 1)
@@ -3742,6 +3873,9 @@ def prematch_scan_save() -> int:
         pred_rows.extend(_trim_fixture_predictions(fixture_preds))
 
     _log_predictions(pred_rows)
+    funnel["tips_saved"] = saved
+    funnel["shadow_only"] = int(SHADOW_ONLY)
+    _save_funnel("prematch", funnel)
     # no_form is the operator-facing symptom of a failed form fetch. It sitting
     # at or near the fixture count means the team-form calls are being refused,
     # not that the card is quiet.
@@ -3933,6 +4067,97 @@ def backfill_historical_prematch(league_id: int, seasons: List[int]) -> Dict[str
 # ───────── Analytics ─────────
 def _norm_cdf(x: float) -> float:
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def compute_shadow_report(days: Optional[int] = 90) -> Dict[str, Any]:
+    """Prospective one-unit returns; pushes excluded from ROI denominator."""
+    cutoff = int(time.time()) - int(days) * 86400 if days else 0
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT s.match_id,s.league_id,s.league,s.phase,s.market,s.suggestion,
+                   s.prob,s.odds,s.clv_pct,s.model_version,
+                   r.final_goals_h,r.final_goals_a,r.btts_yes
+            FROM shadow_picks s LEFT JOIN match_results r ON r.match_id=s.match_id
+            WHERE s.created_ts >= %s ORDER BY s.created_ts
+        """, (cutoff,)).fetchall()
+    groups: Dict[str, Dict[str, Dict[str, Any]]] = {
+        dim: {} for dim in ("market", "league", "probability_bucket", "odds_bucket", "model_version", "phase")}
+    overall: Dict[str, Any] = {}
+
+    def add(bucket: Dict[str, Any], outcome: Optional[int], pending: bool,
+            odds: float, prob: float, clv: Optional[float], fid: int) -> None:
+        bucket["recorded"] = bucket.get("recorded", 0) + 1
+        bucket.setdefault("fixtures", set()).add(fid)
+        if pending:
+            bucket["pending"] = bucket.get("pending", 0) + 1
+        elif outcome is None:
+            bucket["void"] = bucket.get("void", 0) + 1
+        else:
+            bucket["graded"] = bucket.get("graded", 0) + 1
+            bucket["wins"] = bucket.get("wins", 0) + outcome
+            bucket["profit_units"] = bucket.get("profit_units", 0.0) + (odds - 1 if outcome else -1)
+            bucket["predicted_probability_sum"] = bucket.get("predicted_probability_sum", 0.0) + prob
+        if clv is not None:
+            bucket["clv_n"] = bucket.get("clv_n", 0) + 1
+            bucket["clv_sum"] = bucket.get("clv_sum", 0.0) + float(clv)
+
+    for fid, league_id, league, phase, market, suggestion, prob, odds, clv, version, gh, ga, btts in rows:
+        pending = gh is None or ga is None
+        outcome = None if pending else _tip_outcome_for_result(
+            suggestion, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
+        p = float(prob)
+        o = float(odds)
+        pb = f"{min(int(p * 20) * 5, 95):02d}-{min(int(p * 20) * 5 + 5, 100):02d}%"
+        ob = "<1.50" if o < 1.5 else "1.50-1.99" if o < 2 else "2.00-2.99" if o < 3 else "3.00+"
+        labels = {"market": market, "league": f"{league_id}: {league}",
+                  "probability_bucket": pb, "odds_bucket": ob,
+                  "model_version": version, "phase": phase}
+        add(overall, outcome, pending, o, p, clv, int(fid))
+        for dimension, label in labels.items():
+            add(groups[dimension].setdefault(label, {}), outcome, pending, o, p, clv, int(fid))
+
+    def finish(b: Dict[str, Any]) -> Dict[str, Any]:
+        n = b.get("graded", 0)
+        c = b.get("clv_n", 0)
+        profit = b.get("profit_units", 0.0)
+        return {"recorded": b.get("recorded", 0), "unique_fixtures": len(b.get("fixtures", ())),
+                "pending": b.get("pending", 0), "void": b.get("void", 0),
+                "graded": n, "wins": b.get("wins", 0),
+                "profit_units": round(profit, 3), "roi_pct": round(100 * profit / n, 2) if n else None,
+                "hit_rate_pct": round(100 * b.get("wins", 0) / n, 2) if n else None,
+                "mean_model_prob_pct": round(100 * b.get("predicted_probability_sum", 0) / n, 2) if n else None,
+                "clv_n": c, "mean_clv_pct": round(b.get("clv_sum", 0) / c, 3) if c else None}
+
+    completed = {dim: {name: finish(b) for name, b in buckets.items()}
+                 for dim, buckets in groups.items()}
+    # A review flag is not an automatic disable. Repeated slices and market
+    # selection on the same history otherwise manufacture a winning backtest.
+    review = []
+    for dim in ("market", "league"):
+        for name, b in completed[dim].items():
+            if b["graded"] >= 100 and b["roi_pct"] is not None and b["roi_pct"] < 0:
+                review.append({"dimension": dim, "name": name,
+                               "reason": "negative prospective ROI over at least 100 graded picks",
+                               "prematch_clv_available": b["clv_n"]})
+    return {"days": days, "overall": finish(overall), "by": completed,
+            "review_for_disabling": review,
+            "note": "One unit per first qualifying fixture/phase/selection quote; live CLV is undefined. "
+                    "Prematch CLV needs a same-book pre-kickoff quote. Repeated bets on one match "
+                    "are correlated. Review flags do not change production filters."}
+
+
+def compute_scan_funnel(days: int = 7) -> Dict[str, Any]:
+    with db_conn() as c:
+        rows = c.execute("SELECT phase,counts FROM scan_funnel WHERE created_ts >= %s",
+                         (int(time.time()) - int(days) * 86400,)).fetchall()
+    out: Dict[str, Dict[str, int]] = {}
+    for phase, payload in rows:
+        dest = out.setdefault(phase, {"scans": 0})
+        dest["scans"] += 1
+        for k, v in json.loads(payload).items():
+            dest[k] = dest.get(k, 0) + int(v)
+    return {"days": days, "by_phase": out,
+            "note": "Counts are scan observations; the same fixture can appear in several scans."}
 
 
 def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool = False) -> Dict[str, Any]:
@@ -4852,6 +5077,18 @@ def http_price_gate():
     return jsonify({"ok": True,
                     "price_gate": compute_price_gate_breakdown(
                         days=_arg_int("days", 7), phase=request.args.get("phase"))})
+
+
+@app.route("/admin/diagnostics/funnel", methods=["GET"])
+def http_scan_funnel():
+    _require_admin()
+    return jsonify({"ok": True, "funnel": compute_scan_funnel(days=_arg_int("days", 7))})
+
+
+@app.route("/admin/diagnostics/shadow", methods=["GET"])
+def http_shadow_report():
+    _require_admin()
+    return jsonify({"ok": True, "shadow": compute_shadow_report(days=_arg_int("days", 90))})
 
 
 @app.route("/admin/diagnostics/live-stats", methods=["GET"])
