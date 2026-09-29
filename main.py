@@ -90,6 +90,8 @@ from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import uuid
+import hashlib
 import psycopg2
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -667,7 +669,13 @@ def set_setting(key: str, value: str) -> None:
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (key, value))
 
 
+_SCAN_LOCAL = threading.local()
+
+
 def get_setting_cached(key: str) -> Optional[str]:
+    audit = getattr(_SCAN_LOCAL, 'audit', None)
+    if audit is not None and key.startswith(('model', 'conf_threshold')):
+        return audit.settings.get(key)
     v = _SETTINGS_CACHE.get(key, _MISS)
     if v is _MISS:
         v = get_setting(key)
@@ -682,7 +690,8 @@ def invalidate_model_caches_for_key(key: str):
 
 # ───────── Schema ─────────
 def init_db():
-    with db_conn() as c:
+    with _tip_transaction() as c:
+        c.execute('SELECT pg_advisory_xact_lock(%s)', (19017,))
         c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS tips (
             match_id BIGINT, league_id BIGINT, league TEXT,
@@ -726,7 +735,26 @@ def init_db():
             clv_pct DOUBLE PRECISION,
             UNIQUE(match_id, phase, suggestion))""")
 
+        c.execute("""CREATE TABLE IF NOT EXISTS scan_runs (
+            scan_id TEXT PRIMARY KEY, phase TEXT NOT NULL,
+            started_ts BIGINT NOT NULL, finished_ts BIGINT,
+            status TEXT NOT NULL, model_version TEXT NOT NULL, policy_version TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS scan_decisions (
+            id BIGSERIAL PRIMARY KEY, scan_id TEXT NOT NULL REFERENCES scan_runs(scan_id),
+            created_ts BIGINT NOT NULL, match_id BIGINT, league_id BIGINT, kickoff_ts BIGINT,
+            stage TEXT NOT NULL, market TEXT, suggestion TEXT, reason TEXT NOT NULL,
+            prob DOUBLE PRECISION, threshold_pct DOUBLE PRECISION,
+            odds DOUBLE PRECISION, fair_prob DOUBLE PRECISION, ev_pct DOUBLE PRECISION,
+            price_decision TEXT, qualified BOOLEAN NOT NULL DEFAULT FALSE,
+            detail TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS fixture_voids (
+            match_id BIGINT PRIMARY KEY, status TEXT NOT NULL, updated_ts BIGINT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS settlement_checks (
+            match_id BIGINT PRIMARY KEY, last_checked_ts BIGINT NOT NULL)""")
         for stmt in [
+            "ALTER TABLE shadow_picks ADD COLUMN IF NOT EXISTS policy_version TEXT NOT NULL DEFAULT 'legacy'",
+            "ALTER TABLE shadow_picks ADD COLUMN IF NOT EXISTS closing_ts BIGINT",
+            "ALTER TABLE tips ADD COLUMN IF NOT EXISTS closing_ts BIGINT",
             "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS league_id BIGINT",
             "ALTER TABLE match_results ADD COLUMN IF NOT EXISTS kickoff_ts BIGINT",
             "ALTER TABLE tips ADD COLUMN IF NOT EXISTS odds DOUBLE PRECISION",
@@ -751,7 +779,8 @@ def init_db():
             try:
                 c.execute(stmt)
             except Exception as e:
-                log.warning("[SCHEMA] %s -> %s", stmt, e)
+                log.error("[SCHEMA] %s -> %s", stmt, e)
+                raise
 
         for stmt in [
             "CREATE INDEX IF NOT EXISTS idx_results_league ON match_results (league_id)",
@@ -767,6 +796,9 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_pre_snap_kickoff ON prematch_snapshots (kickoff_ts)",
             "CREATE INDEX IF NOT EXISTS idx_pred_match ON predictions (match_id)",
             "CREATE INDEX IF NOT EXISTS idx_pred_created ON predictions (created_ts DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_decisions_scan ON scan_decisions(scan_id)",
+            "CREATE INDEX IF NOT EXISTS idx_decisions_created ON scan_decisions(created_ts)",
+            "CREATE INDEX IF NOT EXISTS idx_decisions_match ON scan_decisions(match_id)",
             "CREATE INDEX IF NOT EXISTS idx_scan_funnel_created ON scan_funnel (created_ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_created ON shadow_picks (created_ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_close ON shadow_picks (phase,kickoff_ts) WHERE closing_odds IS NULL",
@@ -774,7 +806,8 @@ def init_db():
             try:
                 c.execute(stmt)
             except Exception as e:
-                log.warning("[SCHEMA] %s -> %s", stmt, e)
+                log.error("[SCHEMA] %s -> %s", stmt, e)
+                raise
 
         if _env_flag("PURGE_LEGACY_HARVEST_TIPS", "1"):
             try:
@@ -796,9 +829,9 @@ def send_telegram(text: str) -> bool:
                                "disable_web_page_preview": True}, timeout=10)
         if not r.ok:
             log.warning("[TELEGRAM] send failed: HTTP %s — %s", r.status_code, r.text[:300])
-        return r.ok
+        return bool(r.ok and isinstance(r.json(), dict) and r.json().get('ok') is True)
     except Exception as e:
-        log.warning("[TELEGRAM] send raised: %s", e)
+        log.warning("[TELEGRAM] send raised: %s", type(e).__name__)
         return False
 
 
@@ -1048,17 +1081,25 @@ def fetch_match_events(fid: int) -> list:
     return out
 
 
-def fetch_live_matches() -> List[dict]:
-    js = _api_get(FOOTBALL_API_URL, {"live": "all"}) or {}
+def fetch_live_matches(audit=None) -> List[dict]:
+    js = _api_get(FOOTBALL_API_URL, {"live": "all"})
+    if not isinstance(js, dict) or not isinstance(js.get("response"), list) or js.get("errors"):
+        raise RuntimeError("fixture_feed_unavailable")
     observed_ts = int(time.time())
-    matches = [m for m in (js.get("response", []) if isinstance(js, dict) else [])
-               if not _blocked_league(m.get("league") or {})]
+    matches = js['response']
     eligible = []
     for m in matches:
+        fid = (m.get('fixture') or {}).get('id')
+        if _blocked_league(m.get('league') or {}):
+            if audit:
+                audit.record(fid, 'fixture', 'league_excluded')
+            continue
         st = ((m.get("fixture", {}) or {}).get("status", {}) or {})
         elapsed = st.get("elapsed")
         short = (st.get("short") or "").upper()
-        if elapsed is None or elapsed > 90 or short not in INPLAY_STATUSES:
+        if elapsed is None or elapsed > 90 or short not in {'1H', 'HT', '2H'}:
+            if audit:
+                audit.record(fid, 'fixture', 'not_regulation_live')
             continue
         m["_fixture_observed_ts"] = observed_ts
         eligible.append(m)
@@ -1448,7 +1489,8 @@ def _logit(p: float) -> float:
 
 
 def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
-    cached = _MODELS_CACHE.get(name, _MISS)
+    audit = getattr(_SCAN_LOCAL, 'audit', None)
+    cached = audit.models.get(name, _MISS) if audit is not None else _MODELS_CACHE.get(name, _MISS)
     if cached is not _MISS:
         return cached
     mdl = None
@@ -1470,7 +1512,10 @@ def load_model_from_settings(name: str) -> Optional[Dict[str, Any]]:
             break
         except Exception as e:
             log.warning("[MODEL] parse %s failed: %s", name, e)
-    _MODELS_CACHE.set(name, mdl)
+    if audit is not None:
+        audit.models[name] = mdl
+    else:
+        _MODELS_CACHE.set(name, mdl)
     return mdl
 
 
@@ -2356,7 +2401,8 @@ def _save_funnel(phase: str, counts: Dict[str, int]) -> None:
 
 def _shadow_record(fid: int, league_id: int, league: str, kickoff: int,
                    phase: str, minute: int, market: str, suggestion: str,
-                   prob: float, threshold: float, pc: PriceCheck) -> bool:
+                   prob: float, threshold: float, pc: PriceCheck,
+                   model_version: Optional[str] = None, policy_version: str = "legacy") -> bool:
     """One immutable first qualifying quote per fixture/phase/selection."""
     if not SHADOW_ENABLE or not pc.get("passed") or not pc.get("odds"):
         return False
@@ -2364,14 +2410,244 @@ def _shadow_record(fid: int, league_id: int, league: str, kickoff: int,
         inserted = c.execute("""
             INSERT INTO shadow_picks(match_id,league_id,league,kickoff_ts,created_ts,
                 phase,minute,market,suggestion,prob,threshold_pct,odds,book,fair_prob,
-                ev_pct,stake_units,model_version)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ev_pct,stake_units,model_version,policy_version)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT(match_id,phase,suggestion) DO NOTHING RETURNING id
         """, (fid, league_id, league, kickoff, int(time.time()), phase, minute,
               market, suggestion, float(prob), float(threshold), float(pc["odds"]),
               pc.get("book"), pc.get("fair_prob"), pc.get("ev_pct"),
-              _stake_units(prob, pc.get("odds")), _model_version())).fetchone()
+              _stake_units(prob, pc.get("odds")), model_version or _model_version(), policy_version)).fetchone()
     return bool(inserted)
+
+
+class ScanAudit:
+    """Durable terminal decisions. A crashed scan remains visibly incomplete."""
+    def __init__(self, phase: str):
+        self.phase = phase
+        self.scan_id = uuid.uuid4().hex
+        with db_conn() as c:
+            self.settings = dict(c.execute("SELECT key,value FROM settings WHERE key LIKE %s OR key LIKE %s "
+                                           "OR key LIKE %s OR key=%s",
+                                           ('model_latest:%', 'model:%', 'conf_threshold%', 'model_metrics_latest')).fetchall())
+        self.models = {}
+        try:
+            metrics = json.loads(self.settings.get('model_metrics_latest') or '{}')
+            trained = metrics.get('trained_at_utc') or 'unknown'
+        except (ValueError, TypeError, AttributeError):
+            trained = 'unknown'
+        model_hash = hashlib.sha256(json.dumps({k:v for k,v in self.settings.items()
+            if k.startswith(('model:', 'model_latest:'))}, sort_keys=True).encode()).hexdigest()[:16]
+        self.model_version = f"{trained}|{os.getenv('RAILWAY_GIT_COMMIT_SHA', 'unknown')[:12]}|{model_hash}"
+        policy = {k: globals().get(k) for k in (
+            'EDGE_MIN_BPS', 'FAIR_EDGE_MIN_BPS', 'MAX_MODEL_EDGE_BPS',
+            'MIN_BOOKS_FOR_FAIR', 'MIN_BOOKS_FOR_FAIR_LIVE',
+            'MAX_TIPS_PER_SCAN', 'MAX_PREMATCH_TIPS_PER_SCAN', 'PREDICTIONS_PER_MATCH', 'SHADOW_ONLY',
+            'MIN_ODDS_OU', 'MIN_ODDS_BTTS', 'MIN_ODDS_1X2', 'MIN_ODDS_DC', 'MIN_ODDS_DNB',
+            'MAX_ODDS_ALL', 'MAX_PREMATCH_ODDS_ALL', 'MAX_PRICE_VS_FAIR_PCT',
+            'MIN_BOOKS_FOR_EXECUTION', 'MIN_BOOKS_FOR_EXECUTION_LIVE',
+            'MAX_EXECUTION_OUTLIER_PCT', 'REQUIRE_EXECUTABLE_PRICE', 'REQUIRE_FAIR_PRICE',
+            'LIVE_MAX_INPUT_AGE_SEC', 'LIVE_MAX_ODDS_AGE_SEC', 'TIP_MIN_MINUTE',
+            'CORRELATED_EXTRA_EV_BPS', 'DUP_COOLDOWN_MIN', 'PREMATCH_DEDUP_ENABLE',
+            'LEAGUE_ALLOW_IDS', 'LEAGUE_DENY_IDS', 'PREMATCH_LEAGUE_IDS')}
+        policy['thresholds'] = {k:v for k,v in self.settings.items() if k.startswith('conf_threshold')}
+        policy['active'] = sorted(ACTIVE_MARKETS - DISABLED_MARKETS)
+        policy['disabled_leagues'] = sorted(DISABLED_LEAGUE_IDS)
+        self.policy_version = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()[:16]
+        self.counts = defaultdict(int)
+        self.errors = 0
+
+    def __enter__(self):
+        with db_conn() as c:
+            c.execute("INSERT INTO scan_runs(scan_id,phase,started_ts,status,model_version,policy_version) "
+                      "VALUES(%s,%s,%s,'running',%s,%s)",
+                      (self.scan_id, self.phase, int(time.time()), self.model_version, self.policy_version))
+        self.previous_audit = getattr(_SCAN_LOCAL, 'audit', None)
+        _SCAN_LOCAL.audit = self
+        return self
+
+    def record(self, fid, stage, reason, *, league_id=None, kickoff=None,
+               market=None, suggestion=None, prob=None, threshold=None,
+               pc=None, qualified=False, detail=None):
+        pc = pc or {}
+        with db_conn() as c:
+            c.execute("""INSERT INTO scan_decisions(scan_id,created_ts,match_id,league_id,kickoff_ts,
+                stage,market,suggestion,reason,prob,threshold_pct,odds,fair_prob,ev_pct,
+                price_decision,qualified,detail)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (self.scan_id, int(time.time()), fid, league_id, kickoff, stage, market,
+                 suggestion, reason, prob if prob is None or math.isfinite(prob) else None,
+                 threshold if threshold is None or math.isfinite(threshold) else None,
+                 pc.get('odds'), pc.get('fair_prob'), pc.get('ev_pct'),
+                 'qualified' if pc.get('passed') else pc.get('decision'), bool(qualified), detail))
+        self.counts[f'{stage}:{reason}'] += 1
+        if reason in ('fixture_error', 'candidate_error', 'scan_error'):
+            self.errors += 1
+
+    def __exit__(self, typ, error, tb):
+        try:
+            status = 'failed' if typ else 'completed_with_errors' if self.errors else 'completed'
+            if typ:
+                log.error('[AUDIT] scan %s failed: %s', self.scan_id, typ.__name__)
+                self.record(None, 'scan', 'scan_error', detail=typ.__name__)
+            with db_conn() as c:
+                c.execute("UPDATE scan_runs SET finished_ts=%s,status=%s WHERE scan_id=%s",
+                          (int(time.time()), status, self.scan_id))
+            _save_funnel(self.phase, dict(self.counts))
+        finally:
+            _SCAN_LOCAL.audit = self.previous_audit
+        return False
+
+
+def _send_reserved_tip(fid, created_ts, text):
+    """Serialize inline and retry deliveries for one stored tip.
+
+    Telegram has no idempotency key: a crash after remote acceptance but
+    before the local commit remains an ambiguous-delivery case.
+    """
+    with _tip_transaction() as c:
+        c.execute('SELECT pg_advisory_xact_lock(%s,%s)', (19019, fid))
+        row = c.execute('SELECT sent_ok FROM tips WHERE match_id=%s AND created_ts=%s',
+                        (fid, created_ts)).fetchone()
+        if row is None or int(row[0]) != 0:
+            return bool(row and int(row[0]) == 1)
+        try:
+            sent = send_telegram(text)
+        except Exception:
+            log.exception('[DELIVERY] Telegram call failed for fixture %s', fid)
+            sent = False
+        if sent:
+            c.execute('UPDATE tips SET sent_ok=1,telegram_sent_ts=%s WHERE match_id=%s AND created_ts=%s',
+                      (int(time.time()), fid, created_ts))
+        return bool(sent)
+
+
+def _save_candidate_tip(fid, league_id, league, home, away, kickoff, phase, minute,
+                        score, raw, feat, candidates, market, suggestion, prob, pc):
+    """Reserve and insert atomically; only the worker owning the insert can send."""
+    now = int(time.time())
+    pct = round(prob * 100.0, 1)
+    stake = _stake_units(prob, pc.get('odds'))
+    audit_json = _tip_audit_json(fid, phase, feat, raw, candidates, pc, now)
+    with _tip_transaction() as c:
+        if not _reserve_fixture_selection(c, fid, suggestion):
+            return 'duplicate_or_conflicting_selection', False
+        # The primary key is per-fixture/second: obtain a free second while the
+        # fixture lock is held, rather than sending after an INSERT did nothing.
+        previous = c.execute("SELECT MAX(created_ts) FROM tips WHERE match_id=%s", (fid,)).fetchone()[0]
+        created = max(now, int(previous or 0) + 1)
+        inserted = c.execute("""INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,
+            confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,
+            fair_prob,kickoff_ts,is_prematch,stake_units,sent_ok,decision_ts,
+            stats_fetched_ts,odds_fetched_ts,telegram_sent_ts,price_verified,audit_json)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,NULL,%s,%s)
+            ON CONFLICT(match_id,created_ts) DO NOTHING RETURNING created_ts""",
+            (fid, league_id, league, home, away, market, suggestion, pct, prob,
+             score if phase == 'live' else None, minute if phase == 'live' else None, created,
+             pc.get('odds'), pc.get('book'), pc.get('ev_pct'), pc.get('fair_prob'), kickoff,
+             int(phase == 'prematch'), stake, now, _STATS_FETCHED_TS.get(fid) if phase == 'live' else None,
+             pc.get('odds_fetched_ts'), int(bool(pc.get('odds'))), audit_json)).fetchone()
+        if not inserted:
+            return 'insert_conflict', False
+    kickoff_txt = datetime.fromtimestamp(kickoff, TZ_UTC).astimezone(BERLIN_TZ).strftime('%H:%M') if kickoff else 'TBD'
+    message = _format_tip_message(home, away, league, minute, score, suggestion, pct, raw,
+        pc.get('odds'), pc.get('book'), pc.get('ev_pct'), pc.get('fair_prob'), stake,
+        kickoff_txt=kickoff_txt, prematch=phase == 'prematch')
+    sent = _send_reserved_tip(fid, created, message)
+    return ('telegram_sent' if sent else 'telegram_failed'), True
+
+
+def _evaluate_candidates(audit, fx, feat, raw, candidates, saved, cooling_down=False):
+    """Evaluate every candidate, recording shadow independently of delivery limits."""
+    phase = audit.phase
+    live = phase == 'live'
+    fid = int((fx.get('fixture') or {}).get('id') or 0)
+    league_id, league = _league_name(fx)
+    home, away = _teams(fx)
+    kickoff = _kickoff_ts_of(fx)
+    minute = int((raw or {}).get('minute') or 0)
+    score = _pretty_score(fx) if live else ''
+    taken = _fixture_tip_history(fid)
+    # Cooldowns and quotas control delivery only; never truncate research.
+    already_pre = False
+    if not live and PREMATCH_DEDUP_ENABLE:
+        with db_conn() as c:
+            already_pre = bool(c.execute("SELECT 1 FROM tips WHERE match_id=%s AND is_prematch=1 LIMIT 1", (fid,)).fetchone())
+    for missing in sorted(_ALL_MARKET_FAMILIES - {row[0] for row in candidates}):
+        audit.record(fid, 'model', 'no_candidates', league_id=league_id, market=missing)
+    per_match = 0
+    pred_rows = []
+    for market, suggestion, prob, thr in sorted(candidates, key=lambda c: c[2] if math.isfinite(c[2]) else -1, reverse=True):
+        label = market if live else f'PRE {market}'
+        reason = None
+        qualified = False
+        pc = PriceCheck(passed=False, decision='not_priced')
+        try:
+            if suggestion not in ALLOWED_SUGGESTIONS:
+                reason = 'unsupported_selection'
+            elif not math.isfinite(prob) or not 0 <= prob <= 1 or not math.isfinite(thr):
+                reason = 'invalid_probability_or_threshold'
+            elif live and not _candidate_is_sane(suggestion, feat):
+                reason = 'already_decided'
+            else:
+                # Retain priced candidates below the current threshold so
+                # later threshold research is not limited to accepted picks.
+                pc = _price_gate(market, suggestion, fid, prob, live=live)
+                if pc.get('passed') and live:
+                    ODDS_CACHE.invalidate((fid, True))
+                    pc = _price_gate(market, suggestion, fid, prob, live=True)
+                    if pc.get('passed'):
+                        pc = _live_delivery_check(fid, raw, pc)
+                if pc.get('passed') and not pc.get('odds'):
+                    pc = PriceCheck(passed=False, decision='unpriced_candidate')
+                if not live and (not kickoff or kickoff <= time.time()):
+                    pc = PriceCheck(**{**pc, 'passed': False, 'decision': 'kickoff_passed'})
+                qualified = bool(pc.get('passed') and prob * 100 >= thr)
+                if qualified:
+                    _shadow_record(fid, league_id, league, kickoff, phase, minute,
+                                   label, suggestion, prob, thr, pc,
+                                   model_version=audit.model_version, policy_version=audit.policy_version)
+                if not _market_active(market):
+                    reason = 'market_disabled'
+                elif not pc.get('passed'):
+                    reason = pc['decision']
+                elif prob * 100 < thr:
+                    reason = 'model_suppressed' if thr > 100 else 'below_threshold'
+                elif SHADOW_ONLY:
+                    reason = 'shadow_only'
+                elif cooling_down:
+                    reason = 'fixture_cooldown'
+                elif already_pre:
+                    reason = 'fixture_already_tipped'
+                elif per_match >= max(1, PREDICTIONS_PER_MATCH):
+                    reason = 'per_match_cap'
+                elif (MAX_TIPS_PER_SCAN if live else MAX_PREMATCH_TIPS_PER_SCAN) and saved >= (MAX_TIPS_PER_SCAN if live else MAX_PREMATCH_TIPS_PER_SCAN):
+                    reason = 'scan_cap'
+                else:
+                    reason = _history_rejection(suggestion, taken)
+                    if not reason and _correlation_blocked(suggestion, taken):
+                        extra = int(round((pc.get('ev_pct') or 0) * 100)) - EDGE_MIN_BPS
+                        if extra < CORRELATED_EXTRA_EV_BPS:
+                            reason = 'correlated_with_existing_tip'
+                    if not reason:
+                        reason, inserted = _save_candidate_tip(fid, league_id, league, home, away,
+                            kickoff, phase, minute, score, raw, feat, candidates, label, suggestion, prob, pc)
+                        if inserted:
+                            saved += 1
+                            per_match += 1
+                            taken.append(suggestion)
+        except Exception as exc:
+            log.exception('[CANDIDATE] fixture %s evaluation failed', fid)
+            audit.record(fid, 'candidate', 'candidate_error', league_id=league_id, kickoff=kickoff,
+                         market=label, suggestion=suggestion, prob=prob, threshold=thr, pc=pc,
+                         qualified=qualified, detail=type(exc).__name__)
+            continue
+        audit.record(fid, 'candidate', reason, league_id=league_id, kickoff=kickoff,
+                     market=label, suggestion=suggestion, prob=prob, threshold=thr, pc=pc, qualified=qualified)
+        if math.isfinite(prob) and 0 <= prob <= 1 and math.isfinite(thr):
+            pred_rows.append((fid, league_id, kickoff, int(time.time()), phase, minute,
+                              label, suggestion, prob, thr, pc.get('odds'), pc.get('fair_prob'), pc.get('ev_pct'), reason))
+    _log_predictions(pred_rows)
+    return saved
 
 
 # ───────── Elo ─────────
@@ -2505,24 +2781,48 @@ def backfill_results_for_open_matches(max_rows: int = 400) -> int:
               UNION ALL
               SELECT match_id, MAX(created_ts) FROM prematch_snapshots
               WHERE created_ts >= %s GROUP BY match_id
+              UNION ALL
+              SELECT match_id, MAX(created_ts) FROM shadow_picks GROUP BY match_id
+              UNION ALL
+              SELECT match_id, MAX(created_ts) FROM scan_decisions
+              WHERE created_ts >= %s AND stage='candidate' AND match_id IS NOT NULL GROUP BY match_id
             ), agg AS (
               SELECT match_id, MAX(last_ts) AS last_ts FROM seen GROUP BY match_id
             )
             SELECT a.match_id FROM agg a
             LEFT JOIN match_results r ON r.match_id = a.match_id
-            WHERE r.match_id IS NULL ORDER BY a.last_ts DESC LIMIT %s
-        """, (cutoff, cutoff, cutoff, max_rows)).fetchall()
+            LEFT JOIN fixture_voids v ON v.match_id = a.match_id
+            LEFT JOIN settlement_checks q ON q.match_id = a.match_id
+            WHERE r.match_id IS NULL AND v.match_id IS NULL
+            ORDER BY COALESCE(q.last_checked_ts,0) ASC,a.last_ts ASC LIMIT %s
+        """, (cutoff, cutoff, cutoff, cutoff, max_rows)).fetchall()
 
     updated = 0
     for (mid,) in rows:
+        with db_conn() as c:
+            c.execute("INSERT INTO settlement_checks(match_id,last_checked_ts) VALUES(%s,%s) "
+                      "ON CONFLICT(match_id) DO UPDATE SET last_checked_ts=EXCLUDED.last_checked_ts",
+                      (mid, int(time.time())))
         fx = _fixture_by_id(int(mid))
         if not fx:
             continue
         st = (((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+        if st in {'CANC', 'AWD', 'WO'}:
+            with db_conn() as c:
+                c.execute("INSERT INTO fixture_voids(match_id,status,updated_ts) VALUES(%s,%s,%s) "
+                          "ON CONFLICT(match_id) DO NOTHING", (mid, st, int(time.time())))
+            updated += 1
+            continue
         if st not in FINAL_STATUSES:
             continue
-        g = fx.get("goals") or {}
-        gh, ga = int(g.get("home") or 0), int(g.get("away") or 0)
+        # Full-match 1X2/totals/BTTS settle on regulation time, including added
+        # time, not extra time or penalties. Missing scores must stay pending.
+        g = ((fx.get('score') or {}).get('fulltime') or {})
+        if st == 'FT' and (g.get('home') is None or g.get('away') is None):
+            g = fx.get('goals') or {}
+        if g.get('home') is None or g.get('away') is None:
+            continue
+        gh, ga = int(g['home']), int(g['away'])
         league_id = int(((fx.get("league") or {}).get("id")) or 0) or None
         with db_conn() as c2:
             c2.execute(
@@ -2549,167 +2849,79 @@ def backfill_results_for_open_matches(max_rows: int = 400) -> int:
 
 # ───────── Closing line value ─────────
 def capture_closing_lines(limit: int = 200) -> int:
-    """
-    Records, for every prematch tip approaching kickoff, the best available
-    price as the closing line, and stores tip_odds/closing_odds - 1.
+    """Refresh the latest available same-book sample before kickoff.
 
-    FIX: this used to query AFTER kickoff (kickoff_ts <= now) and call
-    fetch_odds(mid, live=False) - the PREMATCH endpoint. Once a fixture goes
-    live its prematch market closes (live prices move to /odds/live instead,
-    per this file's own T0.4 note that /odds is prematch-only), so that query
-    was asking for a prematch price on a market that had already closed by
-    the time it asked. Across weeks of real tips this captured a closing
-    price for exactly zero of them. "Closing line" also just means the last
-    price BEFORE the event starts, industry-wide - fetching it after the fact
-    was never the right definition, independent of the API's behaviour.
-
-    Now queries fixtures approaching kickoff (within CLV_CAPTURE_LEAD_MIN)
-    while the prematch market is still open, so it can actually succeed.
-
-    PREMATCH ONLY. An in-play bet has no well-defined closing line — the market
-    for "Over 2.5 at minute 62" ceases to exist the moment the state changes.
+    This is a sampled pre-kickoff line, not proof of the exact final tick.
+    Its timestamp is retained so coverage and staleness are visible.
     """
     if not CLV_ENABLE:
         return 0
     now = int(time.time())
-    with db_conn() as c:
-        rows = c.execute("""
-            SELECT match_id, created_ts, market, suggestion, odds, book
-            FROM tips
-            WHERE is_prematch=1 AND closing_odds IS NULL AND odds IS NOT NULL
-              AND COALESCE(price_verified,0)=1
-              AND kickoff_ts IS NOT NULL
-              AND kickoff_ts > %s AND kickoff_ts <= %s
-            ORDER BY kickoff_ts ASC LIMIT %s
-        """, (now, now + CLV_CAPTURE_LEAD_MIN * 60, limit)).fetchall()
-
     n = 0
-    no_same_book = 0
-    for (mid, cts, market, sugg, tip_odds, book) in rows:
-        odds_map = fetch_odds(int(mid), live=False)
-        mkey, sel = _market_key_and_selection(market or "", sugg or "")
-        if not mkey or not book:
+    for table in ('tips', 'shadow_picks'):
+        if table == 'shadow_picks' and not SHADOW_ENABLE:
             continue
-        # SAME BOOK, both ends. The tip price is a maximum across whichever
-        # books were quoting at the time, and that set grows towards kickoff -
-        # so comparing it against a closing maximum over MORE books measures
-        # book coverage, not line movement, and is biased negative by
-        # construction. That is what produced "beat close 0% of the time":
-        # a larger maximum is almost always the bigger number, whatever the
-        # market did. Comparing one book against itself removes the bias.
-        closing_prices = ((odds_map.get(mkey) or {}).get("by_book") or {}).get(sel) or {}
-        same = closing_prices.get(book)
-        if same is None:
-            # Better a smaller honest sample than a large biased one: this is
-            # the metric that decides whether the edge is real.
-            no_same_book += 1
-            continue
-        closing = float(same)
-        if closing <= 1.0:
-            continue
-        clv = (float(tip_odds) / closing - 1.0) * 100.0
-        with db_conn() as c2:
-            c2.execute("UPDATE tips SET closing_odds=%s, clv_pct=%s WHERE match_id=%s AND created_ts=%s",
-                       (closing, round(clv, 3), mid, cts))
-        n += 1
-    if n or no_same_book:
-        log.info("[CLV] captured %d closing prices (%d skipped: the book that priced the tip "
-                 "was not quoting at close)", n, no_same_book)
-    if SHADOW_ENABLE:
+        condition = "is_prematch=1 AND COALESCE(price_verified,0)=1" if table == 'tips' else "phase='prematch'"
         with db_conn() as c:
-            shadow_rows = c.execute("""
-                SELECT id,match_id,market,suggestion,odds,book FROM shadow_picks
-                WHERE phase='prematch' AND closing_odds IS NULL AND kickoff_ts > %s
-                  AND kickoff_ts <= %s ORDER BY kickoff_ts LIMIT %s
-            """, (now, now + CLV_CAPTURE_LEAD_MIN * 60, limit)).fetchall()
-        for sid, mid, market, suggestion, entry_odds, book in shadow_rows:
+            rows = c.execute(f"""SELECT match_id,created_ts,market,suggestion,odds,book,kickoff_ts
+                FROM {table} WHERE {condition} AND odds IS NOT NULL
+                AND kickoff_ts > %s AND kickoff_ts <= %s
+                ORDER BY closing_ts ASC NULLS FIRST,kickoff_ts LIMIT %s""",
+                (now, now + CLV_CAPTURE_LEAD_MIN * 60, limit)).fetchall()
+        for mid, created, market, suggestion, entry_odds, book, kickoff in rows:
             if not book:
                 continue
             mkey, sel = _market_key_and_selection(market, suggestion)
             if not mkey or not sel:
                 continue
-            prices = ((fetch_odds(int(mid), live=False).get(mkey) or {}).get("by_book") or {}).get(sel) or {}
+            entry = fetch_odds(int(mid), live=False).get(mkey) or {}
+            observed = entry.get('fetched_ts')
+            if observed is None or not 0 <= time.time() - float(observed) <= 90 or float(observed) >= kickoff:
+                continue
+            source = entry.get('source_update')
+            if source:
+                try:
+                    stamp = datetime.fromisoformat(str(source).replace('Z', '+00:00'))
+                    if stamp.tzinfo is None or not -30 <= time.time() - stamp.timestamp() <= 300:
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    continue
+            prices = (entry.get('by_book') or {}).get(sel) or {}
             close = prices.get(book)
-            if close is None or float(close) <= 1.0:
+            if close is None or not math.isfinite(float(close)) or float(close) <= 1.0:
+                continue
+            # Check time again after the API call: never label a post-kickoff
+            # response as a prematch close.
+            if time.time() >= kickoff:
                 continue
             clv = (float(entry_odds) / float(close) - 1.0) * 100.0
             with db_conn() as c:
-                c.execute("UPDATE shadow_picks SET closing_odds=%s,clv_pct=%s WHERE id=%s",
-                          (float(close), round(clv, 3), sid))
-            n += 1
+                changed = c.execute(f"""UPDATE {table} SET closing_odds=%s,clv_pct=%s,closing_ts=%s
+                    WHERE match_id=%s AND created_ts=%s AND suggestion=%s
+                    AND (closing_ts IS NULL OR closing_ts < %s)""",
+                    (float(close), round(clv, 3), int(observed), mid, created, suggestion, int(observed))).rowcount
+            n += changed
     return n
 
 
-def compute_price_gate_breakdown(days: Optional[int] = None,
-                                 phase: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Why candidates are not becoming tips, read from the `predictions` table
-    rather than scraped out of a log buffer.
-
-    Every candidate that reaches _price_gate() has its decision recorded per
-    row, so the same question the per-scan "[PROD] price_gate:" line answers
-    is answerable over days, filterable, and after the fact.
-
-    SAMPLING, because these counts are not a census: a live candidate is
-    logged only on a harvest tick or when it passed, prematch only when it
-    was scored, both only above PREDICTION_LOG_MIN_PROB, and then trimmed to
-    PREDICTION_LOG_MAX_PER_FIXTURE rows per fixture with every tipped
-    candidate kept. So "tipped" is over-represented relative to reality and
-    the absolute numbers understate volume. The MIX of rejection reasons is
-    what this is for - that is not distorted by keeping extra winners.
-    """
-    cutoff = int(time.time()) - days * 86400 if days else 0
-    sql = "SELECT phase, decision, COUNT(*) FROM predictions WHERE created_ts >= %s"
-    params: List[Any] = [cutoff]
+def compute_price_gate_breakdown(days: Optional[int] = None, phase: Optional[str] = None) -> Dict[str, Any]:
+    cutoff = int(time.time()) - int(days) * 86400 if days else 0
+    sql = """SELECT r.phase,d.price_decision,d.reason,COUNT(*) FROM scan_decisions d
+             JOIN scan_runs r ON r.scan_id=d.scan_id WHERE d.stage='candidate' AND d.created_ts >= %s"""
+    params = [cutoff]
     if phase:
-        sql += " AND phase = %s"
+        sql += ' AND r.phase=%s'
         params.append(phase)
-    sql += " GROUP BY phase, decision"
+    sql += ' GROUP BY r.phase,d.price_decision,d.reason'
     with db_conn() as c:
         rows = c.execute(sql, tuple(params)).fetchall()
-
-    by_phase: Dict[str, Dict[str, int]] = {}
-    for ph, decision, n in rows:
-        by_phase.setdefault(ph or "?", {})[decision or "?"] = int(n)
-
-    # These two are set before the gate runs, so they are not gate outcomes:
-    # they mean the candidate never got that far.
-    not_gate_outcomes = {"below_threshold", "per_match_cap"}
-    summary: Dict[str, Any] = {}
-    for ph, counts in by_phase.items():
-        gate = {k: v for k, v in counts.items() if k not in not_gate_outcomes}
-        reached = sum(gate.values())
-        blockers = sorted(((k, v) for k, v in gate.items() if k != "tipped"),
-                          key=lambda kv: kv[1], reverse=True)
-        summary[ph] = {
-            "reached_price_gate": reached,
-            "tipped": gate.get("tipped", 0),
-            "tipped_pct": round(100.0 * gate.get("tipped", 0) / reached, 1) if reached else 0.0,
-            "blocked_by": [{"reason": k, "n": v,
-                            "pct_of_gated": round(100.0 * v / reached, 1) if reached else 0.0}
-                           for k, v in blockers],
-            "never_reached_gate": {k: counts.get(k, 0) for k in not_gate_outcomes
-                                   if counts.get(k)},
-        }
-
-    return {
-        "window_days": days,
-        "by_phase": summary,
-        "sampling_note": ("Not a census. Live candidates are logged on harvest ticks or when "
-                          "they passed, prematch when scored, both only above "
-                          f"PREDICTION_LOG_MIN_PROB={PREDICTION_LOG_MIN_PROB}, then trimmed to "
-                          f"{PREDICTION_LOG_MAX_PER_FIXTURE}/fixture keeping every tipped one. "
-                          "Read the MIX of blocked_by reasons, not the absolute counts, and "
-                          "treat tipped_pct as an upper bound."),
-        "reading_note": ("no_odds / too_few_books dominating means the market has no usable "
-                         "depth for these fixtures — the answer is league scope, not looser "
-                         "EV gates. too_few_books_for_execution / execution_price_outlier "
-                         "dominating means prices exist but aren't corroborated well enough to "
-                         "actually execute at — see MIN_BOOKS_FOR_EXECUTION(_LIVE) and "
-                         "MAX_EXECUTION_OUTLIER_PCT. ev_below_min / fair_edge_below_min "
-                         "dominating means the model agrees with the market and there is "
-                         "genuinely no edge to bet."),
-    }
+    result = {}
+    for ph, price, reason, n in rows:
+        d = result.setdefault(ph, {'price_decisions': {}, 'terminal_decisions': {}})
+        d['price_decisions'][price or 'not_priced'] = d['price_decisions'].get(price or 'not_priced', 0) + n
+        d['terminal_decisions'][reason] = d['terminal_decisions'].get(reason, 0) + n
+    return {'window_days': days, 'by_phase': result,
+            'note': 'Complete candidate decisions since this audit build; earlier sampled predictions excluded.'}
 
 
 def compute_clv(days: Optional[int] = None) -> Dict[str, Any]:
@@ -3259,289 +3471,64 @@ def _live_stats_diagnostic_payload() -> Dict[str, Any]:
 
 
 def production_scan() -> Tuple[int, int]:
-    matches = fetch_live_matches()
-    live_seen = len(matches)
-    if live_seen == 0:
-        log.info("[PROD] no live")
-        _set_live_snapshot([], live_seen=0, no_coverage=0)
-        _save_funnel("live", {"fixtures_seen": 0, "tips_saved": 0})
-        return 0, 0
-
-    saved = 0
-    now_ts = int(time.time())
-    pred_rows: List[tuple] = []
-    live_snapshot_matches: List[Dict[str, Any]] = []
-    stats_diagnostics: List[Dict[str, Any]] = []
-    harvested = 0
-    no_coverage = 0
-    # Tally of _price_gate() outcomes across the whole scan - saved=0 with a
-    # healthy live_seen count is otherwise unexplainable from this log line
-    # alone (was it no odds? too few books? edge implausible?).
-    gate_decisions: Dict[str, int] = {}
-    funnel: Dict[str, int] = {"fixtures_seen": live_seen}
-    def count(reason: str) -> None:
-        funnel[reason] = funnel.get(reason, 0) + 1
-    last_snap: Dict[int, int] = {}
-    if HARVEST_MODE:
-        try:
-            last_snap = _last_snapshot_ts_bulk(
-                [int((m.get("fixture") or {}).get("id") or 0) for m in matches])
-        except Exception as e:
-            log.warning("[HARVEST] cadence lookup failed (harvesting anyway): %s", e)
-
-    for m in matches:
-        try:
-            fid = int((m.get("fixture", {}) or {}).get("id") or 0)
-            if not fid:
-                continue
-
-            raw = extract_raw_inplay(m)
-            minute = int(raw.get("minute", 0))
-            league_id, league = _league_name(m)
-            home, away = _teams(m)
-            stat_diag = _stats_coverage_details(raw, minute)
-            stat_diag.update({"fixture_id": fid, "league_id": league_id, "league": league,
-                              "home": home, "away": away, "minute": minute})
-            stats_diagnostics.append(stat_diag)
-            if minute < TIP_MIN_MINUTE:
-                count("before_minute")
-                continue
-
-            covered = stats_coverage_ok(raw, minute)
-            # Odds are model inputs, but requesting them for fixtures that
-            # already failed the statistics gate burns one additional API call
-            # per worldwide match without any possibility of producing a tip.
-            # Neutral priors keep harvested rows structurally valid.
-            raw, feat = _complete_live_features(
-                m, raw, fetch_market_price=covered)
-
-            # Harvest BEFORE the coverage and duplicate gates. Three separate
-            # concerns, previously collapsed into one:
-            #   - the cooldown stops us TIPPING a fixture repeatedly
-            #   - the coverage gate stops us TIPPING on an all-zero stats vector
-            #   - harvesting is DATA COLLECTION and should be blocked by neither
-            #
-            # THE REGRESSION THIS FIXES: I moved stats_coverage_ok() ahead of
-            # the harvest block and tightened it from minute 35 to minute 8. Any
-            # fixture whose /fixtures/statistics feed was empty then hit
-            # `continue` before harvesting. Six hours of logs: 33 scans,
-            # 316 live fixtures seen, harvested=1. In-play data collection was
-            # effectively dead, which is also why candidates_logged was 0 —
-            # live predictions are logged on the harvest tick.
-            #
-            # The cadence is stated in TIME, not "the elapsed minute happens to
-            # be divisible by 3", because nothing aligns the scan schedule with
-            # that arithmetic.
-            #
-            # `covered` IS in this condition, and the regression described above
-            # is not the reason to take it out. Both statements are true because
-            # stats_coverage_ok() is not one test:
-            #
-            #   - "did the statistics feed return anything at all?" — the paired
-            #     -fields branch below, checking _stats_home_found /
-            #     _stats_away_found / _stats_returned_fields. When that is False
-            #     the /fixtures/statistics call failed or was refused, and
-            #     extract_raw_inplay() rendered the absence as 0.0 across xg,
-            #     shots, corners and cards. Harvesting that rows teaches the fit
-            #     "no shots and no xG at minute 60" as a real match state — a
-            #     statement about our own blindness, not about football. It is
-            #     not thin data, it is the absence of data, and load_inplay_data()
-            #     has no filter that would drop it later.
-            #
-            #   - "is the observation rich enough to BET on?" — that part is a
-            #     betting judgement and it is NOT what blocks a harvest here.
-            #     Nothing below skips collection for a fixture whose feed
-            #     answered: a real 0-0 at minute 20 returns field groups whose
-            #     values are zero, passes, and is harvested exactly as before.
-            #
-            # The regression above came from a `continue` placed ahead of the
-            # harvest block, which skipped BOTH. This adds a term to the harvest
-            # condition instead; the `if not covered: continue` below still runs
-            # after it, so the gating of TIPPING is unchanged.
-            is_harvest_tick = (
-                HARVEST_MODE
-                and covered
-                and minute >= TRAIN_MIN_MINUTE
-                and (now_ts - last_snap.get(fid, 0)) >= HARVEST_EVERY_MINUTES * 60
-            )
-            if is_harvest_tick:
-                try:
-                    save_snapshot_from_match(m, raw)
-                    last_snap[fid] = now_ts
-                    harvested += 1
-                except Exception as e:
-                    log.warning("[HARVEST] snapshot failed for %s: %s", fid, e)
-
-            # Coverage governs TIPPING only. An all-zero stats vector makes the
-            # model output sigmoid(intercept), which carries no match
-            # information — fine to record, not fine to bet on.
-            if not covered:
-                no_coverage += 1
-                count("statistics_unusable")
-                continue
-            count("statistics_usable")
-
-            # The cooldown stops a fixture being TIPPED twice in quick
-            # succession. It is not a reason to hide the match from the
-            # dashboard: doing that made every fixture disappear from the
-            # live view for DUP_COOLDOWN_MIN minutes starting the moment it
-            # produced a tip - i.e. the matches most worth looking at were
-            # exactly the ones missing. Same split as the harvest block
-            # above: this decides tipping, not what gets displayed.
-            cooling_down = False
-            if DUP_COOLDOWN_MIN > 0:
-                with db_conn() as c:
-                    cooling_down = bool(c.execute(
-                        "SELECT 1 FROM tips WHERE match_id=%s AND created_ts>=%s "
-                        "AND suggestion<>'HARVEST' LIMIT 1",
-                        (fid, now_ts - DUP_COOLDOWN_MIN * 60)).fetchone())
-
-            score = _pretty_score(m)
-            kickoff = _kickoff_ts_of(m)
-
-            candidates = (_ou_candidates(feat, "", _get_market_threshold)
-                          + _btts_candidates(feat, "", _get_market_threshold)
-                          + _wld_candidates(feat, "", _get_market_threshold)
-                          + _dc_dnb_candidates(feat, "", _get_market_threshold))
-            funnel["generated_candidates"] = funnel.get("generated_candidates", 0) + len(candidates)
-            funnel["market_or_sanity_filtered"] = funnel.get("market_or_sanity_filtered", 0) + sum(
-                1 for c in candidates if c[1] not in ALLOWED_SUGGESTIONS
-                or not _candidate_is_sane(c[1], feat) or not _market_active(c[0]))
-            candidates = [c for c in candidates
-                          if c[1] in ALLOWED_SUGGESTIONS and _candidate_is_sane(c[1], feat)
-                          and _market_active(c[0])]
-            candidates.sort(key=lambda x: x[2], reverse=True)
-
-            # Full breakdown for the dashboard, independent of whether any of
-            # these candidates go on to clear a threshold or the price gate.
-            home_id, away_id = _team_ids(m)
-            live_snapshot_matches.append(_build_live_match_entry(
-                fid, league, league_id, home, away, score, minute, candidates,
-                kickoff_ts=kickoff, raw=raw, home_id=home_id, away_id=away_id, feat=feat))
-
-            # Displayed above, just not re-tipped yet.
-            if cooling_down:
-                count("fixture_cooldown")
-                continue
-
-            per_match = 0
-            taken: List[str] = _fixture_tip_history(fid)
-            base_now = int(time.time())
-            fixture_preds: List[tuple] = []
-
-            for idx, (market_txt, suggestion, prob, thr) in enumerate(candidates):
-                count("candidates")
-                below = prob * 100.0 < thr
-                capped = per_match >= max(1, PREDICTIONS_PER_MATCH)
-                pc = PriceCheck(passed=False, odds=None, book=None, fair_prob=None, ev_pct=None,
-                                decision="below_threshold" if below else "per_match_cap")
-                if not below and not capped:
-                    history_reason = _history_rejection(suggestion, taken)
-                    pc = (PriceCheck(passed=False, decision=history_reason) if history_reason else
-                          _price_gate(market_txt, suggestion, fid, prob, live=True))
-                    if pc["passed"]:
-                        ODDS_CACHE.invalidate((fid, True))
-                        pc = _price_gate(market_txt, suggestion, fid, prob, live=True)
-                        if pc["passed"]:
-                            pc = _live_delivery_check(fid, raw, pc)
-                    if pc["passed"] and _correlation_blocked(suggestion, taken):
-                        extra = int(round((pc.get("ev_pct") or 0) * 100)) - EDGE_MIN_BPS
-                        if extra < CORRELATED_EXTRA_EV_BPS:
-                            pc["passed"] = False
-                            pc["decision"] = "correlated_with_existing_tip"
-                    gate_decisions[pc["decision"]] = gate_decisions.get(pc["decision"], 0) + 1
-                count(pc["decision"])
-
-                if PREDICTION_LOG_ENABLE and (is_harvest_tick or pc["passed"]) and prob >= PREDICTION_LOG_MIN_PROB:
-                    fixture_preds.append((fid, league_id, kickoff, base_now, "live", minute,
-                                          market_txt, suggestion, float(prob), float(thr),
-                                          pc.get("odds"), pc.get("fair_prob"), pc.get("ev_pct"),
-                                          pc["decision"]))
-
-                if not pc["passed"]:
+    with ScanAudit('live') as audit:
+        matches = fetch_live_matches(audit=audit)
+        saved = 0
+        snapshots = []
+        diagnostics = []
+        no_coverage = 0
+        last_snap = _last_snapshot_ts_bulk([int((m.get('fixture') or {}).get('id') or 0) for m in matches]) if HARVEST_MODE else {}
+        for fx in matches:
+            fid = int((fx.get('fixture') or {}).get('id') or 0)
+            try:
+                if not fid:
+                    audit.record(None, 'fixture', 'invalid_fixture_id')
                     continue
-
-                _shadow_record(fid, league_id, league, kickoff, "live", minute,
-                               market_txt, suggestion, prob, thr, pc)
-                if SHADOW_ONLY:
-                    per_match += 1
-                    taken.append(suggestion)
-                    break
-
-                created_ts = base_now + idx
-                prob_pct = round(float(prob) * 100.0, 1)
-                stake = _stake_units(prob, pc.get("odds"))
-                decision_ts = int(time.time())
-                audit_json = _tip_audit_json(fid, "live", feat, raw, candidates, pc, decision_ts)
-
-                with _tip_transaction() as c:
-                    if not _reserve_fixture_selection(c, fid, suggestion):
-                        continue
-                    c.execute(
-                        "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,"
-                        "confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,"
-                        "fair_prob,kickoff_ts,is_prematch,stake_units,sent_ok,decision_ts,"
-                        "stats_fetched_ts,odds_fetched_ts,telegram_sent_ts,price_verified,audit_json) "
-                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                        "%s,%s,%s,%s,%s,%s) "
-                        "ON CONFLICT (match_id, created_ts) DO NOTHING",
-                        (fid, league_id, league, home, away, market_txt, suggestion,
-                         float(prob_pct), float(prob), score, minute, created_ts,
-                         pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"),
-                         kickoff, 0, stake, 0, decision_ts, _STATS_FETCHED_TS.get(fid),
-                         pc.get("odds_fetched_ts"), None, int(bool(pc.get("odds"))), audit_json))
-
-                sent = send_telegram(_format_tip_message(
-                    home, away, league, minute, score, suggestion, prob_pct, raw,
-                    pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"), stake))
-                if sent:
+                raw = extract_raw_inplay(fx)
+                minute = int(raw.get('minute', 0))
+                league_id, league = _league_name(fx)
+                home, away = _teams(fx)
+                diag = _stats_coverage_details(raw, minute)
+                diag.update(fixture_id=fid, league_id=league_id, league=league, home=home, away=away, minute=minute)
+                diagnostics.append(diag)
+                if minute < TIP_MIN_MINUTE:
+                    audit.record(fid, 'fixture', 'before_minute', league_id=league_id)
+                    continue
+                if not stats_coverage_ok(raw, minute):
+                    no_coverage += 1
+                    audit.record(fid, 'fixture', diag.get('reason') or 'statistics_unusable', league_id=league_id)
+                    continue
+                raw, feat = _complete_live_features(fx, raw, fetch_market_price=True)
+                if (HARVEST_MODE and minute >= TRAIN_MIN_MINUTE
+                        and time.time() - last_snap.get(fid, 0) >= HARVEST_EVERY_MINUTES * 60):
+                    save_snapshot_from_match(fx, raw)
+                candidates = (_ou_candidates(feat, '', _get_market_threshold)
+                            + _btts_candidates(feat, '', _get_market_threshold)
+                            + _wld_candidates(feat, '', _get_market_threshold)
+                            + _dc_dnb_candidates(feat, '', _get_market_threshold))
+                cooling = False
+                if DUP_COOLDOWN_MIN > 0:
                     with db_conn() as c:
-                        c.execute("UPDATE tips SET sent_ok=1,telegram_sent_ts=%s "
-                                  "WHERE match_id=%s AND created_ts=%s",
-                                  (int(time.time()), fid, created_ts))
-
-                saved += 1
-                per_match += 1
-                taken.append(suggestion)
-                if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                    break
-                if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                    break
-            pred_rows.extend(_trim_fixture_predictions(fixture_preds))
-            if MAX_TIPS_PER_SCAN and saved >= MAX_TIPS_PER_SCAN:
-                break
-        except Exception as e:
-            log.exception("[PROD] failure: %s", e)
-            continue
-
-    _log_predictions(pred_rows)
-    _set_live_snapshot(live_snapshot_matches, live_seen=live_seen, no_coverage=no_coverage,
-                       stats_diagnostics=stats_diagnostics)
-    log.info("[PROD] saved=%d live_seen=%d candidates_logged=%d harvested=%d no_coverage=%d",
-             saved, live_seen, len(pred_rows), harvested, no_coverage)
-    if gate_decisions:
-        log.info("[PROD] price_gate: %s", gate_decisions)
-    funnel["tips_saved"] = saved
-    funnel["shadow_only"] = int(SHADOW_ONLY)
-    _save_funnel("live", funnel)
-    if stats_diagnostics:
-        reason_counts: Dict[str, int] = {}
-        for row in stats_diagnostics:
-            reason = str(row.get("reason") or "unknown")
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
-        log.info("[STATS] latest scan coverage=%s xg_both=%d/%d",
-                 reason_counts,
-                 sum(1 for row in stats_diagnostics
-                     if row.get("xg_home_available") and row.get("xg_away_available")),
-                 len(stats_diagnostics))
-    if live_seen and no_coverage >= live_seen:
-        # Every live fixture lacked usable statistics. Harvesting still runs, but
-        # the rows are goals/minute only and nothing can be tipped. Usually means
-        # the API plan does not include /fixtures/statistics.
-        log.warning("[PROD] no fixture had usable statistics this scan (%d live). "
-                    "Check that your API-Football plan includes /fixtures/statistics — "
-                    "without it the in-play model has nothing to score.", live_seen)
-    return saved, live_seen
+                        cooling = bool(c.execute("SELECT 1 FROM tips WHERE match_id=%s AND created_ts >= %s LIMIT 1",
+                            (fid, int(time.time()) - DUP_COOLDOWN_MIN * 60)).fetchone())
+                saved = _evaluate_candidates(audit, fx, feat, raw, candidates, saved, cooling)
+                audit.record(fid, 'fixture', 'evaluated' if candidates else 'no_models', league_id=league_id)
+                # The dashboard reads the same fixture without governing any decision.
+                try:
+                    home_id, away_id = _team_ids(fx)
+                    visible = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS
+                               and _candidate_is_sane(c[1], feat) and _market_active(c[0])]
+                    snapshots.append(_build_live_match_entry(fid, league, league_id, home, away,
+                        _pretty_score(fx), minute, visible, kickoff_ts=_kickoff_ts_of(fx), raw=raw,
+                        home_id=home_id, away_id=away_id, feat=feat))
+                except Exception:
+                    log.exception('[DASHBOARD] snapshot failed for %s', fid)
+            except Exception as exc:
+                log.exception('[PROD] fixture %s failed', fid)
+                audit.record(fid, 'fixture', 'fixture_error', detail=type(exc).__name__)
+        _set_live_snapshot(snapshots, live_seen=len(matches), no_coverage=no_coverage, stats_diagnostics=diagnostics)
+        log.info('[PROD] saved=%d live_seen=%d no_coverage=%d scan_id=%s', saved, len(matches), no_coverage, audit.scan_id)
+        return saved, len(matches)
 
 
 def score_live_matches_now(
@@ -3627,26 +3614,38 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
     return out
 
 
-def _collect_todays_prematch_fixtures() -> List[dict]:
+def _collect_todays_prematch_fixtures(audit=None) -> List[dict]:
     today_local = datetime.now(BERLIN_TZ).date()
     start_local = datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
     end_local = start_local + timedelta(days=1)
     dates_utc = {start_local.astimezone(TZ_UTC).date(),
                  (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
     fixtures = []
+    seen = set()
     for d in sorted(dates_utc):
-        js = _api_get(FOOTBALL_API_URL, {"date": d.strftime("%Y-%m-%d")}) or {}
-        for r in (js.get("response", []) if isinstance(js, dict) else []):
-            if (((r.get("fixture") or {}).get("status") or {}).get("short") or "").upper() == "NS":
-                fixtures.append(r)
-    fixtures = [f for f in fixtures if not _blocked_league(f.get("league") or {})]
-    if PREMATCH_LEAGUE_IDS:
-        fixtures = [f for f in fixtures
-                    if int(((f.get("league") or {}).get("id") or 0)) in PREMATCH_LEAGUE_IDS]
-    else:
-        log.warning("[PREMATCH] PREMATCH_LEAGUE_IDS is empty — scanning %d fixtures worldwide. "
-                    "This will consume ~%d API calls on a cold cache.",
-                    len(fixtures), len(fixtures) * 3)
+        js = _api_get(FOOTBALL_API_URL, {'date': d.strftime('%Y-%m-%d')})
+        if not isinstance(js, dict) or not isinstance(js.get('response'), list) or js.get('errors'):
+            raise RuntimeError('fixture_feed_unavailable')
+        for fx in js['response']:
+            fid = (fx.get('fixture') or {}).get('id')
+            if fid in seen:
+                continue
+            seen.add(fid)
+            kickoff = _kickoff_ts_of(fx)
+            reason = None
+            if not kickoff or not start_local.timestamp() <= kickoff < end_local.timestamp():
+                reason = 'outside_local_day'
+            elif (((fx.get('fixture') or {}).get('status') or {}).get('short') or '').upper() != 'NS':
+                reason = 'not_prematch'
+            elif _blocked_league(fx.get('league') or {}):
+                reason = 'league_excluded'
+            elif PREMATCH_LEAGUE_IDS and int((fx.get('league') or {}).get('id') or 0) not in PREMATCH_LEAGUE_IDS:
+                reason = 'prematch_league_excluded'
+            if reason:
+                if audit:
+                    audit.record(fid, 'fixture', reason)
+            else:
+                fixtures.append(fx)
     return fixtures
 
 
@@ -3728,220 +3727,61 @@ def _get_prematch_features_bulk(fixtures: List[dict]) -> Tuple[Dict[int, Dict[st
 
 
 def prematch_scan_save() -> int:
-    fixtures = _collect_todays_prematch_fixtures()
-    if not fixtures:
-        _save_funnel("prematch", {"fixtures_seen": 0, "tips_saved": 0})
-        return 0
-    feats_by_fid, freshly_fetched = _get_prematch_features_bulk(fixtures)
-    saved = 0
-    no_form = 0
-    pred_rows: List[tuple] = []
-    funnel: Dict[str, int] = {"fixtures_seen": len(fixtures)}
-    def count(reason: str) -> None:
-        funnel[reason] = funnel.get(reason, 0) + 1
-
-    for fx in fixtures:
-        fixture = fx.get("fixture") or {}
-        lg = fx.get("league") or {}
-        teams = fx.get("teams") or {}
-        fid = int(fixture.get("id") or 0)
-        feat = feats_by_fid.get(fid)
-        if not fid or not feat:
-            count("features_missing")
-            continue
-
-        home = (teams.get("home") or {}).get("name", "")
-        away = (teams.get("away") or {}).get("name", "")
-        league_id = int(lg.get("id") or 0)
-        league = f"{lg.get('country','')} - {lg.get('name','')}".strip(" -")
-        kickoff = _kickoff_ts_of(fx)
-        kickoff_txt = _kickoff_berlin(fixture.get("date"))
-
-        data_block = prematch_data_gate(feat)
-
-        if fid in freshly_fetched and not data_block:
+    with ScanAudit('prematch') as audit:
+        fixtures = _collect_todays_prematch_fixtures(audit=audit)
+        feats, fresh = _get_prematch_features_bulk(fixtures)
+        saved = 0
+        for fx in fixtures:
+            fid = int((fx.get('fixture') or {}).get('id') or 0)
             try:
-                save_prematch_snapshot(fid, feat, kickoff)
-            except Exception as e:
-                log.warning("[PREMATCH] snapshot save failed for %s: %s", fid, e)
-
-        # Scoring an all-zero vector gives every fixture in the outage the same
-        # probability, so the scan can emit a burst of identical tips off data
-        # it never received. Real money on a fetch that failed.
-        if data_block:
-            no_form += 1
-            count("form_unusable")
-            continue
-
-        if PREMATCH_DEDUP_ENABLE:
-            with db_conn() as c:
-                dup = c.execute("SELECT 1 FROM tips WHERE match_id=%s AND is_prematch=1 "
-                                "AND suggestion<>'HARVEST' LIMIT 1", (fid,)).fetchone()
-            if dup:
-                count("fixture_already_tipped")
-                continue
-
-        if MAX_PREMATCH_TIPS_PER_SCAN and saved >= MAX_PREMATCH_TIPS_PER_SCAN:
-            break
-
-        candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
-        funnel["generated_candidates"] = funnel.get("generated_candidates", 0) + len(candidates)
-        funnel["market_filtered"] = funnel.get("market_filtered", 0) + sum(
-            1 for c in candidates if c[1] not in ALLOWED_SUGGESTIONS or not _market_active(c[0]))
-        candidates = [c for c in candidates if c[1] in ALLOWED_SUGGESTIONS and _market_active(c[0])]
-        candidates.sort(key=lambda x: x[2], reverse=True)
-
-        per_match = 0
-        taken: List[str] = _fixture_tip_history(fid)
-        base_now = int(time.time())
-        fixture_preds: List[tuple] = []
-
-        for idx, (mk, sug, prob, thr) in enumerate(candidates):
-            count("candidates")
-            below = prob * 100.0 < thr
-            capped = per_match >= max(1, PREDICTIONS_PER_MATCH)
-            pc = PriceCheck(passed=False, odds=None, book=None, fair_prob=None, ev_pct=None,
-                            decision="below_threshold" if below else "per_match_cap")
-            if not below and not capped:
-                history_reason = _history_rejection(sug, taken)
-                pc = (PriceCheck(passed=False, decision=history_reason) if history_reason else
-                      _price_gate(mk, sug, fid, prob, live=False))
-                if pc["passed"] and _correlation_blocked(sug, taken):
-                    extra = int(round((pc.get("ev_pct") or 0) * 100)) - EDGE_MIN_BPS
-                    if extra < CORRELATED_EXTRA_EV_BPS:
-                        pc["passed"] = False
-                        pc["decision"] = "correlated_with_existing_tip"
-            count(pc["decision"])
-
-            if PREDICTION_LOG_ENABLE and prob >= PREDICTION_LOG_MIN_PROB:
-                fixture_preds.append((fid, league_id, kickoff, base_now, "prematch", 0,
-                                      f"PRE {mk}", sug, float(prob), float(thr),
-                                      pc.get("odds"), pc.get("fair_prob"), pc.get("ev_pct"),
-                                      pc["decision"]))
-
-            if not pc["passed"]:
-                continue
-
-            _shadow_record(fid, league_id, league, kickoff, "prematch", 0,
-                           f"PRE {mk}", sug, prob, thr, pc)
-            if SHADOW_ONLY:
-                per_match += 1
-                taken.append(sug)
-                break
-
-            created_ts = base_now + idx
-            pct = round(float(prob) * 100.0, 1)
-            stake = _stake_units(prob, pc.get("odds"))
-            decision_ts = int(time.time())
-            audit_json = _tip_audit_json(fid, "prematch", feat, None, candidates, pc, decision_ts)
-
-            with _tip_transaction() as c2:
-                if not _reserve_fixture_selection(c2, fid, sug):
+                if not fid:
+                    audit.record(None, 'fixture', 'invalid_fixture_id')
                     continue
-                c2.execute(
-                    "INSERT INTO tips(match_id,league_id,league,home,away,market,suggestion,"
-                    "confidence,confidence_raw,score_at_tip,minute,created_ts,odds,book,ev_pct,"
-                    "fair_prob,kickoff_ts,is_prematch,stake_units,sent_ok,decision_ts,"
-                    "stats_fetched_ts,odds_fetched_ts,telegram_sent_ts,price_verified,audit_json) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                    "%s,%s,%s,%s,%s,%s) "
-                    "ON CONFLICT (match_id, created_ts) DO NOTHING",
-                    (fid, league_id, league, home, away, f"PRE {mk}", sug,
-                     float(pct), float(prob), None, None, created_ts, pc.get("odds"), pc.get("book"),
-                     pc.get("ev_pct"), pc.get("fair_prob"), kickoff, 1, stake, 0, decision_ts, None,
-                     pc.get("odds_fetched_ts"), None, int(bool(pc.get("odds"))), audit_json))
-
-            sent = send_telegram(_format_tip_message(
-                home, away, league, 0, "", sug, pct, None,
-                pc.get("odds"), pc.get("book"), pc.get("ev_pct"), pc.get("fair_prob"),
-                stake, kickoff_txt=kickoff_txt, prematch=True))
-            if sent:
-                with db_conn() as c2:
-                    c2.execute("UPDATE tips SET sent_ok=1,telegram_sent_ts=%s "
-                               "WHERE match_id=%s AND created_ts=%s",
-                               (int(time.time()), fid, created_ts))
-
-            saved += 1
-            per_match += 1
-            taken.append(sug)
-            if per_match >= max(1, PREDICTIONS_PER_MATCH):
-                break
-
-        pred_rows.extend(_trim_fixture_predictions(fixture_preds))
-
-    _log_predictions(pred_rows)
-    funnel["tips_saved"] = saved
-    funnel["shadow_only"] = int(SHADOW_ONLY)
-    _save_funnel("prematch", funnel)
-    # no_form is the operator-facing symptom of a failed form fetch. It sitting
-    # at or near the fixture count means the team-form calls are being refused,
-    # not that the card is quiet.
-    log.info("[PREMATCH] saved=%d candidates_logged=%d no_form=%d/%d",
-             saved, len(pred_rows), no_form, len(fixtures))
-    return saved
+                league_id, _ = _league_name(fx)
+                feat = feats.get(fid)
+                if not feat:
+                    audit.record(fid, 'fixture', 'features_missing', league_id=league_id)
+                    continue
+                block = prematch_data_gate(feat)
+                if block:
+                    audit.record(fid, 'fixture', 'form_unusable', league_id=league_id, detail=str(block))
+                    continue
+                kickoff = _kickoff_ts_of(fx)
+                if not kickoff or kickoff <= time.time():
+                    audit.record(fid, 'fixture', 'kickoff_passed', league_id=league_id)
+                    continue
+                if fid in fresh:
+                    save_prematch_snapshot(fid, feat, kickoff)
+                candidates = (_ou_candidates(feat, 'PRE_', _get_market_threshold_pre)
+                            + _btts_candidates(feat, 'PRE_', _get_market_threshold_pre)
+                            + _wld_candidates(feat, 'PRE_', _get_market_threshold_pre)
+                            + _dc_dnb_candidates(feat, 'PRE_', _get_market_threshold_pre))
+                saved = _evaluate_candidates(audit, fx, feat, None, candidates, saved)
+                audit.record(fid, 'fixture', 'evaluated' if candidates else 'no_models', league_id=league_id)
+            except Exception as exc:
+                log.exception('[PREMATCH] fixture %s failed', fid)
+                audit.record(fid, 'fixture', 'fixture_error', detail=type(exc).__name__)
+        log.info('[PREMATCH] saved=%d fixtures=%d scan_id=%s', saved, len(fixtures), audit.scan_id)
+        return saved
 
 
 def send_match_of_the_day() -> bool:
-    fixtures = _collect_todays_prematch_fixtures()
-    if MOTD_LEAGUE_IDS:
-        fixtures = [f for f in fixtures
-                    if int(((f.get("league") or {}).get("id") or 0)) in MOTD_LEAGUE_IDS]
-    if not fixtures:
-        return send_telegram("🏅 Match of the Day: no eligible fixtures today.")
-
-    feats_by_fid, freshly_fetched = _get_prematch_features_bulk(fixtures)
-    for fx in fixtures:
-        fid = int((fx.get("fixture") or {}).get("id") or 0)
-        if fid in freshly_fetched and not prematch_data_gate(freshly_fetched[fid]):
-            try:
-                save_prematch_snapshot(fid, freshly_fetched[fid], _kickoff_ts_of(fx))
-            except Exception:
-                pass
-
-    best = None
-    for fx in fixtures:
-        fixture = fx.get("fixture") or {}
-        lg = fx.get("league") or {}
-        teams = fx.get("teams") or {}
-        fid = int(fixture.get("id") or 0)
-        feat = feats_by_fid.get(fid)
-        if not feat:
-            continue
-
-        candidates = (_ou_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _btts_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _wld_candidates(feat, "PRE_", _get_market_threshold_pre)
-                      + _dc_dnb_candidates(feat, "PRE_", _get_market_threshold_pre))
-        candidates = [c for c in candidates
-                      if c[1] in ALLOWED_SUGGESTIONS and c[2] * 100.0 >= c[3] and _market_active(c[0])]
-        if not candidates:
-            continue
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        mk, sug, prob, _thr = candidates[0]
-        if prob * 100.0 < MOTD_CONF_MIN:
-            continue
-
-        pc = _price_gate(mk, sug, fid, prob, live=False)
-        if not pc["passed"]:
-            continue
-
-        item = (prob * 100.0, sug, (teams.get("home") or {}).get("name", ""),
-                (teams.get("away") or {}).get("name", ""),
-                f"{lg.get('country','')} - {lg.get('name','')}".strip(" -"),
-                _kickoff_berlin(fixture.get("date")), pc.get("odds"), pc.get("book"),
-                pc.get("ev_pct"), pc.get("fair_prob"), _stake_units(prob, pc.get("odds")))
-        if best is None or item[0] > best[0]:
-            best = item
-
-    if not best:
-        return send_telegram("🏅 Match of the Day: no prematch pick met thresholds.")
-    pct, sug, home, away, league, kickoff_txt, odds, book, ev_pct, fair, stake = best
-    msg = _format_tip_message(home, away, league, 0, "", sug, pct, None, odds, book,
-                              ev_pct, fair, stake, kickoff_txt=kickoff_txt, prematch=True)
-    return send_telegram(msg.replace("🏅 <b>Prematch Tip</b>", "🏅 <b>Match of the Day</b>"))
+    """Recap an already recorded/delivered pick; never create an untracked pick."""
+    if SHADOW_ONLY:
+        return False
+    now = int(time.time())
+    with db_conn() as c:
+        row = c.execute("""SELECT home,away,league,suggestion,confidence,odds,book,ev_pct,
+            fair_prob,stake_units,kickoff_ts FROM tips WHERE is_prematch=1 AND sent_ok=1
+            AND kickoff_ts > %s AND created_ts >= %s ORDER BY confidence DESC LIMIT 1""",
+            (now, now - 86400)).fetchone()
+    if not row:
+        return False
+    home, away, league, sug, pct, odds, book, ev_pct, fair, stake, kickoff = row
+    clock = datetime.fromtimestamp(kickoff, TZ_UTC).astimezone(BERLIN_TZ).strftime('%H:%M')
+    msg = _format_tip_message(home, away, league, 0, '', sug, pct, None,
+        odds, book, ev_pct, fair, stake, kickoff_txt=clock, prematch=True)
+    return send_telegram('🏅 Previously sent pick — original price may have changed\n' + msg)
 
 
 # ───────── Historical backfill ─────────
@@ -4076,12 +3916,13 @@ def compute_shadow_report(days: Optional[int] = 90) -> Dict[str, Any]:
         rows = c.execute("""
             SELECT s.match_id,s.league_id,s.league,s.phase,s.market,s.suggestion,
                    s.prob,s.odds,s.clv_pct,s.model_version,
-                   r.final_goals_h,r.final_goals_a,r.btts_yes
+                   r.final_goals_h,r.final_goals_a,r.btts_yes,v.status,s.policy_version
             FROM shadow_picks s LEFT JOIN match_results r ON r.match_id=s.match_id
+            LEFT JOIN fixture_voids v ON v.match_id=s.match_id
             WHERE s.created_ts >= %s ORDER BY s.created_ts
         """, (cutoff,)).fetchall()
     groups: Dict[str, Dict[str, Dict[str, Any]]] = {
-        dim: {} for dim in ("market", "league", "probability_bucket", "odds_bucket", "model_version", "phase")}
+        dim: {} for dim in ("market", "league", "probability_bucket", "odds_bucket", "model_version", "policy_version", "phase")}
     overall: Dict[str, Any] = {}
 
     def add(bucket: Dict[str, Any], outcome: Optional[int], pending: bool,
@@ -4101,9 +3942,9 @@ def compute_shadow_report(days: Optional[int] = 90) -> Dict[str, Any]:
             bucket["clv_n"] = bucket.get("clv_n", 0) + 1
             bucket["clv_sum"] = bucket.get("clv_sum", 0.0) + float(clv)
 
-    for fid, league_id, league, phase, market, suggestion, prob, odds, clv, version, gh, ga, btts in rows:
-        pending = gh is None or ga is None
-        outcome = None if pending else _tip_outcome_for_result(
+    for fid, league_id, league, phase, market, suggestion, prob, odds, clv, version, gh, ga, btts, void_status, policy in rows:
+        pending = not void_status and (gh is None or ga is None)
+        outcome = None if pending or void_status else _tip_outcome_for_result(
             suggestion, {"final_goals_h": gh, "final_goals_a": ga, "btts_yes": btts})
         p = float(prob)
         o = float(odds)
@@ -4111,7 +3952,7 @@ def compute_shadow_report(days: Optional[int] = 90) -> Dict[str, Any]:
         ob = "<1.50" if o < 1.5 else "1.50-1.99" if o < 2 else "2.00-2.99" if o < 3 else "3.00+"
         labels = {"market": market, "league": f"{league_id}: {league}",
                   "probability_bucket": pb, "odds_bucket": ob,
-                  "model_version": version, "phase": phase}
+                  "model_version": version, "policy_version": policy, "phase": phase}
         add(overall, outcome, pending, o, p, clv, int(fid))
         for dimension, label in labels.items():
             add(groups[dimension].setdefault(label, {}), outcome, pending, o, p, clv, int(fid))
@@ -4140,6 +3981,9 @@ def compute_shadow_report(days: Optional[int] = 90) -> Dict[str, Any]:
                                "reason": "negative prospective ROI over at least 100 graded picks",
                                "prematch_clv_available": b["clv_n"]})
     return {"days": days, "overall": finish(overall), "by": completed,
+            "forward_target": {"graded_target": 500, "graded": overall.get('graded', 0),
+                               "remaining": max(0, 500 - overall.get('graded', 0)),
+                               "commercially_validated": False},
             "review_for_disabling": review,
             "note": "One unit per first qualifying fixture/phase/selection quote; live CLV is undefined. "
                     "Prematch CLV needs a same-book pre-kickoff quote. Repeated bets on one match "
@@ -4147,17 +3991,21 @@ def compute_shadow_report(days: Optional[int] = 90) -> Dict[str, Any]:
 
 
 def compute_scan_funnel(days: int = 7) -> Dict[str, Any]:
+    cutoff = int(time.time()) - max(1, int(days)) * 86400
     with db_conn() as c:
-        rows = c.execute("SELECT phase,counts FROM scan_funnel WHERE created_ts >= %s",
-                         (int(time.time()) - int(days) * 86400,)).fetchall()
-    out: Dict[str, Dict[str, int]] = {}
-    for phase, payload in rows:
-        dest = out.setdefault(phase, {"scans": 0})
-        dest["scans"] += 1
-        for k, v in json.loads(payload).items():
-            dest[k] = dest.get(k, 0) + int(v)
-    return {"days": days, "by_phase": out,
-            "note": "Counts are scan observations; the same fixture can appear in several scans."}
+        runs = c.execute("SELECT phase,status,COUNT(*) FROM scan_runs WHERE started_ts >= %s GROUP BY phase,status", (cutoff,)).fetchall()
+        rows = c.execute("""SELECT r.phase,d.stage,d.reason,COUNT(*) FROM scan_decisions d
+            JOIN scan_runs r ON r.scan_id=d.scan_id WHERE r.started_ts >= %s
+            GROUP BY r.phase,d.stage,d.reason""", (cutoff,)).fetchall()
+        stale = c.execute("SELECT scan_id FROM scan_runs WHERE status='running' AND started_ts < %s",
+                          (int(time.time()) - 3600,)).fetchall()
+    out = {}
+    for phase, status, n in runs:
+        out.setdefault(phase, {'scan_status': {}, 'decisions': {}})['scan_status'][status] = n
+    for phase, stage, reason, n in rows:
+        out.setdefault(phase, {'scan_status': {}, 'decisions': {}})['decisions'][f'{stage}:{reason}'] = n
+    return {'days': days, 'by_phase': out, 'unfinished_over_one_hour': [r[0] for r in stale],
+            'note': 'One terminal record per examined fixture and candidate; repeated scans remain separate.'}
 
 
 def compute_pnl(days: Optional[int] = None, stake: float = 1.0, use_kelly: bool = False) -> Dict[str, Any]:
@@ -4284,7 +4132,9 @@ def compute_calibration(days: Optional[int] = None, phase: Optional[str] = None,
     q = """
         SELECT p.market, p.suggestion, p.prob,
                r.final_goals_h, r.final_goals_a, r.btts_yes
-        FROM predictions p JOIN match_results r ON r.match_id = p.match_id
+        FROM (SELECT DISTINCT ON (match_id,phase,suggestion) * FROM predictions
+              ORDER BY match_id,phase,suggestion,created_ts,id) p
+        JOIN match_results r ON r.match_id = p.match_id
         WHERE p.created_ts >= %s
     """
     params: List[Any] = [cutoff]
@@ -4723,6 +4573,8 @@ def auto_tune_thresholds(days: int = 30) -> Dict[str, float]:
 
 def retry_unsent_tips(minutes: int = 120, limit: int = 200) -> int:
     """Both scan paths send inline; this only catches Telegram outages."""
+    if SHADOW_ONLY:
+        return 0
     cutoff = int(time.time()) - minutes * 60
     with db_conn() as c:
         rows = c.execute(
@@ -4734,17 +4586,35 @@ def retry_unsent_tips(minutes: int = 120, limit: int = 200) -> int:
     retried = 0
     for (mid, league, home, away, market, sugg, conf, score, minute, cts, odds, book,
          ev_pct, fair, stake, is_pre, kickoff) in rows:
+        # A delayed message must not advertise an old, unavailable entry price.
+        max_age = 300 if is_pre else LIVE_MAX_ODDS_AGE_SEC
+        expired = (time.time() - cts > max_age or (is_pre and (not kickoff or time.time() >= kickoff)))
+        if not expired:
+            current = _fixture_by_id(int(mid))
+            status = ((current or {}).get('fixture') or {}).get('status') or {}
+            expired = (not current or (status.get('short') != 'NS' if is_pre else
+                       status.get('short') not in {'1H', 'HT', '2H'} or _pretty_score(current) != score
+                       or status.get('elapsed') is None or int(status['elapsed']) - int(minute or 0) not in (0, 1)))
+        if not expired:
+            key, sel = _market_key_and_selection(market, sugg)
+            ODDS_CACHE.invalidate((int(mid), not bool(is_pre)))
+            entry = fetch_odds(int(mid), live=not bool(is_pre)).get(key) or {}
+            gate = _price_gate(market, sugg, int(mid), float(conf) / 100.0, live=not bool(is_pre))
+            quote = ((entry.get('by_book') or {}).get(sel) or {}).get(book)
+            observed = entry.get('fetched_ts')
+            expired = (not gate.get('passed') or quote is None or odds is None or float(quote) < float(odds)
+                       or observed is None or not 0 <= time.time() - float(observed) <= LIVE_MAX_ODDS_AGE_SEC)
+        if expired:
+            with db_conn() as c:
+                c.execute("UPDATE tips SET sent_ok=-1 WHERE match_id=%s AND created_ts=%s AND sent_ok=0", (mid, cts))
+            continue
         kickoff_txt = "TBD"
         if kickoff:
             kickoff_txt = datetime.fromtimestamp(int(kickoff), TZ_UTC).astimezone(BERLIN_TZ).strftime("%H:%M")
-        ok = send_telegram(_format_tip_message(
+        ok = _send_reserved_tip(mid, cts, _format_tip_message(
             home, away, league, int(minute or 0), score or "", sugg, float(conf), None,
             odds, book, ev_pct, fair, stake, kickoff_txt=kickoff_txt, prematch=bool(is_pre)))
         if ok:
-            with db_conn() as c2:
-                c2.execute("UPDATE tips SET sent_ok=1,telegram_sent_ts=%s "
-                           "WHERE match_id=%s AND created_ts=%s",
-                           (int(time.time()), mid, cts))
             retried += 1
     if retried:
         log.info("[RETRY] resent %d", retried)
@@ -5083,6 +4953,113 @@ def http_price_gate():
 def http_scan_funnel():
     _require_admin()
     return jsonify({"ok": True, "funnel": compute_scan_funnel(days=_arg_int("days", 7))})
+
+
+def _review_threshold_rows(rows, min_cal=100, min_holdout=50):
+    """First prospective quote/fixture, chronological split with a one-day gap.
+
+    This is a research report. Selecting repeatedly on these results consumes
+    the validation set; adoption always requires a later forward period.
+    """
+    if len(rows) < min_cal + min_holdout:
+        return {'status': 'insufficient_data', 'available': len(rows),
+                'minimum': min_cal + min_holdout}
+    ordered = sorted(rows, key=lambda r: (r['kickoff_ts'], r['match_id']))
+    boundary = ordered[int(len(ordered) * .7)]['kickoff_ts']
+    cal = [r for r in ordered if r['kickoff_ts'] < boundary - 86400]
+    holdout = [r for r in ordered if r['kickoff_ts'] >= boundary]
+    if len(cal) < min_cal or len(holdout) < min_holdout:
+        return {'status': 'insufficient_data_after_embargo', 'cal_n': len(cal), 'holdout_n': len(holdout)}
+
+    def evaluate(dataset, threshold):
+        selected = [r for r in dataset if r['prob'] >= threshold]
+        profits = [(r['odds'] - 1) if r['outcome'] else -1.0 for r in selected]
+        n = len(profits)
+        mean = sum(profits) / n if n else 0.0
+        se = math.sqrt(sum((x - mean) ** 2 for x in profits) / (n - 1) / n) if n > 1 else None
+        return {'n': n, 'roi_pct': round(mean * 100, 3) if n else None,
+                'approx_roi_ci_pct': [round((mean - 1.96 * se) * 100, 3), round((mean + 1.96 * se) * 100, 3)] if se is not None else None}
+    trials = [(p / 100, evaluate(cal, p / 100)) for p in range(50, 86, 5)]
+    eligible = [(p, result) for p, result in trials if result['n'] >= min_holdout]
+    if not eligible:
+        return {'status': 'insufficient_selected_calibration', 'cal_n': len(cal), 'holdout_n': len(holdout)}
+    chosen, cal_result = max(eligible, key=lambda pair: (pair[1]['approx_roi_ci_pct'][0], -pair[0]))
+    check = evaluate(holdout, chosen)
+    accepted = (check['n'] >= min_holdout and cal_result['approx_roi_ci_pct'][0] > 0
+                and check['approx_roi_ci_pct'] is not None and check['approx_roi_ci_pct'][0] > 0)
+    return {'status': 'candidate_for_new_forward_test' if accepted else 'holdout_not_confirmed',
+            'threshold_pct': chosen * 100, 'calibration': cal_result, 'holdout': check,
+            'cal_fixture_ids': [r['match_id'] for r in cal],
+            'holdout_fixture_ids': [r['match_id'] for r in holdout],
+            'boundary_ts': boundary, 'embargo_seconds': 86400,
+            'settings_changed': False}
+
+
+def compute_threshold_review(days=365):
+    cutoff = int(time.time()) - max(1, int(days)) * 86400
+    with db_conn() as c:
+        rows = c.execute("""SELECT DISTINCT ON (d.match_id,r.phase,d.suggestion)
+            d.match_id,d.kickoff_ts,r.phase,d.market,d.suggestion,d.prob,d.odds,d.created_ts,
+            r.model_version,m.final_goals_h,m.final_goals_a,m.btts_yes
+            FROM scan_decisions d JOIN scan_runs r ON r.scan_id=d.scan_id
+            JOIN match_results m ON m.match_id=d.match_id
+            WHERE d.stage='candidate' AND d.price_decision='qualified' AND d.created_ts >= %s
+            AND d.prob IS NOT NULL AND d.odds > 1 AND d.kickoff_ts IS NOT NULL
+            ORDER BY d.match_id,r.phase,d.suggestion,d.created_ts,d.id""", (cutoff,)).fetchall()
+    groups = {}
+    excluded_unknown_model = 0
+    for fid, kickoff, phase, market, suggestion, prob, odds, created, version, gh, ga, btts in rows:
+        try:
+            trained = datetime.fromisoformat(version.split('|')[0].replace('Z', '+00:00'))
+            if trained.tzinfo is None or trained.timestamp() > created:
+                raise ValueError('non-prospective model')
+        except (ValueError, TypeError, AttributeError):
+            excluded_unknown_model += 1
+            continue
+        result = _tip_outcome_for_result(suggestion, {'final_goals_h': gh, 'final_goals_a': ga, 'btts_yes': btts})
+        if result is None:
+            continue
+        # Separate directional selections: BTTS Yes is not BTTS No.
+        key = f'{phase}|{market}|{suggestion}'
+        groups.setdefault(key, []).append({'match_id': fid, 'kickoff_ts': kickoff,
+            'prob': float(prob), 'odds': float(odds), 'outcome': result})
+    return {'strategies': {key: _review_threshold_rows(value) for key, value in groups.items()},
+            'excluded_unknown_or_nonprospective_model': excluded_unknown_model,
+            'settings_changed': False,
+            'note': 'ROI research uses prospective first quotes, including below-threshold candidates. '
+                    'A recommendation needs a new untouched forward period and calibration checks before use. '
+                    'Training thresholds are not overwritten by this report.'}
+
+
+@app.route('/admin/diagnostics/threshold-review', methods=['GET'])
+def http_threshold_review():
+    _require_admin()
+    return jsonify({'ok': True, 'review': compute_threshold_review(_arg_int('days', 365))})
+
+
+@app.route('/admin/diagnostics/decisions', methods=['GET'])
+def http_scan_decisions():
+    _require_admin()
+    limit = min(1000, max(1, _arg_int('limit', 100)))
+    sql = """SELECT d.id,d.scan_id,r.phase,d.created_ts,d.match_id,d.stage,d.market,d.suggestion,
+        d.reason,d.prob,d.threshold_pct,d.odds,d.price_decision,d.qualified,d.detail
+        FROM scan_decisions d JOIN scan_runs r ON r.scan_id=d.scan_id WHERE d.id > %s"""
+    params = [max(0, _arg_int('after_id', 0))]
+    for key, col in (('scan_id', 'd.scan_id'), ('match_id', 'd.match_id')):
+        value = request.args.get(key)
+        if value:
+            if key == 'match_id' and not value.isdigit():
+                return jsonify({'ok': False, 'error': 'match_id must be an integer'}), 400
+            sql += f' AND {col}=%s'
+            params.append(int(value) if key == 'match_id' else value)
+    sql += ' ORDER BY d.id LIMIT %s'
+    params.append(limit)
+    with db_conn() as c:
+        rows = c.execute(sql, tuple(params)).fetchall()
+    names = ('id','scan_id','phase','created_ts','match_id','stage','market','suggestion',
+             'reason','prob','threshold_pct','odds','price_decision','qualified','detail')
+    return jsonify({'ok': True, 'decisions': [dict(zip(names, row)) for row in rows],
+                    'next_after_id': rows[-1][0] if rows else None})
 
 
 @app.route("/admin/diagnostics/shadow", methods=["GET"])
