@@ -1,68 +1,18 @@
-"""
-goalsniper — shared feature specification.
+"""Shared, price-free model inputs and numerical helpers.
 
-WHY THIS FILE EXISTS
---------------------
-Previously main.py's extract_features() and train_models.py's load_inplay_data()
-each contained their own copy of the same ~40 derivations. Any divergence between
-them silently breaks train/serve parity, which is exactly the class of bug that
-produced the "shots on target key never matched" and "weights multiplied by 0.0"
-failures. Both paths now call the SAME functions in this module, so drift is
-structurally impossible rather than merely discouraged.
+FEATURES and PRE_FEATURES exclude every market_fair_* column. Those old names
+remain readable for snapshot compatibility but cannot enter new classifier
+weights. Models must declare FEATURE_SCHEMA_VERSION. Historical xG means and
+sample-count indicators are recorded prospectively in prematch snapshots;
+old snapshots carry zero counts rather than invented observed histories.
 
-DESIGN NOTES ON THE FEATURE LISTS
----------------------------------
-The old FEATURES (64) / PRE_FEATURES (~130) lists contained many exactly
-collinear or exactly duplicated columns. Under L2 regularization, perfectly
-collinear features split their shared effect arbitrarily, which makes individual
-coefficients (and therefore `feature_importance`) meaningless. Removed:
-
-  - pm_away_adv_rating       == pm_rating_a                     (exact duplicate)
-  - pm_attack_strength_h/a   == pm_gf_h / pm_gf_a               (exact duplicate)
-  - pm_defense_strength_h/a  == pm_ga_h / pm_ga_a               (exact duplicate)
-  - pm_home_adv_rating       == pm_rating_h + const             (collinear)
-  - pm_expected_total        == (gf_h+gf_a+ga_h+ga_a)/2         (linear combo)
-  - pm_expected_total_diff   == (gf_h+ga_a-gf_a-ga_h)/2         (linear combo)
-  - pm_form_points_diff      == 3(win_h-win_a)+(draw_h-draw_a)  (linear combo)
-  - pm_goal_difference_h/a   == gf - ga                         (linear combo)
-  - pm_loss_h/a              == 1 - win - draw                  (linear combo)
-  - momentum_score           == .5*xg_pm + .3*sot_pm + .2*sh_pm (linear combo)
-  - attack_pressure_h/a/diff == .4*sot + .4*xg + .2*cor         (linear combo)
-  - xg_efficiency_h/a        == goals - xg                      (linear combo)
-  - match_minute_normalized  == minute/90                       (linear combo)
-  - is_first_half            == 1 - is_second_half              (linear combo)
-  - is_draw                  == 1 - is_leading_h - is_leading_a (linear combo)
-  - the ~65 hardcoded-zero live features inside PRE_FEATURES     (constant columns)
-
-Nonlinear derivations (ratios, products, indicators, absolute values) are kept:
-those carry information a linear model cannot recover from the components.
-
-Result: 56 in-play features and 30 prematch features, all of which vary and none
-of which is a linear function of the others.
-
-PREMATCH MARKET ANCHORING
--------------------------
-pm_market_fair_* mirror the in-play market_fair_* features below: the
-de-vigged consensus prematch price, passed straight through as a feature
-rather than only used post-hoc by main.py's EV gate. Missing at call time (a
-fixture with no odds fetched yet, or every snapshot harvested before this was
-added) means neutral, not zero — a bare 0.0 would read as "the market says
-this outcome is impossible", which is false and would teach every
-pre-existing snapshot the wrong thing. See assemble_prematch_features()'s
-`market_fair` parameter and NEUTRAL_MARKET_PRIORS below.
-
-SCALING
--------
-Values here are RAW and on wildly different natural scales (minute 0-120,
-pm_rating_diff -400..400, is_* flags 0/1). train_models.py fits a StandardScaler
-and PERSISTS mean/scale inside the model blob; main.py applies the identical
-transform before scoring. Do not add clipping or rescaling here unless it is
-applied to both paths, which — since both paths call this module — it now
-automatically would be.
+Training and serving call the same builders. Scaling lives in each model blob.
 """
 from __future__ import annotations
 
 import os
+import math
+from xg_history import XG_FEATURES
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -216,6 +166,10 @@ PRE_FEATURES: List[str] = [
     "pm_market_fair_home", "pm_market_fair_draw", "pm_market_fair_away",
     "pm_market_fair_over25", "pm_market_fair_btts_yes",
 ]
+
+FEATURE_SCHEMA_VERSION = 'price-free-xg-v1'
+FEATURES = [k for k in FEATURES if 'market_fair_' not in k]
+PRE_FEATURES = [k for k in PRE_FEATURES if 'market_fair_' not in k] + XG_FEATURES
 
 # Which feature holds each league base rate, per phase. Used by the training
 # loaders to overwrite whatever was stored at harvest time with a rate computed
@@ -605,7 +559,11 @@ def devig(probs: Dict[str, float], market_total: float = 1.0) -> Dict[str, float
     handle favourite-longshot bias better and are worth revisiting once you have
     enough closing-line history to test which fits your books.
     """
-    s = sum(v for v in probs.values() if v and v > 0)
+    if not probs or not math.isfinite(market_total) or market_total <= 0:
+        return {}
+    if any(not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0 for v in probs.values()):
+        return {}
+    s = sum(probs.values())
     if s <= 0:
         return {}
     scale = float(market_total) / s
