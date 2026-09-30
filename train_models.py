@@ -1,69 +1,10 @@
-"""
-goalsniper — model training.
+"""Price-free classifier training with grouped chronological splits.
 
-WHAT CHANGED, AND WHY IT MATTERED
----------------------------------
-
-1. THE SPLIT ACTUALLY SPLITS BY TIME NOW.
-   The old time_order_split() did:
-
-       df_sorted = df.sort_values("_ts").reset_index(drop=True)
-       train_idx = df_sorted.index[:cut].to_numpy()
-
-   reset_index(drop=True) replaces the original row labels with a RangeIndex,
-   so df_sorted.index[:cut] is just [0..cut-1] — positional numbers with no
-   relationship to the sorted order. Those were then used as a mask against
-   df[FEATURES].values, which is in the ORIGINAL order. The result was "the
-   first 75% of rows in whatever order Postgres returned them". There was no
-   temporal separation at all, and every metric and auto-picked threshold the
-   system has ever produced came out of that leaky split.
-
-2. CALIBRATION IS NO LONGER FITTED ON THE EVALUATION SET.
-   Three-way time split: fit on TRAIN, calibrate and pick thresholds on CAL,
-   report metrics on a HOLDOUT that nothing has touched.
-
-3. THE SPLIT IS GROUPED BY MATCH, so correlated in-play snapshots from one
-   fixture cannot straddle a boundary.
-
-4. IN-PLAY TRAINING USES EVERY SNAPSHOT, NOT JUST THE LAST ONE.
-
-5. THE SCALER IS BACK, AND IT SHIPS WITH THE MODEL (mean/scale persisted in the
-   blob, applied by main.py._linpred), so L2 is scale-fair at fit time without
-   breaking serving parity.
-
-6. C IS TUNED on the calibration split; class_weight is NOT "balanced".
-
-7. LEAGUE BASE RATES ARE COMPUTED FROM TRAINING MATCHES ONLY.
-
-8. FEATURE LISTS LIVE IN feature_spec.py, SHARED WITH main.py.
-
-9. SETTINGS WRITES ARE BUFFERED AND FLUSHED IN ONE TRANSACTION.
-
-10. SAMPLE-SIZE FLOOR SCALES WITH FEATURE COUNT.
-
-11. EVERY THRESHOLD IS VERIFIED ON THE HOLDOUT BEFORE IT IS WRITTEN. A
-    threshold picked on the calibration split is the best of ~90 grid points and
-    is biased upward. If its lift does not survive on the holdout at
-    MIN_HOLDOUT_LIFT_SE standard errors over at least MIN_HOLDOUT_SELECTIONS
-    selections, the market is suppressed instead.
-
-12. DOUBLE CHANCE AND DRAW NO BET ARE NOW TRAINED AND VERIFIED, NOT DEFAULTED.
-    These are algebraic transforms of the 1X2 heads, so they need no new model —
-    but they previously had no threshold written at all, which meant main.py's
-    _get_market_threshold() fell through to CONF_THRESHOLD (70). That was a hole
-    straight through the suppression system: PRE 1X2 could be suppressed at 85
-    for failing its holdout while Double Chance, derived from the very same
-    heads, fired at 70 on any fixture with a decent home side. Both markets now
-    get a threshold picked on CAL and verified on the HOLDOUT exactly like every
-    other market, and are suppressed the same way when they fail.
-
-NOT DONE IN THIS PASS, DELIBERATELY
------------------------------------
-A bivariate-Poisson / Dixon-Coles goal model, and using the de-vigged closing
-line as a model FEATURE. Both are genuine modelling changes that deserve a
-deliberate decision rather than being folded into a repair pass. The closing
-line as a feature additionally needs market probabilities attached to historical
-snapshots, which main.py only started capturing recently.
+Training fits and calibrates probabilities and reports holdout discrimination
+and calibration. It never promotes precision-selected betting thresholds.
+Threshold selection belongs to frozen prospective recorded-price EV research.
+A research trial prevents model replacement, including concurrent training
+promotion. Serving rejects older or market-feature-bearing model schemas.
 """
 
 from __future__ import annotations
@@ -94,7 +35,7 @@ else:
 
 from feature_spec import (
     ODDS_TRUSTED_FROM_TS,
-    DEFAULT_LEAGUE_RATES, FEATURES, PRE_FEATURES, NEUTRAL_MARKET_PRIORS,
+    FEATURE_SCHEMA_VERSION, DEFAULT_LEAGUE_RATES, FEATURES, PRE_FEATURES, NEUTRAL_MARKET_PRIORS,
     LEAGUE_RATE_FIELDS_INPLAY, LEAGUE_RATE_FIELDS_PREMATCH,
     build_inplay_features, derive_dc_dnb,
 )
@@ -216,13 +157,9 @@ class SettingsBuffer:
         return (not df.empty) and str(df.iloc[0]["value"]).strip() == "1"
 
     def set_threshold(self, label: str, thr_pct: float, summary: Dict[str, Any]) -> None:
-        if self.is_threshold_locked(label):
-            logger.warning("[THRESHOLD] %s is locked — skipping auto-picked value %.2f%%",
-                           label, thr_pct)
-            self.skipped_locked.append(label)
-            return
-        self.set(f"conf_threshold:{label}", f"{thr_pct:.2f}")
-        summary.setdefault("thresholds", {})[label] = round(float(thr_pct), 2)
+        # Prices do not accompany these historical classifier rows. Precision
+        # cannot establish betting EV. Frozen prospective research owns selection.
+        summary.setdefault('thresholds_not_promoted', {})[label] = 'use frozen recorded-price EV trial'
 
     def flush(self) -> int:
         if not self.pending:
@@ -231,6 +168,12 @@ class SettingsBuffer:
         self.conn.autocommit = False
         try:
             with self.conn.cursor() as cur:
+                cur.execute('SELECT pg_advisory_xact_lock(19021)')
+                cur.execute("SELECT to_regclass('research_trials')")
+                if cur.fetchone()[0]:
+                    cur.execute('SELECT 1 FROM research_trials LIMIT 1')
+                    if cur.fetchone():
+                        raise RuntimeError('training promotion blocked by frozen trial')
                 cur.executemany(
                     "INSERT INTO settings(key,value) VALUES(%s,%s) "
                     "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
@@ -708,6 +651,7 @@ def build_model_blob(model: LogisticRegression, features: List[str],
     serving parity.
     """
     return {
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "intercept": float(model.intercept_.ravel()[0]),
         "weights": {name: float(w) for name, w in zip(features, model.coef_.ravel().tolist())},
         "scaler": {"mean": {n: float(m) for n, m in zip(features, mean.tolist())},
@@ -900,28 +844,12 @@ def _decide_threshold(y_ca, p_ca, y_te, p_te, label: str, buf: "SettingsBuffer",
     Draw No Bet — so no market can acquire a threshold without passing the same
     bar. That was the gap that let Double Chance run on an unvalidated default.
     """
-    thr_prob, diag = _pick_threshold(y_ca, p_ca, target_precision, min_preds,
-                                     default_thr_prob, min_thresh_pct=min_thresh,
-                                     max_thresh_pct=max_thresh)
-    if extra_diag:
-        diag.update(extra_diag)
-    thr_pct = (float(SUPPRESSED_THRESHOLD_PCT) if diag.get("method") == "suppressed"
-               else float(thr_prob * 100.0))
-    holdout = _threshold_on_holdout(y_te, p_te, thr_pct / 100.0)
+    diag = {'method': 'deferred_recorded_price_EV', 'settings_changed': False}
+    holdout = {'n_at_threshold': 0, 'lift_in_std_errors': None,
+               'action': 'No threshold promotion without frozen prospective price evidence'}
+    buf.set_threshold(label, 55.0, summary)
+    return 55.0, diag, holdout
 
-    if diag.get("method") != "suppressed":
-        confirmed, why = _holdout_verdict(holdout)
-        holdout["verdict"] = why
-        if not confirmed:
-            thr_pct = float(SUPPRESSED_THRESHOLD_PCT)
-            holdout["action"] = "SUPPRESSED — calibration lift did not survive the holdout"
-            logger.warning("[HOLDOUT] %s: %s. Calibration said %s. Suppressing at %.1f%%.",
-                           ctx, why, diag.get("lift_over_base_pp"), thr_pct)
-        else:
-            holdout["action"] = "confirmed — threshold kept"
-
-    buf.set_threshold(label, thr_pct, summary)
-    return thr_pct, diag, holdout
 
 
 def _fit_directional_threshold_pair(
@@ -967,6 +895,11 @@ def _train_binary_head(
     Pipeline: standardize on TRAIN -> select C on CAL -> fit -> Platt on CAL ->
     threshold on CAL -> verify on HOLDOUT -> metrics on HOLDOUT.
     """
+    active = {x.strip() for x in os.getenv('ACTIVE_MARKETS', 'BTTS,Over/Under 2.5').split(',') if x.strip()}
+    family = {'BTTS_YES': 'BTTS', 'OU_2.5': 'Over/Under 2.5'}.get(model_key.removeprefix('PRE_'))
+    if family is None or family not in active:
+        summary.setdefault('skipped', {})[model_key] = 'outside concentration scope'
+        return False, {}, None, None
     ctx = metrics_name or model_key
     if not _validate(X_all, y_all, feature_names, ctx):
         return False, {}, None, None
@@ -1277,6 +1210,18 @@ def _fit_derived_market_thresholds(heads, gd: np.ndarray, m_ca: np.ndarray, m_te
                     label, thr_pct, diag.get("method"), holdout.get("lift_over_base_pp"))
 
 
+def _training_league_scope(conn):
+    explicit = os.getenv('LEAGUE_ALLOW_IDS', '')
+    if explicit.strip():
+        chosen = sorted({int(x.strip()) for x in explicit.split(',') if x.strip()})
+    else:
+        rows = _read_sql(conn, "SELECT value FROM settings WHERE key='research:league_scope'")
+        chosen = sorted(set(json.loads(rows.iloc[0]['value']))) if not rows.empty else []
+    if not 3 <= len(chosen) <= 5:
+        raise ValueError('training requires the same 3–5 league concentration scope')
+    return chosen
+
+
 # ─────────────────────── Entry point ─────────────────────── #
 
 def train_models(
@@ -1287,6 +1232,12 @@ def train_models(
 ) -> Dict[str, Any]:
     conn = _connect(db_url or os.getenv("DATABASE_URL"))
     _ensure_training_tables(conn)
+    active_trial = _read_sql(conn, "SELECT to_regclass('research_trials') AS name")
+    if not active_trial.empty and active_trial.iloc[0]['name']:
+        frozen = _read_sql(conn, 'SELECT kind FROM research_trials LIMIT 1')
+        if not frozen.empty:
+            conn.close()
+            return {'ok': False, 'reason': 'models frozen by prospective research trial'}
     _log_locked_thresholds(conn)
     buf = SettingsBuffer(conn)
 
@@ -1317,8 +1268,12 @@ def train_models(
                                "feature_counts": {}, "data_stats": {}, "skipped": {}}
 
     try:
+        scope = _training_league_scope(conn)
+        summary["league_scope"] = scope
         # ══════════ In-play ══════════
         df_ip = load_inplay_data(conn, min_minute=min_minute)
+        if not df_ip.empty:
+            df_ip = df_ip[df_ip["_league_id"].isin(scope)].copy()
         n_ip = len(df_ip)
         n_ip_matches = int(df_ip["_match_id"].nunique()) if n_ip else 0
         need_ip = _effective_min_rows(len(FEATURES), min_rows_env, rows_per_feature)
@@ -1421,6 +1376,8 @@ def train_models(
 
         # ══════════ Prematch ══════════
         df_pre = load_prematch_data(conn)
+        if not df_pre.empty:
+            df_pre = df_pre[df_pre["_league_id"].isin(scope)].copy()
         n_pre = len(df_pre)
         need_pre = _effective_min_rows(len(PRE_FEATURES), min_rows_env, rows_per_feature)
         summary["data_stats"].update({"prematch_rows": n_pre, "prematch_rows_required": need_pre})
