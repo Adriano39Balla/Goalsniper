@@ -42,7 +42,7 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import (
-    Flask, abort, jsonify, redirect, render_template, request, url_for,
+    Flask, abort, jsonify, redirect, render_template, render_template_string, request, url_for,
 )
 # Aliased: this module already has a module-level `session` (a requests.Session
 # for outbound HTTP, defined below) that would otherwise shadow Flask's session
@@ -4518,7 +4518,35 @@ except Exception as e:
 
 
 # ───────── Auth ─────────
+# Explicit report allowlist: a dashboard cookie never authorizes admin actions.
+_BROWSER_REPORTS = frozenset({
+    'http_clv', 'http_clv_breakdown', 'http_price_gate', 'http_scan_funnel',
+    'http_scan_decisions', 'http_shadow_report', 'http_calibration',
+    'http_significance', 'http_league_breakdown', 'http_league_density',
+    'http_odds_provider', 'http_thresholds', 'http_execution_receipt',
+})
+
+
+@app.before_request
+def _browser_report_login():
+    if (request.method == 'GET' and request.endpoint in _BROWSER_REPORTS
+            and request.accept_mimetypes.best == 'text/html'
+            and not request.headers.get('X-API-Key') and not request.is_json
+            and not _dashboard_authed()):
+        return redirect(url_for('dashboard_login', next='diagnostics'))
+
+
+@app.after_request
+def _private_report_headers(response):
+    if request.endpoint in _BROWSER_REPORTS or request.path.startswith('/dashboard'):
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+    return response
+
+
 def _require_admin():
+    if request.method == 'GET' and request.endpoint in _BROWSER_REPORTS and _dashboard_authed():
+        return
     body = request.get_json(silent=True) if request.is_json else None
     key = (request.headers.get("X-API-Key")
            or ((body or {}).get("key") if body else None))
@@ -5044,11 +5072,11 @@ def dashboard_login():
             flask_session.clear()
             flask_session["dash_authed"] = True
             flask_session.permanent = True
-            return redirect(url_for("dashboard"))
+            return redirect(url_for("dashboard_diagnostics" if request.args.get("next") == "diagnostics" else "dashboard"))
         _login_record_failure(ip)
         return render_template("dashboard_login.html", error="Incorrect key."), 401
     if _dashboard_authed():
-        return redirect(url_for("dashboard"))
+        return redirect(url_for("dashboard_diagnostics" if request.args.get("next") == "diagnostics" else "dashboard"))
     return render_template("dashboard_login.html", error=None)
 
 
@@ -5065,6 +5093,71 @@ def dashboard():
     if not _dashboard_authed():
         return redirect(url_for("dashboard_login"))
     return render_template("dashboard.html", refresh_sec=DASHBOARD_REFRESH_SEC)
+
+
+@app.route("/dashboard/diagnostics")
+def dashboard_diagnostics():
+    """Read-only mobile view. Never exposes credentials or changes trial scope."""
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
+    if not _dashboard_authed():
+        return redirect(url_for('dashboard_login', next='diagnostics'))
+    density = compute_league_density(days=365)
+    with db_conn() as c:
+        saved = c.execute("SELECT value FROM settings WHERE key='research:league_scope'").fetchone()
+        trials = c.execute('SELECT kind,created_ts FROM research_trials ORDER BY kind').fetchall()
+    try:
+        saved_scope = json.loads(saved[0]) if saved else []
+    except (ValueError, TypeError):
+        saved_scope = 'Invalid saved value; inspect configuration'
+    labels = {5: 'UEFA Nations League', 39: 'Premier League', 140: 'La Liga',
+              135: 'Serie A', 78: 'Bundesliga', 61: 'Ligue 1',
+              88: 'Eredivisie', 94: 'Primeira Liga'}
+    payload = {'selected_scope': list(LEAGUE_ALLOW_IDS),
+               'prematch_scope': list(PREMATCH_LEAGUE_IDS), 'saved_scope': saved_scope,
+               'environment_scope_empty': not bool(os.getenv('LEAGUE_ALLOW_IDS', '').strip())
+                   and not bool(os.getenv('PREMATCH_LEAGUE_IDS', '').strip()),
+               'max_active_leagues': MAX_ACTIVE_LEAGUES,
+               'shadow_only': SHADOW_ONLY, 'odds_mode': THE_ODDS_API_MODE,
+               'frozen_trials': [{'kind': r[0], 'created_ts': r[1]} for r in trials],
+               'league_density': density['leagues']}
+    response = app.make_response(render_template_string("""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GoalSniper diagnostics</title><style>
+body{font:16px system-ui,sans-serif;background:#101820;color:#edf3f8;margin:0;padding:20px;max-width:780px;margin-inline:auto}
+h1{font-size:26px}h2{font-size:20px}section{background:#1c2936;border-radius:12px;padding:18px;margin:16px 0}
+a{color:#9dd9ff}li{margin:10px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}
+td,th{text-align:left;padding:10px 8px;border-bottom:1px solid #425261}table{width:100%;border-collapse:collapse}
+.note{color:#c4d1dd;line-height:1.5}</style></head><body>
+<h1>GoalSniper diagnostics</h1><p class="note">Read-only. Opening this page does not change leagues or make provider requests.</p>
+<section><h2>Browser checks</h2><ul>
+<li><a href="{{ url_for('http_league_density', days=365) }}">League density (JSON)</a></li>
+<li><a href="{{ url_for('http_scan_funnel', days=7) }}">Scan and rejection counts</a></li>
+<li><a href="{{ url_for('http_shadow_report', days=90) }}">Shadow predictions</a></li>
+<li><a href="{{ url_for('http_odds_provider') }}">Odds provider status</a></li>
+<li><a href="{{ url_for('http_thresholds') }}">Selection thresholds</a></li>
+</ul></section><section><h2>Active leagues</h2><ul>{% for lid in payload.selected_scope %}
+<li>{{ lid }} — {{ labels.get(lid|int, 'Other competition') }}</li>
+{% else %}<li>No active leagues selected. Scans remain blocked.</li>{% endfor %}</ul>
+<p>Prematch IDs: {{ payload.prematch_scope|join(', ') or 'None' }}</p>
+<p>Maximum: {{ payload.max_active_leagues }} competitions.</p>
+<p>Both Railway league variables empty: {{ 'Yes' if payload.environment_scope_empty else 'No' }}</p>
+<p>Database selection: {{ payload.saved_scope }}</p></section>
+<section><h2>Research status</h2><p>Shadow only: {{ 'Yes' if payload.shadow_only else 'No' }}</p>
+<p>Odds provider mode: {{ payload.odds_mode }}</p>
+<p>Frozen trials: {% for trial in payload.frozen_trials %}{{ trial.kind }}{% if not loop.last %}, {% endif %}{% else %}None started{% endfor %}</p>
+<p class="note">Nations League has provider mapping support. It is only active if ID 5 appears above. A change of scope must preserve existing research records.</p></section>
+<section><h2>Stored results, past 365 days</h2><p class="note">Counts use the date a result was recorded. They do not prove model or odds coverage.</p>
+<table><thead><tr><th>Competition</th><th>Settled fixtures</th></tr></thead><tbody>
+{% for row in payload.league_density %}<tr><td>{{ row.league_id }} — {{ labels.get(row.league_id, 'Other') }}</td><td>{{ row.n_settled_fixtures }}</td></tr>{% endfor %}
+</tbody></table></section><details><summary>Diagnostic JSON</summary><pre>{{ diagnostic_json }}</pre></details>
+<p><a href="{{ url_for('dashboard_diagnostics') }}">Refresh</a> · <a href="{{ url_for('dashboard') }}">Dashboard</a></p>
+</body></html>""", payload=payload, labels=labels, diagnostic_json=json.dumps(payload, indent=2)))
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Content-Security-Policy'] = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    return response
 
 
 @app.route("/dashboard/data")
