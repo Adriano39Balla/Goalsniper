@@ -11,7 +11,7 @@ from datetime import datetime
 from threading import RLock
 import requests
 
-SPORTS = {39: 'soccer_epl', 140: 'soccer_spain_la_liga',
+SPORTS = {5: 'soccer_uefa_nations_league', 39: 'soccer_epl', 140: 'soccer_spain_la_liga',
           135: 'soccer_italy_serie_a', 78: 'soccer_germany_bundesliga',
           61: 'soccer_france_ligue_one', 88: 'soccer_netherlands_eredivisie',
           94: 'soccer_portugal_primeira_liga'}
