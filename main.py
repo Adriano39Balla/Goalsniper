@@ -25,7 +25,7 @@ import time
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -1605,6 +1605,52 @@ def _selection_executability(book_prices: Dict[str, float], min_books: int) -> D
             "outlier_pct": outlier_pct, "executable": executable}
 
 
+# The second provider is opt-in; evaluation makes requests only via admin POST.
+from the_odds_feed import OddsFeed
+THE_ODDS_API_MODE = os.getenv("THE_ODDS_API_MODE", "evaluation").strip().lower()
+if THE_ODDS_API_MODE not in ("off", "evaluation", "supplement"):
+    raise SystemExit("THE_ODDS_API_MODE must be off, evaluation or supplement")
+THE_ODDS_API_DAILY_CREDITS = max(0, int(os.getenv("THE_ODDS_API_DAILY_CREDITS", "10")))
+THE_ODDS_API_MONTHLY_CREDITS = max(0, int(os.getenv("THE_ODDS_API_MONTHLY_CREDITS", "100")))
+
+
+def _reserve_odds_credits(cost):
+    # Count attempted paid requests conservatively, even failures. Calendar UTC
+    # budgets survive restarts and share a lock across workers/replicas.
+    day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    month = day[:7]
+    with _tip_transaction() as c:
+        c.execute('SELECT pg_advisory_xact_lock(19022)')
+        row = c.execute("SELECT value FROM settings WHERE key='odds_api:budget'").fetchone()
+        budget = json.loads(row[0]) if row else {}
+        daily = int(budget.get('daily', 0)) if budget.get('day') == day else 0
+        monthly = int(budget.get('monthly', 0)) if budget.get('month') == month else 0
+        if daily + cost > THE_ODDS_API_DAILY_CREDITS or monthly + cost > THE_ODDS_API_MONTHLY_CREDITS:
+            return False
+        value = json.dumps(dict(day=day, month=month, daily=daily+cost, monthly=monthly+cost))
+        c.execute("INSERT INTO settings(key,value) VALUES('odds_api:budget',%s) "
+                  "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (value,))
+    return True
+
+
+_THE_ODDS_FEED = OddsFeed(os.getenv('THE_ODDS_API_KEY', '').strip(), _reserve_odds_credits)
+
+
+def _external_odds_rows(fid):
+    try:
+        js = _api_get(FOOTBALL_API_URL, {'id': int(fid)})
+        fixtures = js.get('response', []) if isinstance(js, dict) else []
+        if len(fixtures) != 1 or fixtures[0].get('fixture', {}).get('id') != int(fid):
+            return []
+        if str(fixtures[0].get('league', {}).get('id')) not in set(map(str, PREMATCH_LEAGUE_IDS)):
+            _THE_ODDS_FEED.status['status'] = 'league_outside_scope'
+            return []
+        return _THE_ODDS_FEED.rows(fixtures[0])
+    except Exception:
+        log.warning('[THE_ODDS_API] adapter failed; external quotes ignored')
+        return []
+
+
 def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     """
     Returns, per market key:
@@ -1637,8 +1683,15 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
     params: Dict[str, Any] = {"fixture": fid}
     # Fetch all sources: execution and sharp benchmark are separate books.
     js = _api_get(ODDS_LIVE_URL if live else ODDS_PREMATCH_URL, params)
+    external_rows = []
+    if not live and THE_ODDS_API_MODE == 'supplement':
+        external_rows = _external_odds_rows(fid)
+        if external_rows:
+            original = js.get('response', []) if isinstance(js, dict) and not js.get('errors') else []
+            js = {'response': external_rows + (original if isinstance(original, list) else [])}
     fetched_ts = int(time.time())
     diagnostics = {"fetched_ts": fetched_ts, "status": "ok", "markets": []}
+    diagnostics['external_provider'] = dict(_THE_ODDS_FEED.status) if not live and THE_ODDS_API_MODE == 'supplement' else {'status': 'not_used'}
     ODDS_DIAGNOSTICS.set(key, diagnostics)
     if not isinstance(js, dict):
         diagnostics["status"] = "api_unavailable"
@@ -2194,9 +2247,10 @@ class ScanAudit:
             'MAX_EXECUTION_OUTLIER_PCT', 'REQUIRE_EXECUTABLE_PRICE', 'REQUIRE_FAIR_PRICE',
             'LIVE_MAX_INPUT_AGE_SEC', 'LIVE_MAX_ODDS_AGE_SEC', 'TIP_MIN_MINUTE',
             'CORRELATED_EXTRA_EV_BPS', 'DUP_COOLDOWN_MIN', 'PREMATCH_DEDUP_ENABLE',
-            'LEAGUE_ALLOW_IDS', 'LEAGUE_DENY_IDS', 'PREMATCH_LEAGUE_IDS')}
+            'LEAGUE_ALLOW_IDS', 'LEAGUE_DENY_IDS', 'PREMATCH_LEAGUE_IDS',
+            'THE_ODDS_API_MODE', 'THE_ODDS_API_DAILY_CREDITS', 'THE_ODDS_API_MONTHLY_CREDITS')}
         policy['code'] = {p: hashlib.sha256(Path(__file__).with_name(p).read_bytes()).hexdigest()
-                          for p in ('main.py', 'feature_spec.py', 'risk_policy.py', 'research_store.py', 'xg_history.py', 'grading.py', 'odds_parser.py')}
+                          for p in ('main.py', 'feature_spec.py', 'risk_policy.py', 'research_store.py', 'xg_history.py', 'grading.py', 'odds_parser.py', 'the_odds_feed.py')}
         policy['thresholds'] = {k:v for k,v in self.settings.items() if k.startswith('research_threshold:')}
         policy['active'] = sorted(ACTIVE_MARKETS - DISABLED_MARKETS)
         policy['disabled_leagues'] = sorted(DISABLED_LEAGUE_IDS)
@@ -4773,6 +4827,33 @@ def http_league_breakdown():
     _require_admin()
     return jsonify({"ok": True, "breakdown": compute_league_breakdown(
         market=request.args.get("market"), days=_arg_int("days"), min_n=_arg_int("min_n", 20))})
+
+
+@app.route("/admin/diagnostics/odds-provider", methods=["GET", "POST"])
+def http_odds_provider():
+    _require_admin()
+    if request.method == 'POST':
+        if THE_ODDS_API_MODE == 'off':
+            return jsonify({'ok': False, 'error': 'provider_disabled'}), 409
+        body = request.get_json(silent=True) or {}
+        if 'fixture_id' in body:
+            try:
+                fid = int(body['fixture_id'])
+                if fid <= 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return jsonify({'ok': False, 'error': 'invalid_fixture_id'}), 400
+            rows = _external_odds_rows(fid)
+            return jsonify({'ok': bool(rows), 'mode': THE_ODDS_API_MODE,
+                            'provider': _THE_ODDS_FEED.status, 'quotes': rows})
+        result = _THE_ODDS_FEED.check()
+        return jsonify({'ok': result['status'] == 'ok', 'mode': THE_ODDS_API_MODE, 'provider': result})
+    with db_conn() as c:
+        row = c.execute("SELECT value FROM settings WHERE key='odds_api:budget'").fetchone()
+    return jsonify({'mode': THE_ODDS_API_MODE, 'provider': _THE_ODDS_FEED.status,
+                    'reserved_budget': json.loads(row[0]) if row else {},
+                    'daily_limit': THE_ODDS_API_DAILY_CREDITS,
+                    'monthly_limit': THE_ODDS_API_MONTHLY_CREDITS})
 
 
 @app.route("/admin/diagnostics/league-density", methods=["GET"])
