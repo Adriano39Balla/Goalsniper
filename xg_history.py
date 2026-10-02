@@ -1,6 +1,10 @@
 """Prospectively observed historical xG features; never backfilled into old decisions."""
 import math
 
+
+class XGHistoryFetchError(RuntimeError):
+    """A historical xG request failed; never convert this into zero features."""
+
 XG_FEATURES = [f'pm_xg_{metric}_{side}' for side in ('h', 'a')
                for metric in ('for', 'against', 'n')]
 
@@ -18,7 +22,10 @@ def historical_xg_features(home_id, away_id, fixtures_h, fixtures_a, cutoff, fet
                 continue
             seen.add(fid)
             parsed = {}
-            for row in fetch_stats(fid) or []:
+            stats = fetch_stats(fid)
+            if stats is None:
+                raise XGHistoryFetchError(f"historical xG fetch failed for fixture {fid}")
+            for row in stats:
                 tid = (row.get('team') or {}).get('id')
                 for stat in row.get('statistics') or []:
                     if str(stat.get('type', '')).lower() not in ('expected_goals', 'expected goals', 'xg'):
