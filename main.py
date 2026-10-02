@@ -1012,22 +1012,26 @@ def _kickoff_ts_of(fx: dict) -> int:
 
 
 # ───────── Live fetches ─────────
-def fetch_match_stats(fid: int) -> list:
+def fetch_match_stats(fid: int) -> Optional[list]:
     cached = STATS_CACHE.get(fid, _MISS)
     if cached is not _MISS:
         return cached
     js = _api_get(f"{FOOTBALL_API_URL}/statistics", {"fixture": fid})
     if not isinstance(js, dict):
-        return []
-    out = js.get("response", []) if isinstance(js, dict) else []
-    api_errors = js.get("errors") if isinstance(js, dict) else None
+        log.warning("[STATS] fixture %s fetch failed; not cached", fid)
+        return None
+    api_errors = js.get("errors")
     if api_errors not in (None, {}, [], ""):
-        log.warning("[STATS] fixture %s returned API errors: %s", fid, api_errors)
-    # Cache successful payloads. Do not turn an API error into a 90-second
-    # authoritative empty result: the next scan should be allowed to retry.
-    if not api_errors:
-        STATS_CACHE.set(fid, out)
-        _STATS_FETCHED_TS[int(fid)] = int(time.time())
+        log.warning("[STATS] fixture %s returned API errors; not cached: %s", fid, api_errors)
+        return None
+    out = js.get("response", [])
+    if not isinstance(out, list):
+        log.warning("[STATS] fixture %s returned malformed payload; not cached", fid)
+        return None
+    # Empty is a successful no-coverage response and may be cached briefly by
+    # the normal stats cache; transport/API failures are represented by None.
+    STATS_CACHE.set(fid, out)
+    _STATS_FETCHED_TS[int(fid)] = int(time.time())
     return out
 
 
@@ -3435,6 +3439,11 @@ def _fetch_historical_xg_stats(fid):
     if cached is not _MISS:
         return cached
     value = fetch_match_stats(fid)
+    if value is None:
+        log.warning("[XG] fixture %s historical stats unavailable; retrying next extraction", fid)
+        return None
+    # Cache only a successful response. Empty means the provider answered and
+    # this fixture has no xG coverage; it is different from a failed fetch.
     _XG_HISTORY_CACHE.set(fid, value)
     return value
 
