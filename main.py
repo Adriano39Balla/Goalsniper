@@ -1668,13 +1668,18 @@ def _external_odds_rows(fid):
         js = _api_get(FOOTBALL_API_URL, {'id': int(fid)})
         fixtures = js.get('response', []) if isinstance(js, dict) else []
         if len(fixtures) != 1 or fixtures[0].get('fixture', {}).get('id') != int(fid):
+            _THE_ODDS_FEED.status.update(status='fixture_lookup_failed', fixture_id=int(fid),
+                                         football_api_results=len(fixtures))
             return []
         if str(fixtures[0].get('league', {}).get('id')) not in set(map(str, PREMATCH_LEAGUE_IDS)):
-            _THE_ODDS_FEED.status['status'] = 'league_outside_scope'
+            _THE_ODDS_FEED.status.update(status='league_outside_scope', fixture_id=int(fid),
+                                         fixture_league_id=fixtures[0].get('league', {}).get('id'))
             return []
+        _THE_ODDS_FEED.status['fixture_id'] = int(fid)
         return _THE_ODDS_FEED.rows(fixtures[0])
     except Exception:
-        log.warning('[THE_ODDS_API] adapter failed; external quotes ignored')
+        _THE_ODDS_FEED.status.update(status='fixture_lookup_failed', fixture_id=int(fid))
+        log.exception('[THE_ODDS_API] fixture lookup failed; external quotes ignored')
         return []
 
 
@@ -4907,13 +4912,17 @@ def http_league_breakdown():
 @app.route("/admin/diagnostics/odds-provider", methods=["GET", "POST"])
 def http_odds_provider():
     _require_admin()
-    if request.method == 'POST':
+    # GET with ?fixture_id=... is intentionally read-only so the same
+    # fixture-level trace is usable from a phone browser; POST remains
+    # supported for scripted checks.
+    if request.method == 'POST' or request.args.get('fixture_id'):
         if THE_ODDS_API_MODE == 'off':
             return jsonify({'ok': False, 'error': 'provider_disabled'}), 409
         body = request.get_json(silent=True) or {}
-        if 'fixture_id' in body:
+        fixture_arg = body.get('fixture_id', request.args.get('fixture_id'))
+        if fixture_arg is not None:
             try:
-                fid = int(body['fixture_id'])
+                fid = int(fixture_arg)
                 if fid <= 0:
                     raise ValueError()
             except (TypeError, ValueError):
