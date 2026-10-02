@@ -140,6 +140,11 @@ DAILY_ACCURACY_MINUTE = int(os.getenv("DAILY_ACCURACY_MINUTE", "6"))
 PREMATCH_SCAN_ENABLE = _env_flag("PREMATCH_SCAN_ENABLE", "1")
 PREMATCH_SCAN_INTERVAL_MIN = int(os.getenv("PREMATCH_SCAN_INTERVAL_MIN", "180"))
 PREMATCH_SNAPSHOT_TTL_SEC = int(os.getenv("PREMATCH_SNAPSHOT_TTL_SEC", "21600"))
+# The old collector queried only the current Berlin calendar day.  That made
+# the evening scan return zero fixtures as soon as tomorrow's schedule was
+# the next available slate.  Keep the window explicit and configurable while
+# retaining the prematch/status checks below.
+PREMATCH_LOOKAHEAD_HOURS = max(1, int(os.getenv("PREMATCH_LOOKAHEAD_HOURS", "48")))
 PREMATCH_DEDUP_ENABLE = _env_flag("PREMATCH_DEDUP_ENABLE", "1")
 MAX_PREMATCH_TIPS_PER_SCAN = int(os.getenv("MAX_PREMATCH_TIPS_PER_SCAN", "40"))
 
@@ -3411,14 +3416,24 @@ def _api_h2h(home_id: int, away_id: int, n: int = 5) -> List[dict]:
 
 
 def _collect_todays_prematch_fixtures(audit=None) -> List[dict]:
-    today_local = datetime.now(BERLIN_TZ).date()
-    start_local = datetime.combine(today_local, datetime.min.time(), tzinfo=BERLIN_TZ)
-    end_local = start_local + timedelta(days=1)
-    dates_utc = {start_local.astimezone(TZ_UTC).date(),
-                 (end_local - timedelta(seconds=1)).astimezone(TZ_UTC).date()}
+    # Despite the historical function name, this is now a forward-looking
+    # prematch window.  Query every UTC calendar date touched by the local
+    # window so Berlin midnight/DST transitions cannot silently drop fixtures.
+    now_utc = datetime.now(TZ_UTC)
+    now_ts = now_utc.timestamp()
+    start_local = now_utc.astimezone(BERLIN_TZ)
+    end_utc = now_utc + timedelta(hours=PREMATCH_LOOKAHEAD_HOURS)
+    end_local = end_utc.astimezone(BERLIN_TZ)
+    start_utc_date = start_local.astimezone(TZ_UTC).date()
+    end_utc_date = end_local.astimezone(TZ_UTC).date()
+    dates_utc = []
+    cursor = start_utc_date
+    while cursor <= end_utc_date:
+        dates_utc.append(cursor)
+        cursor += timedelta(days=1)
     fixtures = []
     seen = set()
-    for d in sorted(dates_utc):
+    for d in dates_utc:
         js = _api_get(FOOTBALL_API_URL, {'date': d.strftime('%Y-%m-%d')})
         if not isinstance(js, dict) or not isinstance(js.get('response'), list) or js.get('errors'):
             raise RuntimeError('fixture_feed_unavailable')
@@ -3429,8 +3444,8 @@ def _collect_todays_prematch_fixtures(audit=None) -> List[dict]:
             seen.add(fid)
             kickoff = _kickoff_ts_of(fx)
             reason = None
-            if not kickoff or not start_local.timestamp() <= kickoff < end_local.timestamp():
-                reason = 'outside_local_day'
+            if not kickoff or not now_ts < kickoff <= end_local.timestamp():
+                reason = 'outside_prematch_horizon'
             elif (((fx.get('fixture') or {}).get('status') or {}).get('short') or '').upper() != 'NS':
                 reason = 'not_prematch'
             elif _blocked_league(fx.get('league') or {}):
@@ -5021,6 +5036,11 @@ def http_status():
             "league_allow_ids": LEAGUE_ALLOW_IDS,
             "prematch_league_ids": PREMATCH_LEAGUE_IDS,
             "max_active_leagues": MAX_ACTIVE_LEAGUES,
+        },
+        "prematch_collection": {
+            "enabled": bool(PREMATCH_SCAN_ENABLE),
+            "lookahead_hours": PREMATCH_LOOKAHEAD_HOURS,
+            "scan_interval_min": PREMATCH_SCAN_INTERVAL_MIN,
         },
         "fair_price": {
             "required": REQUIRE_FAIR_PRICE,
