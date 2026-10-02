@@ -12,6 +12,7 @@ research_store (frozen trials / fills), grading, and xg_history.
 from __future__ import annotations
 
 import hmac
+import secrets
 import json
 import logging
 import math
@@ -42,11 +43,12 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import (
-    Flask, abort, jsonify, redirect, render_template, render_template_string, request, url_for,
+    Flask, abort, g, jsonify, redirect, render_template, render_template_string, request, url_for,
 )
 # Aliased: this module already has a module-level `session` (a requests.Session
 # for outbound HTTP, defined below) that would otherwise shadow Flask's session
 # proxy the moment that line executes.
+from werkzeug.exceptions import HTTPException
 from flask import session as flask_session
 from psycopg2.pool import ThreadedConnectionPool
 from requests.adapters import HTTPAdapter
@@ -4518,7 +4520,7 @@ except Exception as e:
 
 
 # ───────── Auth ─────────
-# Explicit report allowlist: a dashboard cookie never authorizes admin actions.
+# Direct report access is read-only. Actions use the CSRF-protected control form.
 _BROWSER_REPORTS = frozenset({
     'http_clv', 'http_clv_breakdown', 'http_price_gate', 'http_scan_funnel',
     'http_scan_decisions', 'http_shadow_report', 'http_calibration',
@@ -4545,6 +4547,8 @@ def _private_report_headers(response):
 
 
 def _require_admin():
+    if getattr(g, "browser_control_endpoint", None) == request.endpoint:
+        return
     if request.method == 'GET' and request.endpoint in _BROWSER_REPORTS and _dashboard_authed():
         return
     body = request.get_json(silent=True) if request.is_json else None
@@ -5009,7 +5013,7 @@ def http_settings(key: str):
 
 
 # ───────── Web dashboard ─────────
-# Read-only browser view. Auth is session-based: the admin key is checked once
+# Browser reports and manual controls. The admin key is checked once
 # at /dashboard/login and a signed HttpOnly cookie is set, so the raw key is
 # never stored client-side or re-sent on every page load the way a bookmarked
 # ?key=... URL would be. Nothing here can train, scan, or change settings.
@@ -5072,11 +5076,11 @@ def dashboard_login():
             flask_session.clear()
             flask_session["dash_authed"] = True
             flask_session.permanent = True
-            return redirect(url_for("dashboard_diagnostics" if request.args.get("next") == "diagnostics" else "dashboard"))
+            return redirect(url_for({"diagnostics": "dashboard_diagnostics", "controls": "dashboard_controls"}.get(request.args.get("next"), "dashboard")))
         _login_record_failure(ip)
         return render_template("dashboard_login.html", error="Incorrect key."), 401
     if _dashboard_authed():
-        return redirect(url_for("dashboard_diagnostics" if request.args.get("next") == "diagnostics" else "dashboard"))
+        return redirect(url_for({"diagnostics": "dashboard_diagnostics", "controls": "dashboard_controls"}.get(request.args.get("next"), "dashboard")))
     return render_template("dashboard_login.html", error=None)
 
 
@@ -5093,6 +5097,96 @@ def dashboard():
     if not _dashboard_authed():
         return redirect(url_for("dashboard_login"))
     return render_template("dashboard.html", refresh_sec=DASHBOARD_REFRESH_SEC)
+
+
+# Explicitly authenticated admin routes only; never proxy arbitrary URLs.
+def _browser_control_routes():
+    return {r.rule: r for r in app.url_map.iter_rules()
+            if (r.rule.startswith('/admin/') or r.rule in ('/init-db', '/settings/<path:key>'))
+            and r.endpoint.startswith('http_')}
+
+
+@app.route('/dashboard/controls', methods=['GET', 'POST'])
+def dashboard_controls():
+    if not DASHBOARD_ENABLED:
+        return _dashboard_unavailable()
+    if not _dashboard_authed():
+        return redirect(url_for('dashboard_login', next='controls'))
+    routes = _browser_control_routes()
+    result = None
+    status = 200
+    if request.method == 'POST':
+        token = flask_session.get('control_csrf', '')
+        if not token or not _safe_compare(request.form.get('csrf', ''), token):
+            abort(403)
+        # Rotate before dispatch; a refreshed result page cannot repeat the action.
+        flask_session['control_csrf'] = secrets.token_urlsafe(32)
+        rule = routes.get(request.form.get('route', ''))
+        method = request.form.get('method', '')
+        if rule is None or method not in ('GET', 'POST') or method not in rule.methods:
+            abort(400)
+        try:
+            params = json.loads(request.form.get('parameters', '{}') or '{}')
+            query = json.loads(request.form.get('query', '{}') or '{}')
+            body = json.loads(request.form.get('body', '{}') or '{}')
+            if not all(isinstance(v, dict) for v in (params, query, body)):
+                raise ValueError('Inputs must be JSON objects.')
+            if set(params) != set(rule.arguments):
+                raise ValueError('Supply exactly these path parameters: ' + ', '.join(sorted(rule.arguments)))
+            # No arbitrary endpoint, host, header, URL or credentials can be supplied.
+            target = url_for(rule.endpoint, **params)
+            adapter = app.url_map.bind('localhost')
+            matched, values = adapter.match(target, method=method)
+            if matched != rule.endpoint:
+                raise ValueError('Path parameters do not match the selected endpoint.')
+            with app.app_context(), app.test_request_context(target, method=method, query_string=query, json=body):
+                g.browser_control_endpoint = matched
+                response = app.make_response(app.view_functions[matched](**values))
+                status = response.status_code
+                result = response.get_json(silent=True)
+                if result is None:
+                    result = {'status': status, 'message': 'Endpoint returned a non-JSON response.'}
+        except HTTPException as exc:
+            status, result = exc.code, {'ok': False, 'error': exc.description}
+        except (ValueError, TypeError) as exc:
+            status, result = 400, {'ok': False, 'error': str(exc)}
+        except Exception:
+            log.exception('[BROWSER CONTROL] action failed')
+            status, result = 500, {'ok': False, 'error': 'Action failed. Check the application logs.'}
+    if 'control_csrf' not in flask_session:
+        flask_session['control_csrf'] = secrets.token_urlsafe(32)
+    response = app.make_response((render_template_string("""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GoalSniper manual controls</title><style>
+body{font:16px system-ui;background:#101820;color:#edf3f8;max-width:800px;margin:auto;padding:18px}
+a{color:#9dd9ff}details,section{background:#1c2936;border-radius:12px;padding:16px;margin:14px 0}
+button,textarea,select{font:inherit;box-sizing:border-box;width:100%;padding:12px;margin:8px 0}
+button{background:#9dd9ff;color:#101820;border:0;border-radius:8px;font-weight:bold}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}summary{overflow-wrap:anywhere;cursor:pointer}label{display:block}
+</style></head><body><h1>Manual controls</h1>
+<p><a href="{{ url_for('dashboard_diagnostics') }}">Diagnostics</a> · <a href="{{ url_for('dashboard_controls') }}">Fresh controls page</a></p>
+<p>Opening this page runs nothing. Each Run button executes the selected endpoint with your existing permissions and research safeguards.</p>
+<p>Shadow only: <strong>{{ shadow }}</strong>. Training replaces compatible models only if the research rules permit it.</p>
+{% if result is not none %}<section><h2>Result — HTTP {{ status }}</h2><pre>{{ result }}</pre></section>{% endif %}
+<p>For training, open <strong>/admin/train</strong> and tap Run. Leave the JSON fields unchanged. Wait for the result; a timeout does not prove the job stopped. Check Status or logs before retrying.</p>
+<p>Scans and backfills can use provider credits. Train-notify, digest, retry-unsent and MOTD can send Telegram messages. Starting a research trial freezes its scope; adopting thresholds and writing settings change configuration.</p>
+{% for path, rule in routes %}<details {% if path == '/admin/train' %}open{% endif %}><summary>{{ path }}</summary>
+<form method="post" action="{{ url_for('dashboard_controls') }}">
+<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="route" value="{{ path }}">
+<label>Method<select name="method">{% for method in ['POST','GET'] if method in rule.methods %}<option>{{ method }}</option>{% endfor %}</select></label>
+{% if rule.arguments %}<label>Path parameters (JSON)<textarea name="parameters">{{ examples.get(path, {})|tojson }}</textarea></label>{% else %}<input type="hidden" name="parameters" value="{}">{% endif %}
+<label>Query parameters (JSON)<textarea name="query">{}</textarea></label>
+<label>Request body (JSON)<textarea name="body">{}</textarea></label>
+<button type="submit">Run {{ path }}</button></form></details>{% endfor %}
+</body></html>""", routes=sorted(routes.items()), csrf=flask_session['control_csrf'],
+        examples={'/admin/research/<kind>/start': {'kind': 'release'},
+                  '/settings/<path:key>': {'key': 'YOUR_SETTING_NAME'},
+                  '/admin/tip-audit/<int:fid>': {'fid': 0}},
+        result=json.dumps(result, indent=2, default=str) if result is not None else None,
+        status=status, shadow=SHADOW_ONLY), status))
+    response.headers['Content-Security-Policy'] = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
 
 
 @app.route("/dashboard/diagnostics")
@@ -5130,6 +5224,7 @@ a{color:#9dd9ff}li{margin:10px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere
 td,th{text-align:left;padding:10px 8px;border-bottom:1px solid #425261}table{width:100%;border-collapse:collapse}
 .note{color:#c4d1dd;line-height:1.5}</style></head><body>
 <h1>GoalSniper diagnostics</h1><p class="note">Read-only. Opening this page does not change leagues or make provider requests.</p>
+<p><a href="{{ url_for('dashboard_controls') }}">Manual controls — training, scans and all admin endpoints</a></p>
 <section><h2>Browser checks</h2><ul>
 <li><a href="{{ url_for('http_league_density', days=365) }}">League density (JSON)</a></li>
 <li><a href="{{ url_for('http_scan_funnel', days=7) }}">Scan and rejection counts</a></li>
