@@ -1350,23 +1350,15 @@ def train_models(
                             for k in ("model_latest:O25", "model:O25"):
                                 buf.set(k, json.dumps(blob))
 
-            gd = df_ip["final_goals_diff"].to_numpy(dtype=int)
-            heads = {}
-            for key, y in (("WLD_HOME", (gd > 0)), ("WLD_DRAW", (gd == 0)), ("WLD_AWAY", (gd < 0))):
-                ok, mets, p_ca, p_te = _train_binary_head(
-                    buf, X, y.astype(int), m_tr, m_ca, m_te, FEATURES,
-                    key, None, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, 0.45, key, sample_weight_all=inplay_weights)
-                summary["trained"][key] = ok
-                if ok:
-                    summary["metrics"][key] = mets
-                heads[key] = (ok, p_ca, p_te)
+            # The concentrated trainer supports BTTS and OU 2.5 only.
+            # Do not validate deliberately untrained 1X2 heads: doing so aborts
+            # the atomic publication of otherwise valid active-market models.
+            for key in ('WLD_HOME', 'WLD_DRAW', 'WLD_AWAY'):
+                summary['trained'][key] = False
+                summary['skipped'][key] = 'outside concentration scope'
+            for label in ('1X2', 'Double Chance', 'Draw No Bet'):
+                summary['skipped'][label] = 'outside concentration scope'
 
-            parent_ok = _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "1X2",
-                                           target_precision, min_preds, min_thresh, max_thresh)
-            _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "",
-                                           target_precision, min_preds, min_thresh, max_thresh,
-                                           parent_confirmed=parent_ok)
         else:
             reason = (f"have {n_ip} snapshots / {n_ip_matches} fixtures, "
                       f"need {need_ip} / {min_matches_inplay}")
@@ -1422,24 +1414,15 @@ def train_models(
                         f"PRE Over {line_txt}", f"PRE Under {line_txt}", buf, summary,
                         target_precision, min_preds, min_thresh, max_thresh, name)
 
-            gd = df_pre["final_goals_diff"].to_numpy(dtype=int)
-            heads = {}
-            for key, y in (("PRE_WLD_HOME", (gd > 0)), ("PRE_WLD_DRAW", (gd == 0)),
-                           ("PRE_WLD_AWAY", (gd < 0))):
-                ok, mets, p_ca, p_te = _train_binary_head(
-                    buf, Xp, y.astype(int), m_tr, m_ca, m_te, PRE_FEATURES,
-                    key, None, summary, target_precision, min_preds,
-                    min_thresh, max_thresh, 0.45, key)
-                summary["trained"][key] = ok
-                if ok:
-                    summary["metrics"][key] = mets
-                heads[key.replace("PRE_", "")] = (ok, p_ca, p_te)
+            # The concentrated trainer supports BTTS and OU 2.5 only.
+            # Do not validate deliberately untrained 1X2 heads: doing so aborts
+            # the atomic publication of otherwise valid active-market models.
+            for key in ('PRE_WLD_HOME', 'PRE_WLD_DRAW', 'PRE_WLD_AWAY'):
+                summary['trained'][key] = False
+                summary['skipped'][key] = 'outside concentration scope'
+            for label in ('PRE 1X2', 'PRE Double Chance', 'PRE Draw No Bet'):
+                summary['skipped'][label] = 'outside concentration scope'
 
-            parent_ok = _fit_1x2_threshold(heads, gd, m_ca, m_te, buf, summary, "PRE 1X2",
-                                           target_precision, min_preds, min_thresh, max_thresh)
-            _fit_derived_market_thresholds(heads, gd, m_ca, m_te, buf, summary, "PRE ",
-                                           target_precision, min_preds, min_thresh, max_thresh,
-                                           parent_confirmed=parent_ok)
         else:
             reason = f"have {n_pre} rows, need {need_pre}"
             logger.info("Prematch: not enough data (%s).", reason)
