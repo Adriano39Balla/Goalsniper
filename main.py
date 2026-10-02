@@ -110,6 +110,7 @@ API_KEY = os.getenv("API_KEY")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 RUN_SCHEDULER = _env_flag("RUN_SCHEDULER", "1")
+LIVE_SCAN_ENABLE = _env_flag("LIVE_SCAN_ENABLE", "1")
 
 CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "70"))
 MAX_TIPS_PER_SCAN = int(os.getenv("MAX_TIPS_PER_SCAN", "25"))
@@ -212,7 +213,11 @@ REQUIRE_FAIR_PRICE = _env_flag("REQUIRE_FAIR_PRICE", "1")
 # manufacturing an overlay that does not exist (best 1.53 against a "fair" 1.41).
 # Best price is still taken across every book; this governs whether the FAIR side
 # is trustworthy enough to bet against.
-MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "3"))
+ # The release benchmark is Pinnacle's de-vigged close, not a blended
+ # consensus.  The external adapter currently supplies Tipico + Pinnacle;
+ # requiring three books therefore made the default evaluation path
+ # deterministically reject every otherwise valid candidate.
+MIN_BOOKS_FOR_FAIR = int(os.getenv("MIN_BOOKS_FOR_FAIR", "1"))
 # The in-play feed is ONE aggregated source, not a panel of books, so it can
 # never reach MIN_BOOKS_FOR_FAIR - live candidates would sit at
 # too_few_books forever. This is a separate knob rather than a lower global
@@ -411,6 +416,22 @@ ODDS_LIVE_URL = f"{BASE_URL}/odds/live"
 HEADERS = {"x-apisports-key": API_KEY, "Accept": "application/json"}
 INPLAY_STATUSES = {"1H", "HT", "2H", "ET", "BT", "P"}
 FINAL_STATUSES = {"FT", "AET", "PEN"}
+# A postponed/abandoned fixture id is not a future match.  Keeping it pending
+# forever freezes the prospective cohort.  SUSP is only voided after a grace
+# period below, so a same-day interruption can still be settled if resumed.
+VOID_STATUSES = {"CANC", "AWD", "WO", "PST", "ABD"}
+SUSPENDED_VOID_AFTER_SEC = 48 * 3600
+
+
+def _fixture_status_void(status: str, fixture: Optional[dict], now: Optional[int] = None) -> bool:
+    status = (status or "").upper()
+    if status in VOID_STATUSES:
+        return True
+    if status != "SUSP":
+        return False
+    now = int(time.time()) if now is None else int(now)
+    kickoff = _fixture_ts(fixture or {}) if fixture else 0
+    return bool(kickoff and now - kickoff >= SUSPENDED_VOID_AFTER_SEC)
 
 session = requests.Session()
 HTTP_POOL_MAXSIZE = int(os.getenv("HTTP_POOL_MAXSIZE", "30"))
@@ -1790,7 +1811,12 @@ def fetch_odds(fid: int, live: bool) -> Dict[str, Any]:
                     needed = _MARKET_SELECTION_COUNT.get(mkey, 2)
                     source_ts = source_timestamp(r.get('update'))
                     fair_max_age = LIVE_MAX_ODDS_AGE_SEC if live else 300
-                    if len(sel) >= needed and source_ts is not None and 0 <= fetched_ts - source_ts <= fair_max_age:
+                    # Fair price is the sharp benchmark used by release
+                    # evidence.  Do not average the execution book into it:
+                    # doing so mixes Tipico margin with Pinnacle skill and
+                    # makes the benchmark depend on feed composition.
+                    if (book_name == SHARP_BOOK and len(sel) >= needed and
+                            source_ts is not None and 0 <= fetched_ts - source_ts <= fair_max_age):
                         fair_books_seen.setdefault(mkey, set()).add(book_name)
                         total = MARKET_PROBABILITY_TOTAL.get(mkey, 1.0)
                         implied = {k: 1.0 / v for k, v in sel.items() if v > 1.0}
@@ -2255,8 +2281,12 @@ class ScanAudit:
             'CORRELATED_EXTRA_EV_BPS', 'DUP_COOLDOWN_MIN', 'PREMATCH_DEDUP_ENABLE',
             'LEAGUE_ALLOW_IDS', 'LEAGUE_DENY_IDS', 'PREMATCH_LEAGUE_IDS',
             'THE_ODDS_API_MODE', 'THE_ODDS_API_DAILY_CREDITS', 'THE_ODDS_API_MONTHLY_CREDITS')}
-        policy['code'] = {p: hashlib.sha256(Path(__file__).with_name(p).read_bytes()).hexdigest()
-                          for p in ('main.py', 'feature_spec.py', 'risk_policy.py', 'research_store.py', 'xg_history.py', 'grading.py', 'odds_parser.py', 'the_odds_feed.py')}
+        # Source-file hashes are deliberately excluded.  A bug fix or logging
+        # change must not invalidate an already-frozen prospective cohort.
+        # Decision constants/settings below are the policy identity; the
+        # deployed git commit is retained separately in model_version/build
+        # info for audit and rollback.
+        policy['policy_schema'] = 'price-policy-v2'
         policy['thresholds'] = {k:v for k,v in self.settings.items() if k.startswith('research_threshold:')}
         policy['active'] = sorted(ACTIVE_MARKETS - DISABLED_MARKETS)
         policy['disabled_leagues'] = sorted(DISABLED_LEAGUE_IDS)
@@ -2582,7 +2612,7 @@ def backfill_results_for_open_matches(max_rows: int = 400) -> int:
         if not fx:
             continue
         st = (((fx.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
-        if st in {'CANC', 'AWD', 'WO'}:
+        if _fixture_status_void(st, fx):
             with db_conn() as c:
                 c.execute("INSERT INTO fixture_voids(match_id,status,updated_ts) VALUES(%s,%s,%s) "
                           "ON CONFLICT(match_id) DO NOTHING", (mid, st, int(time.time())))
@@ -3229,6 +3259,9 @@ def _live_stats_diagnostic_payload() -> Dict[str, Any]:
 
 
 def production_scan() -> Tuple[int, int]:
+    if not LIVE_SCAN_ENABLE:
+        log.info("[SCAN] live scan disabled (LIVE_SCAN_ENABLE=0); prematch research remains active")
+        return (0, 0)
     with ScanAudit('live') as audit:
         matches = fetch_live_matches(audit=audit)
         saved = 0
@@ -4441,8 +4474,9 @@ def _start_scheduler_once():
         return
     try:
         sched = BackgroundScheduler(timezone=TZ_UTC)
-        sched.add_job(lambda: _run_with_pg_lock(1001, production_scan), "interval",
-                      seconds=SCAN_INTERVAL_SEC, id="scan", max_instances=1, coalesce=True)
+        if LIVE_SCAN_ENABLE:
+            sched.add_job(lambda: _run_with_pg_lock(1001, production_scan), "interval",
+                          seconds=SCAN_INTERVAL_SEC, id="scan", max_instances=1, coalesce=True)
         sched.add_job(lambda: _run_with_pg_lock(1002, backfill_results_for_open_matches, 400),
                       "interval", minutes=BACKFILL_EVERY_MIN, id="backfill",
                       max_instances=1, coalesce=True)
