@@ -134,6 +134,10 @@ class OddsFeed:
             now = time.time()
             sport = SPORTS.get(int(fixture.get('league', {}).get('id', 0)))
             kickoff = int(fixture.get('fixture', {}).get('timestamp', 0))
+            self.status.update(sport_key=sport, fixture_kickoff=kickoff,
+                               event_count=None, matched_event_count=0,
+                               matched_event_id=None, bookmakers=[], markets=[],
+                               quote_age_seconds=None)
             if not sport or kickoff <= now:
                 self.status['status'] = 'unsupported_or_started_fixture'
                 return []
@@ -145,15 +149,28 @@ class OddsFeed:
             if cached is None or now - cached[0] >= 300:
                 events = self.get('sports/' + sport + '/events')
                 if not isinstance(events, list):
+                    self.status['status'] = 'events_request_failed'
                     return []
                 self.cache[cache_key] = (now, events)
             else:
                 events = cached[1]
+            self.status['event_count'] = len(events)
             matches = [e for e in events if isinstance(e, dict) and same_event(e, fixture, sport)]
+            self.status['matched_event_count'] = len(matches)
             if len(matches) != 1 or not re.fullmatch('[a-zA-Z0-9_-]+', str(matches[0].get('id', ''))):
+                # Keep a redacted sample so the admin endpoint explains name,
+                # kickoff, or sport-key mismatches without exposing quotes or
+                # credentials.
+                self.status['event_samples'] = [
+                    {'id': e.get('id'), 'sport_key': e.get('sport_key'),
+                     'home_team': e.get('home_team'), 'away_team': e.get('away_team'),
+                     'kickoff_delta_seconds': (timestamp(e.get('commence_time')) - kickoff)
+                         if timestamp(e.get('commence_time')) is not None else None}
+                    for e in events[:5] if isinstance(e, dict)]
                 self.status['status'] = 'unmatched_or_ambiguous_fixture'
                 return []
             event_id = matches[0]['id']
+            self.status['matched_event_id'] = event_id
             cache_key = ('odds', event_id)
             cached = self.cache.get(cache_key)
             if cached is None or now - cached[0] >= 20:
@@ -166,7 +183,15 @@ class OddsFeed:
                 self.cache[cache_key] = (now, data)
             else:
                 data = cached[1]
+            books = data.get('bookmakers') or []
+            self.status['bookmakers'] = [b.get('key') for b in books if isinstance(b, dict)]
+            self.status['markets'] = sorted({m.get('key') for b in books if isinstance(b, dict)
+                                             for m in (b.get('markets') or [])
+                                             if isinstance(m, dict) and m.get('key')})
             rows = normalize(data, time.time())
+            if rows:
+                ages = [time.time() - (timestamp(r.get('update')) or time.time()) for r in rows]
+                self.status['quote_age_seconds'] = round(max(ages), 1)
             self.status.update(status='quotes_available' if rows else 'no_complete_fresh_markets',
                                event_id=event_id, complete_book_markets=len(rows))
             return rows
