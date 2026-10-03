@@ -134,7 +134,13 @@ class OddsFeed:
             now = time.time()
             sport = SPORTS.get(int(fixture.get('league', {}).get('id', 0)))
             kickoff = int(fixture.get('fixture', {}).get('timestamp', 0))
+            home = (fixture.get('teams', {}).get('home') or {}).get('name')
+            away = (fixture.get('teams', {}).get('away') or {}).get('name')
             self.status.update(sport_key=sport, fixture_kickoff=kickoff,
+                               fixture_id=fixture.get('fixture', {}).get('id'),
+                               fixture_home_team=home, fixture_away_team=away,
+                               event_id=None, complete_book_markets=0, event_samples=[],
+                               http_status=None, last_cost=None,
                                event_count=None, matched_event_count=0,
                                matched_event_id=None, bookmakers=[], markets=[],
                                quote_age_seconds=None)
@@ -161,12 +167,25 @@ class OddsFeed:
                 # Keep a redacted sample so the admin endpoint explains name,
                 # kickoff, or sport-key mismatches without exposing quotes or
                 # credentials.
+                # Rank all events by team identity first, then kickoff proximity.
+                # The first five catalogue entries need not resemble this fixture.
+                candidates = sorted(
+                    (e for e in events if isinstance(e, dict)),
+                    key=lambda e: (
+                        -(int(bool(home) and name(e.get('home_team', '')) == name(home))
+                          + int(bool(away) and name(e.get('away_team', '')) == name(away))),
+                        abs(timestamp(e.get('commence_time')) - kickoff)
+                        if timestamp(e.get('commence_time')) is not None else float('inf')))
                 self.status['event_samples'] = [
                     {'id': e.get('id'), 'sport_key': e.get('sport_key'),
                      'home_team': e.get('home_team'), 'away_team': e.get('away_team'),
+                     'commence_time': e.get('commence_time'),
+                     'home_name_matches': bool(home) and name(e.get('home_team', '')) == name(home),
+                     'away_name_matches': bool(away) and name(e.get('away_team', '')) == name(away),
+                     'sport_matches': e.get('sport_key') == sport,
                      'kickoff_delta_seconds': (timestamp(e.get('commence_time')) - kickoff)
                          if timestamp(e.get('commence_time')) is not None else None}
-                    for e in events[:5] if isinstance(e, dict)]
+                    for e in candidates[:5]]
                 self.status['status'] = 'unmatched_or_ambiguous_fixture'
                 return []
             event_id = matches[0]['id']
