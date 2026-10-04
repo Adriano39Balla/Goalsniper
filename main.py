@@ -4589,6 +4589,7 @@ _BROWSER_REPORTS = frozenset({
     'http_scan_decisions', 'http_shadow_report', 'http_calibration',
     'http_significance', 'http_league_breakdown', 'http_league_density',
     'http_odds_provider', 'http_thresholds', 'http_execution_receipt',
+    'http_fixture_lookup',
 })
 
 
