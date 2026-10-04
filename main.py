@@ -1662,10 +1662,31 @@ def _reserve_odds_credits(cost):
         value = json.dumps(dict(day=day, month=month, daily=daily+cost, monthly=monthly+cost))
         c.execute("INSERT INTO settings(key,value) VALUES('odds_api:budget',%s) "
                   "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (value,))
-    return True
+    return dict(day=day, month=month, reserved=cost)
 
 
-_THE_ODDS_FEED = OddsFeed(os.getenv('THE_ODDS_API_KEY', '').strip(), _reserve_odds_credits)
+def _reconcile_odds_credits(reservation, billed):
+    """Replace this request's reservation with its explicit provider charge."""
+    delta = int(billed) - int(reservation['reserved'])
+    if not delta:
+        return
+    with _tip_transaction() as c:
+        c.execute('SELECT pg_advisory_xact_lock(19022)')
+        row = c.execute("SELECT value FROM settings WHERE key='odds_api:budget'").fetchone()
+        if not row:
+            return
+        budget = json.loads(row[0])
+        # A request completing across midnight must not refund the new day.
+        if budget.get('day') == reservation['day']:
+            budget['daily'] = max(0, int(budget.get('daily', 0)) + delta)
+        if budget.get('month') == reservation['month']:
+            budget['monthly'] = max(0, int(budget.get('monthly', 0)) + delta)
+        c.execute("UPDATE settings SET value=%s WHERE key='odds_api:budget'",
+                  (json.dumps(budget),))
+
+
+_THE_ODDS_FEED = OddsFeed(os.getenv('THE_ODDS_API_KEY', '').strip(), _reserve_odds_credits,
+                          reconcile=_reconcile_odds_credits)
 
 
 def _external_odds_rows(fid):
@@ -2014,6 +2035,10 @@ def _price_gate(market_text: str, suggestion: str, fid: int, prob: float, live: 
 
     if not best:
         res["decision"] = "no_odds"
+        res['detail'] = {'cause': 'execution_book_missing' if entry else 'market_missing',
+                         'execution_book': EXECUTION_BOOK,
+                         'available_books': sorted(((entry.get('by_book') or {}).get(sel) or {}).keys()),
+                         'feed': ODDS_DIAGNOSTICS.get((fid, bool(live))) or {}}
         res["passed"] = bool(ALLOW_TIPS_WITHOUT_ODDS)
         return res
 
@@ -2458,9 +2483,12 @@ def _evaluate_candidates(audit, fx, feat, raw, candidates, saved, cooling_down=F
                 prob = pc.get('effective_prob', prob)
                 qualified = bool(pc.get('passed') and prob * 100 >= thr)
                 if qualified:
-                    _shadow_record(fid, league_id, league, kickoff, phase, minute,
+                    shadow_inserted = _shadow_record(fid, league_id, league, kickoff, phase, minute,
                                    label, suggestion, prob, thr, pc,
                                    model_version=audit.model_version, policy_version=audit.policy_version)
+                    audit.record(fid, 'shadow', 'recorded' if shadow_inserted else
+                                 'already_recorded' if SHADOW_ENABLE else 'disabled',
+                                 league_id=league_id, market=label, suggestion=suggestion)
                 if not _market_active(market):
                     reason = 'market_disabled'
                 elif not pc.get('passed'):
@@ -2499,7 +2527,8 @@ def _evaluate_candidates(audit, fx, feat, raw, candidates, saved, cooling_down=F
                          qualified=qualified, detail=type(exc).__name__)
             continue
         audit.record(fid, 'candidate', reason, league_id=league_id, kickoff=kickoff,
-                     market=label, suggestion=suggestion, prob=prob, threshold=thr, pc=pc, qualified=qualified)
+                     market=label, suggestion=suggestion, prob=prob, threshold=thr, pc=pc, qualified=qualified,
+                     detail=json.dumps(pc['detail']) if pc.get('detail') else None)
         if math.isfinite(prob) and 0 <= prob <= 1 and math.isfinite(thr):
             pred_rows.append((fid, league_id, kickoff, int(time.time()), phase, minute,
                               label, suggestion, prob, thr, pc.get('odds'), pc.get('fair_prob'), pc.get('ev_pct'), reason))
@@ -3550,7 +3579,7 @@ def _get_prematch_features_bulk(fixtures: List[dict]) -> Tuple[Dict[int, Dict[st
     return out, fetched
 
 
-def prematch_scan_save() -> int:
+def prematch_scan_save(return_summary=False):
     with ScanAudit('prematch') as audit:
         fixtures = _collect_todays_prematch_fixtures(audit=audit)
         feats, fresh = _get_prematch_features_bulk(fixtures)
@@ -3585,8 +3614,14 @@ def prematch_scan_save() -> int:
             except Exception as exc:
                 log.exception('[PREMATCH] fixture %s failed', fid)
                 audit.record(fid, 'fixture', 'fixture_error', detail=type(exc).__name__)
-        log.info('[PREMATCH] saved=%d fixtures=%d scan_id=%s', saved, len(fixtures), audit.scan_id)
-        return saved
+        summary = dict(scan_id=audit.scan_id, fixtures=len(fixtures), tips_saved=saved,
+                       shadow_recorded=audit.counts.get('shadow:recorded', 0),
+                       shadow_existing=audit.counts.get('shadow:already_recorded', 0),
+                       telegram_sent=audit.counts.get('candidate:telegram_sent', 0),
+                       shadow_only=SHADOW_ONLY, odds_mode=THE_ODDS_API_MODE,
+                       errors=audit.errors, decisions=dict(audit.counts))
+        log.info('[PREMATCH] %s', json.dumps(summary, sort_keys=True))
+        return summary if return_summary else saved
 
 
 def send_match_of_the_day() -> bool:
@@ -4303,6 +4338,24 @@ def daily_accuracy_digest() -> Optional[str]:
             pass
         msg = "\n".join(lines)
 
+    with db_conn() as c:
+        shadow_count, shadow_fixtures = c.execute(
+            "SELECT count(*),count(DISTINCT match_id) FROM shadow_picks "
+            "WHERE created_ts >= %s AND created_ts < %s",
+            (int(y0.timestamp()), int(y1.timestamp()))).fetchone()
+        blockers = c.execute(
+            "SELECT reason,count(*) FROM scan_decisions WHERE stage='candidate' "
+            "AND qualified=FALSE AND created_ts >= %s AND created_ts < %s "
+            "GROUP BY reason ORDER BY count(*) DESC,reason LIMIT 3",
+            (int(y0.timestamp()), int(y1.timestamp()))).fetchall()
+    msg += (f"\n\n🔬 <b>Shadow research — yesterday</b>"
+            f"\nNew recorded selections: {shadow_count} across {shadow_fixtures} fixtures."
+            "\nResearch records are not sent betting tips."
+            f"\nCurrent mode: shadow-only={'yes' if SHADOW_ONLY else 'no'}; "
+            f"external odds={escape(THE_ODDS_API_MODE)}.")
+    if blockers:
+        msg += "\nRejected candidate evaluations (includes repeat scans): " + ", ".join(
+            f"{escape(reason or 'unknown')}={count}" for reason, count in blockers)
     send_telegram(msg)
     return msg
 
@@ -4721,7 +4774,9 @@ def http_retry_unsent():
 @app.route("/admin/prematch-scan", methods=["POST", "GET"])
 def http_prematch_scan():
     _require_admin()
-    return jsonify({"ok": True, "saved": int(prematch_scan_save())})
+    summary = prematch_scan_save(return_summary=True)
+    return jsonify({"ok": summary['errors'] == 0, "saved": summary['tips_saved'],
+                    "saved_means": "tip records, not shadow picks", **summary})
 
 
 @app.route("/admin/motd", methods=["POST", "GET"])
