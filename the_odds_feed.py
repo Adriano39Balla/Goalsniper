@@ -87,9 +87,10 @@ def normalize(event, now):
 
 
 class OddsFeed:
-    def __init__(self, key, reserve, session=None):
+    def __init__(self, key, reserve, session=None, reconcile=None):
         self.key = key
         self.reserve = reserve  # durable, cross-worker budget reservation
+        self.reconcile = reconcile
         self.session = session or requests.Session()
         self.lock = RLock()
         self.cache = {}
@@ -97,12 +98,15 @@ class OddsFeed:
         self.blocked_until = 0
 
     def get(self, path, cost=0, **params):
+        self.status.update(http_status=None, last_cost=None)
         if not self.key:
             self.status['status'] = 'missing_key'
             return None
         if time.time() < self.blocked_until:
+            self.status['status'] = 'provider_cooldown'
             return None
-        if cost and not self.reserve(cost):
+        reservation = self.reserve(cost) if cost else None
+        if cost and not reservation:
             self.status['status'] = 'local_budget_exhausted'
             return None
         try:
@@ -111,6 +115,11 @@ class OddsFeed:
             self.status.update(http_status=r.status_code,
                 remaining=r.headers.get('x-requests-remaining'),
                 used=r.headers.get('x-requests-used'), last_cost=r.headers.get('x-requests-last'))
+            # Reconcile only an explicit provider charge. A timeout or missing
+            # header keeps the reservation; never assume an unknown cost is zero.
+            billed = r.headers.get('x-requests-last')
+            if cost and self.reconcile and str(billed).isdigit():
+                self.reconcile(reservation, int(billed))
             if r.status_code != 200:
                 self.status['status'] = 'provider_http_error'
                 self.blocked_until = time.time() + (3600 if r.status_code in (401, 403, 422) else 60)
@@ -126,8 +135,15 @@ class OddsFeed:
 
     def check(self):
         with self.lock:
-            data = self.get('sports')
-            return {**self.status, 'sports_available': len(data) if isinstance(data, list) else None}
+            # A successful catalogue request says nothing about the last
+            # fixture's prices. Keep these two diagnostic scopes independent.
+            fixture_status = self.status
+            self.status = {'status': 'not_checked', 'configured': bool(self.key)}
+            try:
+                data = self.get('sports')
+                return {**self.status, 'sports_available': len(data) if isinstance(data, list) else None}
+            finally:
+                self.status = fixture_status
 
     def rows(self, fixture):
         with self.lock:
