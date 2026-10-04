@@ -4924,6 +4924,33 @@ def http_league_breakdown():
         market=request.args.get("market"), days=_arg_int("days"), min_n=_arg_int("min_n", 20))})
 
 
+@app.route('/admin/diagnostics/fixtures', methods=['GET'])
+def http_fixture_lookup():
+    _require_admin()
+    day = request.args.get('date', datetime.now(BERLIN_TZ).date().isoformat())
+    try:
+        if datetime.strptime(day, '%Y-%m-%d').strftime('%Y-%m-%d') != day:
+            raise ValueError()
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'date must be YYYY-MM-DD'}), 400
+    team = request.args.get('team', '').strip().casefold()
+    js = _api_get(FOOTBALL_API_URL, {'date': day, 'timezone': 'Europe/Berlin'})
+    if not isinstance(js, dict) or js.get('errors') or not isinstance(js.get('response'), list):
+        return jsonify({'ok': False, 'error': 'fixture_feed_unavailable'}), 502
+    fixtures = []
+    for fx in js['response']:
+        info, teams, league = fx.get('fixture') or {}, fx.get('teams') or {}, fx.get('league') or {}
+        home, away = (teams.get('home') or {}).get('name', ''), (teams.get('away') or {}).get('name', '')
+        if team and team not in home.casefold() and team not in away.casefold():
+            continue
+        fixtures.append({'fixture_id': info.get('id'), 'home': home, 'away': away,
+                         'kickoff': info.get('date'), 'kickoff_ts': info.get('timestamp'),
+                         'status': (info.get('status') or {}).get('short'),
+                         'league_id': league.get('id'), 'league': league.get('name')})
+    return jsonify({'ok': True, 'date': day, 'timezone': 'Europe/Berlin',
+                    'count': len(fixtures), 'fixtures': fixtures})
+
+
 @app.route("/admin/diagnostics/odds-provider", methods=["GET", "POST"])
 def http_odds_provider():
     _require_admin()
